@@ -13,6 +13,7 @@ rm -rf "$D"; mkdir -p "$D"
 C="$WINEPREFIX/drive_c"
 cp "$P/logs/juegos/$APPID.log" "$D/vrmin.log" 2>/dev/null
 cp "$C/questvrbridge/questvrbridge_log.txt" "$D/runtime_openxr.log" 2>/dev/null
+cp "$C/questvrbridge/questvrbridge_log_anterior.txt" "$D/runtime_openxr_anterior.log" 2>/dev/null
 cp "$P/logs/steam.log" "$D/steam.log" 2>/dev/null
 cp "$P/perfiles/$APPID.json" "$D/perfil.json" 2>/dev/null
 /usr/bin/python3 "$RES/vrjuegos.py" detectar "$APPID" > "$D/deteccion.json" 2>&1
