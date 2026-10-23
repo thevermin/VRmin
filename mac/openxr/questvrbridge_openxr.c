@@ -915,6 +915,7 @@ static int input_value(const Track *t, const char *b, float out[2], int *isPose)
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetInstanceProcAddr(XrInstance instance, const char *name, PFN_xrVoidFunction *function);
 static void init_once(void);
 static void install_gl_hook(void);
+static void fix_opencomposite_stubs(void);
 static void copy_unity_logs(int current);
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrEnumerateInstanceExtensionProperties(const char *layerName, uint32_t cap, uint32_t *count, XrExtensionProperties *props) {
@@ -944,6 +945,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateInstance(const XrInstanceCreateInfo *i
     }
     logmsg("xrCreateInstance de '%s' (%s)", info->applicationInfo.applicationName, info->applicationInfo.engineName);
     install_gl_hook();   /* (solo hace algo si el juego usa OpenGL) */
+    fix_opencomposite_stubs();
     /* Pedirle a la Mac los ajustes de este juego (resolución, campo de visión, controles) */
     snprintf(g_appName, sizeof g_appName, "%s", info->applicationInfo.applicationName[0] ? info->applicationInfo.applicationName : "?");
     g_helloVer = g_cfgVer;
@@ -1420,6 +1422,50 @@ static void install_gl_hook(void) {
         g_origWglGPA = (PROC (WINAPI *)(LPCSTR))o;
         logmsg("OpenGL: ajuste de contexto instalado");
     }
+}
+
+/* OpenComposite nunca implementó IVRCompositor::GetFrameTimeRemaining: si un juego la llama (Google Earth VR),
+ * OpenComposite aborta y el juego nunca manda cuadros. Se busca esa función en su DLL (vrclient_x64.dll, ya
+ * cargada en el proceso) por el nombre que usa al abortar, y se la cambia en memoria por una que responde
+ * «quedan 5 ms» (el archivo en disco no se toca). */
+static void fix_opencomposite_stubs(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    unsigned char *b = (unsigned char *)GetModuleHandleA("vrclient_x64.dll");
+    if (!b) return;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    static const char nombre[] = "\0GetFrameTimeRemaining";   /* (con el \0 de antes y el de después) */
+    unsigned char *lit = NULL, *text = NULL; DWORD textSize = 0; int nLit = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        unsigned char *s = b + sec[i].VirtualAddress; DWORD sz = sec[i].Misc.VirtualSize;
+        if (!memcmp(sec[i].Name, ".text", 6)) { text = s; textSize = sz; }
+        if (!memcmp(sec[i].Name, ".rdata", 7))
+            for (DWORD k = 0; k + sizeof nombre <= sz; k++)
+                if (!memcmp(s + k, nombre, sizeof nombre)) { lit = s + k + 1; nLit++; }
+    }
+    if (nLit != 1 || !text) { logmsg("OpenComposite: no encontré GetFrameTimeRemaining (%d)", nLit); return; }
+    /* La única instrucción «lea reg, [rip+x]» que apunta a ese nombre está dentro de la función */
+    unsigned char *fn = NULL; int nLea = 0;
+    for (DWORD k = 0; k + 7 <= textSize; k++) {
+        unsigned char *p = text + k;
+        if ((p[0] == 0x48 || p[0] == 0x4C) && p[1] == 0x8D && (p[2] & 0xC7) == 5 &&
+            p + 7 + *(int32_t *)(p + 3) == lit) {
+            nLea++;
+            for (unsigned char *q = p; q > p - 0x40 && q > text; q--)
+                if (q[-1] == 0xCC) { fn = q; break; }   /* el comienzo: después del relleno int3 */
+        }
+    }
+    if (nLea != 1 || !fn) { logmsg("OpenComposite: no encontré dónde arreglar GetFrameTimeRemaining (%d)", nLea); return; }
+    /* mov eax, 0.005f ; movd xmm0, eax ; ret */
+    static const unsigned char nuevo[] = { 0xB8, 0x0A, 0xD7, 0xA3, 0x3B, 0x66, 0x0F, 0x6E, 0xC0, 0xC3 };
+    DWORD viejo;
+    if (!VirtualProtect(fn, sizeof nuevo, PAGE_EXECUTE_READWRITE, &viejo)) return;
+    memcpy(fn, nuevo, sizeof nuevo);
+    VirtualProtect(fn, sizeof nuevo, viejo, &viejo);
+    FlushInstructionCache(GetCurrentProcess(), fn, sizeof nuevo);
+    logmsg("OpenComposite: GetFrameTimeRemaining arreglada");
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSession(XrInstance i, const XrSessionCreateInfo *info, XrSession *session) {
