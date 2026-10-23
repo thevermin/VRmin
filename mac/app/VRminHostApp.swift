@@ -1096,6 +1096,9 @@ struct ContentView: View {
     private var header: some View {
         HStack(alignment: .center, spacing: 12) {
             Logo(size: 30)
+            Text("v" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
+                .font(.caption).foregroundStyle(Theme.text2)
+                .help(L("Versión de VRmin Host"))
             Spacer()
             if let t = m.busyTask {
                 ProgressView().controlSize(.small)
