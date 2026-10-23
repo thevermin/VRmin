@@ -1,0 +1,7 @@
+{
+    "file_format_version": "1.0.0",
+    "runtime": {
+        "name": "QuestVRBridge",
+        "library_path": ".\\questvrbridge_openxr.dll"
+    }
+}
