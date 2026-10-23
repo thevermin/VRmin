@@ -258,8 +258,8 @@ def deteccion(juego, forzar=False):
 
 
 def es_vr(det):
-    """VR según Steam; sin respuesta de Steam, si se encontraron archivos de VR"""
-    return det["vr"] if det.get("vr") is not None else bool(det.get("apis"))
+    """VR según Steam, o si se encontraron archivos de VR (la tienda no marca como VR algunos programas, como Google Earth VR)"""
+    return det.get("vr") is True or bool(det.get("apis"))
 
 
 # ---------------------------------------------------------------- perfiles
