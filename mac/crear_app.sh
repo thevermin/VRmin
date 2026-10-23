@@ -12,8 +12,12 @@ falla() { cat "$1"; echo ""; echo ">>> Falló la compilación (detalle en $1). A
 
 # Compila con Swift; si las herramientas de línea de comandos son más nuevas que su propio SwiftUI (pasa con las de
 # macOS 27: «plugin for module 'SwiftUIMacros' not found»), prueba con el SDK anterior que vienen con ellas
+# (-target: que corra desde macOS 14.2, aunque esta Mac tenga un macOS más nuevo; si no, en Macs más viejas
+#  la app aparece tachada y el renderizador no arranca)
+MIN_MACOS=14.2
 swc() {
   local log=$1; shift
+  set -- -target arm64-apple-macos$MIN_MACOS "$@"
   xcrun swiftc "$@" 2> "$log" && return 0
   grep -q "plugin for module 'SwiftUIMacros'" "$log" || return 1
   local sdk; sdk=$(ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX26*.sdk 2>/dev/null | sort | tail -1)
@@ -30,7 +34,7 @@ swc app/compilacion.log -O -parse-as-library app/VRminHostApp.swift app/Idioma.s
 echo "2/3 Compilando el renderizador..."
 swc renderer/compilacion.log -O renderer/main.swift -o "$R/QuestRenderer" || falla renderer/compilacion.log
 echo "3/3 Copiando archivos..."
-xcrun clang -arch x86_64 -arch arm64 -O2 -dynamiclib app/recursos/arreglo_errores.c -o "$R/arreglo_errores.dylib" 2> app/compilacion_arreglo.log || falla app/compilacion_arreglo.log
+xcrun clang -arch x86_64 -arch arm64 -mmacosx-version-min=$MIN_MACOS -O2 -dynamiclib app/recursos/arreglo_errores.c -o "$R/arreglo_errores.dylib" 2> app/compilacion_arreglo.log || falla app/compilacion_arreglo.log
 cp app/recursos/*.sh app/recursos/*.py app/recursos/*.json "$R/"
 cp app/recursos/LICENCIAS_DE_TERCEROS.md "$R/"
 mkdir -p "$R/steam" && cp app/recursos/steam/steamwebhelper.exe "$R/steam/"
