@@ -1,6 +1,7 @@
 name: App de Mac (compilación de prueba)
 on:
   push:
+    branches: [main]   # (no al publicar una release: la etiqueta nueva no cambia el código)
     paths: ['mac/**', '.github/workflows/mac.yml']
   workflow_dispatch:
 jobs:

@@ -1,6 +1,7 @@
 name: App del Quest
 on:
   push:
+    branches: [main]   # (no al publicar una release: la etiqueta nueva no cambia el código)
     paths: ['quest-app/**', '.github/workflows/quest-app.yml']
   workflow_dispatch:
 jobs:
