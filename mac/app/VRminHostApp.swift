@@ -182,11 +182,16 @@ final class AppModel: ObservableObject {
         }
     }
 
-    // MARK: Actualizaciones (la última versión publicada en GitHub)
+    // MARK: Actualizaciones (las versiones publicadas en GitHub: estables y, si se eligió, beta)
     struct Nueva: Equatable { let version: String; let url: URL }
-    @Published var newHost: Nueva?              // una VRmin Host más nueva que esta
-    @Published var latestApk: Nueva?            // la app del Quest de la última versión publicada
+    @Published var newHost: Nueva?              // otra VRmin Host para instalar (más nueva, o la estable si esta es beta)
+    @Published var hostBack = false             // newHost es volver a la estable (esta es una beta)
+    @Published var latestApk: Nueva?            // la app del Quest del canal elegido
+    @Published var betaApks: Set<String> = []   // versiones de la app del Quest que salieron solo como beta
     @Published var questAppVersion: String?     // la del visor (por cable): nil = no se sabe, "" = no está instalada
+    /// Recibir también las versiones beta (pre-release en GitHub); apagado = solo las estables
+    @Published var beta: Bool = UserDefaults.standard.bool(forKey: "beta") {
+        didSet { UserDefaults.standard.set(beta, forKey: "beta"); checkUpdates() } }
     /// "0.40" es más nueva que "0.39" (se compara por partes, como números)
     static func newer(_ a: String, than b: String) -> Bool {
         let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
@@ -197,34 +202,57 @@ final class AppModel: ObservableObject {
         return false
     }
     func checkUpdates() {
-        var req = URLRequest(url: URL(string: "https://api.github.com/repos/thevermin/VRmin/releases/latest")!)
+        var req = URLRequest(url: URL(string: "https://api.github.com/repos/thevermin/VRmin/releases?per_page=30")!)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        let beta = self.beta
         URLSession.shared.dataTask(with: req) { [weak self] d, _, _ in
-            guard let d, let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                  let tag = j["tag_name"] as? String, let assets = j["assets"] as? [[String: Any]] else { return }
-            let v = tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
-            var host: Nueva?, apk: Nueva?
-            for a in assets {
-                guard let n = a["name"] as? String, let s = a["browser_download_url"] as? String, let u = URL(string: s) else { continue }
-                if n.hasSuffix(".zip") && n.contains("Host") { host = Nueva(version: v, url: u) }   // «VRmin Host 0.40.zip»
-                if n.hasSuffix(".apk"), let r = n.range(of: "[0-9]+(\\.[0-9]+)+", options: .regularExpression) {   // «VRmin-0.70.apk»
-                    apk = Nueva(version: String(n[r]), url: u)
+            guard let d, let list = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]] else { return }
+            struct Rel { let v: String; let pre: Bool; var host: URL?; var apk: Nueva? }
+            var rels: [Rel] = []
+            for j in list where (j["draft"] as? Bool) != true {
+                guard let tag = j["tag_name"] as? String else { continue }
+                var r = Rel(v: tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV")), pre: (j["prerelease"] as? Bool) == true)
+                for a in (j["assets"] as? [[String: Any]]) ?? [] {
+                    guard let n = a["name"] as? String, let s = a["browser_download_url"] as? String, let u = URL(string: s) else { continue }
+                    if n.hasSuffix(".zip") && n.contains("Host") { r.host = u }   // «VRmin Host 0.40.zip»
+                    if n.hasSuffix(".apk"), let m = n.range(of: "[0-9]+(\\.[0-9]+)+", options: .regularExpression) {   // «VRmin-0.70.apk»
+                        r.apk = Nueva(version: String(n[m]), url: u)
+                    }
                 }
+                rels.append(r)
             }
+            rels.sort { AppModel.newer($0.v, than: $1.v) }   // la más nueva primero
             let mine = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+            let canal = rels.filter { beta || !$0.pre }
+            var host: Nueva?, back = false
+            if let r = canal.first(where: { $0.host != nil }), AppModel.newer(r.v, than: mine) { host = Nueva(version: r.v, url: r.host!) }
+            else if !beta, rels.contains(where: { $0.pre && $0.v == mine }),   // esta es una beta y se eligió volver a las estables
+                    let r = canal.first(where: { $0.host != nil }) { host = Nueva(version: r.v, url: r.host!); back = true }
+            let apk = canal.first(where: { $0.apk != nil })?.apk
+            let stableApks = Set(rels.filter { !$0.pre }.compactMap { $0.apk?.version })
+            let betaApks = Set(rels.filter { $0.pre }.compactMap { $0.apk?.version }).subtracting(stableApks)
             DispatchQueue.main.async {
-                self?.newHost = host.flatMap { AppModel.newer($0.version, than: mine) ? $0 : nil }
-                self?.latestApk = apk
+                self?.newHost = host; self?.hostBack = back
+                self?.latestApk = apk; self?.betaApks = betaApks
             }
         }.resume()
     }
-    /// Baja la VRmin Host nueva, revisa su firma y se reemplaza (se cierra y se abre la nueva)
+    /// Baja la VRmin Host nueva (o la estable), revisa su firma y se reemplaza (se cierra y se abre la otra)
     func updateHost() {
         guard let n = newHost else { return }
         run(L("Actualizando VRmin Host"), "actualizar_host.sh",
             [n.url.absoluteString, Bundle.main.bundlePath, String(ProcessInfo.processInfo.processIdentifier)]) {
             NSApp.terminate(nil)
         }
+    }
+    /// La app del visor: hay otra para instalar (más nueva, la estable si tiene una beta, o no está instalada)
+    var questAppAction: Bool {
+        guard adbState == "device", let a = latestApk, let v = questAppVersion else { return false }
+        return v.isEmpty || AppModel.newer(a.version, than: v) || questAppBack
+    }
+    var questAppBack: Bool {   // volver a la estable (el visor tiene una beta y ya no se reciben)
+        guard !beta, let a = latestApk, let v = questAppVersion, !v.isEmpty else { return false }
+        return betaApks.contains(v) && a.version != v
     }
     /// Instala (o actualiza) VRmin en el visor por el cable, con adb
     func installQuestApp() {
@@ -1078,9 +1106,13 @@ struct ContentView: View {
             .padding(.horizontal, 12).padding(.vertical, 7)
             .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.white.opacity(0.07)))
             if let n = m.newHost {
-                Button { m.updateHost() } label: { Label(L("Actualizar a la %@", n.version), systemImage: "arrow.down.circle.fill") }
+                Button { m.updateHost() } label: {
+                    Label(m.hostBack ? L("Volver a la %@ (estable)", n.version) : L("Actualizar a la %@", n.version),
+                          systemImage: m.hostBack ? "arrow.uturn.backward.circle.fill" : "arrow.down.circle.fill")
+                }
                     .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
-                    .help(L("Hay una versión nueva de VRmin Host: se baja, se cierra esta y se abre la nueva."))
+                    .help(m.hostBack ? L("Tenés una versión beta y elegiste solo versiones estables: se baja la estable, se cierra esta y se abre la otra.")
+                                     : L("Hay una versión nueva de VRmin Host: se baja, se cierra esta y se abre la nueva."))
             }
             // Apoyar el proyecto (VRmin es gratis)
             Button { NSWorkspace.shared.open(URL(string: "https://ko-fi.com/thevermin")!) } label: {
@@ -1196,27 +1228,24 @@ struct ContentView: View {
                         .help(L("Abre VRmin en el visor directo en el Modo Centinela, sin tocarlo. Después abrí un juego con «Jugar»."))
                 }
             }
-            row(L("App del Quest"), m.adbState == "device" && !(m.questAppVersion ?? "").isEmpty && !questAppAction,
-                questAppStatus, warn: questAppAction) {
-                if questAppAction {
-                    Button(m.questAppVersion == "" ? L("Instalar") : L("Actualizar")) { m.installQuestApp() }
+            row(L("App del Quest"), m.adbState == "device" && !(m.questAppVersion ?? "").isEmpty && !m.questAppAction,
+                questAppStatus, warn: m.questAppAction) {
+                if m.questAppAction {
+                    Button(m.questAppVersion == "" ? L("Instalar") : m.questAppBack ? L("Volver a la estable") : L("Actualizar")) { m.installQuestApp() }
                         .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
-                        .help(L("Se instala por el cable USB-C, sin SideQuest. Tus ajustes del visor se conservan."))
+                        .help(m.questAppBack ? L("Se desinstala la beta del visor y se instala la estable, por el cable USB-C. Los ajustes del visor vuelven a los de fábrica.")
+                              : L("Se instala por el cable USB-C, sin SideQuest. Tus ajustes del visor se conservan."))
                 }
             }
         }
     }
 
-    /// La app del visor: hay una más nueva (o no está instalada) y se puede instalar por el cable
-    private var questAppAction: Bool {
-        guard m.adbState == "device", let a = m.latestApk, let v = m.questAppVersion else { return false }
-        return v.isEmpty || AppModel.newer(a.version, than: v)
-    }
     private var questAppStatus: String {
         guard m.adbInstalled else { return L("Para instalarla desde acá: herramientas del Modo Centinela") }
         if m.adbState == "unauthorized" { return L("Tocá «Permitir» en el visor") }
         guard m.adbState == "device", let v = m.questAppVersion else { return L("Conectá el Quest por cable USB-C para ver su versión") }
         if v.isEmpty { return L("No está instalada en el visor") }
+        if m.questAppBack, let a = m.latestApk { return L("Versión %@ (beta) · estable: %@", v, a.version) }
         if let a = m.latestApk, AppModel.newer(a.version, than: v) { return L("Versión %@ · hay una nueva: %@", v, a.version) }
         return L("Versión %@ · al día", v)
     }
@@ -1584,6 +1613,8 @@ struct SettingsView: View {
                 }
                 Toggle(L("Abrir VRmin Host al iniciar la Mac"), isOn: $m.openAtLogin).toggleStyle(.switch)
                 Toggle(L("No dormir mientras el Quest la usa"), isOn: $m.keepAwake).toggleStyle(.switch)
+                Toggle(L("Recibir versiones beta"), isOn: $m.beta).toggleStyle(.switch)
+                    .help(L("Las betas traen lo nuevo antes, pero pueden fallar. Si lo apagás, VRmin Host te ofrece volver a la versión estable."))
                 HStack {
                     Text(m.data.path).font(.caption).foregroundStyle(Theme.text2).lineLimit(1).truncationMode(.middle)
                     Spacer()

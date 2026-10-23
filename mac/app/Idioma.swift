@@ -15,6 +15,13 @@ func L(_ es: String, _ args: CVarArg...) -> String {
 }
 
 private let EN: [String: String] = [
+    "Se desinstala la beta del visor y se instala la estable, por el cable USB-C. Los ajustes del visor vuelven a los de fábrica.": "The beta is uninstalled from the headset and the stable version is installed over the USB-C cable. Headset settings go back to defaults.",
+    "Volver a la %@ (estable)": "Back to %@ (stable)",
+    "Tenés una versión beta y elegiste solo versiones estables: se baja la estable, se cierra esta y se abre la otra.": "You have a beta version and chose stable versions only: the stable one downloads, this one closes and the other one opens.",
+    "Versión %@ (beta) · estable: %@": "Version %@ (beta) · stable: %@",
+    "Volver a la estable": "Back to stable",
+    "Recibir versiones beta": "Get beta versions",
+    "Las betas traen lo nuevo antes, pero pueden fallar. Si lo apagás, VRmin Host te ofrece volver a la versión estable.": "Betas get new features first, but they may break. If you turn this off, VRmin Host offers to go back to the stable version.",
     "Actualizar a la %@": "Update to %@",
     "Hay una versión nueva de VRmin Host: se baja, se cierra esta y se abre la nueva.": "There's a new version of VRmin Host: it downloads, this one closes and the new one opens.",
     "Actualizando VRmin Host": "Updating VRmin Host",
