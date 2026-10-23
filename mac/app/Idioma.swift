@@ -15,6 +15,7 @@ func L(_ es: String, _ args: CVarArg...) -> String {
 }
 
 private let EN: [String: String] = [
+    "Versión de VRmin Host": "VRmin Host version",
     "Buscar actualizaciones": "Check for updates",
     "Buscando…": "Checking…",
     "No se pudo buscar. ¿Hay internet?": "Couldn't check. Is the Mac online?",
