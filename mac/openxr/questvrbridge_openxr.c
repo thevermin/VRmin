@@ -2594,7 +2594,12 @@ static void init_once(void) {
         char *slash = strrchr(path, '\\');
         if (slash) {
             slash[1] = 0; strcpy(g_dir, path);
-            strcpy(slash + 1, "questvrbridge_log.txt"); g_logf = fopen(path, "w");
+            /* (el del juego anterior queda como questvrbridge_log_anterior.txt) */
+            char prev[MAX_PATH];
+            strcpy(prev, path); strcpy(prev + (slash + 1 - path), "questvrbridge_log_anterior.txt");
+            strcpy(slash + 1, "questvrbridge_log.txt");
+            MoveFileExA(path, prev, MOVEFILE_REPLACE_EXISTING);
+            g_logf = fopen(path, "w");
         }
     }
     g_frameEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
