@@ -201,12 +201,17 @@ final class AppModel: ObservableObject {
         }
         return false
     }
-    func checkUpdates() {
+    @Published var updateMsg: String?           // resultado de «Buscar actualizaciones»
+    func checkUpdates(manual: Bool = false) {
+        if manual { updateMsg = L("Buscando…") }
         var req = URLRequest(url: URL(string: "https://api.github.com/repos/thevermin/VRmin/releases?per_page=30")!)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         let beta = self.beta
         URLSession.shared.dataTask(with: req) { [weak self] d, _, _ in
-            guard let d, let list = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]] else { return }
+            guard let d, let list = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]] else {
+                if manual { DispatchQueue.main.async { self?.updateMsg = L("No se pudo buscar. ¿Hay internet?") } }
+                return
+            }
             struct Rel { let v: String; let pre: Bool; var host: URL?; var apk: Nueva? }
             var rels: [Rel] = []
             for j in list where (j["draft"] as? Bool) != true {
@@ -234,6 +239,7 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.async {
                 self?.newHost = host; self?.hostBack = back
                 self?.latestApk = apk; self?.betaApks = betaApks
+                if manual { self?.updateMsg = host == nil ? L("Estás al día") : back ? L("Podés volver a la estable: botón arriba") : L("Hay una versión nueva: botón arriba") }
             }
         }.resume()
     }
@@ -1630,8 +1636,13 @@ struct SettingsView: View {
                 }
             }
 
-            Text(L("VRmin Host %@ · en el Quest: VRmin", Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
-                .font(.caption).foregroundStyle(Theme.text2)
+            HStack {
+                Text(L("VRmin Host %@ · en el Quest: VRmin", Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
+                    .font(.caption).foregroundStyle(Theme.text2)
+                Spacer()
+                if let msg = m.updateMsg { Text(msg).font(.caption).foregroundStyle(Theme.text2) }
+                Button(L("Buscar actualizaciones")) { m.checkUpdates(manual: true) }.buttonStyle(Pill())
+            }
             // Crédito del proyecto original (lo exige la licencia también en las versiones modificadas)
             Text("VRmin by thevermin · github.com/thevermin/vrmin · GPL-3.0")
                 .font(.caption).foregroundStyle(Theme.text2)
