@@ -15,6 +15,12 @@ func L(_ es: String, _ args: CVarArg...) -> String {
 }
 
 private let EN: [String: String] = [
+    "Buscar actualizaciones": "Check for updates",
+    "Buscando…": "Checking…",
+    "No se pudo buscar. ¿Hay internet?": "Couldn't check. Is the Mac online?",
+    "Estás al día": "You're up to date",
+    "Podés volver a la estable: botón arriba": "You can go back to stable: button at the top",
+    "Hay una versión nueva: botón arriba": "There's a new version: button at the top",
     "Se desinstala la beta del visor y se instala la estable, por el cable USB-C. Los ajustes del visor vuelven a los de fábrica.": "The beta is uninstalled from the headset and the stable version is installed over the USB-C cable. Headset settings go back to defaults.",
     "Volver a la %@ (estable)": "Back to %@ (stable)",
     "Tenés una versión beta y elegiste solo versiones estables: se baja la estable, se cierra esta y se abre la otra.": "You have a beta version and chose stable versions only: the stable one downloads, this one closes and the other one opens.",
