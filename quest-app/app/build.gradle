@@ -15,8 +15,8 @@ android {
         applicationId 'com.vrmin.app'
         minSdk 29
         targetSdk 34   // (la tienda de Meta lo pide para las apps creadas desde marzo de 2026)
-        versionCode 69
-        versionName '0.69'
+        versionCode 70
+        versionName '0.70'
         ndk { abiFilters 'arm64-v8a' }
         externalNativeBuild { cmake { arguments '-DANDROID_STL=c++_shared' } }
         // App ID de la tienda (Developer Dashboard → Development → API). Vacío = sin verificar la compra (versiones de prueba)

@@ -6,7 +6,7 @@
 
 **Play your SteamVR games on a Mac. Streamed to your Meta Quest.**
 
-Free and open source · Apple Silicon Mac + Meta Quest 3 / 3S + Steam
+Free and open source · Apple Silicon Mac + Meta Quest + Steam
 
 [**Download**](../../releases/latest) · [How it works](#how-it-works) · [Install](#install) · [FAQ](#faq) · [☕ Support on Ko-fi](https://ko-fi.com/thevermin)
 
@@ -94,10 +94,29 @@ Put the Quest on your monitor: it tracks you with its cameras while the game sho
 ## Requirements
 
 - A Mac with **Apple Silicon** (M1 or newer), **macOS 14.2** or newer, and Rosetta 2
-- A **Meta Quest 3 or 3S** (Quest 2 and Pro may work, without some mixed‑reality features)
+- A **Meta Quest 3 or 3S** (recommended). **Quest 1, Quest 2 and Quest Pro** are supported experimentally: see
+  [Older headsets](#older-headsets)
 - The Mac and the Quest on the **same Wi‑Fi** network (5/6 GHz, or the Mac on Ethernet, works best)
 - A Steam account with your VR games, and space for them (VRmin installs its own Steam for Windows: games are
   downloaded again there)
+
+### Older headsets
+VRmin runs on Quest 1, Quest 2 and Quest Pro, but it's mostly tested on Quest 3, so expect some rough edges. These
+features need hardware that older headsets don't have, so they probably won't work (or will work differently):
+
+| Feature | Quest 2 / Pro | Quest 1 |
+|---|---|---|
+| Passthrough (portal, mixed reality room, seeing your room) | Black and white on Quest 2, color on Pro | Not available |
+| Real hands with soft edges | Hard edges (needs Quest 3's camera access) | Not available |
+| Hands and controllers at the same time | May not work | Not available |
+| USB-C cable connection | Works with recent system updates | Probably not (old system) |
+| Half frame rate mode (Meta's Space Warp) | Works | Not available |
+| Refresh rate | Up to 120 Hz | 72 Hz only |
+| Several Mac windows at once | Works | May be limited (old system) |
+
+Older headsets also have weaker video decoders: if the picture stutters, lower the quality in VRmin Host's settings
+(this also makes the Mac work less). If you try VRmin on an older headset, please tell us how it went in an
+[Issue](../../issues)!
 
 ## Install
 
