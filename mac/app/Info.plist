@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- El identificador sigue igual que antes: así macOS conserva los permisos ya dados -->
+	<key>CFBundleIdentifier</key><string>local.questvrbridge.app</string>
+	<key>CFBundleName</key><string>VRmin Host</string>
+	<key>CFBundleDisplayName</key><string>VRmin Host</string>
+	<key>CFBundleExecutable</key><string>VRminHost</string>
+	<key>CFBundleIconFile</key><string>AppIcon</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleShortVersionString</key><string>0.40</string>
+	<key>CFBundleVersion</key><string>38</string>
+	<key>LSMinimumSystemVersion</key><string>14.2</string>
+	<key>LSApplicationCategoryType</key><string>public.app-category.games</string>
+	<key>NSHighResolutionCapable</key><true/>
+	<key>NSPrincipalClass</key><string>NSApplication</string>
+	<key>NSCameraUsageDescription</key><string>En el Modo Centinela, VRmin Host usa la cámara para seguir tu cabeza (no se guarda ni se envía ninguna imagen).</string>
+	<key>NSAudioCaptureUsageDescription</key><string>VRmin Host envía el sonido de la Mac y de los juegos al Quest.</string>
+	<key>NSLocalNetworkUsageDescription</key><string>VRmin Host se comunica con tu Quest por la red local.</string>
+</dict>
+</plist>

@@ -1,0 +1,17 @@
+{
+  "_ayuda": "Ajustes conocidos por juego (por número de Steam). Lo que elijas en la app para un juego tiene prioridad. Claves: runtime (auto|openxr|openvr|steamvr|oculus|plano), args (lista), env (solo al abrir en modo directo), lanzar (steam|directo), exe (ruta dentro de la carpeta del juego), nota, estado (sin probar|funciona|con problemas|no funciona).",
+  "juegos": {
+    "469610": {
+      "runtime": "openvr",
+      "args": [
+        "-vrmode",
+        "OpenVR"
+      ],
+      "nota": "Rick and Morty: Virtual Rick-ality necesita «-vrmode OpenVR» para abrir en VR"
+    },
+    "658920": {
+      "estado": "no funciona",
+      "nota": "Half-Life 2: VR Mod usa Vulkan con «geometry shaders» (DXVK) y es de 32 bits: las Mac no tienen esos shaders en Vulkan, así que todavía no abre"
+    }
+  }
+}
