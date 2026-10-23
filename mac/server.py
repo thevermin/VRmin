@@ -334,16 +334,25 @@ async def main():
         sys.exit("Falta el certificado. Ejecutá: bash start.sh")
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
-    quest_srv = await asyncio.start_server(handle_quest, "0.0.0.0", PORT, ssl=ctx)
+    # El puerto del navegador es opcional (la app del Quest no lo usa): si otro programa de la Mac ya lo ocupa, se sigue sin él
+    try:
+        quest_srv = await asyncio.start_server(handle_quest, "0.0.0.0", PORT, ssl=ctx)
+    except OSError as e:
+        quest_srv = None
+        print(f"Aviso: el puerto {PORT} está ocupado por otro programa ({e}); sigo sin la página para el navegador del Quest", flush=True)
     rend_srv = await asyncio.start_server(handle_renderer, "127.0.0.1", RENDER_PORT)
     # (la app nativa del Quest se conecta al renderizador, que pide el emparejado; acá ya no se atiende)
     print("=" * 64)
     print(" QuestVRBridge - Etapa 2 (video desde la Mac)")
-    print(f" En el navegador del Quest 3 abrí:  https://{local_ip()}:{PORT}")
+    if quest_srv:
+        print(f" En el navegador del Quest 3 abrí:  https://{local_ip()}:{PORT}")
     print(" Ctrl+C para cortar")
     print("=" * 64, flush=True)
     asyncio.ensure_future(reporter())
     # (el aviso en la red lo hace QuestRenderer con el nombre de la Mac; uno acá la mostraba dos veces, con ".local")
+    if not quest_srv:
+        async with rend_srv:
+            await rend_srv.serve_forever()
     async with quest_srv, rend_srv:
         await asyncio.gather(quest_srv.serve_forever(), rend_srv.serve_forever())
 
