@@ -1,0 +1,19 @@
+*.pem
+.DS_Store
+build/
+.gradle/
+.cxx/
+local.properties
+*.app/
+mac/renderer/QuestRenderer
+mac/renderer/compilacion.log
+mac/app/compilacion.log
+capturas/
+mac/diag/*.exe
+__pycache__/
+mac/test/gpu_name.inc
+
+# Signing keys never go in the repository
+*.jks
+*.keystore
+quest-app/keystore/

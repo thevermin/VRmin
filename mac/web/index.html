@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuestVRBridge</title>
+<style>
+  body { margin: 0; font: 18px/1.5 system-ui, sans-serif; background: #111; color: #eee;
+         display: flex; min-height: 100vh; align-items: center; justify-content: center; }
+  main { max-width: 680px; padding: 24px; }
+  h1 { font-size: 28px; margin: 0 0 8px; }
+  button { font-size: 22px; padding: 14px 28px; border-radius: 12px; border: 0;
+           background: #3b82f6; color: white; cursor: pointer; }
+  button:disabled { background: #555; }
+  #status { margin: 16px 0; padding: 12px; background: #222; border-radius: 8px;
+            font-family: ui-monospace, monospace; white-space: pre-line; font-size: 16px; }
+  .ok { color: #4ade80; } .bad { color: #f87171; } .mid { color: #facc15; }
+  p.note { font-size: 15px; color: #aaa; }
+</style>
+</head>
+<body>
+<main>
+  <h1>QuestVRBridge · Etapa 2</h1>
+  <p>La escena la dibuja tu Mac y llega al visor como video.</p>
+  <div id="status">Conectando con la Mac…</div>
+  <button id="go" disabled>Entrar en VR</button>
+  <p class="note">Si ves un anillo de cubos de colores girando, columnas naranjas y muchos cubitos flotando,
+    eso lo está generando la Mac. Si ves un solo cubo girando delante tuyo, el video no está llegando
+    y estás viendo la escena de respaldo del visor. Para salir, apretá el botón Meta del control derecho.</p>
+</main>
+<script>
+"use strict";
+const statusEl = document.getElementById("status");
+const goBtn = document.getElementById("go");
+
+// ---------- Estado ----------
+let ws, wsOpen = false, lastRtt = null, rttAvg = null;
+let decoder = null, decoderCfg = null, codecInfo = "buscando…", decodeErr = "", waitingKey = true;
+let pendingFrame = null, streamFrameId = -1, lastStreamTime = 0, streamW = 2048, streamH = 1024;
+// Nitidez: 0 = apagada, 0.25 = suave (por defecto), 0.5 = fuerte. Se puede cambiar con ?nitidez=0.4 en la dirección.
+const SHARP = (() => { const v = parseFloat(new URLSearchParams(location.search).get("nitidez")); return isFinite(v) ? Math.max(0, Math.min(1, v)) : 0.25; })();
+let m2p = null, vfps = 0, vfpsCount = 0;
+const sent = new Map();   // id de pose -> { t, views }
+let poseId = 0;
+let xrSession = null;
+let targetHz = 72;        // lo manda la Mac al conectar (VR_FPS)
+
+setInterval(() => { vfps = vfpsCount; vfpsCount = 0; }, 1000);
+
+function setStatus() {
+  const L = [];
+  L.push(navigator.xr ? '<span class="ok">WebXR: disponible</span>' : '<span class="bad">WebXR: NO disponible</span>');
+  L.push(wsOpen ? '<span class="ok">Mac: conectada</span>' : '<span class="bad">Mac: sin conexión</span>');
+  if (rttAvg != null) L.push(`Red ida y vuelta: ${rttAvg.toFixed(1)} ms`);
+  L.push(`Decodificador: ${codecInfo}`);
+  if (decodeErr) L.push(`<span class="bad">Error de video: ${decodeErr}</span>`);
+  const live = performance.now() - lastStreamTime < 1000;
+  L.push(live ? `<span class="ok">Video de la Mac: ${vfps} fps</span>` : '<span class="mid">Video de la Mac: todavía no llega (entrá en VR)</span>');
+  if (m2p != null && live) L.push(`Latencia total (movimiento → imagen decodificada): ${m2p.toFixed(0)} ms`);
+  if (performance.now() - aLast < 1000) L.push(actx && actx.state === "running" ? '<span class="ok">Sonido: llegando</span>' : '<span class="mid">Sonido: llega, se activa al entrar en VR</span>');
+  statusEl.innerHTML = L.join("\n");
+}
+setInterval(setStatus, 500);
+
+// ---------- Conexión ----------
+function connect() {
+  ws = new WebSocket(`wss://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { wsOpen = true; requestKey(); };
+  ws.onclose = () => { wsOpen = false; setTimeout(connect, 1000); };
+  ws.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) {
+      if (ev.data.byteLength > 8 && new Uint8Array(ev.data, 0, 1)[0] === 2) onAudio(ev.data); else onVideo(ev.data);
+      return;
+    }
+    const m = JSON.parse(ev.data);
+    if (m.type === "config" && m.fps) { targetHz = m.fps; return; }
+    if (m.type === "echo" && typeof m.t === "number") {
+      lastRtt = performance.now() - m.t;
+      rttAvg = rttAvg == null ? lastRtt : rttAvg * 0.9 + lastRtt * 0.1;
+    }
+  };
+}
+function requestKey() { if (wsOpen) ws.send('{"type":"key"}'); }
+connect();
+
+// Fuera de VR: pings para medir la red
+setInterval(() => {
+  if (wsOpen && !xrSession) ws.send(JSON.stringify({ type: "pose", t: performance.now(), rtt: lastRtt }));
+}, 100);
+
+// ---------- Decodificación de video (WebCodecs) ----------
+async function setupDecoder() {
+  if (!("VideoDecoder" in window)) { codecInfo = "WebCodecs NO disponible en este navegador"; return; }
+  for (const codec of ["avc1.640033", "avc1.64002A", "avc1.4D0033", "avc1.42E033"]) {
+    const cfg = { codec, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" };
+    try { if ((await VideoDecoder.isConfigSupported(cfg)).supported) { decoderCfg = cfg; break; } } catch (e) {}
+  }
+  if (!decoderCfg) decoderCfg = { codec: "avc1.640033", optimizeForLatency: true };
+  codecInfo = `${decoderCfg.codec} (${decoderCfg.hardwareAcceleration ? "por hardware" : "por defecto"})`;
+  makeDecoder();
+}
+function makeDecoder() {
+  try { if (decoder && decoder.state !== "closed") decoder.close(); } catch (e) {}
+  decoder = new VideoDecoder({
+    output: (frame) => {
+      if (pendingFrame) pendingFrame.close();
+      pendingFrame = frame;
+      vfpsCount++;
+      const s = sent.get(frame.timestamp);
+      if (s) { const l = performance.now() - s.t; m2p = m2p == null ? l : m2p * 0.9 + l * 0.1; }
+    },
+    error: (e) => { decodeErr = String(e && e.message || e); setTimeout(() => { makeDecoder(); requestKey(); }, 200); },
+  });
+  decoder.configure(decoderCfg);
+  waitingKey = true;
+}
+function onVideo(buf) {
+  if (!decoder || decoder.state !== "configured" || buf.byteLength < 9) return;
+  const dv = new DataView(buf);
+  if (dv.getUint8(0) !== 1) return;
+  const id = dv.getUint32(1), key = dv.getUint8(5) === 1;
+  if (waitingKey && !key) return;
+  if (decoder.decodeQueueSize > 6) { waitingKey = true; requestKey(); return; }  // se atrasó: saltar al próximo cuadro completo
+  waitingKey = false;
+  try {
+    decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: id, data: new Uint8Array(buf, 8) }));
+  } catch (e) { decodeErr = String(e.message || e); waitingKey = true; requestKey(); }
+}
+setupDecoder();
+
+// ---------- Sonido del juego (PCM 16 bits estéreo, bloques de 20 ms) ----------
+// Se programa cada bloque un poco adelante (≈60 ms) para absorber la variación de la red.
+let actx = null, aNext = 0, aLast = 0, aGaps = 0;
+function startAudio() {
+  try {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+    if (actx.state !== "running") actx.resume();
+  } catch (e) { log("Sonido no disponible: " + (e.message || e)); }
+}
+function onAudio(buf) {
+  aLast = performance.now();
+  if (!actx || actx.state !== "running") return;
+  const rate = new DataView(buf).getUint32(4);
+  const s = new Int16Array(buf, 8, (buf.byteLength - 8) >> 1);
+  const n = s.length >> 1;
+  if (!n || rate < 8000) return;
+  const now = actx.currentTime;
+  if (aNext < now + 0.015) { aNext = now + 0.06; aGaps++; }   // se vació: volver a llenar
+  else if (aNext > now + 0.3) return;                           // demasiado atrasado: saltear
+  const ab = actx.createBuffer(2, n, rate);
+  const L = ab.getChannelData(0), R = ab.getChannelData(1);
+  for (let i = 0; i < n; i++) { L[i] = s[2 * i] / 32768; R[i] = s[2 * i + 1] / 32768; }
+  const src = actx.createBufferSource();
+  src.buffer = ab; src.connect(actx.destination); src.start(aNext);
+  aNext += n / rate;
+}
+
+// ---------- Matrices (column-major, como WebGL) ----------
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k]; o[c * 4 + r] = s;
+  }
+  return o;
+}
+function inv(m) {
+  const a00=m[0],a01=m[1],a02=m[2],a03=m[3],a10=m[4],a11=m[5],a12=m[6],a13=m[7],
+        a20=m[8],a21=m[9],a22=m[10],a23=m[11],a30=m[12],a31=m[13],a32=m[14],a33=m[15];
+  const b00=a00*a11-a01*a10,b01=a00*a12-a02*a10,b02=a00*a13-a03*a10,b03=a01*a12-a02*a11,
+        b04=a01*a13-a03*a11,b05=a02*a13-a03*a12,b06=a20*a31-a21*a30,b07=a20*a32-a22*a30,
+        b08=a20*a33-a23*a30,b09=a21*a32-a22*a31,b10=a21*a33-a23*a31,b11=a22*a33-a23*a32;
+  let det=b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06;
+  if (!det) return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+  det = 1 / det;
+  return new Float32Array([
+    (a11*b11-a12*b10+a13*b09)*det, (a02*b10-a01*b11-a03*b09)*det, (a31*b05-a32*b04+a33*b03)*det, (a22*b04-a21*b05-a23*b03)*det,
+    (a12*b08-a10*b11-a13*b07)*det, (a00*b11-a02*b08+a03*b07)*det, (a32*b02-a30*b05-a33*b01)*det, (a20*b05-a22*b02+a23*b01)*det,
+    (a10*b10-a11*b08+a13*b06)*det, (a01*b08-a00*b10-a03*b06)*det, (a30*b04-a31*b02+a33*b00)*det, (a21*b02-a20*b04-a23*b00)*det,
+    (a11*b07-a10*b09-a12*b06)*det, (a00*b09-a01*b07+a02*b06)*det, (a31*b01-a30*b03-a32*b00)*det, (a20*b03-a21*b01+a22*b00)*det]);
+}
+function rotOnly(m) { const o = new Float32Array(m); o[12] = o[13] = o[14] = 0; return o; }
+function trs(x, y, z, sx, sy, sz) { return new Float32Array([sx,0,0,0, 0,sy,0,0, 0,0,sz,0, x,y,z,1]); }
+function rotY(a) { const c = Math.cos(a), s = Math.sin(a); return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]); }
+const v3 = (p) => [+p.x.toFixed(4), +p.y.toFixed(4), +p.z.toFixed(4)];
+const q4 = (o) => [+o.x.toFixed(4), +o.y.toFixed(4), +o.z.toFixed(4), +o.w.toFixed(4)];
+
+// ---------- WebXR ----------
+let gl, cubeProg, streamProg, cubeBuf, triBuf, streamTex, refSpace, loc = {}, sloc = {};
+
+if (navigator.xr) {
+  navigator.xr.isSessionSupported("immersive-vr").then((ok) => {
+    goBtn.disabled = !ok;
+    if (!ok) goBtn.textContent = "VR no soportada en este navegador";
+  });
+}
+goBtn.onclick = startXR;
+
+function log(msg) {
+  console.log(msg);
+  try { if (wsOpen) ws.send(JSON.stringify({ type: "log", msg: String(msg) })); } catch (e) {}
+}
+window.addEventListener("error", (e) => log("ERROR JS: " + e.message + " (línea " + e.lineno + ")"));
+window.addEventListener("unhandledrejection", (e) => log("ERROR JS (promesa): " + (e.reason && e.reason.message || e.reason)));
+
+async function startXR() {
+  try {
+    startAudio();   // tiene que ser en el toque del botón (regla de los navegadores)
+    log("Entrando en VR…");
+    const session = await navigator.xr.requestSession("immersive-vr", { optionalFeatures: ["local-floor"] });
+    xrSession = session;
+    log("Sesión VR creada");
+    const canvas = document.createElement("canvas");
+    gl = canvas.getContext("webgl2", { xrCompatible: true, antialias: false }) ||
+         canvas.getContext("webgl", { xrCompatible: true, antialias: false });
+    log("Contexto gráfico: " + (gl ? (gl instanceof WebGL2RenderingContext ? "WebGL2" : "WebGL1") : "NINGUNO"));
+    initGL();
+    session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+    try { refSpace = await session.requestReferenceSpace("local-floor"); }
+    catch (e) { refSpace = await session.requestReferenceSpace("local"); }
+    session.addEventListener("end", () => { xrSession = null; log("Saliste de VR"); });
+    session.requestAnimationFrame(onFrame);
+    log("Bucle de dibujo iniciado");
+    requestKey();
+    // Pedir la frecuencia de la Mac (o la más alta que no la supere) sin esperar la respuesta
+    // (en algunos visores esta promesa no vuelve nunca)
+    try {
+      const rates = session.supportedFrameRates ? Array.from(session.supportedFrameRates) : [];
+      log("Frecuencias que acepta el visor: " + (rates.join(", ") || "desconocidas") + " · la Mac pide " + targetHz + " Hz");
+      const ok = rates.filter((r) => r <= targetHz + 0.5).sort((a, b) => b - a);
+      if (ok.length && session.updateTargetFrameRate) {
+        session.updateTargetFrameRate(ok[0]).then(() => log("Frecuencia: " + ok[0] + " Hz"), (e) => log("No se pudo fijar " + ok[0] + " Hz: " + e));
+      }
+    } catch (e) { log("No se pudo fijar la frecuencia: " + e); }
+  } catch (e) {
+    log("ERROR al entrar en VR: " + (e && e.message || e));
+  }
+}
+
+function compile(vs, fs) {
+  const sh = (t, src) => {
+    const s = gl.createShader(t); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) log("ERROR shader: " + gl.getShaderInfoLog(s));
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, sh(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  return p;
+}
+
+function initGL() {
+  cubeProg = compile(
+    `attribute vec3 p; uniform mat4 P, V, M; varying float s;
+     void main(){ gl_Position = P*V*M*vec4(p,1.0); s = 0.75 + 0.5*p.y + 0.3*p.x; }`,
+    `precision mediump float; uniform vec3 c; varying float s;
+     void main(){ gl_FragColor = vec4(c*s,1.0); }`);
+  for (const n of ["P", "V", "M", "c"]) loc[n] = gl.getUniformLocation(cubeProg, n);
+  loc.p = gl.getAttribLocation(cubeProg, "p");
+
+  // Reproyección rotacional: cada píxel del ojo actual se busca en la imagen que
+  // la Mac dibujó con una pose un poco más vieja, así la imagen no "se arrastra"
+  // al girar la cabeza aunque el video llegue con algo de retraso.
+  streamProg = compile(
+    `attribute vec2 a; varying vec2 n; void main(){ n = a; gl_Position = vec4(a, 0.0, 1.0); }`,
+    `precision highp float; varying vec2 n; uniform mat4 R; uniform float off; uniform sampler2D tex;
+     uniform vec2 texel; uniform float sharp;
+     void main(){
+       vec4 c = R * vec4(n, 0.5, 1.0);
+       if (c.w <= 0.0) { gl_FragColor = vec4(0.0,0.0,0.0,1.0); return; }
+       vec2 q = c.xy / c.w;
+       if (abs(q.x) > 1.0 || abs(q.y) > 1.0) { gl_FragColor = vec4(0.0,0.0,0.0,1.0); return; }
+       vec2 uv = vec2((q.x * 0.5 + 0.5) * 0.5 + off, 1.0 - (q.y * 0.5 + 0.5));
+       // Nitidez (unsharp mask de 5 muestras): recupera detalle perdido al estirar la imagen
+       vec3 m = texture2D(tex, uv).rgb;
+       vec3 nb = texture2D(tex, uv + vec2(texel.x, 0.0)).rgb + texture2D(tex, uv - vec2(texel.x, 0.0)).rgb
+               + texture2D(tex, uv + vec2(0.0, texel.y)).rgb + texture2D(tex, uv - vec2(0.0, texel.y)).rgb;
+       vec3 outc = m + sharp * (4.0 * m - nb);
+       gl_FragColor = vec4(clamp(outc, 0.0, 1.0), 1.0);
+     }`);
+  sloc.a = gl.getAttribLocation(streamProg, "a");
+  sloc.R = gl.getUniformLocation(streamProg, "R");
+  sloc.off = gl.getUniformLocation(streamProg, "off");
+  sloc.tex = gl.getUniformLocation(streamProg, "tex");
+  sloc.texel = gl.getUniformLocation(streamProg, "texel");
+  sloc.sharp = gl.getUniformLocation(streamProg, "sharp");
+
+  const f = [[-1,-1,1,1,-1,1,1,1,1,-1,1,1],[1,-1,-1,-1,-1,-1,-1,1,-1,1,1,-1],[-1,-1,-1,-1,-1,1,-1,1,1,-1,1,-1],
+             [1,-1,1,1,-1,-1,1,1,-1,1,1,1],[-1,1,1,1,1,1,1,1,-1,-1,1,-1],[-1,-1,-1,1,-1,-1,1,-1,1,-1,-1,1]];
+  const v = [];
+  for (const q of f) for (const i of [0,1,2,0,2,3]) v.push(q[i*3]*0.5, q[i*3+1]*0.5, q[i*3+2]*0.5);
+  cubeBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, cubeBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(v), gl.STATIC_DRAW);
+  triBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, triBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+
+  streamTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, streamTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function drawCubes(view, objs) {
+  gl.useProgram(cubeProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER, cubeBuf);
+  gl.enableVertexAttribArray(loc.p);
+  gl.vertexAttribPointer(loc.p, 3, gl.FLOAT, false, 0, 0);
+  gl.uniformMatrix4fv(loc.P, false, view.projectionMatrix);
+  gl.uniformMatrix4fv(loc.V, false, view.transform.inverse.matrix);
+  for (const [m, c] of objs) {
+    gl.uniformMatrix4fv(loc.M, false, m);
+    gl.uniform3fv(loc.c, c);
+    gl.drawArrays(gl.TRIANGLES, 0, 36);
+  }
+}
+
+// Subida del cuadro a la GPU del visor. Primero intenta directo (más rápido);
+// si el navegador no lo soporta, pasa por un canvas 2D.
+let uploadMode = "directo", glErr = "", frameFmt = "", pix = "", lastDiag = 0;
+let cv2d = null, ctx2d = null;
+function ensureCanvas(w, h) {
+  if (!cv2d || cv2d.width !== w || cv2d.height !== h) {
+    cv2d = typeof OffscreenCanvas !== "undefined" ? new OffscreenCanvas(w, h) : Object.assign(document.createElement("canvas"), { width: w, height: h });
+    ctx2d = cv2d.getContext("2d", { willReadFrequently: false });
+  }
+}
+function uploadFrame(f) {
+  frameFmt = `${f.format || "?"} ${f.displayWidth}x${f.displayHeight}`;
+  gl.bindTexture(gl.TEXTURE_2D, streamTex);
+  while (gl.getError()) {}
+  const t = performance.now();
+  // Una vez por segundo: leer un píxel del centro del ojo izquierdo para diagnóstico
+  if (t - lastDiag > 1000) {
+    lastDiag = t;
+    try {
+      ensureCanvas(f.displayWidth, f.displayHeight);
+      ctx2d.drawImage(f, 0, 0);
+      const d = ctx2d.getImageData(Math.floor(f.displayWidth / 4), Math.floor(f.displayHeight / 2), 1, 1).data;
+      pix = `${d[0]},${d[1]},${d[2]}`;
+    } catch (e) { pix = "err " + (e.message || e); }
+  }
+  if (uploadMode === "directo") {
+    try {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, f);
+      const e = gl.getError();
+      if (!e) return;
+      glErr = "directo: error GL " + e;
+    } catch (e) { glErr = "directo: " + (e.message || e); }
+    uploadMode = "canvas";
+  }
+  try {
+    ensureCanvas(f.displayWidth, f.displayHeight);
+    ctx2d.drawImage(f, 0, 0);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv2d);
+    const e = gl.getError();
+    if (e) glErr += " | canvas: error GL " + e;
+  } catch (e) { glErr += " | canvas: " + (e.message || e); }
+}
+
+let firstFrameLogged = false, lastFrameErr = 0;
+function onFrame(time, frame) {
+  const session = frame.session;
+  session.requestAnimationFrame(onFrame);
+  if (!firstFrameLogged) { firstFrameLogged = true; log("Primer cuadro de VR dibujándose"); }
+  try { drawXR(time, frame, session); }
+  catch (e) { const t = performance.now(); if (t - lastFrameErr > 1000) { lastFrameErr = t; log("ERROR en el cuadro: " + (e && e.message || e)); } }
+}
+
+// Estado compacto para el runtime OpenXR del juego (77 números):
+// [válido] + 2 ojos × (pos3, quat4, tanIzq, tanDer, tanAbajo, tanArriba)
+// + 2 manos (izq, der) × (presente, grip pos3+quat4, aim pos3+quat4,
+//   gatillo, grip, stickX, stickY, stickClick, A/X, B/Y, toqueGatillo, toqueStick, toqueA/X, toqueB/Y, menú)
+function xrState(frame, session, pose) {
+  const r5 = (x) => Math.round(x * 1e5) / 1e5;
+  const out = [1];
+  for (let e = 0; e < 2; e++) {
+    const v = pose.views[e] || pose.views[0];
+    const p = v.transform.position, o = v.transform.orientation, P = v.projectionMatrix;
+    out.push(r5(p.x), r5(p.y), r5(p.z), r5(o.x), r5(o.y), r5(o.z), r5(o.w),
+      r5((P[8] - 1) / P[0]), r5((P[8] + 1) / P[0]), r5((P[9] - 1) / P[5]), r5((P[9] + 1) / P[5]));
+  }
+  for (const side of ["left", "right"]) {
+    let src = null;
+    for (const s of session.inputSources) if (s.handedness === side && s.gripSpace) src = s;
+    const gp = src && frame.getPose(src.gripSpace, refSpace);
+    const ap = src && src.targetRaySpace && frame.getPose(src.targetRaySpace, refSpace);
+    if (!gp) { for (let k = 0; k < 27; k++) out.push(0); continue; }
+    out.push(1);
+    for (const t of [gp.transform, (ap || gp).transform]) {
+      out.push(r5(t.position.x), r5(t.position.y), r5(t.position.z),
+        r5(t.orientation.x), r5(t.orientation.y), r5(t.orientation.z), r5(t.orientation.w));
+    }
+    const g = src.gamepad, b = (i) => (g && g.buttons[i]) || { value: 0, pressed: false, touched: false };
+    const ax = (i) => (g && g.axes.length > i ? g.axes[i] : 0);
+    out.push(r5(b(0).value), r5(b(1).value), r5(ax(2)), r5(-ax(3)), b(3).pressed ? 1 : 0,
+      b(4).pressed ? 1 : 0, b(5).pressed ? 1 : 0, b(0).touched ? 1 : 0, b(3).touched ? 1 : 0,
+      b(4).touched ? 1 : 0, b(5).touched ? 1 : 0, 0);
+  }
+  return out;
+}
+
+function drawXR(time, frame, session) {
+  const pose = frame.getViewerPose(refSpace);
+  if (!pose) return;
+
+  // 1) Pose -> Mac (incluye las matrices de cada ojo para que la Mac dibuje igual)
+  const hands = [], handMats = [];
+  for (const src of session.inputSources) {
+    if (!src.gripSpace) continue;
+    const gp = frame.getPose(src.gripSpace, refSpace);
+    if (!gp) continue;
+    hands.push({ h: src.handedness, p: v3(gp.transform.position), o: q4(gp.transform.orientation) });
+    handMats.push(gp.transform.matrix);
+  }
+  const views = pose.views.map((v) => ({ P: Array.from(v.projectionMatrix), V: Array.from(v.transform.inverse.matrix) }));
+  const id = ++poseId;
+  const now = performance.now();
+  sent.set(id, { t: now, views });
+  if (sent.size > 400) sent.delete(sent.keys().next().value);
+  if (wsOpen) {
+    ws.send(JSON.stringify({ type: "pose", id, t: now, rtt: lastRtt, m2p, vfps,
+      diag: { up: uploadMode, glErr, fmt: frameFmt, pix, derr: decodeErr, codec: codecInfo },
+      head: { p: v3(pose.transform.position), o: q4(pose.transform.orientation) }, hands, views,
+      xr: xrState(frame, session, pose) }));
+  }
+
+  // 2) Subir el último cuadro decodificado
+  if (pendingFrame) {
+    uploadFrame(pendingFrame);
+    streamW = pendingFrame.displayWidth || streamW; streamH = pendingFrame.displayHeight || streamH;
+    streamFrameId = pendingFrame.timestamp;
+    pendingFrame.close();
+    pendingFrame = null;
+    lastStreamTime = now;
+  }
+  const src = sent.get(streamFrameId);
+  const live = src && now - lastStreamTime < 1000;
+
+  // 3) Dibujar
+  const layer = session.renderState.baseLayer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+  gl.clearColor(0.05, 0.06, 0.09, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const ctrl = handMats.map((m) => [mul(m, trs(0, 0, 0, 0.05, 0.05, 0.12)), [0.95, 0.95, 1.0]]);
+  pose.views.forEach((view, i) => {
+    const vp = layer.getViewport(view);
+    gl.viewport(vp.x, vp.y, vp.width, vp.height);
+    if (live && src.views[i]) {
+      const r = src.views[i];
+      const R = mul(new Float32Array(r.P), mul(rotOnly(new Float32Array(r.V)),
+                mul(inv(rotOnly(view.transform.inverse.matrix)), inv(view.projectionMatrix))));
+      gl.disable(gl.DEPTH_TEST);
+      gl.useProgram(streamProg);
+      gl.bindBuffer(gl.ARRAY_BUFFER, triBuf);
+      gl.enableVertexAttribArray(sloc.a);
+      gl.vertexAttribPointer(sloc.a, 2, gl.FLOAT, false, 0, 0);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, streamTex);
+      gl.uniform1i(sloc.tex, 0);
+      gl.uniformMatrix4fv(sloc.R, false, R);
+      gl.uniform1f(sloc.off, i === 0 ? 0.0 : 0.5);
+      gl.uniform2f(sloc.texel, 1 / streamW, 1 / streamH);
+      gl.uniform1f(sloc.sharp, SHARP);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.enable(gl.DEPTH_TEST);
+      // Las manos/controles ya los dibuja el juego (o la escena de la Mac): no agregamos nada encima.
+    } else {
+      gl.enable(gl.DEPTH_TEST);
+      const objs = [];
+      for (let k = -5; k <= 5; k++) {
+        objs.push([trs(k, 0, 0, 0.02, 0.01, 10), [0.3, 0.3, 0.4]]);
+        objs.push([trs(0, 0, k, 10, 0.01, 0.02), [0.3, 0.3, 0.4]]);
+      }
+      objs.push([mul(trs(0, 1.4, -1.5, 0.4, 0.4, 0.4), rotY(time / 1500)), [0.5, 0.5, 0.5]]);
+      drawCubes(view, objs.concat(ctrl));
+    }
+  });
+}
+</script>
+</body>
+</html>

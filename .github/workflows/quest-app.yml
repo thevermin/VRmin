@@ -1,0 +1,40 @@
+name: App del Quest
+on:
+  push:
+    paths: ['quest-app/**', '.github/workflows/quest-app.yml']
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: '8.9' }
+      - name: Clave de la tienda (si está configurada en los secretos del repositorio)
+        env: { KS: "${{ secrets.VRMIN_KEYSTORE_B64 }}" }
+        run: |
+          if [ -n "$KS" ]; then echo "$KS" | base64 -d > "$RUNNER_TEMP/tienda.jks"; echo "VRMIN_KEYSTORE=$RUNNER_TEMP/tienda.jks" >> "$GITHUB_ENV"; echo "Firma de la tienda: sí"; else echo "Firma de la tienda: no (firma fija de prueba)"; fi
+      - name: Compilar APK
+        working-directory: quest-app
+        shell: bash
+        env:
+          VRMIN_KEYSTORE_PASSWORD: ${{ secrets.VRMIN_KEYSTORE_PASSWORD }}
+          VRMIN_KEY_ALIAS: ${{ secrets.VRMIN_KEY_ALIAS }}
+          VRMIN_KEY_PASSWORD: ${{ secrets.VRMIN_KEY_PASSWORD }}
+          VRMIN_META_APP_ID: ${{ secrets.VRMIN_META_APP_ID }}
+        run: |
+          set +e
+          gradle assembleRelease --stacktrace --no-daemon 2>&1 | tee build.log
+          st=${PIPESTATUS[0]}
+          if [ $st -ne 0 ]; then
+            # Los errores como anotaciones (se ven sin bajar el registro completo)
+            grep -E "error:|\.java:[0-9]+: error|What went wrong" -A2 build.log | head -60 | while IFS= read -r l; do echo "::error::$l"; done
+          fi
+          exit $st
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VRmin-quest-apk
+          path: quest-app/app/build/outputs/apk/release/*.apk
+          retention-days: 14

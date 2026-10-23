@@ -1,0 +1,93 @@
+name: App de Mac (compilación de prueba)
+on:
+  push:
+    paths: ['mac/**', '.github/workflows/mac.yml']
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Renderizador
+        run: |
+          xcrun swiftc -O mac/renderer/main.swift -o "$RUNNER_TEMP/QuestRenderer" 2> "$RUNNER_TEMP/err.txt" || { grep -m15 "error:" "$RUNNER_TEMP/err.txt" | while read -r l; do echo "::error::$l"; done; exit 1; }
+      - name: Shaders de Metal (se revisan antes de abrir)
+        run: |
+          awk '/let code = """/{f=1;next} /^        """/{if(f){f=0; n++; print "// ---" > "/dev/null"}} f' mac/renderer/main.swift > "$RUNNER_TEMP/fov.metal"
+          if xcrun -sdk macosx metal -c "$RUNNER_TEMP/fov.metal" -o "$RUNNER_TEMP/fov.air" 2> "$RUNNER_TEMP/merr.txt"; then echo "Metal OK"
+          elif grep -q "error:" "$RUNNER_TEMP/merr.txt" && ! grep -qi "toolchain\|cannot execute\|unable to find" "$RUNNER_TEMP/merr.txt"; then
+            grep -m15 "error:" "$RUNNER_TEMP/merr.txt" | while read -r l; do echo "::error::$l"; done; exit 1
+          else cat "$RUNNER_TEMP/merr.txt"; echo "::warning::No hay compilador de Metal en este runner"; fi
+      - name: Prueba de la imagen del juego en la GPU (MetalFX, recorte, foveated encoding)
+        run: |
+          T="$RUNNER_TEMP/fovtest"; mkdir -p "$T"
+          {
+            echo 'import Foundation'; echo 'import VideoToolbox'; echo 'import CoreMedia'; echo 'import Metal'; echo 'import MetalFX'; echo 'import CoreVideo'; echo 'import simd'
+            echo 'let env = ["VR_EYE": "1280", "VR_FOV": "2,1,0.62,0.38,0.5"]'
+            echo 'let EYE = 1280'
+            awk '/^struct Fovea \{/,/^let H = FOVEA/' mac/renderer/main.swift
+            awk '/^final class Foveator \{/,/^}$/' mac/renderer/main.swift
+            cat mac/test/fov_main_tail.swift
+          } > "$T/main.swift"
+          xcrun swiftc -O "$T/main.swift" -o "$T/fovtest" 2> "$T/err.txt" || { grep -m15 "error:" "$T/err.txt" | while read -r l; do echo "::error::$l"; done; exit 1; }
+          "$T/fovtest" || { echo "::error::La prueba de la GPU falló (ver el registro)"; exit 1; }
+      - name: Prueba de la copia directa (textura compartida entre dos procesos)
+        continue-on-error: true
+        run: |
+          T="$RUNNER_TEMP/gpushare"; mkdir -p "$T"
+          { echo 'import Foundation'; echo 'import Metal'; echo 'import ObjectiveC'
+            awk '/^enum GpuShare \{/,/^}$/' mac/renderer/main.swift
+            cat mac/test/gpushare_main_tail.swift; } > "$T/main.swift"
+          xcrun swiftc -O "$T/main.swift" -o "$T/gst" 2> "$T/err.txt" || { grep -m15 "error:" "$T/err.txt" | while read -r l; do echo "::error::$l"; done; exit 1; }
+          N="vrmin.prueba.$$"
+          "$T/gst" servidor "$N" & sleep 3
+          if R=$("$T/gst" cliente "$N" 2>&1); then echo "::notice::Copia directa: $R"; else echo "::warning::Copia directa: $R"; fi
+      - name: App
+        run: |
+          xcrun swiftc -O -parse-as-library mac/app/VRminHostApp.swift mac/app/Idioma.swift mac/app/Tutoriales.swift mac/app/LogEn.swift -o "$RUNNER_TEMP/VRminHost" 2> "$RUNNER_TEMP/err2.txt" || { grep -m15 "error:" "$RUNNER_TEMP/err2.txt" | while read -r l; do echo "::error::$l"; done; exit 1; }
+      - name: Paquete para distribuir (firma ad hoc)
+        run: bash mac/crear_app.sh --paquete
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VRmin-Host-mac
+          path: mac/VRmin Host *.zip
+          retention-days: 7
+  d3dshare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y -qq gcc-mingw-w64-x86-64 > /dev/null && bash mac/test/d3dshare.sh d3dshare.exe
+      - uses: actions/upload-artifact@v4
+        with: { name: d3dshare, path: d3dshare.exe, retention-days: 1 }
+  motor:
+    # Instala el motor de verdad (Wine 11 + DXMT), crea el Windows y prueba la copia directa de punta a punta:
+    # un programa D3D11 bajo Wine comparte una textura y un programa de la Mac la abre por su nombre
+    needs: d3dshare
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: d3dshare, path: d3d }
+      - name: Motor, wineboot y copia directa
+        run: |
+          softwareupdate --install-rosetta --agree-to-license > /dev/null 2>&1 || true
+          export QVB_DATA="$RUNNER_TEMP/datos" VRMIN_LANG=es
+          mkdir -p mac/app/recursos/openxr && cp mac/openxr/questvrbridge_openxr.dll mac/openxr/questvrbridge_openxr.json mac/app/recursos/openxr/
+          bash mac/app/recursos/instalar_motor.sh || echo "::warning::instalar_motor.sh terminó con error"
+          tail -15 "$QVB_DATA/logs/instalar_motor.log" 2>/dev/null | while read -r l; do echo "::warning::im: $l"; done
+          tail -8 "$QVB_DATA/logs/wineboot.log" | while read -r l; do echo "::warning::wb: $l"; done
+          S=$(stat -f %z "$QVB_DATA/prefijo/system.reg" 2>/dev/null || echo 0)
+          [ "$S" -gt 100000 ] || { echo "::error::wineboot no creó el Windows ($S bytes)"; exit 1; }
+          echo "::notice::Windows creado ($S bytes) · $(cat "$QVB_DATA/prefijo/.wine_usado" 2>/dev/null)"
+          source mac/app/recursos/entorno.sh
+          unset DYLD_INSERT_LIBRARIES
+          "$WINE" d3d/d3dshare.exe > d3d.txt 2>&1 &
+          for i in $(seq 1 30); do grep -q "NOMBRE\|falló\|Copia directa" d3d.txt && break; sleep 1; done
+          cat d3d.txt | grep -v "^msync\|fixme" | head -20 | while read -r l; do echo "::notice::exe: $l"; done
+          N=$(grep -o "DXMT_shared_resource_[0-9a-fA-Fx]*" d3d.txt | head -1)
+          # (en los runners de GitHub la GPU es virtual y DXMT no crea texturas compartidas: ahí es solo un aviso)
+          [ -n "$N" ] || { echo "::warning::el programa D3D11 no obtuvo el nombre de la textura compartida (normal en la GPU virtual de CI)"; exit 0; }
+          { echo 'import Foundation'; echo 'import Metal'; echo 'import ObjectiveC'
+            awk '/^enum GpuShare \{/,/^}$/' mac/renderer/main.swift; cat mac/test/gpuopen_main_tail.swift; } > "$RUNNER_TEMP/go.swift"
+          xcrun swiftc -O "$RUNNER_TEMP/go.swift" -o "$RUNNER_TEMP/go"
+          R=$("$RUNNER_TEMP/go" "$N" 2>&1) && echo "::notice::Copia directa de punta a punta: $R" || { echo "::error::La Mac no pudo abrir $N: $R"; exit 1; }

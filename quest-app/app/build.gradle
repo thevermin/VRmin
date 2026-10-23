@@ -1,0 +1,63 @@
+plugins { id 'com.android.application' }
+
+// Datos de la tienda: vienen de variables de entorno (GitHub Actions) o de ~/.gradle/gradle.properties.
+// Nunca van en el repositorio.
+def dato = { String n -> System.getenv(n) ?: (project.findProperty(n) ?: '') }
+def claveTienda = dato('VRMIN_KEYSTORE')
+// Clave fija de prueba (opcional; no está en el repositorio público): sin ella se usa la de depuración de Android
+def hayFija = file('../keystore/debug.keystore').exists()
+
+android {
+    namespace 'org.questvrbridge.client'
+    compileSdk 34
+    defaultConfig {
+        // Identificador en la tienda de Meta (queda fijo para siempre una vez publicado)
+        applicationId 'com.vrmin.app'
+        minSdk 29
+        targetSdk 34   // (la tienda de Meta lo pide para las apps creadas desde marzo de 2026)
+        versionCode 69
+        versionName '0.69'
+        ndk { abiFilters 'arm64-v8a' }
+        externalNativeBuild { cmake { arguments '-DANDROID_STL=c++_shared' } }
+        // App ID de la tienda (Developer Dashboard → Development → API). Vacío = sin verificar la compra (versiones de prueba)
+        resValue 'string', 'meta_app_id', dato('VRMIN_META_APP_ID')
+    }
+    buildFeatures { prefab true }
+    externalNativeBuild { cmake { path 'src/main/cpp/CMakeLists.txt'; version '3.22.1' } }
+    // Firma fija para que cada versión nueva se instale encima de la anterior
+    signingConfigs {
+        fija {
+            storeFile file('../keystore/debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+        // Firma de la tienda (la clave la crea mac/crear_clave_tienda.sh y se guarda fuera del repositorio)
+        if (claveTienda) {
+            tienda {
+                storeFile file(claveTienda)
+                storePassword dato('VRMIN_KEYSTORE_PASSWORD')
+                keyAlias dato('VRMIN_KEY_ALIAS') ?: 'vrmin'
+                keyPassword dato('VRMIN_KEY_PASSWORD') ?: dato('VRMIN_KEYSTORE_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        // Para probar (se puede depurar)
+        debug { debuggable true; signingConfig hayFija ? signingConfigs.fija : signingConfigs.debug }
+        // Para distribuir: sin depuración, misma firma fija (se instala encima de cualquier versión anterior)
+        release { debuggable false; minifyEnabled false; signingConfig claveTienda ? signingConfigs.tienda : (hayFija ? signingConfigs.fija : signingConfigs.debug) }
+    }
+    applicationVariants.all { v ->
+        v.outputs.all { outputFileName = "VRmin-${v.versionName}${v.buildType.name == 'release' ? '' : '-prueba'}.apk" }
+    }
+    packagingOptions { jniLibs { useLegacyPackaging true } }
+    // La revisión automática de Android para versiones de distribución no aplica a una app de visor (pantalla virtual, sin teléfono)
+    lint { checkReleaseBuilds false; abortOnError false }
+}
+
+dependencies {
+    implementation 'org.khronos.openxr:openxr_loader_for_android:1.0.34'
+    // Plataforma de Meta: verificar que el usuario compró la app (tienda)
+    implementation 'com.meta.horizon.platform.ovr:android-platform-sdk:77.0.1'
+}
