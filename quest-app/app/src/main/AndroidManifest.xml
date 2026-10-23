@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" android:installLocation="auto">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Cable USB-C (red USB de Horizon OS 2.5+, como Virtual Desktop) -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-feature android:name="android.hardware.vr.headtracking" android:required="false" android:version="1" />
+    <uses-feature android:glEsVersion="0x00030002" android:required="true" />
+    <!-- Ver tu cuarto real durante la transición de entrada y salida de la sala VR -->
+    <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
+    <!-- Seguimiento de manos (para usar la sala sin controles y ver tus manos reales) -->
+    <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
+    <uses-feature android:name="oculus.software.handtracking" android:required="false" />
+    <!-- Cámaras del visor (Passthrough Camera API): para ver tus manos reales con el borde difuminado -->
+    <uses-permission android:name="horizonos.permission.HEADSET_CAMERA" />
+    <!-- Forma de los controles (modelo que da Meta) -->
+    <uses-feature android:name="com.oculus.feature.RENDER_MODEL" android:required="false" />
+    <uses-permission android:name="com.oculus.permission.RENDER_MODEL" />
+
+    <queries>
+        <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+        <intent><action android:name="org.khronos.openxr.OpenXRRuntimeService" /></intent>
+        <intent><action android:name="org.khronos.openxr.OpenXRApiLayerService" /></intent>
+    </queries>
+
+    <application android:label="VRmin" android:icon="@drawable/ic_launcher" android:roundIcon="@drawable/ic_launcher" android:hasCode="true" android:allowBackup="false"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        <meta-data android:name="com.oculus.supportedDevices" android:value="quest|quest2|questpro|quest3|quest3s" />
+        <!-- Al abrir la sala VR, la pantalla de carga del Quest muestra tu cuarto (no negro) si venías con passthrough -->
+        <meta-data android:name="com.oculus.ossplash.background" android:value="passthrough-contextual" />
+        <meta-data android:name="com.oculus.handtracking.frequency" android:value="HIGH" />
+        <meta-data android:name="com.oculus.handtracking.version" android:value="V2.0" />
+
+        <!-- Ventana normal del Quest: lista de juegos y escritorio de la Mac -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true"
+            android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode">
+            <layout android:defaultWidth="1540dp" android:defaultHeight="1000dp" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Una ventana de una app de la Mac (se pueden abrir varias a la vez) -->
+        <activity
+            android:name=".WindowActivity"
+            android:exported="false"
+            android:resizeableActivity="true"
+            android:autoRemoveFromRecents="true"
+            android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode">
+            <layout android:defaultWidth="1200dp" android:defaultHeight="800dp" />
+        </activity>
+
+        <!-- Parte inmersiva (VR) para jugar: en su propio proceso, se abre desde la ventana -->
+        <activity
+            android:name=".VrActivity"
+            android:process=":vr"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:taskAffinity="org.questvrbridge.client.vr"
+            android:screenOrientation="landscape"
+            android:resizeableActivity="false"
+            android:excludeFromRecents="true"
+            android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode">
+            <meta-data android:name="android.app.lib_name" android:value="qvbclient" />
+            <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="com.oculus.intent.category.VR" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
