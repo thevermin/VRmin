@@ -1,5 +1,5 @@
 /*
- * QuestVRBridge OpenXR runtime (Windows x64, D3D11 y Vulkan).
+ * QuestVRBridge OpenXR runtime (Windows x64, D3D11, Vulkan y OpenGL).
  *
  * Se carga dentro del "Windows" de GameHub (Wine) en lugar de SteamVR/Oculus.
  * - Recibe la pose de la cabeza y los controles del Quest a través de
@@ -34,10 +34,14 @@
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+#include <GL/gl.h>
+#include <GL/glext.h>
+#include <GL/wglext.h>
 
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_D3D11
 #define XR_USE_GRAPHICS_API_VULKAN
+#define XR_USE_GRAPHICS_API_OPENGL
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/openxr_loader_negotiation.h>
@@ -764,6 +768,7 @@ typedef struct Swapchain {
     uint32_t w, h, arraySize, mips, count;
     ID3D11Texture2D *img[3];
     VkImage vimg[3]; VkDeviceMemory vmem[3];   /* (sesión Vulkan) */
+    GLuint gltex[3]; int isGl;                 /* (sesión OpenGL) */
     uint32_t next, released;
 } Swapchain;
 
@@ -792,6 +797,9 @@ typedef struct Session {
     VkCommandPool vkPool; VkCommandBuffer vkCb[STAGES]; VkFence vkFence[STAGES];
     VkBuffer vkBuf[STAGES]; VkDeviceMemory vkBufMem[STAGES]; void *vkMap[STAGES];
     int vkWarned;
+    /* OpenGL: el contexto del juego, y para leer la imagen un framebuffer y dos PBO */
+    int gl; HDC gldc; HGLRC glrc;
+    GLuint glFbo, glPbo[STAGES]; GLsync glSync[STAGES];
 } Session;
 
 static Instance g_instance;
@@ -829,6 +837,7 @@ static void set_state(Session *s, XrSessionState st) {
 static const char *g_extensions[] = {
     XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
     XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
+    XR_KHR_OPENGL_ENABLE_EXTENSION_NAME,
     XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME,
 };
 #define N_EXT (sizeof g_extensions / sizeof g_extensions[0])
@@ -905,6 +914,7 @@ static int input_value(const Track *t, const char *b, float out[2], int *isPose)
 /* ------------------------------------------------------------------ */
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetInstanceProcAddr(XrInstance instance, const char *name, PFN_xrVoidFunction *function);
 static void init_once(void);
+static void install_gl_hook(void);
 static void copy_unity_logs(int current);
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrEnumerateInstanceExtensionProperties(const char *layerName, uint32_t cap, uint32_t *count, XrExtensionProperties *props) {
@@ -933,6 +943,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateInstance(const XrInstanceCreateInfo *i
         if (!ok) { logmsg("Extensión no soportada pedida: %s", info->enabledExtensionNames[i]); return XR_ERROR_EXTENSION_NOT_PRESENT; }
     }
     logmsg("xrCreateInstance de '%s' (%s)", info->applicationInfo.applicationName, info->applicationInfo.engineName);
+    install_gl_hook();   /* (solo hace algo si el juego usa OpenGL) */
     /* Pedirle a la Mac los ajustes de este juego (resolución, campo de visión, controles) */
     snprintf(g_appName, sizeof g_appName, "%s", info->applicationInfo.applicationName[0] ? info->applicationInfo.applicationName : "?");
     g_helloVer = g_cfgVer;
@@ -1091,6 +1102,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetD3D11GraphicsRequirementsKHR(XrInstance i
 /* ------------------------------------------------------------------ */
 static PFN_vkGetInstanceProcAddr g_vkGIPA;
 static void install_vulkan_hook(void);
+static int patch_iat(HMODULE mod, const char *dll, const char *fn, void *repl, void **orig);
 static struct {
     PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
@@ -1244,6 +1256,172 @@ static void vk_session_release(Session *s) {
     if (s->vkPool) vk.DestroyCommandPool(s->vkDev, s->vkPool, NULL);
 }
 
+/* ------------------------------------------------------------------ */
+/* OpenGL (XR_KHR_opengl_enable). Los juegos con OpenGL (por ejemplo,  */
+/* Google Earth VR por OpenComposite) dibujan en texturas que crea el  */
+/* runtime en su contexto; en xrEndFrame se leen (con PBO, sin esperar)*/
+/* a la memoria compartida con la Mac.                                 */
+/* ------------------------------------------------------------------ */
+static struct {
+    PROC (WINAPI *GetProcAddress)(LPCSTR);
+    HGLRC (WINAPI *GetCurrentContext)(void);
+    HDC (WINAPI *GetCurrentDC)(void);
+    BOOL (WINAPI *MakeCurrent)(HDC, HGLRC);
+    void (WINAPI *GenTextures)(GLsizei, GLuint *);
+    void (WINAPI *DeleteTextures)(GLsizei, const GLuint *);
+    void (WINAPI *BindTexture)(GLenum, GLuint);
+    void (WINAPI *TexImage2D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+    void (WINAPI *TexParameteri)(GLenum, GLenum, GLint);
+    void (WINAPI *PixelStorei)(GLenum, GLint);
+    void (WINAPI *ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
+    void (WINAPI *GetIntegerv)(GLenum, GLint *);
+    void (WINAPI *ReadBuffer)(GLenum);
+    PFNGLTEXIMAGE3DPROC TexImage3D;
+    PFNGLGENFRAMEBUFFERSPROC GenFramebuffers; PFNGLDELETEFRAMEBUFFERSPROC DeleteFramebuffers;
+    PFNGLBINDFRAMEBUFFERPROC BindFramebuffer; PFNGLFRAMEBUFFERTEXTURELAYERPROC FramebufferTextureLayer;
+    PFNGLFRAMEBUFFERTEXTURE2DPROC FramebufferTexture2D;
+    PFNGLGENBUFFERSPROC GenBuffers; PFNGLDELETEBUFFERSPROC DeleteBuffers; PFNGLBINDBUFFERPROC BindBuffer;
+    PFNGLBUFFERDATAPROC BufferData; PFNGLMAPBUFFERRANGEPROC MapBufferRange; PFNGLUNMAPBUFFERPROC UnmapBuffer;
+    PFNGLFENCESYNCPROC FenceSync; PFNGLCLIENTWAITSYNCPROC ClientWaitSync; PFNGLDELETESYNCPROC DeleteSync;
+} gl;
+
+static int gl_load(void) {
+    static int ok = -1;
+    if (ok >= 0) return ok;
+    HMODULE m = LoadLibraryA("opengl32.dll");
+    ok = 0;
+    if (!m) { logmsg("OpenGL: no se encontró opengl32.dll"); return 0; }
+#define GL1(f, n) do { FARPROC f_ = GetProcAddress(m, n); memcpy(&gl.f, &f_, sizeof f_); } while (0)
+    GL1(GetProcAddress, "wglGetProcAddress"); GL1(GetCurrentContext, "wglGetCurrentContext"); GL1(GetCurrentDC, "wglGetCurrentDC");
+    GL1(MakeCurrent, "wglMakeCurrent"); GL1(GenTextures, "glGenTextures"); GL1(DeleteTextures, "glDeleteTextures");
+    GL1(BindTexture, "glBindTexture"); GL1(TexImage2D, "glTexImage2D"); GL1(TexParameteri, "glTexParameteri");
+    GL1(PixelStorei, "glPixelStorei"); GL1(ReadPixels, "glReadPixels"); GL1(GetIntegerv, "glGetIntegerv"); GL1(ReadBuffer, "glReadBuffer");
+#undef GL1
+    ok = gl.GetProcAddress && gl.MakeCurrent && gl.GenTextures && gl.ReadPixels;
+    if (!ok) logmsg("OpenGL: faltan funciones de opengl32.dll");
+    return ok;
+}
+/* Las funciones nuevas (≥ 1.2) se piden con un contexto activo */
+static int gl_load_ext(void) {
+#define GLX(f, n) do { PROC f_ = gl.GetProcAddress(n); memcpy(&gl.f, &f_, sizeof f_); if (!gl.f) { logmsg("OpenGL: falta %s", n); return 0; } } while (0)
+    GLX(TexImage3D, "glTexImage3D"); GLX(GenFramebuffers, "glGenFramebuffers"); GLX(DeleteFramebuffers, "glDeleteFramebuffers");
+    GLX(BindFramebuffer, "glBindFramebuffer"); GLX(FramebufferTextureLayer, "glFramebufferTextureLayer");
+    GLX(FramebufferTexture2D, "glFramebufferTexture2D"); GLX(GenBuffers, "glGenBuffers"); GLX(DeleteBuffers, "glDeleteBuffers");
+    GLX(BindBuffer, "glBindBuffer"); GLX(BufferData, "glBufferData"); GLX(MapBufferRange, "glMapBufferRange");
+    GLX(UnmapBuffer, "glUnmapBuffer"); GLX(FenceSync, "glFenceSync"); GLX(ClientWaitSync, "glClientWaitSync"); GLX(DeleteSync, "glDeleteSync");
+#undef GLX
+    return 1;
+}
+
+/* Activa el contexto del juego en este hilo si hace falta (y después se restaura el que estaba) */
+typedef struct { HDC dc; HGLRC rc; int changed; } GlPrev;
+static int gl_begin(Session *s, GlPrev *p) {
+    p->rc = gl.GetCurrentContext(); p->dc = gl.GetCurrentDC(); p->changed = 0;
+    if (p->rc == s->glrc) return 1;
+    if (!gl.MakeCurrent(s->gldc, s->glrc)) return 0;
+    p->changed = 1;
+    return 1;
+}
+static void gl_end(GlPrev *p) { if (p->changed) gl.MakeCurrent(p->dc, p->rc); }
+
+XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetOpenGLGraphicsRequirementsKHR(XrInstance i, XrSystemId id, XrGraphicsRequirementsOpenGLKHR *req) {
+    (void)i; (void)id;
+    req->minApiVersionSupported = XR_MAKE_VERSION(3, 2, 0);
+    req->maxApiVersionSupported = XR_MAKE_VERSION(4, 6, 0);
+    return XR_SUCCESS;
+}
+
+static const int64_t g_glFormats[] = {
+    GL_SRGB8_ALPHA8, GL_RGBA8, GL_DEPTH_COMPONENT32F, GL_DEPTH24_STENCIL8, GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT16,
+};
+#define N_GLFMT (sizeof g_glFormats / sizeof g_glFormats[0])
+/* formato interno → formato/tipo para crear la textura; isDepth; el equivalente "typeless" de DXGI */
+static DXGI_FORMAT typeless_of_gl(int64_t f, GLenum *fmt, GLenum *type, int *isDepth) {
+    *isDepth = 0; *fmt = GL_RGBA; *type = GL_UNSIGNED_BYTE;
+    switch (f) {
+    case GL_SRGB8_ALPHA8: case GL_RGBA8: return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    case GL_DEPTH_COMPONENT32F: *isDepth = 1; *fmt = GL_DEPTH_COMPONENT; *type = GL_FLOAT; return DXGI_FORMAT_R32_TYPELESS;
+    case GL_DEPTH24_STENCIL8: *isDepth = 1; *fmt = GL_DEPTH_STENCIL; *type = GL_UNSIGNED_INT_24_8; return DXGI_FORMAT_R24G8_TYPELESS;
+    case GL_DEPTH_COMPONENT24: *isDepth = 1; *fmt = GL_DEPTH_COMPONENT; *type = GL_UNSIGNED_INT; return DXGI_FORMAT_R24G8_TYPELESS;
+    case GL_DEPTH_COMPONENT16: *isDepth = 1; *fmt = GL_DEPTH_COMPONENT; *type = GL_UNSIGNED_SHORT; return DXGI_FORMAT_R16_TYPELESS;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+static XrResult gl_create_swapchain(Session *s, const XrSwapchainCreateInfo *ci, XrSwapchain *out) {
+    GLenum fmt, type; int isDepth;
+    DXGI_FORMAT tl = typeless_of_gl(ci->format, &fmt, &type, &isDepth);
+    if (tl == DXGI_FORMAT_UNKNOWN) { logmsg("Formato de swapchain OpenGL no soportado: 0x%llx", (long long)ci->format); return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED; }
+    GlPrev p;
+    if (!gl_begin(s, &p)) { logmsg("OpenGL: no se pudo activar el contexto del juego"); return XR_ERROR_RUNTIME_FAILURE; }
+    Swapchain *sc = calloc(1, sizeof *sc);
+    sc->format = ci->format; sc->dxgi = tl; sc->isGl = 1;
+    sc->w = ci->width; sc->h = ci->height;
+    sc->arraySize = ci->arraySize ? ci->arraySize : 1;
+    sc->mips = ci->mipCount ? ci->mipCount : 1;
+    sc->count = 3;
+    GLenum target = sc->arraySize > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+    GLint prevTex = 0; gl.GetIntegerv(sc->arraySize > 1 ? GL_TEXTURE_BINDING_2D_ARRAY : GL_TEXTURE_BINDING_2D, &prevTex);
+    gl.GenTextures((GLsizei)sc->count, sc->gltex);
+    for (uint32_t k = 0; k < sc->count; k++) {
+        gl.BindTexture(target, sc->gltex[k]);
+        for (uint32_t m = 0; m < sc->mips; m++) {
+            GLsizei w = (GLsizei)(sc->w >> m), h = (GLsizei)(sc->h >> m);
+            if (w < 1) w = 1;
+            if (h < 1) h = 1;
+            if (target == GL_TEXTURE_2D_ARRAY) gl.TexImage3D(target, (GLint)m, (GLint)ci->format, w, h, (GLsizei)sc->arraySize, 0, fmt, type, NULL);
+            else gl.TexImage2D(target, (GLint)m, (GLint)ci->format, w, h, 0, fmt, type, NULL);
+        }
+        gl.TexParameteri(target, GL_TEXTURE_MAX_LEVEL, (GLint)sc->mips - 1);
+    }
+    gl.BindTexture(target, (GLuint)prevTex);
+    gl_end(&p);
+    logmsg("Swapchain OpenGL %ux%u formato 0x%llx capas %u%s", ci->width, ci->height, (long long)ci->format, sc->arraySize, isDepth ? " (profundidad)" : "");
+    *out = (XrSwapchain)sc;
+    return XR_SUCCESS;
+}
+
+/* Juegos que piden un contexto OpenGL 3.2+ «de compatibilidad»: macOS solo da contextos «core», y Wine
+   se niega. Se pide core (forward-compatible), que en la Mac es OpenGL 4.1. */
+static PFNWGLCREATECONTEXTATTRIBSARBPROC g_origCreateCtxAttribs;
+static PROC (WINAPI *g_origWglGPA)(LPCSTR);
+static HGLRC WINAPI hook_wglCreateContextAttribsARB(HDC dc, HGLRC share, const int *attribs) {
+    int a[64], n = 0, major = 1, minor = 0, profile = -1, flagsAt = -1;
+    for (; attribs && attribs[n] && n < 60; n += 2) {
+        a[n] = attribs[n]; a[n + 1] = attribs[n + 1];
+        if (a[n] == WGL_CONTEXT_MAJOR_VERSION_ARB) major = a[n + 1];
+        if (a[n] == WGL_CONTEXT_MINOR_VERSION_ARB) minor = a[n + 1];
+        if (a[n] == WGL_CONTEXT_PROFILE_MASK_ARB) profile = n;
+        if (a[n] == WGL_CONTEXT_FLAGS_ARB) flagsAt = n;
+    }
+    if (major * 10 + minor >= 32 && profile >= 0 && (a[profile + 1] & WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB)) {
+        a[profile + 1] = WGL_CONTEXT_CORE_PROFILE_BIT_ARB;
+        if (flagsAt >= 0) a[flagsAt + 1] |= WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB;
+        else { a[n++] = WGL_CONTEXT_FLAGS_ARB; a[n++] = WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB; }
+        logmsg("OpenGL: el juego pidió un contexto %d.%d de compatibilidad; se pide core (lo que tiene la Mac)", major, minor);
+    }
+    a[n] = 0;
+    return g_origCreateCtxAttribs(dc, share, attribs ? a : NULL);
+}
+static PROC WINAPI hook_wglGetProcAddress(LPCSTR name) {
+    PROC p = g_origWglGPA(name);
+    if (p && name && !strcmp(name, "wglCreateContextAttribsARB")) {
+        g_origCreateCtxAttribs = (PFNWGLCREATECONTEXTATTRIBSARBPROC)(void (*)(void))p;
+        return (PROC)(void (*)(void))hook_wglCreateContextAttribsARB;
+    }
+    return p;
+}
+static void install_gl_hook(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    void *o = NULL;
+    if (patch_iat(GetModuleHandleA(NULL), "opengl32.dll", "wglGetProcAddress", (void *)hook_wglGetProcAddress, &o)) {
+        g_origWglGPA = (PROC (WINAPI *)(LPCSTR))o;
+        logmsg("OpenGL: ajuste de contexto instalado");
+    }
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSession(XrInstance i, const XrSessionCreateInfo *info, XrSession *session) {
     (void)i;
     const XrBaseInStructure *n = (const XrBaseInStructure *)info->next;
@@ -1252,6 +1430,22 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSession(XrInstance i, const XrSessionC
     while (n) {
         if (n->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) gb = (const XrGraphicsBindingD3D11KHR *)n;
         if (n->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) vb = (const XrGraphicsBindingVulkanKHR *)n;
+        if (n->type == XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR) {
+            const XrGraphicsBindingOpenGLWin32KHR *gb2 = (const XrGraphicsBindingOpenGLWin32KHR *)n;
+            if (g_session) return XR_ERROR_LIMIT_REACHED;
+            if (!gb2->hGLRC || !gl_load()) { logmsg("xrCreateSession: OpenGL no disponible"); return XR_ERROR_GRAPHICS_DEVICE_INVALID; }
+            Session *s = calloc(1, sizeof *s);
+            s->gl = 1; s->gldc = gb2->hDC; s->glrc = gb2->hGLRC;
+            GlPrev p;
+            if (!gl_begin(s, &p) || !gl_load_ext()) { gl_end(&p); free(s); logmsg("xrCreateSession: no se pudo usar el contexto OpenGL del juego"); return XR_ERROR_GRAPHICS_DEVICE_INVALID; }
+            gl_end(&p);
+            g_session = s;
+            *session = (XrSession)s;
+            logmsg("Sesión creada (OpenGL)");
+            set_state(s, XR_SESSION_STATE_IDLE);
+            set_state(s, XR_SESSION_STATE_READY);
+            return XR_SUCCESS;
+        }
         n = n->next;
     }
     if (g_session) return XR_ERROR_LIMIT_REACHED;
@@ -1281,6 +1475,15 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSession(XrInstance i, const XrSessionC
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroySession(XrSession session) {
     Session *s = (Session *)session;
     if (s->vk) vk_session_release(s);
+    if (s->gl) {
+        GlPrev p;
+        if (gl_begin(s, &p)) {
+            if (s->glPbo[0]) gl.DeleteBuffers(STAGES, s->glPbo);
+            if (s->glFbo) gl.DeleteFramebuffers(1, &s->glFbo);
+            for (int k = 0; k < STAGES; k++) if (s->glSync[k]) gl.DeleteSync(s->glSync[k]);
+            gl_end(&p);
+        }
+    }
     for (int k = 0; k < 3; k++) if (s->staging[k]) ID3D11Texture2D_Release(s->staging[k]);
     EnterCriticalSection(&g_gpuLock); gpu_release(); g_gpuShmGen = -1; g_gpuCtx = NULL; LeaveCriticalSection(&g_gpuLock);
     if (s->ctx) ID3D11DeviceContext_Release(s->ctx);
@@ -1530,6 +1733,13 @@ static DXGI_FORMAT typeless_of(int64_t f, int *isDepth) {
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrEnumerateSwapchainFormats(XrSession s, uint32_t cap, uint32_t *count, int64_t *formats) {
+    if (((Session *)s)->gl) {
+        *count = (uint32_t)N_GLFMT;
+        if (cap == 0) return XR_SUCCESS;
+        if (cap < N_GLFMT) return XR_ERROR_SIZE_INSUFFICIENT;
+        for (uint32_t i = 0; i < N_GLFMT; i++) formats[i] = g_glFormats[i];
+        return XR_SUCCESS;
+    }
     if (((Session *)s)->vk) {
         *count = (uint32_t)N_VKFMT;
         if (cap == 0) return XR_SUCCESS;
@@ -1597,6 +1807,7 @@ static XrResult vk_create_swapchain(Session *s, const XrSwapchainCreateInfo *ci,
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSwapchain(XrSession session, const XrSwapchainCreateInfo *ci, XrSwapchain *out) {
     Session *s = (Session *)session;
     if (s->vk) return vk_create_swapchain(s, ci, out);
+    if (s->gl) return gl_create_swapchain(s, ci, out);
     int isDepth;
     DXGI_FORMAT tl = typeless_of(ci->format, &isDepth);
     if (tl == DXGI_FORMAT_UNKNOWN) { logmsg("Formato de swapchain no soportado: %lld", (long long)ci->format); return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED; }
@@ -1634,6 +1845,10 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSwapchain(XrSession session, const XrS
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroySwapchain(XrSwapchain h) {
     Swapchain *sc = (Swapchain *)h;
     for (uint32_t k = 0; k < sc->count; k++) if (sc->img[k]) ID3D11Texture2D_Release(sc->img[k]);
+    if (sc->isGl && g_session && g_session->gl) {
+        GlPrev p;
+        if (gl_begin(g_session, &p)) { gl.DeleteTextures((GLsizei)sc->count, sc->gltex); gl_end(&p); }
+    }
     if (g_session && g_session->vk) {
         vk.QueueWaitIdle(g_session->vkQueue);
         for (uint32_t k = 0; k < sc->count; k++) {
@@ -1650,6 +1865,11 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEnumerateSwapchainImages(XrSwapchain h, uint
     *count = sc->count;
     if (cap == 0) return XR_SUCCESS;
     if (cap < sc->count) return XR_ERROR_SIZE_INSUFFICIENT;
+    if (sc->isGl) {
+        XrSwapchainImageOpenGLKHR *gi = (XrSwapchainImageOpenGLKHR *)images;
+        for (uint32_t k = 0; k < sc->count; k++) gi[k].image = sc->gltex[k];
+        return XR_SUCCESS;
+    }
     if (sc->vimg[0]) {
         XrSwapchainImageVulkanKHR *vi = (XrSwapchainImageVulkanKHR *)images;
         for (uint32_t k = 0; k < sc->count; k++) vi[k].image = sc->vimg[k];
@@ -2063,6 +2283,99 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, XrTi
     shm_notify(ss, s->stPose[r], fmt_code(s->stFmt), s->stW, s->stH);
 }
 
+/* OpenGL: lee los dos ojos lado a lado con PBO (el del cuadro anterior ya terminó en la GPU) y los pasa a la
+   memoria compartida con la Mac. OpenGL guarda las filas de abajo hacia arriba: se dan vuelta al copiar. */
+static void gl_readback(Session *s, const XrCompositionLayerProjection *pl, XrTime displayTime) {
+    Swapchain *sc0 = (Swapchain *)pl->views[0].subImage.swapchain;
+    if (!sc0 || !sc0->isGl || sc0->dxgi != DXGI_FORMAT_R8G8B8A8_TYPELESS) return;
+    int rw = pl->views[0].subImage.imageRect.extent.width, rh = pl->views[0].subImage.imageRect.extent.height;
+    int flip = !(rh < 0);   /* (OpenGL: de abajo hacia arriba, salvo que la altura venga negativa) */
+    uint32_t ew = (uint32_t)(rw < 0 ? -rw : rw), eh = (uint32_t)(rh < 0 ? -rh : rh);
+    if (!ew || !eh || ew > 2560 || eh > 2560) { InterlockedIncrement(&g_skipFmt); return; }
+    if (!shm_active()) {
+        if (g_shmMode < 0 && !s->vkWarned) { s->vkWarned = 1; logmsg("OpenGL: sin memoria compartida con la Mac no se pueden mandar los cuadros"); }
+        InterlockedIncrement(&g_statBusy); return;
+    }
+    GlPrev p;
+    if (!gl_begin(s, &p)) { InterlockedIncrement(&g_mapFail); return; }
+    GLint prevRead = 0, prevPack = 0, prevRow = 0;
+    gl.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevRead);
+    gl.GetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prevPack);
+    gl.GetIntegerv(GL_PACK_ROW_LENGTH, &prevRow);
+    size_t size = (size_t)ew * 2 * eh * 4;
+    if (!s->glPbo[0] || s->stW != ew || s->stH != eh) {
+        if (s->glPbo[0]) gl.DeleteBuffers(STAGES, s->glPbo);
+        for (int k = 0; k < STAGES; k++) { if (s->glSync[k]) gl.DeleteSync(s->glSync[k]); s->glSync[k] = NULL; s->stValid[k] = 0; }
+        gl.GenBuffers(STAGES, s->glPbo);
+        for (int k = 0; k < STAGES; k++) { gl.BindBuffer(GL_PIXEL_PACK_BUFFER, s->glPbo[k]); gl.BufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)size, NULL, GL_STREAM_READ); }
+        if (!s->glFbo) gl.GenFramebuffers(1, &s->glFbo);
+        s->stW = ew; s->stH = eh; s->stFmt = sc0->dxgi;
+        logmsg("Imagen del juego (OpenGL): %ux%u por ojo (RGBA)", ew, eh);
+    }
+    /* 1) Leer los dos ojos al PBO actual (la GPU lo hace sola; acá no se espera) */
+    g_inside = "xrEndFrame: leyendo ojos (OpenGL)";
+    int k = s->stNext;
+    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, s->glFbo);
+    gl.BindBuffer(GL_PIXEL_PACK_BUFFER, s->glPbo[k]);
+    gl.PixelStorei(GL_PACK_ROW_LENGTH, (GLint)(ew * 2));
+    int ok = 1;
+    for (int e = 0; e < 2 && ok; e++) {
+        const XrSwapchainSubImage *si = &pl->views[e].subImage;
+        Swapchain *sc = (Swapchain *)si->swapchain;
+        if (!sc || !sc->isGl || sc->dxgi != s->stFmt) { ok = 0; break; }
+        int x = si->imageRect.offset.x, y = si->imageRect.offset.y, w = si->imageRect.extent.width, h = si->imageRect.extent.height;
+        if (w < 0) { x += w; w = -w; }
+        if (h < 0) { y += h; h = -h; }
+        if (w > (int)ew) w = (int)ew;
+        if (h > (int)eh) h = (int)eh;
+        GLuint tex = sc->gltex[sc->released];
+        if (sc->arraySize > 1) gl.FramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0, (GLint)si->imageArrayIndex);
+        else gl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+        gl.ReadBuffer(GL_COLOR_ATTACHMENT0);
+        gl.ReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, (void *)(uintptr_t)((size_t)e * ew * 4));
+    }
+    if (ok) {
+        if (s->glSync[k]) gl.DeleteSync(s->glSync[k]);
+        s->glSync[k] = gl.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        uint32_t id = 0;
+        EnterCriticalSection(&g_lock);
+        id = g_track.id;
+        for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].time == displayTime) { id = g_poseHist[hh].id; break; }
+        LeaveCriticalSection(&g_lock);
+        s->stPose[k] = id; s->stValid[k] = 1; s->stFlip[k] = flip;
+        s->stNext = (k + 1) % STAGES;
+        /* 2) El PBO del cuadro anterior → memoria compartida */
+        int r = s->stNext;
+        ShmHdr *sh = (ShmHdr *)g_shm;
+        int ss = -1;
+        if (s->stValid[r]) for (int i = 0; i < SHM_SLOTS; i++) if (InterlockedCompareExchange(&sh->state[i], 2, 0) == 0) { ss = i; break; }
+        if (s->stValid[r] && ss < 0) { InterlockedIncrement(&g_statBusy); s->stValid[r] = 0; }
+        if (ss >= 0) {
+            int64_t c0 = now_ns();
+            if (s->glSync[r]) gl.ClientWaitSync(s->glSync[r], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL);
+            gl.BindBuffer(GL_PIXEL_PACK_BUFFER, s->glPbo[r]);
+            const uint8_t *src = (const uint8_t *)gl.MapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)size, GL_MAP_READ_BIT);
+            g_sumMap += (now_ns() - c0) / 1e6;
+            if (src) {
+                uint32_t rb = s->stW * 2 * 4;
+                uint8_t *dst = g_shm + SHM_HDR + (size_t)ss * SHM_SLOT_MAX;
+                if (!s->stFlip[r]) memcpy(dst, src, (size_t)rb * s->stH);
+                else for (uint32_t yy = 0; yy < s->stH; yy++) memcpy(dst + (size_t)yy * rb, src + (size_t)(s->stH - 1 - yy) * rb, rb);
+                gl.UnmapBuffer(GL_PIXEL_PACK_BUFFER);
+                g_sumCopy += (now_ns() - c0) / 1e6; g_nCopy++;
+                MemoryBarrier();
+                sh->state[ss] = 1;
+                shm_notify(ss, s->stPose[r], fmt_code(s->stFmt), s->stW, s->stH);
+            } else { sh->state[ss] = 0; InterlockedIncrement(&g_mapFail); }
+            s->stValid[r] = 0;
+        }
+    } else InterlockedIncrement(&g_skipFmt);
+    gl.PixelStorei(GL_PACK_ROW_LENGTH, prevRow);
+    gl.BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prevPack);
+    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevRead);
+    gl_end(&p);
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEndInfo *info) {
     Session *s = (Session *)session;
     g_inside = "xrEndFrame";
@@ -2087,6 +2400,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
                     logmsg("Ajuste multi-pass consultado por el juego %ld veces", (long)g_hookHits);
                 }
                 if (s->vk) vk_readback(s, pl, info->displayTime);
+                else if (s->gl) gl_readback(s, pl, info->displayTime);
                 else {
                     EnterCriticalSection(&g_gpuLock);
                     readback(s, pl, info->displayTime);
@@ -2364,6 +2678,7 @@ static const struct { const char *name; PFN_xrVoidFunction fn; } g_fns[] = {
     FN(xrGetD3D11GraphicsRequirementsKHR),
     FN(xrGetVulkanInstanceExtensionsKHR), FN(xrGetVulkanDeviceExtensionsKHR),
     FN(xrGetVulkanGraphicsDeviceKHR), FN(xrGetVulkanGraphicsRequirementsKHR),
+    FN(xrGetOpenGLGraphicsRequirementsKHR),
     FN(xrCreateSession), FN(xrDestroySession), FN(xrBeginSession), FN(xrEndSession), FN(xrRequestExitSession),
     FN(xrEnumerateReferenceSpaces), FN(xrCreateReferenceSpace), FN(xrGetReferenceSpaceBoundsRect),
     FN(xrCreateActionSpace), FN(xrLocateSpace), FN(xrLocateSpaces), FN(xrDestroySpace),
