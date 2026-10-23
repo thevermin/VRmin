@@ -1090,6 +1090,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetD3D11GraphicsRequirementsKHR(XrInstance i
 /* leer y de ahí a la memoria compartida con la Mac.                   */
 /* ------------------------------------------------------------------ */
 static PFN_vkGetInstanceProcAddr g_vkGIPA;
+static void install_vulkan_hook(void);
 static struct {
     PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
@@ -1161,13 +1162,14 @@ static XrResult ext_string(const char *str, uint32_t cap, uint32_t *count, char 
 
 /* (no hace falta ninguna extensión de Vulkan: la imagen se lee con una copia común) */
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetVulkanInstanceExtensionsKHR(XrInstance i, XrSystemId id, uint32_t cap, uint32_t *count, char *buf) {
-    (void)i; (void)id; return ext_string("", cap, count, buf);
+    (void)i; (void)id; install_vulkan_hook(); return ext_string("", cap, count, buf);
 }
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetVulkanDeviceExtensionsKHR(XrInstance i, XrSystemId id, uint32_t cap, uint32_t *count, char *buf) {
     (void)i; (void)id; return ext_string("", cap, count, buf);
 }
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetVulkanGraphicsDeviceKHR(XrInstance i, XrSystemId id, VkInstance inst, VkPhysicalDevice *out) {
     (void)i; (void)id;
+    install_vulkan_hook();
     if (!vk_loader()) return XR_ERROR_RUNTIME_FAILURE;
     PFN_vkEnumeratePhysicalDevices en = (PFN_vkEnumeratePhysicalDevices)g_vkGIPA(inst, "vkEnumeratePhysicalDevices");
     uint32_t n = 1;
@@ -2478,6 +2480,85 @@ static int patch_iat(HMODULE mod, const char *dll, const char *fn, void *repl, v
         }
     }
     return 0;
+}
+
+/* Vulkan: algunos juegos (DOOM VFR) piden funciones de la GPU que Metal no tiene (por ejemplo depth bounds o
+   cull distance) y vkCreateDevice falla. Se interceptan vkCreateDevice/vkGetInstanceProcAddr del juego y se
+   apagan solo las funciones que la Mac no tiene; el resto queda igual. */
+static PFN_vkCreateDevice g_origVkCreateDevice;
+static PFN_vkGetInstanceProcAddr g_origVkGIPA;
+static const char *const g_vkFeatNames[] = {
+    "robustBufferAccess", "fullDrawIndexUint32", "imageCubeArray", "independentBlend", "geometryShader",
+    "tessellationShader", "sampleRateShading", "dualSrcBlend", "logicOp", "multiDrawIndirect",
+    "drawIndirectFirstInstance", "depthClamp", "depthBiasClamp", "fillModeNonSolid", "depthBounds", "wideLines",
+    "largePoints", "alphaToOne", "multiViewport", "samplerAnisotropy", "textureCompressionETC2",
+    "textureCompressionASTC_LDR", "textureCompressionBC", "occlusionQueryPrecise", "pipelineStatisticsQuery",
+    "vertexPipelineStoresAndAtomics", "fragmentStoresAndAtomics", "shaderTessellationAndGeometryPointSize",
+    "shaderImageGatherExtended", "shaderStorageImageExtendedFormats", "shaderStorageImageMultisample",
+    "shaderStorageImageReadWithoutFormat", "shaderStorageImageWriteWithoutFormat",
+    "shaderUniformBufferArrayDynamicIndexing", "shaderSampledImageArrayDynamicIndexing",
+    "shaderStorageBufferArrayDynamicIndexing", "shaderStorageImageArrayDynamicIndexing", "shaderClipDistance",
+    "shaderCullDistance", "shaderFloat64", "shaderInt64", "shaderInt16", "shaderResourceResidency",
+    "shaderResourceMinLod", "sparseBinding", "sparseResidencyBuffer", "sparseResidencyImage2D",
+    "sparseResidencyImage3D", "sparseResidency2Samples", "sparseResidency4Samples", "sparseResidency8Samples",
+    "sparseResidency16Samples", "sparseResidencyAliased", "variableMultisampleRate", "inheritedQueries",
+};
+#define N_VKFEAT (sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32))
+
+/* Apaga en «want» lo que la GPU no tiene; devuelve cuántas apagó */
+static int vk_mask_features(VkPhysicalDeviceFeatures *want, const VkPhysicalDeviceFeatures *has) {
+    VkBool32 *w = (VkBool32 *)want; const VkBool32 *h = (const VkBool32 *)has;
+    int n = 0;
+    for (size_t i = 0; i < N_VKFEAT; i++)
+        if (w[i] && !h[i]) {
+            w[i] = VK_FALSE; n++;
+            logmsg("Vulkan: el juego pidió «%s», que la GPU de la Mac no tiene: se apaga", i < sizeof g_vkFeatNames / sizeof g_vkFeatNames[0] ? g_vkFeatNames[i] : "?");
+        }
+    return n;
+}
+
+static VkResult VKAPI_CALL hook_vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, const VkAllocationCallbacks *al, VkDevice *dev) {
+    static PFN_vkGetPhysicalDeviceFeatures gpf;
+    if (!gpf) gpf = (PFN_vkGetPhysicalDeviceFeatures)(void (*)(void))GetProcAddress(GetModuleHandleA("vulkan-1.dll"), "vkGetPhysicalDeviceFeatures");
+    if (!gpf || !ci) return g_origVkCreateDevice(pd, ci, al, dev);
+    VkPhysicalDeviceFeatures has; gpf(pd, &has);
+    VkDeviceCreateInfo c = *ci;
+    VkPhysicalDeviceFeatures f;
+    if (ci->pEnabledFeatures) { f = *ci->pEnabledFeatures; vk_mask_features(&f, &has); c.pEnabledFeatures = &f; }
+    /* (también en VkPhysicalDeviceFeatures2 dentro de pNext: se cambia y se restaura después) */
+    VkPhysicalDeviceFeatures2 *f2 = NULL; VkPhysicalDeviceFeatures saved;
+    for (VkBaseOutStructure *n = (VkBaseOutStructure *)ci->pNext; n; n = n->pNext)
+        if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) { f2 = (VkPhysicalDeviceFeatures2 *)n; break; }
+    if (f2) { saved = f2->features; vk_mask_features(&f2->features, &has); }
+    VkResult r = g_origVkCreateDevice(pd, &c, al, dev);
+    if (f2) f2->features = saved;
+    logmsg("Vulkan: vkCreateDevice del juego → %d", (int)r);
+    return r;
+}
+
+static PFN_vkVoidFunction VKAPI_CALL hook_vkGetInstanceProcAddr(VkInstance inst, const char *name) {
+    PFN_vkVoidFunction p = g_origVkGIPA(inst, name);
+    if (p && name && !strcmp(name, "vkCreateDevice")) {
+        g_origVkCreateDevice = (PFN_vkCreateDevice)p;
+        return (PFN_vkVoidFunction)hook_vkCreateDevice;
+    }
+    return p;
+}
+
+/* Se instala una vez, cuando el juego usa Vulkan con nuestro runtime (en el .exe del juego) */
+static void install_vulkan_hook(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    HMODULE exe = GetModuleHandleA(NULL), vk1 = GetModuleHandleA("vulkan-1.dll");
+    if (!vk1) return;
+    void *o = NULL;
+    int a = patch_iat(exe, "vulkan-1.dll", "vkCreateDevice", (void *)hook_vkCreateDevice, &o);
+    if (a) g_origVkCreateDevice = (PFN_vkCreateDevice)o;
+    else g_origVkCreateDevice = (PFN_vkCreateDevice)(void (*)(void))GetProcAddress(vk1, "vkCreateDevice");
+    int b = patch_iat(exe, "vulkan-1.dll", "vkGetInstanceProcAddr", (void *)hook_vkGetInstanceProcAddr, &o);
+    if (b) g_origVkGIPA = (PFN_vkGetInstanceProcAddr)o;
+    logmsg("Vulkan: ajuste de funciones de la GPU instalado (vkCreateDevice %s, vkGetInstanceProcAddr %s)", a ? "sí" : "no", b ? "sí" : "no");
 }
 
 static void install_d3d11_hook(void) {
