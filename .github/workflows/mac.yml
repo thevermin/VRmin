@@ -46,7 +46,7 @@ jobs:
         run: |
           xcrun swiftc -O -parse-as-library mac/app/VRminHostApp.swift mac/app/Idioma.swift mac/app/Tutoriales.swift mac/app/LogEn.swift -o "$RUNNER_TEMP/VRminHost" 2> "$RUNNER_TEMP/err2.txt" || { grep -m15 "error:" "$RUNNER_TEMP/err2.txt" | while read -r l; do echo "::error::$l"; done; exit 1; }
       - name: Paquete para distribuir (firma ad hoc)
-        run: bash mac/crear_app.sh --paquete
+        run: VRMIN_ADHOC=1 bash mac/crear_app.sh --paquete
       - uses: actions/upload-artifact@v4
         with:
           name: VRmin-Host-mac

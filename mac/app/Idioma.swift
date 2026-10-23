@@ -15,6 +15,19 @@ func L(_ es: String, _ args: CVarArg...) -> String {
 }
 
 private let EN: [String: String] = [
+    "Actualizar a la %@": "Update to %@",
+    "Hay una versión nueva de VRmin Host: se baja, se cierra esta y se abre la nueva.": "There's a new version of VRmin Host: it downloads, this one closes and the new one opens.",
+    "Actualizando VRmin Host": "Updating VRmin Host",
+    "Instalando VRmin en el Quest": "Installing VRmin on the Quest",
+    "Actualizando VRmin en el Quest": "Updating VRmin on the Quest",
+    "App del Quest": "Quest app",
+    "Para instalarla desde acá: herramientas del Modo Centinela": "To install it from here: Sentinel Mode tools",
+    "Conectá el Quest por cable USB-C para ver su versión": "Connect the Quest with a USB-C cable to see its version",
+    "No está instalada en el visor": "Not installed on the headset",
+    "Versión %@ · hay una nueva: %@": "Version %@ · new one available: %@",
+    "Versión %@ · al día": "Version %@ · up to date",
+    "Actualizar": "Update",
+    "Se instala por el cable USB-C, sin SideQuest. Tus ajustes del visor se conservan.": "Installs over the USB-C cable, no SideQuest needed. Your headset settings are kept.",
     "Apoyar en Ko-fi": "Support on Ko-fi",
     "VRmin es gratis. Si te sirve, podés invitarme un café en Ko-fi": "VRmin is free. If it helps you, you can buy me a coffee on Ko-fi",
     "Falta instalar el motor": "Engine not installed",

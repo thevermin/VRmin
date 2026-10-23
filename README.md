@@ -104,7 +104,8 @@ Put the Quest on your monitor: it tracks you with its cameras while the game sho
 ### 1. On your Mac
 1. Download **`VRmin Host <version>.zip`** from [Releases](../../releases/latest) and double‑click it.
 2. Drag **VRmin Host** to your **Applications** folder.
-3. The first time, **right‑click → Open** (macOS warns because the app isn't from the App Store).
+3. The first time, **right‑click → Open** (macOS warns because the app isn't from the App Store). On newer macOS
+   versions, if it still won't open, go to **System Settings → Privacy & Security** and click **Open Anyway**.
 4. In VRmin Host, click **Install** next to *Windows games engine*, then **Install** next to *Steam*.
 5. Open Steam from VRmin Host, sign in, and download your VR games.
 6. macOS will ask for **Screen Recording** (to show your desktop and windows) and **Accessibility** (for the pointer
@@ -117,9 +118,16 @@ Put the Quest on your monitor: it tracks you with its cameras while the game sho
    [SideQuest](https://sidequestvr.com) (or `adb install VRmin-<version>.apk`).
 3. Find it in **Library → Unknown sources → VRmin**.
 
+Once VRmin Host is set up, it can also install and update the Quest app for you: turn on **Sentinel Mode**'s tools
+in VRmin Host, connect the Quest with a USB-C cable and click **Install** next to *Quest app*.
+
 ### 3. Play
 Open **VRmin Host** on the Mac and **VRmin** on the Quest. The Quest finds your Mac by itself: pick it and connect.
 Choose a game from the **Games** tab, and play.
+
+### Updates
+VRmin Host checks for new versions by itself: when there's one, click **Update** at the top. The Quest app updates
+from VRmin Host too, over the USB-C cable.
 
 ## FAQ
 
