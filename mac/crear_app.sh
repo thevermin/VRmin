@@ -46,9 +46,16 @@ for s in 16 32 128 256 512; do
 done
 iconutil -c icns "$I" -o "$NUEVA/Contents/Resources/AppIcon.icns" || echo "Aviso: no se pudo armar el ícono"
 if [ $PAQUETE = 1 ]; then
-  # Firma «ad hoc»: sin cuenta de desarrollador de Apple. Quien la baje la abre con clic derecho → Abrir
-  # (o la notariza el día que haya una cuenta de desarrollador; ver README).
-  codesign --force --sign - "$R/QuestRenderer" && codesign --force --sign - "$R/arreglo_errores.dylib" && codesign --force --deep --sign - "$NUEVA" || { echo "Falló la firma"; exit 1; }
+  # Sin cuenta de desarrollador de Apple: quien la baje la abre con clic derecho → Abrir.
+  codesign --force --sign - "$R/arreglo_errores.dylib" || { echo "Falló la firma"; exit 1; }
+  if [ "$VRMIN_ADHOC" = 1 ]; then
+    # (GitHub Actions: firma «ad hoc», solo para probar que compila)
+    codesign --force --sign - "$R/QuestRenderer" && codesign --force --deep --sign - "$NUEVA" || { echo "Falló la firma"; exit 1; }
+  else
+    # Con el certificado fijo de VRmin (el mismo de cada versión): así macOS conserva los permisos al actualizar
+    bash app/firmar.sh "$NUEVA" "$R/QuestRenderer"
+    codesign -dvv "$NUEVA" 2>&1 | grep -q "Authority=QuestVRBridge Local" || { echo "Falló la firma con el certificado de VRmin"; exit 1; }
+  fi
   # (en una carpeta aparte: la app instalada en esta Mac, con firma local, queda igual y conserva sus permisos)
   T=$(mktemp -d); mv "$NUEVA" "$T/$APP"
   V=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$T/$APP/Contents/Info.plist")

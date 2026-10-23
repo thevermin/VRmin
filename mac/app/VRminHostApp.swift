@@ -145,6 +145,7 @@ final class AppModel: ObservableObject {
         guard adbInstalled, !adbChecking else { if !adbInstalled { adbState = "" }; return }
         adbChecking = true
         let adb = adbPath
+        let needVer = questAppVersion == nil
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let p = Process(); let pipe = Pipe()
             p.executableURL = adb; p.arguments = ["devices"]
@@ -158,8 +159,78 @@ final class AppModel: ObservableObject {
                     if f.count >= 2 { st = String(f[1]); if st == "device" { break } }
                 }
             }
-            DispatchQueue.main.async { self?.adbChecking = false; if self?.adbState != st { self?.adbState = st } }
+            // Versión de VRmin instalada en el visor (para avisar si hay una nueva)
+            var ver: String?
+            if st == "device" && needVer {
+                let q = Process(); let qp = Pipe()
+                q.executableURL = adb; q.arguments = ["shell", "dumpsys", "package", "com.vrmin.app"]
+                q.standardOutput = qp; q.standardError = FileHandle.nullDevice
+                if (try? q.run()) != nil {
+                    let o = String(decoding: qp.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                    q.waitUntilExit()
+                    if let r = o.range(of: "versionName=[^\\s]+", options: .regularExpression) { ver = String(o[r].dropFirst(12)) }
+                    else if q.terminationStatus == 0 { ver = "" }   // no está instalada
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.adbChecking = false
+                if self.adbState != st { self.adbState = st }
+                if st != "device" { if self.questAppVersion != nil { self.questAppVersion = nil } }
+                else if let ver { self.questAppVersion = ver }
+            }
         }
+    }
+
+    // MARK: Actualizaciones (la última versión publicada en GitHub)
+    struct Nueva: Equatable { let version: String; let url: URL }
+    @Published var newHost: Nueva?              // una VRmin Host más nueva que esta
+    @Published var latestApk: Nueva?            // la app del Quest de la última versión publicada
+    @Published var questAppVersion: String?     // la del visor (por cable): nil = no se sabe, "" = no está instalada
+    /// "0.40" es más nueva que "0.39" (se compara por partes, como números)
+    static func newer(_ a: String, than b: String) -> Bool {
+        let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(x.count, y.count) {
+            let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+            if p != q { return p > q }
+        }
+        return false
+    }
+    func checkUpdates() {
+        var req = URLRequest(url: URL(string: "https://api.github.com/repos/thevermin/VRmin/releases/latest")!)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        URLSession.shared.dataTask(with: req) { [weak self] d, _, _ in
+            guard let d, let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  let tag = j["tag_name"] as? String, let assets = j["assets"] as? [[String: Any]] else { return }
+            let v = tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
+            var host: Nueva?, apk: Nueva?
+            for a in assets {
+                guard let n = a["name"] as? String, let s = a["browser_download_url"] as? String, let u = URL(string: s) else { continue }
+                if n.hasSuffix(".zip") && n.contains("Host") { host = Nueva(version: v, url: u) }   // «VRmin Host 0.40.zip»
+                if n.hasSuffix(".apk"), let r = n.range(of: "[0-9]+(\\.[0-9]+)+", options: .regularExpression) {   // «VRmin-0.70.apk»
+                    apk = Nueva(version: String(n[r]), url: u)
+                }
+            }
+            let mine = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+            DispatchQueue.main.async {
+                self?.newHost = host.flatMap { AppModel.newer($0.version, than: mine) ? $0 : nil }
+                self?.latestApk = apk
+            }
+        }.resume()
+    }
+    /// Baja la VRmin Host nueva, revisa su firma y se reemplaza (se cierra y se abre la nueva)
+    func updateHost() {
+        guard let n = newHost else { return }
+        run(L("Actualizando VRmin Host"), "actualizar_host.sh",
+            [n.url.absoluteString, Bundle.main.bundlePath, String(ProcessInfo.processInfo.processIdentifier)]) {
+            NSApp.terminate(nil)
+        }
+    }
+    /// Instala (o actualiza) VRmin en el visor por el cable, con adb
+    func installQuestApp() {
+        guard let a = latestApk else { return }
+        run(questAppVersion == "" ? L("Instalando VRmin en el Quest") : L("Actualizando VRmin en el Quest"),
+            "actualizar_app_quest.sh", [adbPath.path, a.url.absoluteString]) { [weak self] in self?.questAppVersion = nil }
     }
     @Published var steamStuck = false          // Steam avisó que se trabó (su bucle principal dejó de responder)
     private var steamLogSeen: UInt64 = 0
@@ -263,6 +334,8 @@ final class AppModel: ObservableObject {
         append(L("Datos en: %@", data.path))
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.refresh() }
+        checkUpdates()
+        _ = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in self?.checkUpdates() }
         startRemoteStart()
     }
 
@@ -682,7 +755,7 @@ final class AppModel: ObservableObject {
     }
 
     // MARK: Tareas (un script a la vez)
-    func run(_ title: String, _ script: String, _ args: [String] = [], exclusive: Bool = true) {
+    func run(_ title: String, _ script: String, _ args: [String] = [], exclusive: Bool = true, then: (() -> Void)? = nil) {
         if exclusive {
             guard busyTask == nil else { return }
             busyTask = title
@@ -695,6 +768,7 @@ final class AppModel: ObservableObject {
                 self.append(pr.terminationStatus == 0 ? L("✓ %@: listo", title) : L("✗ %@: terminó con un error (código %ld)", title, Int(pr.terminationStatus)))
                 if exclusive { self.busyTask = nil }
                 self.refresh()
+                if pr.terminationStatus == 0 { then?() }
             }
         }
         do { try p.run() }
@@ -1003,6 +1077,11 @@ struct ContentView: View {
             }
             .padding(.horizontal, 12).padding(.vertical, 7)
             .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.white.opacity(0.07)))
+            if let n = m.newHost {
+                Button { m.updateHost() } label: { Label(L("Actualizar a la %@", n.version), systemImage: "arrow.down.circle.fill") }
+                    .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
+                    .help(L("Hay una versión nueva de VRmin Host: se baja, se cierra esta y se abre la nueva."))
+            }
             // Apoyar el proyecto (VRmin es gratis)
             Button { NSWorkspace.shared.open(URL(string: "https://ko-fi.com/thevermin")!) } label: {
                 Label(L("Apoyar en Ko-fi"), systemImage: "cup.and.saucer.fill")
@@ -1117,7 +1196,29 @@ struct ContentView: View {
                         .help(L("Abre VRmin en el visor directo en el Modo Centinela, sin tocarlo. Después abrí un juego con «Jugar»."))
                 }
             }
+            row(L("App del Quest"), m.adbState == "device" && !(m.questAppVersion ?? "").isEmpty && !questAppAction,
+                questAppStatus, warn: questAppAction) {
+                if questAppAction {
+                    Button(m.questAppVersion == "" ? L("Instalar") : L("Actualizar")) { m.installQuestApp() }
+                        .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
+                        .help(L("Se instala por el cable USB-C, sin SideQuest. Tus ajustes del visor se conservan."))
+                }
+            }
         }
+    }
+
+    /// La app del visor: hay una más nueva (o no está instalada) y se puede instalar por el cable
+    private var questAppAction: Bool {
+        guard m.adbState == "device", let a = m.latestApk, let v = m.questAppVersion else { return false }
+        return v.isEmpty || AppModel.newer(a.version, than: v)
+    }
+    private var questAppStatus: String {
+        guard m.adbInstalled else { return L("Para instalarla desde acá: herramientas del Modo Centinela") }
+        if m.adbState == "unauthorized" { return L("Tocá «Permitir» en el visor") }
+        guard m.adbState == "device", let v = m.questAppVersion else { return L("Conectá el Quest por cable USB-C para ver su versión") }
+        if v.isEmpty { return L("No está instalada en el visor") }
+        if let a = m.latestApk, AppModel.newer(a.version, than: v) { return L("Versión %@ · hay una nueva: %@", v, a.version) }
+        return L("Versión %@ · al día", v)
     }
 
     /// Instrucciones: modo desarrollador del Quest (una sola vez) para el Modo Centinela
