@@ -24,7 +24,7 @@ codesign --verify --strict "$NUEVA" 2>/dev/null || falla "La app bajada no tiene
   || falla "La app bajada no es VRmin Host" "The downloaded app isn't VRmin Host"
 REQ="$(codesign -d -r- "$APP" 2>&1 | sed -n 's/^designated => //p')"
 if [[ "$REQ" == *certificate* ]]; then
-  codesign --verify -R="=$REQ" "$NUEVA" 2>/dev/null || falla "La app bajada no está firmada por VRmin" "The downloaded app isn't signed by VRmin"
+  codesign --verify --test-requirement="=$REQ" "$NUEVA" 2>/dev/null || falla "La app bajada no está firmada por VRmin" "The downloaded app isn't signed by VRmin"
 fi
 say "Listo: VRmin Host se cierra y se abre la versión nueva." "Done: VRmin Host closes and the new version opens."
 # Cuando esta app se cierra: la nueva en su lugar (si falla, vuelve la de antes) y se abre
