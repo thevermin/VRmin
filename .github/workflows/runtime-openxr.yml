@@ -10,14 +10,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Herramientas (mingw-w64) y cabeceras de OpenXR
+      - name: Herramientas (mingw-w64) y cabeceras de OpenXR y Vulkan
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64 >/dev/null
           git clone -q --depth 1 --branch release-1.1.43 https://github.com/KhronosGroup/OpenXR-SDK.git "$RUNNER_TEMP/openxr"
+          git clone -q --depth 1 --branch v1.3.296 https://github.com/KhronosGroup/Vulkan-Headers.git "$RUNNER_TEMP/vulkan"
       - name: Compilar questvrbridge_openxr.dll
         run: |
           x86_64-w64-mingw32-gcc -O2 -shared -o "$RUNNER_TEMP/questvrbridge_openxr.dll" mac/openxr/questvrbridge_openxr.c \
-            mac/openxr/questvrbridge_openxr.def -I"$RUNNER_TEMP/openxr/include" \
+            mac/openxr/questvrbridge_openxr.def -I"$RUNNER_TEMP/openxr/include" -I"$RUNNER_TEMP/vulkan/include" \
             -ld3d11 -ldxgi -ldxguid -luuid -lws2_32 -lwinmm -static-libgcc -Wl,--kill-at > build.log 2>&1 || true
           grep -E "error" build.log | head -20 | while IFS= read -r l; do echo "::error::$l"; done
           test -f "$RUNNER_TEMP/questvrbridge_openxr.dll"
@@ -33,5 +34,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add mac/openxr/questvrbridge_openxr.dll
-          git commit -qm "Runtime OpenXR compilado" || exit 0
+          git commit -qm "Build the OpenXR runtime DLL" || exit 0
           for i in 1 2 3; do git pull -q --rebase && git push -q && break; sleep 3; done

@@ -28,11 +28,12 @@ Without a store key the APK is signed with your local Android debug key. Install
 
 `mac/openxr/questvrbridge_openxr.dll` is committed, and rebuilt by the `runtime-openxr` workflow when the source
 changes. To build it by hand you need mingw-w64 and the headers from
-[OpenXR-SDK release-1.1.43](https://github.com/KhronosGroup/OpenXR-SDK/releases/tag/release-1.1.43):
+[OpenXR-SDK release-1.1.43](https://github.com/KhronosGroup/OpenXR-SDK/releases/tag/release-1.1.43) and
+[Vulkan-Headers v1.3.296](https://github.com/KhronosGroup/Vulkan-Headers/releases/tag/v1.3.296):
 
 ```bash
 x86_64-w64-mingw32-gcc -O2 -shared -o mac/openxr/questvrbridge_openxr.dll \
-  mac/openxr/questvrbridge_openxr.c mac/openxr/questvrbridge_openxr.def -I<OpenXR-SDK>/include \
+  mac/openxr/questvrbridge_openxr.c mac/openxr/questvrbridge_openxr.def -I<OpenXR-SDK>/include -I<Vulkan-Headers>/include \
   -ld3d11 -ldxgi -ldxguid -luuid -lws2_32 -lwinmm -static-libgcc -Wl,--kill-at
 ```
 
