@@ -36,7 +36,7 @@ It is two apps that work together:
 ## Features
 
 ### 🎮 SteamVR games on your Mac
-Your SteamVR library, running on Apple Silicon. Tested with games like **SUPERHOT VR** and **Beat Saber**.
+Your SteamVR library, running on Apple Silicon. Tested with games like **SUPERHOT VR**, **Beat Saber**, **Aircar** and **Kayak VR: Mirage** ([full list](../../discussions/6)).
 VRmin picks the right VR runtime for each game automatically (OpenXR directly, or OpenVR through OpenComposite).
 
 <img src="docs/media/library.jpg" alt="Your SteamVR library inside VRmin" width="640">
@@ -94,14 +94,15 @@ Put the Quest on your monitor: it tracks you with its cameras while the game sho
 ## Requirements
 
 - A Mac with **Apple Silicon** (M1 or newer), **macOS 14.2** or newer, and Rosetta 2
-- A **Meta Quest 3 or 3S** (recommended). **Quest 1, Quest 2 and Quest Pro** are supported experimentally: see
-  [Older headsets](#older-headsets)
+- A **Meta Quest 3 or 3S** (recommended). **Quest 2** works too (confirmed by testers); **Quest 1** and **Quest Pro**
+  are experimental: see [Older headsets](#older-headsets)
 - The Mac and the Quest on the **same Wi‑Fi** network (5/6 GHz, or the Mac on Ethernet, works best)
 - A Steam account with your VR games, and space for them (VRmin installs its own Steam for Windows: games are
   downloaded again there)
 
 ### Older headsets
-VRmin runs on Quest 1, Quest 2 and Quest Pro, but it's mostly tested on Quest 3, so expect some rough edges. These
+VRmin runs on Quest 1, Quest 2 and Quest Pro. Quest 2 has been confirmed working by testers; Quest 1 and Pro haven't been
+tested yet, so expect some rough edges. These
 features need hardware that older headsets don't have, so they probably won't work (or will work differently):
 
 | Feature | Quest 2 / Pro | Quest 1 |
