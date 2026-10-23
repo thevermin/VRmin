@@ -27,7 +27,7 @@
 
     <application android:label="VRmin" android:icon="@drawable/ic_launcher" android:roundIcon="@drawable/ic_launcher" android:hasCode="true" android:allowBackup="false"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
-        <meta-data android:name="com.oculus.supportedDevices" android:value="quest2|questpro|quest3|quest3s" />
+        <meta-data android:name="com.oculus.supportedDevices" android:value="quest|quest2|questpro|quest3|quest3s" />
         <!-- Al abrir la sala VR, la pantalla de carga del Quest muestra tu cuarto (no negro) si venías con passthrough -->
         <meta-data android:name="com.oculus.ossplash.background" android:value="passthrough-contextual" />
         <meta-data android:name="com.oculus.handtracking.frequency" android:value="HIGH" />
