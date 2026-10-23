@@ -9,8 +9,8 @@
 	<key>CFBundleExecutable</key><string>VRminHost</string>
 	<key>CFBundleIconFile</key><string>AppIcon</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>0.45</string>
-	<key>CFBundleVersion</key><string>43</string>
+	<key>CFBundleShortVersionString</key><string>0.46</string>
+	<key>CFBundleVersion</key><string>44</string>
 	<key>LSMinimumSystemVersion</key><string>14.2</string>
 	<key>LSApplicationCategoryType</key><string>public.app-category.games</string>
 	<key>NSHighResolutionCapable</key><true/>
