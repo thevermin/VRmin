@@ -1405,8 +1405,92 @@ static HGLRC WINAPI hook_wglCreateContextAttribsARB(HDC dc, HGLRC share, const i
     a[n] = 0;
     return g_origCreateCtxAttribs(dc, share, attribs ? a : NULL);
 }
+/* OpenComposite copia los cuadros con funciones de OpenGL 4.3/4.5 que la Mac no tiene (llega hasta 4.1):
+ * se hacen con funciones viejas equivalentes */
+static struct {
+    int ok;
+    void (WINAPI *GetTexLevelParameteriv)(GLenum, GLint, GLenum, GLint *);
+    GLenum (WINAPI *GetError)(void);
+    GLboolean (WINAPI *IsEnabled)(GLenum);
+    void (WINAPI *Enable)(GLenum); void (WINAPI *Disable)(GLenum);
+    PFNGLBLITFRAMEBUFFERPROC BlitFramebuffer;
+    GLuint fbo[2];
+} glx;
+static int glx_load(void) {
+    if (glx.ok) return glx.ok > 0;
+    glx.ok = -1;
+    if (!gl_load() || !gl_load_ext()) return 0;
+    HMODULE m = GetModuleHandleA("opengl32.dll");
+    FARPROC f;
+    f = GetProcAddress(m, "glGetTexLevelParameteriv"); memcpy(&glx.GetTexLevelParameteriv, &f, sizeof f);
+    f = GetProcAddress(m, "glGetError"); memcpy(&glx.GetError, &f, sizeof f);
+    f = GetProcAddress(m, "glIsEnabled"); memcpy(&glx.IsEnabled, &f, sizeof f);
+    f = GetProcAddress(m, "glEnable"); memcpy(&glx.Enable, &f, sizeof f);
+    f = GetProcAddress(m, "glDisable"); memcpy(&glx.Disable, &f, sizeof f);
+    PROC p = gl.GetProcAddress("glBlitFramebuffer"); memcpy(&glx.BlitFramebuffer, &p, sizeof p);
+    if (!glx.GetTexLevelParameteriv || !glx.GetError || !glx.IsEnabled || !glx.BlitFramebuffer) return 0;
+    gl.GenFramebuffers(2, glx.fbo);
+    glx.ok = 1;
+    return 1;
+}
+/* Enlaza la textura con el tipo que tenga (2D o arreglo 2D) y devuelve ese tipo; 0 si no se pudo */
+static GLenum glx_bind_any(GLuint tex) {
+    static const GLenum tipos[] = { GL_TEXTURE_2D, GL_TEXTURE_2D_ARRAY };
+    while (glx.GetError() != GL_NO_ERROR) {}
+    for (int i = 0; i < 2; i++) {
+        gl.BindTexture(tipos[i], tex);
+        if (glx.GetError() == GL_NO_ERROR) return tipos[i];
+    }
+    return 0;
+}
+static void APIENTRY emu_glGetTextureLevelParameteriv(GLuint tex, GLint level, GLenum pname, GLint *params) {
+    if (!glx_load()) return;
+    GLint p2d = 0, parr = 0;
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &p2d); gl.GetIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &parr);
+    GLenum t = glx_bind_any(tex);
+    if (t) glx.GetTexLevelParameteriv(t, level, pname, params);
+    gl.BindTexture(GL_TEXTURE_2D, (GLuint)p2d); gl.BindTexture(GL_TEXTURE_2D_ARRAY, (GLuint)parr);
+}
+static void glx_attach(GLenum fb, GLuint tex, GLenum target, GLint level, GLint z, GLbitfield *mask) {
+    GLint p2d = 0, parr = 0, fmt = 0;
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &p2d); gl.GetIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &parr);
+    gl.BindTexture(target, tex);
+    glx.GetTexLevelParameteriv(target, level, GL_TEXTURE_INTERNAL_FORMAT, &fmt);
+    gl.BindTexture(GL_TEXTURE_2D, (GLuint)p2d); gl.BindTexture(GL_TEXTURE_2D_ARRAY, (GLuint)parr);
+    GLenum at = GL_COLOR_ATTACHMENT0; *mask = GL_COLOR_BUFFER_BIT;
+    if (fmt == GL_DEPTH24_STENCIL8 || fmt == GL_DEPTH32F_STENCIL8) { at = GL_DEPTH_STENCIL_ATTACHMENT; *mask = GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT; }
+    else if (fmt == GL_DEPTH_COMPONENT16 || fmt == GL_DEPTH_COMPONENT24 || fmt == GL_DEPTH_COMPONENT32F || fmt == GL_DEPTH_COMPONENT32) { at = GL_DEPTH_ATTACHMENT; *mask = GL_DEPTH_BUFFER_BIT; }
+    if (target == GL_TEXTURE_2D_ARRAY) gl.FramebufferTextureLayer(fb, at, tex, level, z);
+    else gl.FramebufferTexture2D(fb, at, GL_TEXTURE_2D, tex, level);
+}
+static void APIENTRY emu_glCopyImageSubData(GLuint src, GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ,
+                                            GLuint dst, GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ,
+                                            GLsizei w, GLsizei h, GLsizei depth) {
+    if (!glx_load()) return;
+    static int avisado;
+    if (!avisado) { avisado = 1; logmsg("OpenGL: copia de cuadros de OpenComposite hecha sin OpenGL 4.3 (0x%x → 0x%x)", srcTarget, dstTarget); }
+    GLint rfb = 0, dfb = 0;
+    gl.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &rfb); gl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfb);
+    GLboolean sc = glx.IsEnabled(GL_SCISSOR_TEST), srgb = glx.IsEnabled(GL_FRAMEBUFFER_SRGB);
+    if (sc) glx.Disable(GL_SCISSOR_TEST);
+    if (srgb) glx.Disable(GL_FRAMEBUFFER_SRGB);
+    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, glx.fbo[0]);
+    gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, glx.fbo[1]);
+    for (GLsizei z = 0; z < (depth > 0 ? depth : 1); z++) {
+        GLbitfield m1, m2;
+        glx_attach(GL_READ_FRAMEBUFFER, src, srcTarget, srcLevel, srcZ + z, &m1);
+        glx_attach(GL_DRAW_FRAMEBUFFER, dst, dstTarget, dstLevel, dstZ + z, &m2);
+        glx.BlitFramebuffer(srcX, srcY, srcX + w, srcY + h, dstX, dstY, dstX + w, dstY + h, m1 & m2, GL_NEAREST);
+    }
+    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)rfb); gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)dfb);
+    if (sc) glx.Enable(GL_SCISSOR_TEST);
+    if (srgb) glx.Enable(GL_FRAMEBUFFER_SRGB);
+}
+
 static PROC WINAPI hook_wglGetProcAddress(LPCSTR name) {
     PROC p = g_origWglGPA(name);
+    if (!p && name && !strcmp(name, "glGetTextureLevelParameteriv")) return (PROC)(void (*)(void))emu_glGetTextureLevelParameteriv;
+    if (!p && name && !strcmp(name, "glCopyImageSubData")) return (PROC)(void (*)(void))emu_glCopyImageSubData;
     if (p && name && !strcmp(name, "wglCreateContextAttribsARB")) {
         g_origCreateCtxAttribs = (PFNWGLCREATECONTEXTATTRIBSARBPROC)(void (*)(void))p;
         return (PROC)(void (*)(void))hook_wglCreateContextAttribsARB;
@@ -1421,6 +1505,11 @@ static void install_gl_hook(void) {
     if (patch_iat(GetModuleHandleA(NULL), "opengl32.dll", "wglGetProcAddress", (void *)hook_wglGetProcAddress, &o)) {
         g_origWglGPA = (PROC (WINAPI *)(LPCSTR))o;
         logmsg("OpenGL: ajuste de contexto instalado");
+    }
+    /* También en OpenComposite, para darle las funciones que la Mac no tiene */
+    if (patch_iat(GetModuleHandleA("vrclient_x64.dll"), "opengl32.dll", "wglGetProcAddress", (void *)hook_wglGetProcAddress, &o)) {
+        if (!g_origWglGPA) g_origWglGPA = (PROC (WINAPI *)(LPCSTR))o;
+        logmsg("OpenGL: funciones para OpenComposite instaladas");
     }
 }
 
