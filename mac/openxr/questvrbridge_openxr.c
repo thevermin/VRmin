@@ -1,5 +1,5 @@
 /*
- * QuestVRBridge OpenXR runtime (Windows x64, D3D11).
+ * QuestVRBridge OpenXR runtime (Windows x64, D3D11 y Vulkan).
  *
  * Se carga dentro del "Windows" de GameHub (Wine) en lugar de SteamVR/Oculus.
  * - Recibe la pose de la cabeza y los controles del Quest a través de
@@ -7,9 +7,10 @@
  * - Copia las imágenes de cada ojo que dibuja el juego y se las manda a
  *   QuestRenderer, que las comprime y las envía al visor.
  *
- * Compilar (desde Linux/Mac con mingw-w64; cabeceras de OpenXR-SDK 1.1.x, por ejemplo release-1.1.43):
+ * Compilar (desde Linux/Mac con mingw-w64; cabeceras de OpenXR-SDK 1.1.x, por ejemplo release-1.1.43,
+ * y de Vulkan-Headers, por ejemplo v1.3.296):
  *   x86_64-w64-mingw32-gcc -O2 -shared -o questvrbridge_openxr.dll questvrbridge_openxr.c questvrbridge_openxr.def \
- *       -I<OpenXR-SDK>/include -ld3d11 -ldxgi -ldxguid -luuid -lws2_32 -lwinmm -static-libgcc -Wl,--kill-at
+ *       -I<OpenXR-SDK>/include -I<Vulkan-Headers>/include -ld3d11 -ldxgi -ldxguid -luuid -lws2_32 -lwinmm -static-libgcc -Wl,--kill-at
  * (GitHub Actions lo compila solo: «Runtime OpenXR (Windows)».)
  */
 #define COBJMACROS
@@ -31,8 +32,12 @@
 #include <stdarg.h>
 #include <math.h>
 
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>
+
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_D3D11
+#define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/openxr_loader_negotiation.h>
@@ -758,6 +763,7 @@ typedef struct Swapchain {
     DXGI_FORMAT dxgi;
     uint32_t w, h, arraySize, mips, count;
     ID3D11Texture2D *img[3];
+    VkImage vimg[3]; VkDeviceMemory vmem[3];   /* (sesión Vulkan) */
     uint32_t next, released;
 } Swapchain;
 
@@ -780,6 +786,12 @@ typedef struct Session {
     uint32_t stPose[3]; int stValid[3]; int stNext;
     XrPath profile;
     int frameCount;
+    /* Vulkan (juegos que dibujan con Vulkan, por ejemplo por OpenComposite): la imagen se lee de la GPU a la memoria */
+    int vk;
+    VkInstance vkInst; VkPhysicalDevice vkPhys; VkDevice vkDev; VkQueue vkQueue;
+    VkCommandPool vkPool; VkCommandBuffer vkCb[STAGES]; VkFence vkFence[STAGES];
+    VkBuffer vkBuf[STAGES]; VkDeviceMemory vkBufMem[STAGES]; void *vkMap[STAGES];
+    int vkWarned;
 } Session;
 
 static Instance g_instance;
@@ -816,6 +828,7 @@ static void set_state(Session *s, XrSessionState st) {
 
 static const char *g_extensions[] = {
     XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
+    XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
     XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME,
 };
 #define N_EXT (sizeof g_extensions / sizeof g_extensions[0])
@@ -1070,16 +1083,187 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetD3D11GraphicsRequirementsKHR(XrInstance i
     return XR_SUCCESS;
 }
 
+/* ------------------------------------------------------------------ */
+/* Vulkan (XR_KHR_vulkan_enable). Los juegos con Vulkan (por ejemplo,  */
+/* juegos de OpenVR por OpenComposite) dibujan en imágenes que crea el */
+/* runtime; en xrEndFrame se copian (en la GPU) a memoria que se puede */
+/* leer y de ahí a la memoria compartida con la Mac.                   */
+/* ------------------------------------------------------------------ */
+static PFN_vkGetInstanceProcAddr g_vkGIPA;
+static struct {
+    PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
+    PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
+    PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
+    PFN_vkGetDeviceQueue GetDeviceQueue;
+    PFN_vkCreateImage CreateImage; PFN_vkDestroyImage DestroyImage;
+    PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements; PFN_vkBindImageMemory BindImageMemory;
+    PFN_vkCreateBuffer CreateBuffer; PFN_vkDestroyBuffer DestroyBuffer;
+    PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements; PFN_vkBindBufferMemory BindBufferMemory;
+    PFN_vkAllocateMemory AllocateMemory; PFN_vkFreeMemory FreeMemory;
+    PFN_vkMapMemory MapMemory; PFN_vkUnmapMemory UnmapMemory;
+    PFN_vkCreateCommandPool CreateCommandPool; PFN_vkDestroyCommandPool DestroyCommandPool;
+    PFN_vkAllocateCommandBuffers AllocateCommandBuffers; PFN_vkFreeCommandBuffers FreeCommandBuffers;
+    PFN_vkResetCommandBuffer ResetCommandBuffer;
+    PFN_vkBeginCommandBuffer BeginCommandBuffer; PFN_vkEndCommandBuffer EndCommandBuffer;
+    PFN_vkCmdPipelineBarrier CmdPipelineBarrier; PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
+    PFN_vkQueueSubmit QueueSubmit; PFN_vkQueueWaitIdle QueueWaitIdle;
+    PFN_vkCreateFence CreateFence; PFN_vkDestroyFence DestroyFence;
+    PFN_vkWaitForFences WaitForFences; PFN_vkResetFences ResetFences;
+} vk;
+
+/* vkGetInstanceProcAddr del Vulkan de Wine (el mismo vulkan-1.dll que cargó el juego) */
+static int vk_loader(void) {
+    if (g_vkGIPA) return 1;
+    HMODULE m = LoadLibraryA("vulkan-1.dll");
+    if (m) g_vkGIPA = (PFN_vkGetInstanceProcAddr)(void (*)(void))GetProcAddress(m, "vkGetInstanceProcAddr");
+    if (!g_vkGIPA) logmsg("Vulkan: no se encontró vulkan-1.dll");
+    return g_vkGIPA != NULL;
+}
+
+static int vk_load(VkInstance inst, VkDevice dev) {
+#define VKI(n) vk.n = (PFN_vk##n)g_vkGIPA(inst, "vk" #n)
+#define VKD(n) do { vk.n = (PFN_vk##n)vk.GetDeviceProcAddr(dev, "vk" #n); if (!vk.n) { logmsg("Vulkan: falta vk" #n); return 0; } } while (0)
+    VKI(EnumeratePhysicalDevices); VKI(GetPhysicalDeviceMemoryProperties); VKI(GetDeviceProcAddr);
+    if (!vk.GetDeviceProcAddr || !vk.GetPhysicalDeviceMemoryProperties) { logmsg("Vulkan: faltan funciones de la instancia"); return 0; }
+    VKD(GetDeviceQueue); VKD(CreateImage); VKD(DestroyImage); VKD(GetImageMemoryRequirements); VKD(BindImageMemory);
+    VKD(CreateBuffer); VKD(DestroyBuffer); VKD(GetBufferMemoryRequirements); VKD(BindBufferMemory);
+    VKD(AllocateMemory); VKD(FreeMemory); VKD(MapMemory); VKD(UnmapMemory);
+    VKD(CreateCommandPool); VKD(DestroyCommandPool); VKD(AllocateCommandBuffers); VKD(FreeCommandBuffers); VKD(ResetCommandBuffer);
+    VKD(BeginCommandBuffer); VKD(EndCommandBuffer); VKD(CmdPipelineBarrier); VKD(CmdCopyImageToBuffer);
+    VKD(QueueSubmit); VKD(QueueWaitIdle); VKD(CreateFence); VKD(DestroyFence); VKD(WaitForFences); VKD(ResetFences);
+#undef VKI
+#undef VKD
+    return 1;
+}
+
+/* Tipo de memoria con las propiedades pedidas (y, si hay, también las preferidas) */
+static int vk_memtype(Session *s, uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags prefer) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vk.GetPhysicalDeviceMemoryProperties(s->vkPhys, &mp);
+    int best = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        if (!((bits >> i) & 1) || (f & want) != want) continue;
+        if ((f & prefer) == prefer) return (int)i;
+        if (best < 0) best = (int)i;
+    }
+    return best;
+}
+
+static XrResult ext_string(const char *str, uint32_t cap, uint32_t *count, char *buf) {
+    uint32_t n = (uint32_t)strlen(str) + 1;
+    *count = n;
+    if (cap == 0) return XR_SUCCESS;
+    if (cap < n) return XR_ERROR_SIZE_INSUFFICIENT;
+    memcpy(buf, str, n);
+    return XR_SUCCESS;
+}
+
+/* (no hace falta ninguna extensión de Vulkan: la imagen se lee con una copia común) */
+XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetVulkanInstanceExtensionsKHR(XrInstance i, XrSystemId id, uint32_t cap, uint32_t *count, char *buf) {
+    (void)i; (void)id; return ext_string("", cap, count, buf);
+}
+XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetVulkanDeviceExtensionsKHR(XrInstance i, XrSystemId id, uint32_t cap, uint32_t *count, char *buf) {
+    (void)i; (void)id; return ext_string("", cap, count, buf);
+}
+XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetVulkanGraphicsDeviceKHR(XrInstance i, XrSystemId id, VkInstance inst, VkPhysicalDevice *out) {
+    (void)i; (void)id;
+    if (!vk_loader()) return XR_ERROR_RUNTIME_FAILURE;
+    PFN_vkEnumeratePhysicalDevices en = (PFN_vkEnumeratePhysicalDevices)g_vkGIPA(inst, "vkEnumeratePhysicalDevices");
+    uint32_t n = 1;
+    VkPhysicalDevice pd = VK_NULL_HANDLE;
+    if (!en || (en(inst, &n, &pd) < 0) || !pd) { logmsg("Vulkan: no hay GPU"); return XR_ERROR_RUNTIME_FAILURE; }
+    *out = pd;   /* (en la Mac hay una sola) */
+    return XR_SUCCESS;
+}
+XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetVulkanGraphicsRequirementsKHR(XrInstance i, XrSystemId id, XrGraphicsRequirementsVulkanKHR *req) {
+    (void)i; (void)id;
+    req->minApiVersionSupported = XR_MAKE_VERSION(1, 0, 0);
+    req->maxApiVersionSupported = XR_MAKE_VERSION(1, 3, 0);
+    return XR_SUCCESS;
+}
+
+/* Ejecuta en la cola del juego un cambio de diseño (layout) de una imagen y espera a que termine */
+static int vk_initial_layout(Session *s, VkImage img, VkImageAspectFlags aspect, VkImageLayout layout, uint32_t mips, uint32_t layers) {
+    VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    ai.commandPool = s->vkPool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
+    VkCommandBuffer cb;
+    if (vk.AllocateCommandBuffers(s->vkDev, &ai, &cb) != VK_SUCCESS) return 0;
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vk.BeginCommandBuffer(cb, &bi);
+    VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    b.srcAccessMask = 0; b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = layout;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img;
+    b.subresourceRange.aspectMask = aspect; b.subresourceRange.levelCount = mips; b.subresourceRange.layerCount = layers;
+    vk.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    vk.EndCommandBuffer(cb);
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+    int ok = vk.QueueSubmit(s->vkQueue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS && vk.QueueWaitIdle(s->vkQueue) == VK_SUCCESS;
+    vk.FreeCommandBuffers(s->vkDev, s->vkPool, 1, &cb);
+    return ok;
+}
+
+static void vk_free_buffers(Session *s) {
+    for (int k = 0; k < STAGES; k++) {
+        if (s->vkMap[k]) vk.UnmapMemory(s->vkDev, s->vkBufMem[k]);
+        if (s->vkBuf[k]) vk.DestroyBuffer(s->vkDev, s->vkBuf[k], NULL);
+        if (s->vkBufMem[k]) vk.FreeMemory(s->vkDev, s->vkBufMem[k], NULL);
+        s->vkMap[k] = NULL; s->vkBuf[k] = VK_NULL_HANDLE; s->vkBufMem[k] = VK_NULL_HANDLE; s->stValid[k] = 0;
+    }
+}
+
+static int vk_session_setup(Session *s, const XrGraphicsBindingVulkanKHR *vb) {
+    if (!vk_loader() || !vk_load(vb->instance, vb->device)) return 0;
+    s->vk = 1;
+    s->vkInst = vb->instance; s->vkPhys = vb->physicalDevice; s->vkDev = vb->device;
+    vk.GetDeviceQueue(s->vkDev, vb->queueFamilyIndex, vb->queueIndex, &s->vkQueue);
+    VkCommandPoolCreateInfo pi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pi.queueFamilyIndex = vb->queueFamilyIndex;
+    if (vk.CreateCommandPool(s->vkDev, &pi, NULL, &s->vkPool) != VK_SUCCESS) { logmsg("Vulkan: no se pudo crear el command pool"); return 0; }
+    VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    ai.commandPool = s->vkPool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = STAGES;
+    if (vk.AllocateCommandBuffers(s->vkDev, &ai, s->vkCb) != VK_SUCCESS) { logmsg("Vulkan: no se pudieron crear los command buffers"); return 0; }
+    VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    for (int k = 0; k < STAGES; k++)
+        if (vk.CreateFence(s->vkDev, &fi, NULL, &s->vkFence[k]) != VK_SUCCESS) { logmsg("Vulkan: no se pudo crear el fence"); return 0; }
+    return 1;
+}
+
+static void vk_session_release(Session *s) {
+    if (!s->vkDev) return;
+    if (s->vkQueue) vk.QueueWaitIdle(s->vkQueue);
+    vk_free_buffers(s);
+    for (int k = 0; k < STAGES; k++) if (s->vkFence[k]) vk.DestroyFence(s->vkDev, s->vkFence[k], NULL);
+    if (s->vkPool) vk.DestroyCommandPool(s->vkDev, s->vkPool, NULL);
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSession(XrInstance i, const XrSessionCreateInfo *info, XrSession *session) {
     (void)i;
     const XrBaseInStructure *n = (const XrBaseInStructure *)info->next;
     const XrGraphicsBindingD3D11KHR *gb = NULL;
+    const XrGraphicsBindingVulkanKHR *vb = NULL;
     while (n) {
         if (n->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) gb = (const XrGraphicsBindingD3D11KHR *)n;
+        if (n->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) vb = (const XrGraphicsBindingVulkanKHR *)n;
         n = n->next;
     }
-    if (!gb || !gb->device) { logmsg("xrCreateSession sin D3D11"); return XR_ERROR_GRAPHICS_DEVICE_INVALID; }
     if (g_session) return XR_ERROR_LIMIT_REACHED;
+    if (vb && !gb) {
+        Session *s = calloc(1, sizeof *s);
+        if (!vb->device || !vk_session_setup(s, vb)) { vk_session_release(s); free(s); logmsg("xrCreateSession: Vulkan no disponible"); return XR_ERROR_GRAPHICS_DEVICE_INVALID; }
+        g_session = s;
+        *session = (XrSession)s;
+        logmsg("Sesión creada (Vulkan, familia de cola %u)", vb->queueFamilyIndex);
+        set_state(s, XR_SESSION_STATE_IDLE);
+        set_state(s, XR_SESSION_STATE_READY);
+        return XR_SUCCESS;
+    }
+    if (!gb || !gb->device) { logmsg("xrCreateSession sin D3D11 ni Vulkan"); return XR_ERROR_GRAPHICS_DEVICE_INVALID; }
     Session *s = calloc(1, sizeof *s);
     s->dev = gb->device;
     ID3D11Device_AddRef(s->dev);
@@ -1094,6 +1278,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSession(XrInstance i, const XrSessionC
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroySession(XrSession session) {
     Session *s = (Session *)session;
+    if (s->vk) vk_session_release(s);
     for (int k = 0; k < 3; k++) if (s->staging[k]) ID3D11Texture2D_Release(s->staging[k]);
     EnterCriticalSection(&g_gpuLock); gpu_release(); g_gpuShmGen = -1; g_gpuCtx = NULL; LeaveCriticalSection(&g_gpuLock);
     if (s->ctx) ID3D11DeviceContext_Release(s->ctx);
@@ -1311,6 +1496,23 @@ static const int64_t g_formats[] = {
     DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
 };
 #define N_FMT (sizeof g_formats / sizeof g_formats[0])
+static const int64_t g_vkFormats[] = {
+    VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM,
+    VK_FORMAT_D32_SFLOAT, VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT_S8_UINT,   /* (sin D24S8: Metal no lo tiene) */
+};
+#define N_VKFMT (sizeof g_vkFormats / sizeof g_vkFormats[0])
+/* Formato de Vulkan → el equivalente "typeless" de DXGI (así el resto del código no cambia) */
+static DXGI_FORMAT typeless_of_vk(int64_t f, int *isDepth) {
+    *isDepth = 0;
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    case VK_FORMAT_D32_SFLOAT: *isDepth = 1; return DXGI_FORMAT_R32_TYPELESS;
+    case VK_FORMAT_D16_UNORM: *isDepth = 1; return DXGI_FORMAT_R16_TYPELESS;
+    case VK_FORMAT_D32_SFLOAT_S8_UINT: *isDepth = 2; return DXGI_FORMAT_R32G8X24_TYPELESS;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
 
 static DXGI_FORMAT typeless_of(int64_t f, int *isDepth) {
     *isDepth = 0;
@@ -1326,7 +1528,13 @@ static DXGI_FORMAT typeless_of(int64_t f, int *isDepth) {
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrEnumerateSwapchainFormats(XrSession s, uint32_t cap, uint32_t *count, int64_t *formats) {
-    (void)s;
+    if (((Session *)s)->vk) {
+        *count = (uint32_t)N_VKFMT;
+        if (cap == 0) return XR_SUCCESS;
+        if (cap < N_VKFMT) return XR_ERROR_SIZE_INSUFFICIENT;
+        for (uint32_t i = 0; i < N_VKFMT; i++) formats[i] = g_vkFormats[i];
+        return XR_SUCCESS;
+    }
     *count = (uint32_t)N_FMT;
     if (cap == 0) return XR_SUCCESS;
     if (cap < N_FMT) return XR_ERROR_SIZE_INSUFFICIENT;
@@ -1334,8 +1542,59 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEnumerateSwapchainFormats(XrSession s, uint3
     return XR_SUCCESS;
 }
 
+static XrResult vk_create_swapchain(Session *s, const XrSwapchainCreateInfo *ci, XrSwapchain *out) {
+    int isDepth;
+    DXGI_FORMAT tl = typeless_of_vk(ci->format, &isDepth);
+    if (tl == DXGI_FORMAT_UNKNOWN) { logmsg("Formato de swapchain Vulkan no soportado: %lld", (long long)ci->format); return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED; }
+    Swapchain *sc = calloc(1, sizeof *sc);
+    sc->format = ci->format; sc->dxgi = tl;
+    sc->w = ci->width; sc->h = ci->height;
+    sc->arraySize = ci->arraySize ? ci->arraySize : 1;
+    sc->mips = ci->mipCount ? ci->mipCount : 1;
+    sc->count = 3;
+    VkImageCreateInfo ic = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    if (ci->usageFlags & XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT) ic.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    ic.imageType = VK_IMAGE_TYPE_2D; ic.format = (VkFormat)ci->format;
+    ic.extent.width = ci->width; ic.extent.height = ci->height; ic.extent.depth = 1;
+    ic.mipLevels = sc->mips; ic.arrayLayers = sc->arraySize;
+    ic.samples = VK_SAMPLE_COUNT_1_BIT; ic.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ic.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+               (isDepth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    if (ci->usageFlags & XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT) ic.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    ic.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageAspectFlags aspect = !isDepth ? VK_IMAGE_ASPECT_COLOR_BIT
+                              : (isDepth == 2 ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT);
+    VkImageLayout layout = isDepth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    for (uint32_t k = 0; k < sc->count; k++) {
+        VkMemoryRequirements mr;
+        VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        int ok = vk.CreateImage(s->vkDev, &ic, NULL, &sc->vimg[k]) == VK_SUCCESS;
+        if (ok) {
+            vk.GetImageMemoryRequirements(s->vkDev, sc->vimg[k], &mr);
+            int mt = vk_memtype(s, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            ma.allocationSize = mr.size; ma.memoryTypeIndex = (uint32_t)mt;
+            ok = mt >= 0 && vk.AllocateMemory(s->vkDev, &ma, NULL, &sc->vmem[k]) == VK_SUCCESS
+                 && vk.BindImageMemory(s->vkDev, sc->vimg[k], sc->vmem[k], 0) == VK_SUCCESS
+                 && vk_initial_layout(s, sc->vimg[k], aspect, layout, sc->mips, sc->arraySize);
+        }
+        if (!ok) {
+            logmsg("Vulkan: no se pudo crear la imagen %ux%u formato %lld capas %u", ci->width, ci->height, (long long)ci->format, sc->arraySize);
+            for (uint32_t j = 0; j <= k; j++) {
+                if (sc->vimg[j]) vk.DestroyImage(s->vkDev, sc->vimg[j], NULL);
+                if (sc->vmem[j]) vk.FreeMemory(s->vkDev, sc->vmem[j], NULL);
+            }
+            free(sc);
+            return XR_ERROR_RUNTIME_FAILURE;
+        }
+    }
+    logmsg("Swapchain Vulkan %ux%u formato %lld capas %u%s", ci->width, ci->height, (long long)ci->format, sc->arraySize, isDepth ? " (profundidad)" : "");
+    *out = (XrSwapchain)sc;
+    return XR_SUCCESS;
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSwapchain(XrSession session, const XrSwapchainCreateInfo *ci, XrSwapchain *out) {
     Session *s = (Session *)session;
+    if (s->vk) return vk_create_swapchain(s, ci, out);
     int isDepth;
     DXGI_FORMAT tl = typeless_of(ci->format, &isDepth);
     if (tl == DXGI_FORMAT_UNKNOWN) { logmsg("Formato de swapchain no soportado: %lld", (long long)ci->format); return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED; }
@@ -1373,6 +1632,13 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSwapchain(XrSession session, const XrS
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroySwapchain(XrSwapchain h) {
     Swapchain *sc = (Swapchain *)h;
     for (uint32_t k = 0; k < sc->count; k++) if (sc->img[k]) ID3D11Texture2D_Release(sc->img[k]);
+    if (g_session && g_session->vk) {
+        vk.QueueWaitIdle(g_session->vkQueue);
+        for (uint32_t k = 0; k < sc->count; k++) {
+            if (sc->vimg[k]) vk.DestroyImage(g_session->vkDev, sc->vimg[k], NULL);
+            if (sc->vmem[k]) vk.FreeMemory(g_session->vkDev, sc->vmem[k], NULL);
+        }
+    }
     free(sc);
     return XR_SUCCESS;
 }
@@ -1382,6 +1648,11 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEnumerateSwapchainImages(XrSwapchain h, uint
     *count = sc->count;
     if (cap == 0) return XR_SUCCESS;
     if (cap < sc->count) return XR_ERROR_SIZE_INSUFFICIENT;
+    if (sc->vimg[0]) {
+        XrSwapchainImageVulkanKHR *vi = (XrSwapchainImageVulkanKHR *)images;
+        for (uint32_t k = 0; k < sc->count; k++) vi[k].image = sc->vimg[k];
+        return XR_SUCCESS;
+    }
     XrSwapchainImageD3D11KHR *im = (XrSwapchainImageD3D11KHR *)images;
     for (uint32_t k = 0; k < sc->count; k++) im[k].texture = sc->img[k];
     return XR_SUCCESS;
@@ -1641,6 +1912,155 @@ static void readback(Session *s, const XrCompositionLayerProjection *pl, XrTime 
     SetEvent(g_frameEvent);
 }
 
+/* Vulkan: copia los dos ojos (en la GPU) a memoria que se puede leer, lado a lado; lee la del cuadro
+   anterior (ya terminó en la GPU) y la pasa a la memoria compartida con la Mac */
+static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, XrTime displayTime) {
+    Swapchain *sc0 = (Swapchain *)pl->views[0].subImage.swapchain;
+    if (!sc0 || !sc0->vimg[0]) return;
+    if (sc0->dxgi != DXGI_FORMAT_R8G8B8A8_TYPELESS && sc0->dxgi != DXGI_FORMAT_B8G8R8A8_TYPELESS) return;
+    int rw = pl->views[0].subImage.imageRect.extent.width, rh = pl->views[0].subImage.imageRect.extent.height;
+    int flip = rh < 0;
+    uint32_t ew = (uint32_t)(rw < 0 ? -rw : rw);
+    uint32_t eh = (uint32_t)(rh < 0 ? -rh : rh);
+    if (!ew || !eh || ew > 2560 || eh > 2560) { InterlockedIncrement(&g_skipFmt); return; }
+    if (!shm_active()) {   /* (con Vulkan, los cuadros van solo por la memoria compartida) */
+        if (g_shmMode < 0 && !s->vkWarned) { s->vkWarned = 1; logmsg("Vulkan: sin memoria compartida con la Mac no se pueden mandar los cuadros"); }
+        InterlockedIncrement(&g_statBusy); return;
+    }
+
+    if (!s->vkBuf[0] || s->stW != ew || s->stH != eh || s->stFmt != sc0->dxgi) {
+        vk.QueueWaitIdle(s->vkQueue);
+        vk_free_buffers(s);
+        VkBufferCreateInfo bc = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bc.size = (VkDeviceSize)ew * 2 * eh * 4; bc.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; bc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        for (int k = 0; k < STAGES; k++) {
+            VkMemoryRequirements mr;
+            VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+            int ok = vk.CreateBuffer(s->vkDev, &bc, NULL, &s->vkBuf[k]) == VK_SUCCESS;
+            if (ok) {
+                vk.GetBufferMemoryRequirements(s->vkDev, s->vkBuf[k], &mr);
+                int mt = vk_memtype(s, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+                ma.allocationSize = mr.size; ma.memoryTypeIndex = (uint32_t)mt;
+                ok = mt >= 0 && vk.AllocateMemory(s->vkDev, &ma, NULL, &s->vkBufMem[k]) == VK_SUCCESS
+                     && vk.BindBufferMemory(s->vkDev, s->vkBuf[k], s->vkBufMem[k], 0) == VK_SUCCESS
+                     && vk.MapMemory(s->vkDev, s->vkBufMem[k], 0, VK_WHOLE_SIZE, 0, &s->vkMap[k]) == VK_SUCCESS;
+            }
+            if (!ok) { logmsg("Vulkan: no se pudo crear la memoria de lectura"); vk_free_buffers(s); return; }
+        }
+        s->stW = ew; s->stH = eh; s->stFmt = sc0->dxgi;
+        logmsg("Imagen del juego (Vulkan): %ux%u por ojo (%s)%s", ew, eh, fmt_code(sc0->dxgi) ? "RGBA" : "BGRA", flip ? ", dada vuelta (se corrige)" : "");
+    }
+
+    /* 1) Copiar los dos ojos a la memoria de lectura actual */
+    g_inside = "xrEndFrame: copiando ojos en la GPU (Vulkan)";
+    int k = s->stNext;
+    vk.WaitForFences(s->vkDev, 1, &s->vkFence[k], VK_TRUE, 1000000000ULL);
+    VkImage imgs[2]; uint32_t layers[2]; VkBufferImageCopy reg[2];
+    for (int e = 0; e < 2; e++) {
+        const XrSwapchainSubImage *si = &pl->views[e].subImage;
+        Swapchain *sc = (Swapchain *)si->swapchain;
+        if (!sc || !sc->vimg[0] || sc->dxgi != s->stFmt) { InterlockedIncrement(&g_skipFmt); return; }
+        int x = si->imageRect.offset.x, y = si->imageRect.offset.y;
+        int w = si->imageRect.extent.width, h = si->imageRect.extent.height;
+        if (w < 0) { x += w; w = -w; }
+        if (h < 0) { y += h; h = -h; }
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        if (w > (int)ew) w = (int)ew;
+        if (h > (int)eh) h = (int)eh;
+        if (x + w > (int)sc->w) w = (int)sc->w - x;
+        if (y + h > (int)sc->h) h = (int)sc->h - y;
+        if (w <= 0 || h <= 0) { InterlockedIncrement(&g_skipFmt); return; }
+        imgs[e] = sc->vimg[sc->released]; layers[e] = si->imageArrayIndex;
+        memset(&reg[e], 0, sizeof reg[e]);
+        reg[e].bufferOffset = (VkDeviceSize)e * ew * 4;
+        reg[e].bufferRowLength = ew * 2; reg[e].bufferImageHeight = eh;
+        reg[e].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        reg[e].imageSubresource.baseArrayLayer = layers[e]; reg[e].imageSubresource.layerCount = 1;
+        reg[e].imageOffset.x = x; reg[e].imageOffset.y = y;
+        reg[e].imageExtent.width = (uint32_t)w; reg[e].imageExtent.height = (uint32_t)h; reg[e].imageExtent.depth = 1;
+    }
+    int nb = (imgs[1] == imgs[0] && layers[1] == layers[0]) ? 1 : 2;   /* (los dos ojos en la misma imagen y capa: un solo cambio) */
+    VkImageMemoryBarrier toSrc[2], back[2];
+    for (int e = 0; e < nb; e++) {
+        VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = imgs[e];
+        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.subresourceRange.levelCount = 1; b.subresourceRange.baseArrayLayer = layers[e]; b.subresourceRange.layerCount = 1;
+        toSrc[e] = b; back[e] = b;
+        toSrc[e].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT; toSrc[e].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toSrc[e].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; toSrc[e].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        back[e].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; back[e].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        back[e].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; back[e].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
+    VkCommandBuffer cb = s->vkCb[k];
+    vk.ResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vk.BeginCommandBuffer(cb, &bi);
+    vk.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, (uint32_t)nb, toSrc);
+    for (int e = 0; e < 2; e++) vk.CmdCopyImageToBuffer(cb, imgs[e], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->vkBuf[k], 1, &reg[e]);
+    VkBufferMemoryBarrier hb = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+    hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; hb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    hb.srcQueueFamilyIndex = hb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    hb.buffer = s->vkBuf[k]; hb.size = VK_WHOLE_SIZE;
+    vk.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                          0, NULL, 1, &hb, (uint32_t)nb, back);
+    vk.EndCommandBuffer(cb);
+    vk.ResetFences(s->vkDev, 1, &s->vkFence[k]);
+    VkSubmitInfo sub = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    sub.commandBufferCount = 1; sub.pCommandBuffers = &cb;
+    if (vk.QueueSubmit(s->vkQueue, 1, &sub, s->vkFence[k]) != VK_SUCCESS) {
+        /* (el fence quedó sin señal: se rearma para que el próximo uso no espere de más) */
+        VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }; fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        vk.DestroyFence(s->vkDev, s->vkFence[k], NULL); vk.CreateFence(s->vkDev, &fi, NULL, &s->vkFence[k]);
+        InterlockedIncrement(&g_mapFail); return;
+    }
+    uint32_t id = 0;
+    EnterCriticalSection(&g_lock);
+    id = g_track.id;
+    for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].time == displayTime) { id = g_poseHist[hh].id; break; }
+    LeaveCriticalSection(&g_lock);
+    s->stPose[k] = id; s->stValid[k] = 1; s->stFlip[k] = flip;
+    s->stNext = (k + 1) % STAGES;
+
+    /* 2) Leer la copia del cuadro anterior y pasarla a la memoria compartida */
+    int r = s->stNext;
+    if (!s->stValid[r]) return;
+    ShmHdr *sh = (ShmHdr *)g_shm;
+    int ss = -1;
+    for (int i = 0; i < SHM_SLOTS; i++) if (InterlockedCompareExchange(&sh->state[i], 2, 0) == 0) { ss = i; break; }
+    if (ss < 0) {
+        if (!g_shmFullSince) g_shmFullSince = now_ns();
+        else if (now_ns() - g_shmFullSince > 1500000000LL) {
+            g_shmFullSince = 0;
+            closesocket(g_fsock); g_fsock = INVALID_SOCKET; g_fsockRetry = 0; g_shmMode = 0;
+            logmsg("La Mac no libera los cuadros: rearmando la conexión de imágenes");
+        }
+        InterlockedIncrement(&g_statBusy); s->stValid[r] = 0; return;
+    }
+    g_shmFullSince = 0;
+    int64_t c0 = now_ns();
+    g_inside = "xrEndFrame: esperando la copia de la GPU (Vulkan)";
+    if (vk.WaitForFences(s->vkDev, 1, &s->vkFence[r], VK_TRUE, 1000000000ULL) != VK_SUCCESS) {
+        sh->state[ss] = 0; s->stValid[r] = 0; InterlockedIncrement(&g_mapFail); return;
+    }
+    g_sumMap += (now_ns() - c0) / 1e6;
+    g_inside = "xrEndFrame: copiando imagen a la memoria compartida (Vulkan)";
+    uint32_t rb = s->stW * 2 * 4;
+    uint8_t *dst = g_shm + SHM_HDR + (size_t)ss * SHM_SLOT_MAX;
+    const uint8_t *src = (const uint8_t *)s->vkMap[r];
+    if (!s->stFlip[r]) memcpy(dst, src, (size_t)rb * s->stH);
+    else for (uint32_t y = 0; y < s->stH; y++) memcpy(dst + (size_t)y * rb, src + (size_t)(s->stH - 1 - y) * rb, rb);
+    g_sumCopy += (now_ns() - c0) / 1e6; g_nCopy++;
+    s->stValid[r] = 0;
+    MemoryBarrier();
+    sh->state[ss] = 1;
+    shm_notify(ss, s->stPose[r], fmt_code(s->stFmt), s->stW, s->stH);
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEndInfo *info) {
     Session *s = (Session *)session;
     g_inside = "xrEndFrame";
@@ -1664,9 +2084,12 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
                     }
                     logmsg("Ajuste multi-pass consultado por el juego %ld veces", (long)g_hookHits);
                 }
-                EnterCriticalSection(&g_gpuLock);
-                readback(s, pl, info->displayTime);
-                LeaveCriticalSection(&g_gpuLock);
+                if (s->vk) vk_readback(s, pl, info->displayTime);
+                else {
+                    EnterCriticalSection(&g_gpuLock);
+                    readback(s, pl, info->displayTime);
+                    LeaveCriticalSection(&g_gpuLock);
+                }
                 break;
             }
         }
@@ -1937,6 +2360,8 @@ static const struct { const char *name; PFN_xrVoidFunction fn; } g_fns[] = {
     FN(xrGetSystem), FN(xrGetSystemProperties), FN(xrEnumerateEnvironmentBlendModes),
     FN(xrEnumerateViewConfigurations), FN(xrGetViewConfigurationProperties), FN(xrEnumerateViewConfigurationViews),
     FN(xrGetD3D11GraphicsRequirementsKHR),
+    FN(xrGetVulkanInstanceExtensionsKHR), FN(xrGetVulkanDeviceExtensionsKHR),
+    FN(xrGetVulkanGraphicsDeviceKHR), FN(xrGetVulkanGraphicsRequirementsKHR),
     FN(xrCreateSession), FN(xrDestroySession), FN(xrBeginSession), FN(xrEndSession), FN(xrRequestExitSession),
     FN(xrEnumerateReferenceSpaces), FN(xrCreateReferenceSpace), FN(xrGetReferenceSpaceBoundsRect),
     FN(xrCreateActionSpace), FN(xrLocateSpace), FN(xrLocateSpaces), FN(xrDestroySpace),

@@ -150,7 +150,8 @@ from VRmin Host too, over the USB-C cable.
 
 **Which games work?**
 Many SteamVR games that use DirectX 11 work, but not all of them. VRmin Host shows what it detected for each game and
-lets you try another VR runtime. Games with anti‑cheat, or that need DirectX 12 or Vulkan, usually don't work yet.
+lets you try another VR runtime. Games with anti‑cheat or DirectX 12 usually don't work yet. Support for Vulkan games
+(like DOOM VFR) is experimental.
 
 **How much latency is there?**
 Around 50–60 ms from your head moving to the picture changing, on a good 5 GHz Wi‑Fi network. The first minutes
