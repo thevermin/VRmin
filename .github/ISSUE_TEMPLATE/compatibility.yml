@@ -1,0 +1,50 @@
+name: Compatibility report
+description: Tell us how a game or a headset worked for you, even if everything was fine!
+labels: [compatibility]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Reports like this help everyone know what works. Good news is just as useful as bad news!
+  - type: input
+    id: game
+    attributes:
+      label: Game or headset you tried
+      placeholder: "Beat Saber"
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: How did it go?
+      options:
+        - Works great
+        - Works, with small problems
+        - Starts, but it's not playable
+        - Doesn't start
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Details
+      description: What worked, what didn't, how it felt (smoothness, delay, image quality), and any settings you changed.
+  - type: input
+    id: mac
+    attributes:
+      label: Mac model
+      placeholder: "MacBook Pro M3 Pro, 18 GB"
+    validations:
+      required: true
+  - type: dropdown
+    id: headset
+    attributes:
+      label: Headset
+      options: [Quest 3, Quest 3S, Quest Pro, Quest 2, Quest 1]
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: VRmin versions
+      placeholder: "Host 0.40, Quest app 0.70"

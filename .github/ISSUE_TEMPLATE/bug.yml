@@ -1,0 +1,60 @@
+name: Something doesn't work
+description: Report a bug or a problem with VRmin Host or the Quest app.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping make VRmin better! The more details you give, the faster it gets fixed.
+        **Tip:** click **"Something's wrong"** in VRmin Host. It collects the logs into a .zip on your Desktop (no keys or personal data) that you can attach below.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: "I clicked Play on SUPERHOT VR, the headset showed a black screen for a few seconds and then went back to the room."
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: Game (if it's about a game)
+      placeholder: "SUPERHOT VR"
+  - type: input
+    id: mac
+    attributes:
+      label: Mac model
+      description: Apple menu → About This Mac.
+      placeholder: "MacBook Air M2, 16 GB"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "macOS 15.7"
+    validations:
+      required: true
+  - type: dropdown
+    id: headset
+    attributes:
+      label: Headset
+      options: [Quest 3, Quest 3S, Quest Pro, Quest 2, Quest 1]
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: VRmin versions
+      description: VRmin Host's version is at the bottom of its Settings. The Quest app's version is in the "Quest app" row of VRmin Host.
+      placeholder: "Host 0.40, Quest app 0.70"
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection
+      options: [Wi-Fi, USB-C cable, Not sure]
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and screenshots
+      description: Drag the .zip from "Something's wrong" here, plus any screenshots or videos.
