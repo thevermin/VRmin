@@ -1860,16 +1860,17 @@ static int oc_patch_slot(void **slot, void *nuevo, void **orig) {
     VirtualProtect(slot, sizeof(void *), viejo, &viejo);
     return 1;
 }
-/* Earth pregunta en cada cuadro si cada control está conectado, y OpenComposite contesta que el izquierdo casi
- * nunca y el derecho un cuadro sí y otro no: Earth dibuja los controles pero no les hace caso. Para Earth, los
- * controles 1 y 2 cuentan siempre como conectados. */
+/* Earth pregunta en cada cuadro si cada control está conectado, y OpenComposite contesta del derecho (el que se
+ * usa, con posición todo el tiempo) un cuadro sí y otro no: Earth lo dibuja pero no le hace caso. Para Earth, un
+ * control con posición cuenta siempre como conectado. */
 typedef unsigned char (*PFN_ocConn)(void *self, uint32_t dev);
 typedef int (*PFN_ocClass)(void *self, uint32_t dev);
 static PFN_ocConn o_ocConn; static PFN_ocClass o_ocClass;
 static LONG g_connForced;
 static unsigned char h_ocConn(void *self, uint32_t dev) {
     unsigned char r = o_ocConn(self, dev);
-    if (!r && (dev == 1 || dev == 2)) {
+    /* (solo si ese control de verdad tiene posición: 1 = izquierdo, 2 = derecho; uno quieto en la mesa se apaga) */
+    if (!r && (dev == 1 || dev == 2) && g_track.valid && g_track.handValid[dev - 1]) {
         if (InterlockedIncrement(&g_connForced) == 1) logmsg("OpenComposite decía que el control %u no estaba conectado: se lo cuenta como conectado", dev);
         return 1;
     }
@@ -1877,7 +1878,7 @@ static unsigned char h_ocConn(void *self, uint32_t dev) {
 }
 static int h_ocClass(void *self, uint32_t dev) {
     int r = o_ocClass(self, dev);
-    return (r == 0 && (dev == 1 || dev == 2)) ? 2 : r;   /* 2 = TrackedDeviceClass_Controller */
+    return (r == 0 && (dev == 1 || dev == 2) && g_track.valid && g_track.handValid[dev - 1]) ? 2 : r;   /* 2 = TrackedDeviceClass_Controller */
 }
 static void fix_opencomposite_connected(unsigned char *b) {
     void **sConn = oc_vtable_slot(b, "CVRSystem_017::IsTrackedDeviceConnected");
@@ -1935,7 +1936,7 @@ static void fix_opencomposite_models(const char *app) {
         ocm_replace(s, sz, "Oculus Quest2", "Oculus Rift S");
     }
     fix_opencomposite_events(b);
-    (void)fix_opencomposite_connected;   /* (apagado: con los controles forzados Earth dejaba de dibujarlos) */
+    fix_opencomposite_connected(b);
 }
 
 /* El wininet de Wine se rompe si el juego cierra una conexión mientras sus pedidos siguen abiertos en otros
