@@ -1561,14 +1561,33 @@ static void fix_opencomposite_stubs(void) {
 
 /* El wininet de Wine se rompe si el juego cierra una conexión mientras sus pedidos siguen abiertos en otros
  * hilos: recorre la lista de pedidos sin protegerla (Google Earth VR se cerraba así al bajar el mapa).
- * Esos cierres se saltean: cada pedido igual se cierra solo, y la conexión queda abierta (ocupa muy poco). */
+ * Esos cierres se saltean: cada pedido igual se cierra solo, y la conexión queda abierta (ocupa muy poco).
+ * (Wine no sabe decir de qué tipo es cada handle, así que se anotan las conexiones al crearlas.) */
 typedef void *HINET;
 static BOOL (WINAPI *o_InternetCloseHandle)(HINET);
-static BOOL (WINAPI *o_InternetQueryOptionA)(HINET, DWORD, LPVOID, LPDWORD);
+static HINET (WINAPI *o_InternetOpenA)(LPCSTR, DWORD, LPCSTR, LPCSTR, DWORD);
+static HINET (WINAPI *o_InternetConnectA)(HINET, LPCSTR, WORD, LPCSTR, LPCSTR, DWORD, DWORD, DWORD_PTR);
+static SRWLOCK g_inetLock = SRWLOCK_INIT;
+static HINET g_inetConns[16384];
+static void inet_add(HINET h) {
+    if (!h) return;
+    AcquireSRWLockExclusive(&g_inetLock);
+    for (int i = 0; i < 16384; i++) if (!g_inetConns[i]) { g_inetConns[i] = h; break; }
+    ReleaseSRWLockExclusive(&g_inetLock);
+}
+static int inet_take(HINET h) {
+    int found = 0;
+    AcquireSRWLockExclusive(&g_inetLock);
+    for (int i = 0; i < 16384; i++) if (g_inetConns[i] == h) { g_inetConns[i] = NULL; found = 1; break; }
+    ReleaseSRWLockExclusive(&g_inetLock);
+    return found;
+}
+static HINET WINAPI h_InternetOpenA(LPCSTR a, DWORD b, LPCSTR c, LPCSTR d, DWORD e) { HINET r = o_InternetOpenA(a, b, c, d, e); inet_add(r); return r; }
+static HINET WINAPI h_InternetConnectA(HINET h, LPCSTR a, WORD b, LPCSTR c, LPCSTR d, DWORD e, DWORD f, DWORD_PTR g) {
+    HINET r = o_InternetConnectA(h, a, b, c, d, e, f, g); inet_add(r); return r;
+}
 static BOOL WINAPI h_InternetCloseHandle(HINET h) {
-    DWORD tipo = 0, n = sizeof tipo;
-    /* 66 = INTERNET_OPTION_HANDLE_TYPE; 1 = sesión, 2..6 = conexión (FTP/gopher/HTTP) */
-    if (h && o_InternetQueryOptionA && o_InternetQueryOptionA(h, 66, &tipo, &n) && tipo >= 1 && tipo <= 6) {
+    if (h && inet_take(h)) {
         static LONG avisos;
         if (InterlockedIncrement(&avisos) == 1) logmsg("Internet: cierre de conexión salteado (arreglo para el wininet de Wine)");
         return TRUE;
@@ -1579,15 +1598,13 @@ static void install_wininet_fix(void) {
     static int done;
     if (done) return;
     done = 1;
-    HMODULE w = GetModuleHandleA("wininet.dll");
-    if (!w) return;
-    FARPROC q = GetProcAddress(w, "InternetQueryOptionA");
-    memcpy(&o_InternetQueryOptionA, &q, sizeof q);
-    void *o;
-    if (o_InternetQueryOptionA && patch_iat(GetModuleHandleA(NULL), "wininet.dll", "InternetCloseHandle", (void *)h_InternetCloseHandle, &o)) {
-        memcpy(&o_InternetCloseHandle, &o, sizeof o);
-        logmsg("Internet: arreglo para el wininet de Wine instalado");
-    }
+    HMODULE exe = GetModuleHandleA(NULL);
+    void *a, *b, *c;
+    if (!patch_iat(exe, "wininet.dll", "InternetCloseHandle", (void *)h_InternetCloseHandle, &a)) return;
+    memcpy(&o_InternetCloseHandle, &a, sizeof a);
+    if (patch_iat(exe, "wininet.dll", "InternetConnectA", (void *)h_InternetConnectA, &b)) memcpy(&o_InternetConnectA, &b, sizeof b);
+    if (patch_iat(exe, "wininet.dll", "InternetOpenA", (void *)h_InternetOpenA, &c)) memcpy(&o_InternetOpenA, &c, sizeof c);
+    logmsg("Internet: arreglo para el wininet de Wine instalado");
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSession(XrInstance i, const XrSessionCreateInfo *info, XrSession *session) {
