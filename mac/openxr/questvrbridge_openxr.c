@@ -916,6 +916,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetInstanceProcAddr(XrInstance instance, con
 static void init_once(void);
 static void install_gl_hook(void);
 static void fix_opencomposite_stubs(void);
+static void fix_opencomposite_models(const char *app);
 static void install_wininet_fix(void);
 static void copy_unity_logs(int current);
 
@@ -947,6 +948,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateInstance(const XrInstanceCreateInfo *i
     logmsg("xrCreateInstance de '%s' (%s)", info->applicationInfo.applicationName, info->applicationInfo.engineName);
     install_gl_hook();   /* (solo hace algo si el juego usa OpenGL) */
     fix_opencomposite_stubs();
+    fix_opencomposite_models(info->applicationInfo.applicationName);
     install_wininet_fix();
     /* Pedirle a la Mac los ajustes de este juego (resolución, campo de visión, controles) */
     snprintf(g_appName, sizeof g_appName, "%s", info->applicationInfo.applicationName[0] ? info->applicationInfo.applicationName : "?");
@@ -1594,7 +1596,24 @@ static void APIENTRY hook_glShaderSource(GLuint sh, GLsizei count, const GLchar 
     }
     ADD("#line 1\n");
     /* El resto, sin las sentencias «precision …;» (en GLSL de escritorio no hacen nada y la Mac se queja) */
+    int prof = 0, esFuncion = 0;   /* (para sacar el «;» suelto después de una función: «void main() { … };») */
     for (char *p = src; *p; ) {
+        if (*p == '{') {
+            if (prof == 0) { size_t k = n; while (k > 0 && (out[k - 1] == ' ' || out[k - 1] == '\t' || out[k - 1] == '\n' || out[k - 1] == '\r')) k--; esFuncion = k > 0 && out[k - 1] == ')'; }
+            prof++;
+        } else if (*p == '}' && prof > 0 && --prof == 0 && esFuncion) {
+            out[n++] = *p++;
+            char *q = p; while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+            if (*q == ';') { while (p < q) out[n++] = *p++; p++; }
+            continue;
+        }
+        if (*p == ';' && prof == 0) {   /* «MACRO(…);» suelto afuera de funciones (la macro ya arma la función) */
+            size_t k = n; while (k > 0 && out[k - 1] != '\n') k--;
+            size_t a = k; while (a < n && (out[a] == ' ' || out[a] == '\t')) a++;
+            size_t z = n; while (z > a && (out[z - 1] == ' ' || out[z - 1] == '\t')) z--;
+            size_t b = a; while (b < z && ((out[b] >= 'A' && out[b] <= 'Z') || (out[b] >= '0' && out[b] <= '9') || out[b] == '_')) b++;
+            if (b > a && b < z && out[b] == '(' && out[z - 1] == ')' && out[a] >= 'A' && out[a] <= 'Z') { p++; continue; }
+        }
         if (!strncmp(p, "precision", 9) && (p == src || !es_palabra(p[-1])) && (p[9] == ' ' || p[9] == '\t')) {
             char *pc = p + 9;
             while (*pc == ' ' || *pc == '\t' || es_palabra(*pc)) pc++;
@@ -1718,6 +1737,35 @@ static void fix_opencomposite_stubs(void) {
     VirtualProtect(fn, sizeof nuevo, viejo, &viejo);
     FlushInstructionCache(GetCurrentProcess(), fn, sizeof nuevo);
     logmsg("OpenComposite: GetFrameTimeRemaining arreglada");
+}
+
+/* Google Earth VR solo reconoce los controles si el modelo dice «Rift» (o «Vive»); OpenComposite los presenta como
+ * «Oculus Quest (… Controller)» y Earth ni los dibuja ni les hace caso. Solo para Earth, se cambia ese texto en la
+ * memoria de OpenComposite (el archivo no se toca). */
+static void ocm_replace(unsigned char *s, DWORD sz, const char *de, const char *a) {
+    size_t ld = strlen(de) + 1, la = strlen(a) + 1;
+    for (DWORD k = 0; k + ld <= sz; k++) {
+        if (memcmp(s + k, de, ld) || (k > 0 && s[k - 1] != 0)) continue;
+        DWORD viejo;
+        if (!VirtualProtect(s + k, ld, PAGE_READWRITE, &viejo)) return;
+        memset(s + k, 0, ld); memcpy(s + k, a, la < ld ? la : ld - 1);
+        VirtualProtect(s + k, ld, viejo, &viejo);
+        logmsg("OpenComposite: modelo «%s» presentado como «%s»", de, a);
+    }
+}
+static void fix_opencomposite_models(const char *app) {
+    if (!app || !strstr(app, "Earth")) return;
+    unsigned char *b = (unsigned char *)GetModuleHandleA("vrclient_x64.dll");
+    if (!b) return;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (memcmp(sec[i].Name, ".rdata", 7)) continue;
+        unsigned char *s = b + sec[i].VirtualAddress; DWORD sz = sec[i].Misc.VirtualSize;
+        ocm_replace(s, sz, "Oculus Quest (Left Controller)", "Oculus Rift (Left Controller)");
+        ocm_replace(s, sz, "Oculus Quest (Right Controller)", "Oculus Rift (Right Controller)");
+        ocm_replace(s, sz, "Oculus Quest2", "Oculus Rift S");
+    }
 }
 
 /* El wininet de Wine se rompe si el juego cierra una conexión mientras sus pedidos siguen abiertos en otros
