@@ -1409,6 +1409,7 @@ static HGLRC WINAPI hook_wglCreateContextAttribsARB(HDC dc, HGLRC share, const i
 }
 /* OpenComposite copia los cuadros con funciones de OpenGL 4.3/4.5 que la Mac no tiene (llega hasta 4.1):
  * se hacen con funciones viejas equivalentes */
+static LONG g_shOk, g_shFail;   /* (diagnóstico: shaders del juego) */
 static struct {
     int ok;
     void (WINAPI *GetTexLevelParameteriv)(GLenum, GLint, GLenum, GLint *);
@@ -1514,8 +1515,8 @@ static void APIENTRY emu_glCopyImageSubData(GLuint src, GLenum srcTarget, GLint 
             gl.BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack); gl.PixelStorei(GL_PACK_ROW_LENGTH, row);
             while (glx.GetError() != GL_NO_ERROR) {}
             logmsg("Diagnóstico copia: textura %u tipo 0x%x formato 0x%x %dx%d muestras %d, copia %dx%d desde %d,%d · error 0x%x · "
-                   "brillo del juego %.1f (máx %u) · errores de OpenGL del juego %d (último 0x%x)",
-                   src, srcTarget, fmt, sw, shh, ss, w, h, srcX, srcY, err, sum / 64.0, mx, nErrJuego, errJuego);
+                   "brillo del juego %.1f (máx %u) · errores de OpenGL del juego %d (último 0x%x) · shaders %ld bien, %ld rechazados",
+                   src, srcTarget, fmt, sw, shh, ss, w, h, srcX, srcY, err, sum / 64.0, mx, nErrJuego, errJuego, g_shOk, g_shFail);
             nErrJuego = 0;
         }
     }
@@ -1524,8 +1525,57 @@ static void APIENTRY emu_glCopyImageSubData(GLuint src, GLenum srcTarget, GLint 
     if (srgb) glx.Enable(GL_FRAMEBUFFER_SRGB);
 }
 
+/* (diagnóstico: shaders del juego que la Mac no acepta) */
+static PFNGLCOMPILESHADERPROC o_glCompileShader;
+static PFNGLLINKPROGRAMPROC o_glLinkProgram;
+static PFNGLGETSHADERIVPROC p_glGetShaderiv;
+static PFNGLGETSHADERINFOLOGPROC p_glGetShaderInfoLog;
+static PFNGLGETSHADERSOURCEPROC p_glGetShaderSource;
+static PFNGLGETPROGRAMIVPROC p_glGetProgramiv;
+static PFNGLGETPROGRAMINFOLOGPROC p_glGetProgramInfoLog;
+static LONG g_prFail;
+static void shader_loaders(void) {
+    if (p_glGetShaderiv) return;
+    PROC q;
+    q = g_origWglGPA("glGetShaderiv"); memcpy(&p_glGetShaderiv, &q, sizeof q);
+    q = g_origWglGPA("glGetShaderInfoLog"); memcpy(&p_glGetShaderInfoLog, &q, sizeof q);
+    q = g_origWglGPA("glGetShaderSource"); memcpy(&p_glGetShaderSource, &q, sizeof q);
+    q = g_origWglGPA("glGetProgramiv"); memcpy(&p_glGetProgramiv, &q, sizeof q);
+    q = g_origWglGPA("glGetProgramInfoLog"); memcpy(&p_glGetProgramInfoLog, &q, sizeof q);
+}
+static void APIENTRY hook_glCompileShader(GLuint sh) {
+    o_glCompileShader(sh);
+    shader_loaders();
+    if (!p_glGetShaderiv) return;
+    GLint ok = 1; p_glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (ok) { InterlockedIncrement(&g_shOk); return; }
+    LONG n = InterlockedIncrement(&g_shFail);
+    if (n > 12) return;
+    char info[700] = "", src[200] = ""; GLsizei len = 0;
+    if (p_glGetShaderInfoLog) p_glGetShaderInfoLog(sh, sizeof info, &len, info);
+    if (p_glGetShaderSource) p_glGetShaderSource(sh, sizeof src, &len, src);
+    for (char *c = src; *c; c++) if (*c == '\n' || *c == '\r') *c = ' ';
+    for (char *c = info; *c; c++) if (*c == '\n' || *c == '\r') *c = ' ';
+    logmsg("OpenGL: la Mac rechazó un shader del juego (%ld rechazados, %ld aceptados): %s · empieza: %.120s", n, g_shOk, info, src);
+}
+static void APIENTRY hook_glLinkProgram(GLuint pr) {
+    o_glLinkProgram(pr);
+    shader_loaders();
+    if (!p_glGetProgramiv) return;
+    GLint ok = 1; p_glGetProgramiv(pr, GL_LINK_STATUS, &ok);
+    if (ok) return;
+    LONG n = InterlockedIncrement(&g_prFail);
+    if (n > 6) return;
+    char info[500] = ""; GLsizei len = 0;
+    if (p_glGetProgramInfoLog) p_glGetProgramInfoLog(pr, sizeof info, &len, info);
+    for (char *c = info; *c; c++) if (*c == '\n' || *c == '\r') *c = ' ';
+    logmsg("OpenGL: no se pudo armar un programa del juego (%ld): %s", n, info);
+}
+
 static PROC WINAPI hook_wglGetProcAddress(LPCSTR name) {
     PROC p = g_origWglGPA(name);
+    if (p && name && !strcmp(name, "glCompileShader")) { memcpy(&o_glCompileShader, &p, sizeof p); return (PROC)(void (*)(void))hook_glCompileShader; }
+    if (p && name && !strcmp(name, "glLinkProgram")) { memcpy(&o_glLinkProgram, &p, sizeof p); return (PROC)(void (*)(void))hook_glLinkProgram; }
     if (!p && name && !strcmp(name, "glGetTextureLevelParameteriv")) return (PROC)(void (*)(void))emu_glGetTextureLevelParameteriv;
     if (!p && name && !strcmp(name, "glCopyImageSubData")) return (PROC)(void (*)(void))emu_glCopyImageSubData;
     if (p && name && !strcmp(name, "wglCreateContextAttribsARB")) {
