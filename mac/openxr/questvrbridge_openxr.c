@@ -3176,14 +3176,6 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrAttachSessionActionSets(XrSession session, c
             for (int j = 0; j < g_actions[k]->nall; j++)
                 if (g_actions[k]->all[j].profile == ip) { s->profile = ip; break; }
     }
-    /* DOOM VFR se hizo para los controles de Vive (con trackpad) y con los de Oculus anda a medias: se le presentan
-     * los del Quest como Vive (el stick hace de trackpad: moverlo es deslizar el dedo, hundirlo es hacer clic) */
-    if (!s->profile && strstr(g_appName, "DOOMVFR")) {
-        XrPath vp = intern_path("/interaction_profiles/htc/vive_controller");
-        for (int k = 0; k < g_nactions && !s->profile; k++)
-            for (int j = 0; j < g_actions[k]->nall; j++)
-                if (g_actions[k]->all[j].profile == vp) { s->profile = vp; break; }
-    }
     for (size_t p = 0; p < sizeof g_profilePref / sizeof g_profilePref[0] && !s->profile; p++) {
         XrPath pp = intern_path(g_profilePref[p]);
         for (int k = 0; k < g_nactions && !s->profile; k++)
