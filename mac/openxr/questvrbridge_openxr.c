@@ -1888,6 +1888,64 @@ static void fix_opencomposite_connected(unsigned char *b) {
     if (oc_patch_slot(sConn, (void *)h_ocConn, &o)) memcpy(&o_ocConn, &o, sizeof o);
     if (oc_patch_slot(sClass, (void *)h_ocClass, &o)) memcpy(&o_ocClass, &o, sizeof o);
 }
+/* La raíz del parpadeo: OpenComposite guarda el control derecho en su «backend» (XrBackend::GetDevice) y un cuadro
+ * sí y otro no lo devuelve vacío. Se envuelve ese método: si vuelve vacío para un control que la Mac sí está
+ * siguiendo, se devuelve el último que había (con su referencia sumada, como hace un shared_ptr). */
+typedef void **(*PFN_ocGetDev)(void *self, void **out, uint32_t idx);
+static PFN_ocGetDev o_ocGetDev;
+static void *g_devCache[3][2];
+static LONG g_devFixed;
+static void **h_ocGetDev(void *self, void **out, uint32_t idx) {
+    void **r = o_ocGetDev(self, out, idx);
+    if (idx != 1 && idx != 2) return r;
+    if (out[0]) {
+        if (out[0] != g_devCache[idx][0]) {   /* otro objeto: se guarda (con una referencia propia para que no se borre) */
+            if (out[1]) InterlockedIncrement((volatile LONG *)((uint8_t *)out[1] + 8));
+            g_devCache[idx][0] = out[0]; g_devCache[idx][1] = out[1];
+        }
+    } else if (g_devCache[idx][0] && g_track.valid && g_track.handValid[idx - 1]) {
+        if (g_devCache[idx][1]) InterlockedIncrement((volatile LONG *)((uint8_t *)g_devCache[idx][1] + 8));
+        out[0] = g_devCache[idx][0]; out[1] = g_devCache[idx][1];
+        if (InterlockedIncrement(&g_devFixed) == 1) logmsg("OpenComposite perdía el control %u entre cuadros: se usa el último que tenía", idx);
+    }
+    return r;
+}
+/* La tabla de métodos de una clase de OpenComposite, por su nombre (RTTI de Visual C++) */
+static void **oc_class_vtable(unsigned char *b, const char *clase) {
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    DWORD imgSize = nt->OptionalHeader.SizeOfImage;
+    char nombre[128]; snprintf(nombre, sizeof nombre, ".?AV%s@@", clase);
+    size_t ln = strlen(nombre) + 1;
+    DWORD td = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections && !td; i++) {
+        if (memcmp(sec[i].Name, ".data", 6)) continue;
+        unsigned char *s = b + sec[i].VirtualAddress;
+        for (DWORD k = 0; k + ln <= sec[i].Misc.VirtualSize; k++) if (!memcmp(s + k, nombre, ln)) { td = sec[i].VirtualAddress + k - 0x10; break; }
+    }
+    if (!td) return NULL;
+    void **vt = NULL; int n = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (memcmp(sec[i].Name, ".rdata", 7)) continue;
+        unsigned char *s = b + sec[i].VirtualAddress; DWORD sz = sec[i].Misc.VirtualSize;
+        for (DWORD k = 0; k + 24 <= sz; k += 4) {
+            uint32_t *col = (uint32_t *)(s + k);
+            if (col[0] != 1 || col[1] != 0 || col[3] != td || col[5] != sec[i].VirtualAddress + k) continue;   /* (objeto principal) */
+            unsigned char *colVa = s + k;
+            for (DWORD j = 0; j + 16 <= sz; j += 8)
+                if (*(unsigned char **)(s + j) == colVa) { vt = (void **)(s + j + 8); n++; }
+        }
+    }
+    (void)imgSize;
+    return n == 1 ? vt : NULL;
+}
+static void fix_opencomposite_devices(unsigned char *b) {
+    void **vt = oc_class_vtable(b, "XrBackend");
+    void *o;
+    if (vt && oc_patch_slot(&vt[1], (void *)h_ocGetDev, &o)) { memcpy(&o_ocGetDev, &o, sizeof o); logmsg("OpenComposite: controles sin parpadeo instalado"); }
+    else logmsg("OpenComposite: no encontré XrBackend::GetDevice");
+}
+
 static void fix_opencomposite_events(unsigned char *b) {
     void **sPoll = oc_vtable_slot(b, "CVRSystem_017::PollNextEvent");
     void **sPose = oc_vtable_slot(b, "CVRSystem_017::PollNextEventWithPose");
@@ -1936,7 +1994,8 @@ static void fix_opencomposite_models(const char *app) {
         ocm_replace(s, sz, "Oculus Quest2", "Oculus Rift S");
     }
     fix_opencomposite_events(b);
-    fix_opencomposite_connected(b);
+    (void)fix_opencomposite_connected;   /* (reemplazado por fix_opencomposite_devices: arregla el parpadeo en el origen) */
+    fix_opencomposite_devices(b);
 }
 
 /* El wininet de Wine se rompe si el juego cierra una conexión mientras sus pedidos siguen abiertos en otros
