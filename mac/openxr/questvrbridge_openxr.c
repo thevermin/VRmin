@@ -1764,7 +1764,7 @@ static volatile LONG g_ocSendsButtons;
 static volatile int64_t g_realBindingsAt;   /* cuándo OpenComposite cargó los controles de verdad (0: todavía no) */
 static uint64_t g_prevPressed[8], g_prevTouched[8];
 static struct { uint32_t type, dev, button; } g_evq[64];
-static int g_evHead, g_evTail;
+static int g_vrqHead, g_vrqTail;   /* (otros nombres: g_evHead/g_evTail son la cola de eventos de OpenXR) */
 static CRITICAL_SECTION g_evLock; static INIT_ONCE g_evOnce = INIT_ONCE_STATIC_INIT;
 static BOOL CALLBACK ev_init(PINIT_ONCE o, PVOID p, PVOID *c) { (void)o; (void)p; (void)c; InitializeCriticalSection(&g_evLock); return TRUE; }
 /* Cuando el juego pregunta el estado de un control, los cambios de botones quedan anotados como eventos.
@@ -1785,11 +1785,11 @@ static unsigned char h_ocState(void *self, uint32_t dev, void *st, uint32_t cb) 
         for (int k = 0; k < 1; k++) {   /* (solo apretar/soltar: los eventos de «tocar» confundían a Earth al arrancar) */
             uint64_t now = k ? tc : pr, before = k ? g_prevTouched[dev] : g_prevPressed[dev];
             if (!((now ^ before) & m)) continue;
-            int next = (g_evTail + 1) % 64;
-            if (next == g_evHead) continue;   /* (cola llena) */
-            g_evq[g_evTail].type = k ? ((now & m) ? 202 : 203) : ((now & m) ? 200 : 201);
-            g_evq[g_evTail].dev = dev; g_evq[g_evTail].button = (uint32_t)bit; g_evTail = next;
-            { static LONG nq; if (InterlockedIncrement(&nq) < 60) logmsg("Diagnóstico eventos: en cola tipo %u disp %u botón %d (controles reales hace %.1f s)", g_evq[(g_evTail + 63) % 64].type, dev, bit, (now_ns() - g_realBindingsAt) / 1e9); }
+            int next = (g_vrqTail + 1) % 64;
+            if (next == g_vrqHead) continue;   /* (cola llena) */
+            g_evq[g_vrqTail].type = k ? ((now & m) ? 202 : 203) : ((now & m) ? 200 : 201);
+            g_evq[g_vrqTail].dev = dev; g_evq[g_vrqTail].button = (uint32_t)bit; g_vrqTail = next;
+            { static LONG nq; if (InterlockedIncrement(&nq) < 60) logmsg("Diagnóstico eventos: en cola tipo %u disp %u botón %d (controles reales hace %.1f s)", g_evq[(g_vrqTail + 63) % 64].type, dev, bit, (now_ns() - g_realBindingsAt) / 1e9); }
         }
     }
     g_prevPressed[dev] = pr; g_prevTouched[dev] = tc;
@@ -1801,12 +1801,12 @@ static int ev_synth(void *self, void *ev, uint32_t cb) {
     InitOnceExecuteOnce(&g_evOnce, ev_init, NULL, NULL);
     int got = 0;
     EnterCriticalSection(&g_evLock);
-    if (g_evHead != g_evTail && ev && cb >= 20) {
+    if (g_vrqHead != g_vrqTail && ev && cb >= 20) {
         uint8_t *e = (uint8_t *)ev; memset(e, 0, cb);
-        memcpy(e + 0, &g_evq[g_evHead].type, 4); memcpy(e + 4, &g_evq[g_evHead].dev, 4);
-        memcpy(e + 16, &g_evq[g_evHead].button, 4);   /* (VREvent_t: tipo, dispositivo, edad, y el botón a los 16 bytes) */
-        { static LONG nd; if (InterlockedIncrement(&nd) < 60) logmsg("Diagnóstico eventos: entregado tipo %u disp %u botón %u (cola %d→%d, tamaño %u)", g_evq[g_evHead].type, g_evq[g_evHead].dev, g_evq[g_evHead].button, g_evHead, g_evTail, cb); }
-        g_evHead = (g_evHead + 1) % 64; got = 1;
+        memcpy(e + 0, &g_evq[g_vrqHead].type, 4); memcpy(e + 4, &g_evq[g_vrqHead].dev, 4);
+        memcpy(e + 16, &g_evq[g_vrqHead].button, 4);   /* (VREvent_t: tipo, dispositivo, edad, y el botón a los 16 bytes) */
+        { static LONG nd; if (InterlockedIncrement(&nd) < 60) logmsg("Diagnóstico eventos: entregado tipo %u disp %u botón %u (cola %d→%d, tamaño %u)", g_evq[g_vrqHead].type, g_evq[g_vrqHead].dev, g_evq[g_vrqHead].button, g_vrqHead, g_vrqTail, cb); }
+        g_vrqHead = (g_vrqHead + 1) % 64; got = 1;
     }
     LeaveCriticalSection(&g_evLock);
     if (got) { static LONG avisado; if (InterlockedIncrement(&avisado) == 1) logmsg("OpenComposite: armando los eventos de botones para el juego"); }
