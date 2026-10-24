@@ -1753,6 +1753,105 @@ static void ocm_replace(unsigned char *s, DWORD sz, const char *de, const char *
         logmsg("OpenComposite: modelo «%s» presentado como «%s»", de, a);
     }
 }
+/* Google Earth VR hace caso a los botones solo por los eventos «botón apretado/soltado» de OpenVR, y OpenComposite
+ * (en el modo de controles viejo) no los manda: el juego ve el botón apretado pero no hace nada. Se arman esos
+ * eventos comparando el estado de los controles entre una consulta y otra. (Solo si OpenComposite no los manda.) */
+typedef unsigned char (*PFN_ocPoll)(void *self, void *ev, uint32_t cb);
+typedef unsigned char (*PFN_ocPollPose)(void *self, int origin, void *ev, uint32_t cb, void *pose);
+typedef unsigned char (*PFN_ocState)(void *self, uint32_t dev, void *st, uint32_t cb);
+static PFN_ocPoll o_ocPoll; static PFN_ocPollPose o_ocPollPose; static PFN_ocState o_ocState;
+static volatile LONG g_ocSendsButtons;
+static uint64_t g_prevPressed[8], g_prevTouched[8];
+static struct { uint32_t type, dev, button; } g_evq[64];
+static int g_evHead, g_evTail;
+static CRITICAL_SECTION g_evLock; static INIT_ONCE g_evOnce = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK ev_init(PINIT_ONCE o, PVOID p, PVOID *c) { (void)o; (void)p; (void)c; InitializeCriticalSection(&g_evLock); return TRUE; }
+static int ev_synth(void *self, void *ev, uint32_t cb) {
+    InitOnceExecuteOnce(&g_evOnce, ev_init, NULL, NULL);
+    EnterCriticalSection(&g_evLock);
+    if (g_evHead == g_evTail && o_ocState) {
+        for (uint32_t d = 1; d < 8; d++) {
+            uint8_t st[64]; memset(st, 0, sizeof st);
+            if (!o_ocState(self, d, st, 64)) continue;
+            uint64_t pr, tc; memcpy(&pr, st + 8, 8); memcpy(&tc, st + 16, 8);
+            for (int bit = 0; bit < 64; bit++) {
+                uint64_t m = 1ULL << bit;
+                if ((pr ^ g_prevPressed[d]) & m) { g_evq[g_evTail].type = (pr & m) ? 200 : 201; g_evq[g_evTail].dev = d; g_evq[g_evTail].button = (uint32_t)bit; g_evTail = (g_evTail + 1) % 64; }
+                if ((tc ^ g_prevTouched[d]) & m) { g_evq[g_evTail].type = (tc & m) ? 202 : 203; g_evq[g_evTail].dev = d; g_evq[g_evTail].button = (uint32_t)bit; g_evTail = (g_evTail + 1) % 64; }
+            }
+            g_prevPressed[d] = pr; g_prevTouched[d] = tc;
+        }
+    }
+    int got = 0;
+    if (g_evHead != g_evTail && ev && cb >= 20) {
+        uint8_t *e = (uint8_t *)ev; memset(e, 0, cb);
+        memcpy(e + 0, &g_evq[g_evHead].type, 4); memcpy(e + 4, &g_evq[g_evHead].dev, 4);
+        memcpy(e + 16, &g_evq[g_evHead].button, 4);   /* (VREvent_t: tipo, dispositivo, edad, y el botón a los 16 bytes) */
+        g_evHead = (g_evHead + 1) % 64; got = 1;
+    }
+    LeaveCriticalSection(&g_evLock);
+    if (got) { static LONG avisado; if (InterlockedIncrement(&avisado) == 1) logmsg("OpenComposite: armando los eventos de botones para el juego"); }
+    return got;
+}
+static void ev_seen(void *ev) {
+    uint32_t ty; memcpy(&ty, ev, 4);
+    if ((ty == 200 || ty == 201) && !g_ocSendsButtons) { g_ocSendsButtons = 1; logmsg("OpenComposite ya manda eventos de botones: no hace falta armarlos"); }
+}
+static unsigned char h_ocPoll(void *self, void *ev, uint32_t cb) {
+    if (o_ocPoll(self, ev, cb)) { if (ev) ev_seen(ev); return 1; }
+    return !g_ocSendsButtons && ev_synth(self, ev, cb);
+}
+static unsigned char h_ocPollPose(void *self, int origin, void *ev, uint32_t cb, void *pose) {
+    if (o_ocPollPose(self, origin, ev, cb, pose)) { if (ev) ev_seen(ev); return 1; }
+    if (g_ocSendsButtons || !ev_synth(self, ev, cb)) return 0;
+    if (pose) memset(pose, 0, 80);   /* (TrackedDevicePose_t sin pose válida) */
+    return 1;
+}
+/* La función de OpenComposite que usa ese nombre (para sus registros) y el lugar de su tabla de métodos */
+static void **oc_vtable_slot(unsigned char *b, const char *nombreMetodo) {
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    unsigned char *text = NULL, *rd = NULL; DWORD textSize = 0, rdSize = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (!memcmp(sec[i].Name, ".text", 6)) { text = b + sec[i].VirtualAddress; textSize = sec[i].Misc.VirtualSize; }
+        if (!memcmp(sec[i].Name, ".rdata", 7)) { rd = b + sec[i].VirtualAddress; rdSize = sec[i].Misc.VirtualSize; }
+    }
+    if (!text || !rd) return NULL;
+    size_t ln = strlen(nombreMetodo) + 1; unsigned char *lit = NULL; int nLit = 0;
+    for (DWORD k = 1; k + ln <= rdSize; k++) if (rd[k - 1] == 0 && !memcmp(rd + k, nombreMetodo, ln)) { lit = rd + k; nLit++; }
+    if (nLit != 1) return NULL;
+    unsigned char *fn = NULL; int nLea = 0;
+    for (DWORD k = 0; k + 7 <= textSize; k++) {
+        unsigned char *p = text + k;
+        if ((p[0] == 0x48 || p[0] == 0x4C) && p[1] == 0x8D && (p[2] & 0xC7) == 5 && p + 7 + *(int32_t *)(p + 3) == lit) {
+            nLea++;
+            for (unsigned char *q = p; q > p - 0x80 && q > text; q--) if (q[-1] == 0xCC) { fn = q; break; }
+        }
+    }
+    if (nLea != 1 || !fn) return NULL;
+    void **slot = NULL; int nSlot = 0;
+    for (DWORD k = 0; k + 8 <= rdSize; k += 8) if (*(unsigned char **)(rd + k) == fn) { slot = (void **)(rd + k); nSlot++; }
+    return nSlot == 1 ? slot : NULL;
+}
+static int oc_patch_slot(void **slot, void *nuevo, void **orig) {
+    DWORD viejo;
+    if (!slot || !VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &viejo)) return 0;
+    *orig = *slot; *slot = nuevo;
+    VirtualProtect(slot, sizeof(void *), viejo, &viejo);
+    return 1;
+}
+static void fix_opencomposite_events(unsigned char *b) {
+    void **sPoll = oc_vtable_slot(b, "CVRSystem_017::PollNextEvent");
+    void **sPose = oc_vtable_slot(b, "CVRSystem_017::PollNextEventWithPose");
+    void **sState = oc_vtable_slot(b, "CVRSystem_017::GetControllerState");
+    if (!sPoll || !sPose || !sState) { logmsg("OpenComposite: no encontré dónde armar los eventos de botones"); return; }
+    o_ocState = (PFN_ocState)*sState;
+    void *o;
+    if (oc_patch_slot(sPoll, (void *)h_ocPoll, &o)) memcpy(&o_ocPoll, &o, sizeof o);
+    if (oc_patch_slot(sPose, (void *)h_ocPollPose, &o)) memcpy(&o_ocPollPose, &o, sizeof o);
+    logmsg("OpenComposite: eventos de botones listos para armar si hacen falta");
+}
+
 static void fix_opencomposite_models(const char *app) {
     if (!app || !strstr(app, "Earth")) return;
     unsigned char *b = (unsigned char *)GetModuleHandleA("vrclient_x64.dll");
@@ -1766,6 +1865,7 @@ static void fix_opencomposite_models(const char *app) {
         ocm_replace(s, sz, "Oculus Quest (Right Controller)", "Oculus Rift (Right Controller)");
         ocm_replace(s, sz, "Oculus Quest2", "Oculus Rift S");
     }
+    fix_opencomposite_events(b);
 }
 
 /* El wininet de Wine se rompe si el juego cierra una conexión mientras sus pedidos siguen abiertos en otros
