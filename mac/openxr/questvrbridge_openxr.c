@@ -1761,6 +1761,7 @@ typedef unsigned char (*PFN_ocPollPose)(void *self, int origin, void *ev, uint32
 typedef unsigned char (*PFN_ocState)(void *self, uint32_t dev, void *st, uint32_t cb);
 static PFN_ocPoll o_ocPoll; static PFN_ocPollPose o_ocPollPose; static PFN_ocState o_ocState;
 static volatile LONG g_ocSendsButtons;
+static volatile int64_t g_realBindingsAt;   /* cuándo OpenComposite cargó los controles de verdad (0: todavía no) */
 static uint64_t g_prevPressed[8], g_prevTouched[8];
 static struct { uint32_t type, dev, button; } g_evq[64];
 static int g_evHead, g_evTail;
@@ -1771,6 +1772,11 @@ static BOOL CALLBACK ev_init(PINIT_ONCE o, PVOID p, PVOID *c) { (void)o; (void)p
 static unsigned char h_ocState(void *self, uint32_t dev, void *st, uint32_t cb) {
     unsigned char r = o_ocState(self, dev, st, cb);
     if (!r || g_ocSendsButtons || dev >= 8 || !st || cb < 24) return r;
+    /* Hasta que OpenComposite no reinició su sesión con los controles (y pasaron 3 s), no se arma nada */
+    if (!g_realBindingsAt || now_ns() - g_realBindingsAt < 3000000000LL) {
+        memcpy(&g_prevPressed[dev], (uint8_t *)st + 8, 8);
+        return r;
+    }
     InitOnceExecuteOnce(&g_evOnce, ev_init, NULL, NULL);
     uint64_t pr, tc; memcpy(&pr, (uint8_t *)st + 8, 8); memcpy(&tc, (uint8_t *)st + 16, 8);
     EnterCriticalSection(&g_evLock);
@@ -3014,6 +3020,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrSuggestInteractionProfileBindings(XrInstance
     }
     LeaveCriticalSection(&g_lock);
     logmsg("Bindings sugeridos para %s (%u)", path_str(sb->interactionProfile), sb->countSuggestedBindings);
+    if (sb->countSuggestedBindings >= 10) g_realBindingsAt = now_ns();   /* (OpenComposite ya armó los controles de verdad) */
     return XR_SUCCESS;
 }
 
