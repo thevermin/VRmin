@@ -1773,6 +1773,14 @@ static BOOL CALLBACK ev_init(PINIT_ONCE o, PVOID p, PVOID *c) { (void)o; (void)p
  * (No se le pregunta nada a OpenComposite desde adentro de PollNextEvent: ahí reinicia su sesión y se rompe.) */
 static unsigned char h_ocState(void *self, uint32_t dev, void *st, uint32_t cb) {
     unsigned char r = o_ocState(self, dev, st, cb);
+    if (r && st && cb >= 64 && dev < 8) {   /* (diagnóstico: grip y palancas, solo cuando cambian) */
+        static int lg[8]; static LONG n; float ax[5][2]; uint64_t pr;
+        memcpy(&pr, (uint8_t *)st + 8, 8); memcpy(ax, (uint8_t *)st + 24, 40);
+        int k = (int)(ax[2][0] * 10 + 0.5f) * 4 + (int)((pr >> 2) & 1) * 2 + (fabsf(ax[0][0]) > 0.5f);
+        if (k != lg[dev] && InterlockedIncrement(&n) < 200)
+            logmsg("Diagnóstico grip: disp %u botón grip %d · eje2 (grip) %.2f · stick %.2f,%.2f", dev, (int)((pr >> 2) & 1), ax[2][0], ax[0][0], ax[0][1]);
+        lg[dev] = k;
+    }
     if (!r || g_ocSendsButtons || dev >= 8 || !st || cb < 24) return r;
     /* Hasta que OpenComposite no reinició su sesión con los controles (y pasaron 3 s), no se arma nada */
     if (!g_realBindingsAt || now_ns() - g_realBindingsAt < 3000000000LL) {
