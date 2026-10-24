@@ -837,9 +837,7 @@ static void set_state(Session *s, XrSessionState st) {
 #define FILL_STR(dst, src) do { strncpy((dst), (src), sizeof(dst) - 1); (dst)[sizeof(dst) - 1] = 0; } while (0)
 
 static const char *g_extensions[] = {
-#ifdef _WIN64
-    XR_KHR_D3D11_ENABLE_EXTENSION_NAME,   /* (en 32 bits no: no hay DXMT, y el D3D11 de Wine no llega; OpenComposite usa Vulkan) */
-#endif
+    XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
     XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
     XR_KHR_OPENGL_ENABLE_EXTENSION_NAME,
     XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME,
@@ -928,6 +926,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetInstanceProcAddr(XrInstance instance, con
 static void init_once(void);
 static void install_gl_hook(void);
 static void install_dxvk_hooks(void);
+static void fix_opencomposite_32(void);
 static void fix_opencomposite_stubs(void);
 static void fix_opencomposite_models(const char *app);
 static void install_wininet_fix(void);
@@ -961,6 +960,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateInstance(const XrInstanceCreateInfo *i
     logmsg("xrCreateInstance de '%s' (%s)", info->applicationInfo.applicationName, info->applicationInfo.engineName);
     install_gl_hook();   /* (solo hace algo si el juego usa OpenGL) */
     install_dxvk_hooks();   /* (solo si el juego trae DXVK, como Half-Life 2: VR Mod) */
+    fix_opencomposite_32();
     fix_opencomposite_stubs();
     fix_opencomposite_models(info->applicationInfo.applicationName);
     install_wininet_fix();
@@ -3699,6 +3699,35 @@ static PFN_vkVoidFunction VKAPI_CALL hook_vkGetInstanceProcAddr(VkInstance inst,
         return (PFN_vkVoidFunction)hook_vkCreateDevice;
     }
     return p;
+}
+
+/* OpenComposite arranca siempre con una sesión D3D11 provisoria. En juegos de 32 bits el D3D11 de Wine (sin DXMT)
+ * no llega al nivel 11_0 que pide en una Mac (OpenGL 4.1), y OpenComposite se cerraba («createDeviceRes»). Si falla,
+ * se reintenta pidiendo el 10_1/10_0: esa sesión es solo de paso, el juego después dibuja con Vulkan. */
+#ifndef _WIN64
+typedef HRESULT (WINAPI *PFN_D3D11CreateDeviceX)(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL *, UINT, UINT,
+                                                ID3D11Device **, D3D_FEATURE_LEVEL *, ID3D11DeviceContext **);
+static PFN_D3D11CreateDeviceX o_ocD3D11CreateDevice;
+static HRESULT WINAPI h_ocD3D11CreateDevice(IDXGIAdapter *ad, D3D_DRIVER_TYPE dt, HMODULE sw, UINT fl, const D3D_FEATURE_LEVEL *lv, UINT nl, UINT sdk,
+                                            ID3D11Device **dev, D3D_FEATURE_LEVEL *got, ID3D11DeviceContext **ctx) {
+    HRESULT hr = o_ocD3D11CreateDevice(ad, dt, sw, fl, lv, nl, sdk, dev, got, ctx);
+    if (SUCCEEDED(hr)) return hr;
+    static const D3D_FEATURE_LEVEL bajos[] = { D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
+    HRESULT hr2 = o_ocD3D11CreateDevice(ad, dt, sw, fl & ~(UINT)D3D11_CREATE_DEVICE_DEBUG, bajos, 2, sdk, dev, got, ctx);
+    if (FAILED(hr2)) hr2 = o_ocD3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, bajos, 2, sdk, dev, got, ctx);
+    logmsg("OpenComposite: D3D11 provisorio (32 bits) 0x%08lx → reintento con nivel 10: 0x%08lx", (unsigned long)hr, (unsigned long)hr2);
+    return hr2;
+}
+#endif
+static void fix_opencomposite_32(void) {
+#ifndef _WIN64
+    static int done;
+    if (done) return;
+    done = 1;
+    void *o;
+    if (patch_iat(GetModuleHandleA("vrclient.dll"), "d3d11.dll", "D3D11CreateDevice", (void *)h_ocD3D11CreateDevice, &o))
+        memcpy(&o_ocD3D11CreateDevice, &o, sizeof o);
+#endif
 }
 
 /* --- DXVK (Half-Life 2: VR Mod trae el suyo: DirectX 9 → Vulkan) ---
