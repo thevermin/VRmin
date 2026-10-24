@@ -1618,6 +1618,14 @@ static void APIENTRY hook_glCompileShader(GLuint sh) {
     if (ok) { InterlockedIncrement(&g_shOk); return; }
     LONG n = InterlockedIncrement(&g_shFail);
     if (n > 12) return;
+    if (p_glGetShaderSource) {   /* (el shader entero, para poder ver qué no le gustó a la Mac) */
+        static char todo[65536]; GLsizei l2 = 0;
+        p_glGetShaderSource(sh, sizeof todo, &l2, todo);
+        CreateDirectoryA("C:\\questvrbridge\\shaders", NULL);
+        char nombre[64]; snprintf(nombre, sizeof nombre, "C:\\questvrbridge\\shaders\\rechazado_%ld.txt", n);
+        FILE *fs = fopen(nombre, "wb");
+        if (fs) { fwrite(todo, 1, (size_t)l2, fs); fclose(fs); }
+    }
     char info[700] = "", src[200] = ""; GLsizei len = 0;
     if (p_glGetShaderInfoLog) p_glGetShaderInfoLog(sh, sizeof info, &len, info);
     if (p_glGetShaderSource) p_glGetShaderSource(sh, sizeof src, &len, src);
