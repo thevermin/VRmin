@@ -1566,6 +1566,8 @@ final class MenuUi implements Link.Listener {
         into.addView(Ui.section(ctx, I18n.t("Controles")));
         toggle(into, null, I18n.t("Emular controles de Valve Index"), I18n.t("Para juegos que funcionan mejor con Index: los dedos se mueven según cómo tocás los botones") + again,
                 v != null && v.optBoolean("index"), on -> sendAdv(scope, "index", String.valueOf(on)));
+        toggle(into, null, I18n.t("Emular controles de HTC Vive"), I18n.t("Para juegos hechos para los controles de Vive: el stick hace de trackpad (moverlo es deslizar el dedo, hundirlo es hacer clic)") + again,
+                v != null && v.optBoolean("vive"), on -> sendAdv(scope, "vive", String.valueOf(on)));
     }
 
     /// El próximo monitor físico de la Mac que todavía no está abierto (null si ya están todos)

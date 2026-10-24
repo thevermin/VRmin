@@ -139,6 +139,7 @@ static int g_eyeW = 1024, g_eyeH = 1024, g_fps = 72;
  * campo de visión recortado (las esquinas casi no se ven por las lentes) y emular controles de Valve Index */
 static volatile float g_fovK = 1.0f;
 static volatile int g_index = 0;
+static volatile int g_vive = 0;    /* emular controles de HTC Vive (el stick hace de trackpad) */
 static volatile int g_vigia = 0;   /* Modo Centinela: el cuadro se ve en la Mac sin reproyección → adelantar las poses */
 static volatile LONG g_cfgVer = 0, g_helloVer = -1;
 static char g_appName[128];
@@ -286,10 +287,11 @@ static void parse_config_line(const char *line) {
     if ((p = strstr(line, "\"fps\":"))) { int v = atoi(p + 6 + (p[6] == ' ')); if (v >= 30 && v <= 144) g_fps = v; }
     if ((p = strstr(line, "\"fovk\":"))) { double v = atof(p + 7); if (v >= 0.6 && v <= 1.0) g_fovK = (float)v; }
     if ((p = strstr(line, "\"index\":"))) g_index = atoi(p + 8) != 0;
+    if ((p = strstr(line, "\"vive\":"))) g_vive = atoi(p + 7) != 0;
     if ((p = strstr(line, "\"vg\":"))) g_vigia = atoi(p + 5) != 0;
     if (strstr(line, "\"pv\":")) {
         InterlockedIncrement(&g_cfgVer);
-        logmsg("Ajustes del juego: %dx%d por ojo, campo de visión %.0f%%%s", g_eyeW, g_eyeH, g_fovK * 100.0, g_index ? ", controles de Index" : "");
+        logmsg("Ajustes del juego: %dx%d por ojo, campo de visión %.0f%%%s", g_eyeW, g_eyeH, g_fovK * 100.0, g_index ? ", controles de Index" : g_vive ? ", controles de Vive" : "");
     }
 }
 
@@ -835,7 +837,9 @@ static void set_state(Session *s, XrSessionState st) {
 #define FILL_STR(dst, src) do { strncpy((dst), (src), sizeof(dst) - 1); (dst)[sizeof(dst) - 1] = 0; } while (0)
 
 static const char *g_extensions[] = {
-    XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
+#ifdef _WIN64
+    XR_KHR_D3D11_ENABLE_EXTENSION_NAME,   /* (en 32 bits no: no hay DXMT, y el D3D11 de Wine no llega; OpenComposite usa Vulkan) */
+#endif
     XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
     XR_KHR_OPENGL_ENABLE_EXTENSION_NAME,
     XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME,
@@ -871,6 +875,14 @@ static XrPosef space_world(const Space *sp, const Track *t, int *valid) {
         if (hand < 0) { *valid = 0; return sp->offset; }
         base = useAim ? t->aim[hand] : t->grip[hand];
         *valid = t->valid && t->handValid[hand];
+        /* Emulando Vive: OpenComposite ubica la mano del juego como si fuera un control de Vive (más largo), y quedaba
+         * unos centímetros atrás del control real (el control en la punta de los dedos): se adelanta la pose */
+        static XrPath vivePath;
+        if (g_vive && !vivePath) vivePath = intern_path("/interaction_profiles/htc/vive_controller");
+        if (g_vive && g_session && g_session->profile == vivePath) {
+            XrPosef adel = { {0, 0, 0, 1}, {0, 0, -0.08f} };
+            base = pmul(base, adel);
+        }
     }
     return pmul(base, sp->offset);
 }
@@ -2267,10 +2279,10 @@ static void fill_velocity(void *next, const Track *t, const Space *sp, XrPosef b
 }
 
 static LONG g_dgLocOk, g_dgLocBad, g_dgPoseOn[3], g_dgPoseOff[3];   /* (diagnóstico de controles) */
+static Track track_for_time(XrTime time);
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation *loc) {
     g_inside = "xrLocateSpace";
-    Track t;
-    EnterCriticalSection(&g_lock); t = g_track; LeaveCriticalSection(&g_lock);
+    Track t = track_for_time(time);
     predict(&t, time);
     int v1, v2;
     XrPosef a = space_world((Space *)space, &t, &v1);
@@ -2315,6 +2327,31 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateSpaces(XrSession session, const XrSpac
 #define POSE_HIST 16
 static struct { XrTime time; uint32_t id; } g_poseHist[POSE_HIST];
 static int g_poseHistIdx;
+static Track g_poseTrack[POSE_HIST];
+/* La pose de un momento dado: la primera vez que alguien la pide (vistas o ubicación de la cabeza/controles) se
+ * guarda, y las demás veces para ese mismo momento se devuelve la misma. Así el juego dibuja con la misma pose que
+ * después se le informa a la Mac para corregir la imagen; si no, al mover la cabeza la imagen temblaba (DOOM VFR
+ * pide la cabeza y las vistas en momentos distintos del cuadro). */
+static volatile XrTime g_frameTimes[4];   /* los últimos momentos de cuadro que dio xrWaitFrame */
+static Track track_for_time(XrTime time) {
+    Track t;
+    EnterCriticalSection(&g_lock);
+    int esCuadro = 0;
+    for (int q = 0; q < 4; q++) if (g_frameTimes[q] == time) esCuadro = 1;
+    if (!esCuadro) { t = g_track; LeaveCriticalSection(&g_lock); return t; }   /* (otro momento: la pose de ahora) */
+    int ya = -1;
+    for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].time == time) { ya = hh; break; }
+    if (ya >= 0) t = g_poseTrack[ya];
+    else {
+        t = g_track;
+        g_poseHist[g_poseHistIdx].time = time;
+        g_poseHist[g_poseHistIdx].id = t.id;
+        g_poseTrack[g_poseHistIdx] = t;
+        g_poseHistIdx = (g_poseHistIdx + 1) % POSE_HIST;
+    }
+    LeaveCriticalSection(&g_lock);
+    return t;
+}
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateViews(XrSession s, const XrViewLocateInfo *info, XrViewState *state, uint32_t cap, uint32_t *count, XrView *views) {
     g_inside = "xrLocateViews";
@@ -2322,13 +2359,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateViews(XrSession s, const XrViewLocateI
     *count = 2;
     if (cap == 0) return XR_SUCCESS;
     if (cap < 2) return XR_ERROR_SIZE_INSUFFICIENT;
-    Track t;
-    EnterCriticalSection(&g_lock);
-    t = g_track;
-    g_poseHist[g_poseHistIdx].time = info->displayTime;
-    g_poseHist[g_poseHistIdx].id = t.id;
-    g_poseHistIdx = (g_poseHistIdx + 1) % POSE_HIST;
-    LeaveCriticalSection(&g_lock);
+    Track t = track_for_time(info->displayTime);
     predict(&t, info->displayTime);
     int vb;
     XrPosef base = space_world((Space *)info->space, &t, &vb);
@@ -2581,6 +2612,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrWaitFrame(XrSession session, const XrFrameWa
     while (now_ns() < g_nextFrame) { gpu_poll(); /* espera activa breve */ }
     { int64_t e = now_ns(); g_sumWait += (e - now) / 1e6; g_nWait++; g_waitEnd = e; }
     st->predictedDisplayTime = g_nextFrame + period;
+    { static int q; g_frameTimes[q] = st->predictedDisplayTime; q = (q + 1) % 4; }
     st->predictedDisplayPeriod = period;
     st->shouldRender = (s->state == XR_SESSION_STATE_VISIBLE || s->state == XR_SESSION_STATE_FOCUSED) ? XR_TRUE : XR_FALSE;
     return XR_SUCCESS;
@@ -3172,8 +3204,15 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrAttachSessionActionSets(XrSession session, c
     Session *s = (Session *)session;
     EnterCriticalSection(&g_lock);
     s->profile = XR_NULL_PATH;
+    /* Emular Vive: si el juego tiene controles de Vive, se eligen esos (el stick hace de trackpad) */
+    if (g_vive) {
+        XrPath vp = intern_path("/interaction_profiles/htc/vive_controller");
+        for (int k = 0; k < g_nactions && !s->profile; k++)
+            for (int j = 0; j < g_actions[k]->nall; j++)
+                if (g_actions[k]->all[j].profile == vp) { s->profile = vp; break; }
+    }
     /* Emular Index: si el juego tiene controles de Index, se eligen esos (dedos y botones como en un Index) */
-    if (g_index) {
+    if (g_index && !s->profile) {
         XrPath ip = intern_path("/interaction_profiles/valve/index_controller");
         for (int k = 0; k < g_nactions && !s->profile; k++)
             for (int j = 0; j < g_actions[k]->nall; j++)

@@ -730,6 +730,8 @@ final class I18nEn {
         m.put("Las esquinas casi no se ven por las lentes: si el juego no las dibuja, rinde más", "The corners are barely visible through the lenses: if the game skips them, it runs faster");
         m.put("Controles", "Controllers");
         m.put("Emular controles de Valve Index", "Emulate Valve Index controllers");
+        m.put("Emular controles de HTC Vive", "Emulate HTC Vive controllers");
+        m.put("Para juegos hechos para los controles de Vive: el stick hace de trackpad (moverlo es deslizar el dedo, hundirlo es hacer clic)", "For games made for Vive controllers: the thumbstick acts as the trackpad (move it to slide, press it to click)");
         m.put("Para juegos que funcionan mejor con Index: los dedos se mueven según cómo tocás los botones", "For games that work better with Index: fingers move based on how you touch the buttons");
         m.put("Se aplican la próxima vez que abras el juego.", "They apply the next time you open the game.");
         m.put("Este juego", "This game");
