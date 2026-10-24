@@ -1776,7 +1776,7 @@ static unsigned char h_ocState(void *self, uint32_t dev, void *st, uint32_t cb) 
     EnterCriticalSection(&g_evLock);
     for (int bit = 0; bit < 64; bit++) {
         uint64_t m = 1ULL << bit;
-        for (int k = 0; k < 2; k++) {
+        for (int k = 0; k < 1; k++) {   /* (solo apretar/soltar: los eventos de «tocar» confundían a Earth al arrancar) */
             uint64_t now = k ? tc : pr, before = k ? g_prevTouched[dev] : g_prevPressed[dev];
             if (!((now ^ before) & m)) continue;
             int next = (g_evTail + 1) % 64;
@@ -1879,7 +1879,7 @@ static unsigned char h_diagState(void *self, uint32_t dev, void *st, uint32_t cb
     }
     return r;
 }
-static void diag_opencomposite_state(unsigned char *b) {
+static __attribute__((unused)) void diag_opencomposite_state(unsigned char *b) {
     void **s = oc_vtable_slot(b, "CVRSystem_017::GetControllerState");
     void *o;
     if (s && oc_patch_slot(s, (void *)h_diagState, &o)) { memcpy(&o_diagState, &o, sizeof o); logmsg("Diagnóstico: anotando el estado de los controles que ve el juego"); }
@@ -1898,8 +1898,7 @@ static void fix_opencomposite_models(const char *app) {
         ocm_replace(s, sz, "Oculus Quest (Right Controller)", "Oculus Rift (Right Controller)");
         ocm_replace(s, sz, "Oculus Quest2", "Oculus Rift S");
     }
-    (void)fix_opencomposite_events;   /* (apagado: con los eventos armados Earth dejaba de mostrar los controles) */
-    diag_opencomposite_state(b);
+    fix_opencomposite_events(b);
 }
 
 /* El wininet de Wine se rompe si el juego cierra una conexión mientras sus pedidos siguen abiertos en otros
