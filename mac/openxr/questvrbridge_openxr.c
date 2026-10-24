@@ -3525,8 +3525,35 @@ static VkResult VKAPI_CALL hook_vkCreateDevice(VkPhysicalDevice pd, const VkDevi
     return r;
 }
 
+/* MoltenVK contesta VK_SUBOPTIMAL_KHR cuando la ventana del juego no tiene justo el tamaño de su swapchain (pasa con
+ * las pantallas Retina), y DOOM VFR lo toma como error fatal y se cierra. Es un aviso, no un error: se pasa como
+ * VK_SUCCESS (la imagen se puede usar igual). */
+static PFN_vkAcquireNextImageKHR g_origVkAcquire;
+static PFN_vkQueuePresentKHR g_origVkPresent;
+static PFN_vkGetDeviceProcAddr g_origVkGDPA;
+static VkResult VKAPI_CALL hook_vkAcquireNextImageKHR(VkDevice d, VkSwapchainKHR sc, uint64_t to, VkSemaphore se, VkFence fe, uint32_t *idx) {
+    VkResult r = g_origVkAcquire(d, sc, to, se, fe, idx);
+    if (r == VK_SUBOPTIMAL_KHR) { static LONG n; if (InterlockedIncrement(&n) == 1) logmsg("Vulkan: «imagen no óptima» de la ventana tomada como normal"); return VK_SUCCESS; }
+    return r;
+}
+static VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) {
+    VkResult r = g_origVkPresent(q, pi);
+    return r == VK_SUBOPTIMAL_KHR ? VK_SUCCESS : r;
+}
+static PFN_vkVoidFunction vk_wrap(const char *name, PFN_vkVoidFunction p);
+static PFN_vkVoidFunction VKAPI_CALL hook_vkGetDeviceProcAddr(VkDevice d, const char *name) {
+    return vk_wrap(name, g_origVkGDPA(d, name));
+}
+static PFN_vkVoidFunction vk_wrap(const char *name, PFN_vkVoidFunction p) {
+    if (!p || !name) return p;
+    if (!strcmp(name, "vkAcquireNextImageKHR")) { g_origVkAcquire = (PFN_vkAcquireNextImageKHR)p; return (PFN_vkVoidFunction)hook_vkAcquireNextImageKHR; }
+    if (!strcmp(name, "vkQueuePresentKHR")) { g_origVkPresent = (PFN_vkQueuePresentKHR)p; return (PFN_vkVoidFunction)hook_vkQueuePresentKHR; }
+    if (!strcmp(name, "vkGetDeviceProcAddr")) { g_origVkGDPA = (PFN_vkGetDeviceProcAddr)p; return (PFN_vkVoidFunction)hook_vkGetDeviceProcAddr; }
+    return p;
+}
+
 static PFN_vkVoidFunction VKAPI_CALL hook_vkGetInstanceProcAddr(VkInstance inst, const char *name) {
-    PFN_vkVoidFunction p = g_origVkGIPA(inst, name);
+    PFN_vkVoidFunction p = vk_wrap(name, g_origVkGIPA(inst, name));
     if (p && name && !strcmp(name, "vkCreateDevice")) {
         g_origVkCreateDevice = (PFN_vkCreateDevice)p;
         return (PFN_vkVoidFunction)hook_vkCreateDevice;
@@ -3547,6 +3574,11 @@ static void install_vulkan_hook(void) {
     else g_origVkCreateDevice = (PFN_vkCreateDevice)(void (*)(void))GetProcAddress(vk1, "vkCreateDevice");
     int b = patch_iat(exe, "vulkan-1.dll", "vkGetInstanceProcAddr", (void *)hook_vkGetInstanceProcAddr, &o);
     if (b) g_origVkGIPA = (PFN_vkGetInstanceProcAddr)o;
+    /* (las funciones de la ventana: directas o pedidas con vkGetDeviceProcAddr) */
+    if (patch_iat(exe, "vulkan-1.dll", "vkGetDeviceProcAddr", (void *)hook_vkGetDeviceProcAddr, &o)) g_origVkGDPA = (PFN_vkGetDeviceProcAddr)o;
+    else g_origVkGDPA = (PFN_vkGetDeviceProcAddr)(void (*)(void))GetProcAddress(vk1, "vkGetDeviceProcAddr");
+    if (patch_iat(exe, "vulkan-1.dll", "vkAcquireNextImageKHR", (void *)hook_vkAcquireNextImageKHR, &o)) g_origVkAcquire = (PFN_vkAcquireNextImageKHR)o;
+    if (patch_iat(exe, "vulkan-1.dll", "vkQueuePresentKHR", (void *)hook_vkQueuePresentKHR, &o)) g_origVkPresent = (PFN_vkQueuePresentKHR)o;
     logmsg("Vulkan: ajuste de funciones de la GPU instalado (vkCreateDevice %s, vkGetInstanceProcAddr %s)", a ? "sí" : "no", b ? "sí" : "no");
 }
 
