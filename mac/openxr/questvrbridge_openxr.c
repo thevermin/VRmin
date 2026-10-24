@@ -1876,7 +1876,7 @@ static void fix_opencomposite_models(const char *app) {
         ocm_replace(s, sz, "Oculus Quest (Right Controller)", "Oculus Rift (Right Controller)");
         ocm_replace(s, sz, "Oculus Quest2", "Oculus Rift S");
     }
-    fix_opencomposite_events(b);
+    (void)fix_opencomposite_events;   /* (apagado: con los eventos armados Earth dejaba de mostrar los controles) */
 }
 
 /* El wininet de Wine se rompe si el juego cierra una conexión mientras sus pedidos siguen abiertos en otros
