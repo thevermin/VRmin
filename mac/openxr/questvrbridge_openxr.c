@@ -1471,6 +1471,8 @@ static void APIENTRY emu_glCopyImageSubData(GLuint src, GLenum srcTarget, GLint 
     if (!glx_load()) return;
     static int avisado;
     if (!avisado) { avisado = 1; logmsg("OpenGL: copia de cuadros de OpenComposite hecha sin OpenGL 4.3 (0x%x → 0x%x)", srcTarget, dstTarget); }
+    static GLenum errJuego; static int nErrJuego;   /* (diagnóstico: errores de OpenGL que dejó el juego) */
+    { GLenum e0 = glx.GetError(); if (e0 != GL_NO_ERROR) { errJuego = e0; nErrJuego++; } }
     GLint rfb = 0, dfb = 0;
     gl.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &rfb); gl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfb);
     GLboolean sc = glx.IsEnabled(GL_SCISSOR_TEST), srgb = glx.IsEnabled(GL_FRAMEBUFFER_SRGB);
@@ -1499,9 +1501,22 @@ static void APIENTRY emu_glCopyImageSubData(GLuint src, GLenum srcTarget, GLint 
                 glx.GetTexLevelParameteriv(srcTarget, srcLevel, GL_TEXTURE_SAMPLES, &ss);
                 gl.BindTexture(GL_TEXTURE_2D, (GLuint)p2d);
             }
+            /* brillo de la textura del juego (antes de la copia): 8x8 puntos */
+            GLint pack = 0, row = 0; unsigned sum = 0, mx = 0;
+            gl.GetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack); gl.GetIntegerv(GL_PACK_ROW_LENGTH, &row);
+            gl.BindBuffer(GL_PIXEL_PACK_BUFFER, 0); gl.PixelStorei(GL_PACK_ROW_LENGTH, 0);
+            gl.BindFramebuffer(GL_READ_FRAMEBUFFER, glx.fbo[0]);
+            for (int yy = 0; yy < 8; yy++) for (int xx = 0; xx < 8; xx++) {
+                unsigned char px[4] = { 0 };
+                gl.ReadPixels(srcX + (2 * xx + 1) * w / 16, srcY + (2 * yy + 1) * h / 16, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                unsigned v = (px[0] + px[1] + px[2]) / 3; sum += v; if (v > mx) mx = v;
+            }
+            gl.BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack); gl.PixelStorei(GL_PACK_ROW_LENGTH, row);
             while (glx.GetError() != GL_NO_ERROR) {}
-            logmsg("Diagnóstico copia: textura %u tipo 0x%x formato 0x%x %dx%d muestras %d, copia %dx%d desde %d,%d · error 0x%x",
-                   src, srcTarget, fmt, sw, shh, ss, w, h, srcX, srcY, err);
+            logmsg("Diagnóstico copia: textura %u tipo 0x%x formato 0x%x %dx%d muestras %d, copia %dx%d desde %d,%d · error 0x%x · "
+                   "brillo del juego %.1f (máx %u) · errores de OpenGL del juego %d (último 0x%x)",
+                   src, srcTarget, fmt, sw, shh, ss, w, h, srcX, srcY, err, sum / 64.0, mx, nErrJuego, errJuego);
+            nErrJuego = 0;
         }
     }
     gl.BindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)rfb); gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)dfb);
