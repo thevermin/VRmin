@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Herramientas (mingw-w64) y cabeceras de OpenXR y Vulkan
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64 >/dev/null
+          sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 >/dev/null
           git clone -q --depth 1 --branch release-1.1.43 https://github.com/KhronosGroup/OpenXR-SDK.git "$RUNNER_TEMP/openxr"
           git clone -q --depth 1 --branch v1.3.296 https://github.com/KhronosGroup/Vulkan-Headers.git "$RUNNER_TEMP/vulkan"
       - name: Compilar questvrbridge_openxr.dll
@@ -23,17 +23,26 @@ jobs:
             -ld3d11 -ldxgi -ldxguid -luuid -lws2_32 -lwinmm -static-libgcc -Wl,--kill-at > build.log 2>&1 || true
           grep -E "error" build.log | head -20 | while IFS= read -r l; do echo "::error::$l"; done
           test -f "$RUNNER_TEMP/questvrbridge_openxr.dll"
+          # (y el de 32 bits, para juegos de 32 bits como Half-Life 2: VR Mod)
+          i686-w64-mingw32-gcc -O2 -shared -o "$RUNNER_TEMP/questvrbridge_openxr32.dll" mac/openxr/questvrbridge_openxr.c \
+            mac/openxr/questvrbridge_openxr.def -I"$RUNNER_TEMP/openxr/include" -I"$RUNNER_TEMP/vulkan/include" \
+            -ld3d11 -ldxgi -ldxguid -luuid -lws2_32 -lwinmm -static-libgcc -Wl,--kill-at -Wl,--enable-stdcall-fixup > build32.log 2>&1 || true
+          grep -E "error" build32.log | head -20 | while IFS= read -r l; do echo "::error::$l"; done
+          test -f "$RUNNER_TEMP/questvrbridge_openxr32.dll"
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-openxr-dll
-          path: ${{ runner.temp }}/questvrbridge_openxr.dll
+          path: |
+            ${{ runner.temp }}/questvrbridge_openxr.dll
+            ${{ runner.temp }}/questvrbridge_openxr32.dll
           retention-days: 7
       - name: Guardar el DLL en el repositorio (lo usa crear_app.sh)
         if: github.event_name == 'push'
         run: |
           cp "$RUNNER_TEMP/questvrbridge_openxr.dll" mac/openxr/questvrbridge_openxr.dll
+          cp "$RUNNER_TEMP/questvrbridge_openxr32.dll" mac/openxr/questvrbridge_openxr32.dll
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add mac/openxr/questvrbridge_openxr.dll
-          git commit -qm "Build the OpenXR runtime DLL" || exit 0
+          git add mac/openxr/questvrbridge_openxr.dll mac/openxr/questvrbridge_openxr32.dll
+          git commit -qm "Build the OpenXR runtime DLLs" || exit 0
           for i in 1 2 3; do git pull -q --rebase && git push -q && break; sleep 3; done

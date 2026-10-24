@@ -41,6 +41,7 @@ mkdir -p "$R/steam" && cp app/recursos/steam/steamwebhelper.exe "$R/steam/"
 cp server.py "$R/"
 cp web/index.html "$R/web/"
 cp openxr/questvrbridge_openxr.dll openxr/questvrbridge_openxr.json "$R/openxr/"
+[ -f openxr/questvrbridge_openxr32.dll ] && cp openxr/questvrbridge_openxr32.dll openxr/questvrbridge_openxr32.json "$R/openxr/"
 chmod +x "$R"/*.sh "$R/QuestRenderer"
 # Ícono (a partir de app/AppIcon.png)
 I="$(mktemp -d)/AppIcon.iconset"; mkdir -p "$I"

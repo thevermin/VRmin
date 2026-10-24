@@ -915,6 +915,7 @@ static int input_value(const Track *t, const char *b, float out[2], int *isPose)
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetInstanceProcAddr(XrInstance instance, const char *name, PFN_xrVoidFunction *function);
 static void init_once(void);
 static void install_gl_hook(void);
+static void install_dxvk_hooks(void);
 static void fix_opencomposite_stubs(void);
 static void fix_opencomposite_models(const char *app);
 static void install_wininet_fix(void);
@@ -947,6 +948,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateInstance(const XrInstanceCreateInfo *i
     }
     logmsg("xrCreateInstance de '%s' (%s)", info->applicationInfo.applicationName, info->applicationInfo.engineName);
     install_gl_hook();   /* (solo hace algo si el juego usa OpenGL) */
+    install_dxvk_hooks();   /* (solo si el juego trae DXVK, como Half-Life 2: VR Mod) */
     fix_opencomposite_stubs();
     fix_opencomposite_models(info->applicationInfo.applicationName);
     install_wininet_fix();
@@ -2907,8 +2909,9 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, XrTi
     s->stPose[k] = id; s->stValid[k] = 1; s->stFlip[k] = flip;
     s->stNext = (k + 1) % STAGES;
 
-    /* 2) Leer la copia del cuadro anterior y pasarla a la memoria compartida */
-    int r = s->stNext;
+    /* 2) Leer la copia y pasarla a la memoria compartida. Se espera la de este mismo cuadro (no la del anterior): un
+     *    cuadro menos de atraso entre mover la cabeza y verlo, que con Vulkan mareaba (DOOM VFR) */
+    int r = k;
     if (!s->stValid[r]) return;
     ShmHdr *sh = (ShmHdr *)g_shm;
     int ss = -1;
@@ -3658,6 +3661,75 @@ static PFN_vkVoidFunction VKAPI_CALL hook_vkGetInstanceProcAddr(VkInstance inst,
     }
     return p;
 }
+
+/* --- DXVK (Half-Life 2: VR Mod trae el suyo: DirectX 9 → Vulkan) ---
+ * DXVK 2 se niega a arrancar si la GPU no tiene «geometryShader», y las de Apple (MoltenVK) no lo tienen. Half-Life 2
+ * no lo necesita: se le dice a DXVK que sí está (vkGetPhysicalDeviceFeatures/2) y al crear el dispositivo se apaga
+ * de nuevo (vkCreateDevice), así MoltenVK no lo rechaza. DXVK carga el Vulkan de Wine (winevulkan.dll) por su cuenta,
+ * sin pasar por las importaciones del juego, así que se intervienen esas funciones directamente: empiezan todas con
+ * los mismos 5 bytes («mov edi,edi»/«push ebp; mov ebp,esp» de Wine), que se cambian por un salto (y se guardan,
+ * con un salto de vuelta, para llamar a la original). Nuestro runtime se carga cuando DXVK inicia OpenVR, antes de
+ * que busque la GPU. */
+#ifndef _WIN64
+static void *hot_hook(void *fn, void *hook) {
+    unsigned char *p = (unsigned char *)fn;
+    if (!p || memcmp(p, "\x66\x90\x55\x89\xe5", 5)) return NULL;
+    unsigned char *tr = (unsigned char *)VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!tr) return NULL;
+    memcpy(tr, p, 5); tr[5] = 0xE9; *(int32_t *)(tr + 6) = (int32_t)((p + 5) - (tr + 10));
+    DWORD old;
+    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old)) return NULL;
+    p[0] = 0xE9; *(int32_t *)(p + 1) = (int32_t)((unsigned char *)hook - (p + 5));
+    VirtualProtect(p, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    return tr;
+}
+static PFN_vkGetPhysicalDeviceFeatures g_dxRealFeat;
+static PFN_vkGetPhysicalDeviceFeatures2 g_dxRealFeat2;
+static PFN_vkCreateDevice g_dxRealCreate;
+static void VKAPI_CALL dx_GetPhysicalDeviceFeatures(VkPhysicalDevice pd, VkPhysicalDeviceFeatures *f) {
+    g_dxRealFeat(pd, f);
+    if (f) f->geometryShader = VK_TRUE;
+}
+static void VKAPI_CALL dx_GetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f) {
+    g_dxRealFeat2(pd, f);
+    if (f) f->features.geometryShader = VK_TRUE;
+}
+static VkResult VKAPI_CALL dx_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, const VkAllocationCallbacks *al, VkDevice *dev) {
+    if (!ci) return g_dxRealCreate(pd, ci, al, dev);
+    VkPhysicalDeviceFeatures has; g_dxRealFeat(pd, &has);
+    VkDeviceCreateInfo c = *ci; VkPhysicalDeviceFeatures f;
+    if (ci->pEnabledFeatures) { f = *ci->pEnabledFeatures; vk_mask_features(&f, &has); c.pEnabledFeatures = &f; }
+    VkPhysicalDeviceFeatures2 *f2 = NULL; VkPhysicalDeviceFeatures saved;
+    for (VkBaseOutStructure *n = (VkBaseOutStructure *)ci->pNext; n; n = n->pNext)
+        if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) { f2 = (VkPhysicalDeviceFeatures2 *)n; break; }
+    if (f2) { saved = f2->features; vk_mask_features(&f2->features, &has); }
+    VkResult r = g_dxRealCreate(pd, &c, al, dev);
+    if (f2) f2->features = saved;
+    logmsg("DXVK: vkCreateDevice → %d", (int)r);
+    return r;
+}
+static void install_dxvk_hooks(void) {
+    static int done;
+    if (done) return;
+    if (!GetModuleHandleA("dxvk_d3d9.dll") && !GetModuleHandleA("dxvk_dxgi.dll")) return;
+    HMODULE wv = LoadLibraryA("winevulkan.dll");
+    if (!wv) return;
+    done = 1;
+    static const char *fn[] = { "vkGetPhysicalDeviceFeatures", "vkGetPhysicalDeviceFeatures2", "vkCreateDevice" };
+    for (int i = 0; i < 3; i++) {   /* (las tres o ninguna) */
+        unsigned char *p = (unsigned char *)GetProcAddress(wv, fn[i]);
+        if (!p || memcmp(p, "\x66\x90\x55\x89\xe5", 5)) { logmsg("DXVK: %s no tiene el comienzo esperado: no se toca", fn[i]); return; }
+    }
+    void *a = hot_hook((void *)GetProcAddress(wv, "vkGetPhysicalDeviceFeatures"), (void *)dx_GetPhysicalDeviceFeatures);
+    void *b = hot_hook((void *)GetProcAddress(wv, "vkGetPhysicalDeviceFeatures2"), (void *)dx_GetPhysicalDeviceFeatures2);
+    void *c = hot_hook((void *)GetProcAddress(wv, "vkCreateDevice"), (void *)dx_CreateDevice);
+    memcpy(&g_dxRealFeat, &a, sizeof a); memcpy(&g_dxRealFeat2, &b, sizeof b); memcpy(&g_dxRealCreate, &c, sizeof c);
+    logmsg("DXVK: GPU presentada con geometryShader (%s, %s, %s)", a ? "sí" : "no", b ? "sí" : "no", c ? "sí" : "no");
+}
+#else
+static void install_dxvk_hooks(void) {}
+#endif
 
 /* Se instala una vez, cuando el juego usa Vulkan con nuestro runtime (en el .exe del juego) */
 static void install_vulkan_hook(void) {

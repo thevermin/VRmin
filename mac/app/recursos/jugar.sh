@@ -35,6 +35,7 @@ find "$WINEPREFIX/drive_c/users/"*/AppData/LocalLow -maxdepth 3 -type f \( -name
 # Siempre la última versión de nuestro runtime
 mkdir -p "$WINEPREFIX/drive_c/questvrbridge"
 cp "$RES/openxr/questvrbridge_openxr.dll" "$RES/openxr/questvrbridge_openxr.json" "$WINEPREFIX/drive_c/questvrbridge/"
+[ -f "$RES/openxr/questvrbridge_openxr32.dll" ] && cp "$RES/openxr/questvrbridge_openxr32.dll" "$RES/openxr/questvrbridge_openxr32.json" "$WINEPREFIX/drive_c/questvrbridge/"
 preparar_runtime "$RUNTIME" 2>&1 | tee -a "$LOG"
 gpu_luid_dxmt 2>&1 | tee -a "$LOG"
 

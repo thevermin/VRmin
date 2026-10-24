@@ -113,6 +113,11 @@ Q="$WINEPREFIX/drive_c/questvrbridge"
 mkdir -p "$Q"
 cp "$RES/openxr/questvrbridge_openxr.dll" "$RES/openxr/questvrbridge_openxr.json" "$Q/"
 "$WINE" reg add 'HKLM\Software\Khronos\OpenXR\1' /v ActiveRuntime /t REG_SZ /d 'C:\questvrbridge\questvrbridge_openxr.json' /f
+# (y el de 32 bits, para juegos de 32 bits; jugar.sh baja OpenComposite de 32 bits la primera vez)
+if [ -f "$RES/openxr/questvrbridge_openxr32.dll" ]; then
+  cp "$RES/openxr/questvrbridge_openxr32.dll" "$RES/openxr/questvrbridge_openxr32.json" "$Q/"
+  "$WINE" reg add 'HKLM\Software\Wow6432Node\Khronos\OpenXR\1' /v ActiveRuntime /t REG_SZ /d 'C:\questvrbridge\questvrbridge_openxr32.json' /f && touch "$Q/.runtime32"
+fi
 "$WINESERVER" -w
 
 paso "OpenComposite (para juegos de SteamVR/OpenVR)" "OpenComposite (for SteamVR/OpenVR games)"
