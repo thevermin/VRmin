@@ -1789,6 +1789,7 @@ static unsigned char h_ocState(void *self, uint32_t dev, void *st, uint32_t cb) 
             if (next == g_evHead) continue;   /* (cola llena) */
             g_evq[g_evTail].type = k ? ((now & m) ? 202 : 203) : ((now & m) ? 200 : 201);
             g_evq[g_evTail].dev = dev; g_evq[g_evTail].button = (uint32_t)bit; g_evTail = next;
+            { static LONG nq; if (InterlockedIncrement(&nq) < 60) logmsg("Diagnóstico eventos: en cola tipo %u disp %u botón %d (controles reales hace %.1f s)", g_evq[(g_evTail + 63) % 64].type, dev, bit, (now_ns() - g_realBindingsAt) / 1e9); }
         }
     }
     g_prevPressed[dev] = pr; g_prevTouched[dev] = tc;
@@ -1804,6 +1805,7 @@ static int ev_synth(void *self, void *ev, uint32_t cb) {
         uint8_t *e = (uint8_t *)ev; memset(e, 0, cb);
         memcpy(e + 0, &g_evq[g_evHead].type, 4); memcpy(e + 4, &g_evq[g_evHead].dev, 4);
         memcpy(e + 16, &g_evq[g_evHead].button, 4);   /* (VREvent_t: tipo, dispositivo, edad, y el botón a los 16 bytes) */
+        { static LONG nd; if (InterlockedIncrement(&nd) < 60) logmsg("Diagnóstico eventos: entregado tipo %u disp %u botón %u (cola %d→%d, tamaño %u)", g_evq[g_evHead].type, g_evq[g_evHead].dev, g_evq[g_evHead].button, g_evHead, g_evTail, cb); }
         g_evHead = (g_evHead + 1) % 64; got = 1;
     }
     LeaveCriticalSection(&g_evLock);
@@ -1812,6 +1814,7 @@ static int ev_synth(void *self, void *ev, uint32_t cb) {
 }
 static void ev_seen(void *ev) {
     uint32_t ty; memcpy(&ty, ev, 4);
+    { static LONG ns; uint32_t d; memcpy(&d, (uint8_t *)ev + 4, 4); if (InterlockedIncrement(&ns) < 80) logmsg("Diagnóstico eventos: OpenComposite mandó tipo %u disp %u", ty, d); }
     if ((ty == 200 || ty == 201) && !g_ocSendsButtons) { g_ocSendsButtons = 1; logmsg("OpenComposite ya manda eventos de botones: no hace falta armarlos"); }
 }
 static unsigned char h_ocPoll(void *self, void *ev, uint32_t cb) {
