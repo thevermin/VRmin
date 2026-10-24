@@ -1194,12 +1194,20 @@ static XrResult ext_string(const char *str, uint32_t cap, uint32_t *count, char 
     return XR_SUCCESS;
 }
 
-/* (no hace falta ninguna extensión de Vulkan: la imagen se lee con una copia común) */
+/* (no hace falta ninguna extensión de Vulkan: la imagen se lee con una copia común. En 32 bits igual se nombran
+ *  algunas que la Mac tiene: Half-Life 2: VR Mod convertía la lista vacía en una extensión sin nombre y se cerraba) */
+#ifdef _WIN64
+#define VK_EXT_INST ""
+#define VK_EXT_DEV ""
+#else
+#define VK_EXT_INST "VK_KHR_external_memory_capabilities VK_KHR_get_physical_device_properties2"
+#define VK_EXT_DEV "VK_KHR_external_memory"
+#endif
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetVulkanInstanceExtensionsKHR(XrInstance i, XrSystemId id, uint32_t cap, uint32_t *count, char *buf) {
-    (void)i; (void)id; install_vulkan_hook(); return ext_string("", cap, count, buf);
+    (void)i; (void)id; install_vulkan_hook(); return ext_string(VK_EXT_INST, cap, count, buf);
 }
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetVulkanDeviceExtensionsKHR(XrInstance i, XrSystemId id, uint32_t cap, uint32_t *count, char *buf) {
-    (void)i; (void)id; return ext_string("", cap, count, buf);
+    (void)i; (void)id; return ext_string(VK_EXT_DEV, cap, count, buf);
 }
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetVulkanGraphicsDeviceKHR(XrInstance i, XrSystemId id, VkInstance inst, VkPhysicalDevice *out) {
     (void)i; (void)id;
@@ -2293,7 +2301,7 @@ static void fill_velocity(void *next, const Track *t, const Space *sp, XrPosef b
 }
 
 static LONG g_dgLocOk, g_dgLocBad, g_dgPoseOn[3], g_dgPoseOff[3];
-static LONG g_dgPoseHit, g_dgPoseMiss;   /* (diagnóstico: cuadros con la pose con la que se dibujaron / sin ella) */   /* (diagnóstico de controles) */
+static LONG g_dgPoseHit, g_dgPoseMiss, g_dgPoseFix;   /* (diagnóstico: cuadros con la pose con la que se dibujaron / sin ella) */   /* (diagnóstico de controles) */
 static Track track_for_time(XrTime time);
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation *loc) {
     g_inside = "xrLocateSpace";
@@ -2888,6 +2896,38 @@ static DWORD WINAPI vk_reader(void *arg) {
     return 0;
 }
 
+/* Con qué pose se dibujó el cuadro: la que el juego dice en la capa (la pose de cada ojo). Se busca entre las
+ * últimas poses entregadas la que coincide; si ninguna coincide, la del momento del cuadro. DOOM VFR dibuja con una
+ * pose de un cuadro antes que el momento que informa: el visor corregía con la equivocada y la imagen temblaba. */
+static uint32_t pose_id_for_layer(const XrCompositionLayerProjection *pl, XrTime displayTime) {
+    uint32_t id;
+    EnterCriticalSection(&g_lock);
+    id = g_track.id;
+    int hit = -1;
+    for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].time == displayTime) { id = g_poseHist[hh].id; hit = hh; break; }
+    InterlockedIncrement(hit >= 0 ? &g_dgPoseHit : &g_dgPoseMiss);
+    if (!g_vigia && pl->space) {
+        int best = -1; float bd = 1e9f, dHit = 1e9f;
+        for (int hh = 0; hh < POSE_HIST; hh++) {
+            const Track *tr = &g_poseTrack[hh];
+            if (!g_poseHist[hh].time || !tr->valid) continue;
+            int vb;
+            XrPosef eye = pmul(space_world((const Space *)pl->space, tr, &vb), pl->views[0].pose);
+            if (!vb) continue;
+            const XrQuaternionf a = eye.orientation, b = tr->eye[0].orientation;
+            float dot = fabsf(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w);
+            float dx = eye.position.x - tr->eye[0].position.x, dy = eye.position.y - tr->eye[0].position.y, dz = eye.position.z - tr->eye[0].position.z;
+            float d = (1.0f - dot) + (dx * dx + dy * dy + dz * dz);
+            if (hh == hit) dHit = d;
+            if (d < bd) { bd = d; best = hh; }
+        }
+        /* (coincide de verdad: menos de ~0,5° y ~5 mm de diferencia) */
+        if (best >= 0 && bd < 4e-5f && dHit >= 4e-5f) { id = g_poseHist[best].id; InterlockedIncrement(&g_dgPoseFix); }
+    }
+    LeaveCriticalSection(&g_lock);
+    return id;
+}
+
 /* Vulkan: copia los dos ojos (en la GPU) a memoria que se puede leer, lado a lado; lee la del cuadro
    anterior (ya terminó en la GPU) y la pasa a la memoria compartida con la Mac */
 static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, XrTime displayTime) {
@@ -2995,12 +3035,7 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, XrTi
         vk.DestroyFence(s->vkDev, s->vkFence[k], NULL); vk.CreateFence(s->vkDev, &fi, NULL, &s->vkFence[k]);
         InterlockedIncrement(&g_mapFail); return;
     }
-    uint32_t id = 0;
-    EnterCriticalSection(&g_lock);
-    id = g_track.id;
-    { int hit = 0; for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].time == displayTime) { id = g_poseHist[hh].id; hit = 1; break; }
-      InterlockedIncrement(hit ? &g_dgPoseHit : &g_dgPoseMiss); }
-    LeaveCriticalSection(&g_lock);
+    uint32_t id = pose_id_for_layer(pl, displayTime);
     s->stPose[k] = id; s->stValid[k] = 1; s->stFlip[k] = flip;
     s->stNext = (k + 1) % STAGES;
 
@@ -3178,9 +3213,9 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
         logmsg("Diagnóstico controles: ubicaciones bien %ld / mal %ld · pose activa (sin mano/izq/der) %ld/%ld/%ld, inactiva %ld/%ld/%ld · manos válidas izq %d der %d",
                g_dgLocOk, g_dgLocBad, g_dgPoseOn[0], g_dgPoseOn[1], g_dgPoseOn[2], g_dgPoseOff[0], g_dgPoseOff[1], g_dgPoseOff[2], g_track.handValid[0], g_track.handValid[1]);
         g_dgLocOk = g_dgLocBad = 0; for (int q = 0; q < 3; q++) g_dgPoseOn[q] = g_dgPoseOff[q] = 0;
-        if (g_dgPoseHit + g_dgPoseMiss) logmsg("Diagnóstico poses: %ld cuadros con su pose, %ld sin ella · espera de la copia %.1f ms promedio",
-                                               g_dgPoseHit, g_dgPoseMiss, g_nCopy ? g_sumMap / g_nCopy : 0.0);
-        g_dgPoseHit = g_dgPoseMiss = 0;
+        if (g_dgPoseHit + g_dgPoseMiss) logmsg("Diagnóstico poses: %ld cuadros con su pose, %ld sin ella · %ld corregidos con la pose de la capa · espera de la copia %.1f ms promedio",
+                                               g_dgPoseHit, g_dgPoseMiss, g_dgPoseFix, g_nCopy ? g_sumMap / g_nCopy : 0.0);
+        g_dgPoseHit = g_dgPoseMiss = g_dgPoseFix = 0;
         g_statSubmitted = g_statSent = g_statBusy = 0;
         g_skipNoSock = g_skipFmt = g_mapFail = g_noProj = g_layers = 0;
         g_statT0 = tnow;
