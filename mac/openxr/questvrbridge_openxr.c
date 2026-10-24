@@ -3527,8 +3527,7 @@ static VkResult VKAPI_CALL hook_vkCreateDevice(VkPhysicalDevice pd, const VkDevi
 
 /* DOOM VFR en la Mac:
  * - Sus shaders escriben gl_CullDistance, y la traducción de MoltenVK a Metal falla con eso (el shader no compila y
- *   todo queda negro). Se cambia CullDistance por ClipDistance en el SPIR-V (la Mac sí lo tiene): los triángulos
- *   que se iban a descartar enteros se recortan, que a la vista es casi lo mismo.
+ *   todo queda negro): ver spv_redirect_cull.
  * - Usa profundidad de 24 bits (X8_D24), que las GPU de Apple no tienen: se usa 32 bits (D32_SFLOAT). */
 static PFN_vkCreateShaderModule g_origVkCreateShaderModule;
 static PFN_vkCreateImage g_origVkCreateImage;
@@ -3539,45 +3538,66 @@ static VkFormat vk_fix_format(VkFormat f) {
     if (f == VK_FORMAT_D24_UNORM_S8_UINT) return VK_FORMAT_D32_SFLOAT_S8_UINT;
     return f;
 }
+/* gl_PerVertex de DOOM: escribe primero la «cull distance» y después la «clip distance». MoltenVK no sabe traducir
+ * la cull (el shader no compila → negro). Las escrituras a la cull se mandan a la clip (que igual se sobreescribe
+ * enseguida), y así la cull queda sin usar y MoltenVK no la emite. Probado con SPIRV-Cross sobre shaders de DOOM. */
+static int spv_redirect_cull(uint32_t *c, size_t n) {
+    enum { MX = 16, MC = 512 };
+    uint32_t sId[MX], sCull[MX], sClip[MX]; int ns = 0;
+    uint32_t pId[MX], pS[MX]; int np = 0;
+    uint32_t vId[MX], vS[MX]; int nv = 0;
+    uint32_t kId[MC], kT[MC], kV[MC]; int nk = 0;
+    for (size_t i = 5; i < n; ) {   /* structs con cull y clip */
+        uint32_t op = c[i] & 0xFFFF, wc = c[i] >> 16; if (!wc || i + wc > n) return 0;
+        if (op == 72 && wc >= 5 && c[i + 3] == 11 && (c[i + 4] == 3 || c[i + 4] == 4)) {
+            int k = 0; while (k < ns && sId[k] != c[i + 1]) k++;
+            if (k == ns) { if (ns == MX) return 0; sId[ns] = c[i + 1]; sCull[ns] = sClip[ns] = 0xFFFFFFFF; ns++; }
+            if (c[i + 4] == 4) sCull[k] = c[i + 2]; else sClip[k] = c[i + 2];
+        }
+        i += wc;
+    }
+    for (size_t i = 5; i < n; ) {   /* punteros, variables y constantes enteras */
+        uint32_t op = c[i] & 0xFFFF, wc = c[i] >> 16;
+        if (op == 32 && wc == 4) for (int k = 0; k < ns; k++) if (sId[k] == c[i + 3] && np < MX) { pId[np] = c[i + 1]; pS[np++] = k; }
+        if (op == 59 && wc >= 4) for (int k = 0; k < np; k++) if (pId[k] == c[i + 1] && nv < MX) { vId[nv] = c[i + 2]; vS[nv++] = pS[k]; }
+        if (op == 43 && wc == 4 && nk < MC) { kT[nk] = c[i + 1]; kId[nk] = c[i + 2]; kV[nk++] = c[i + 3]; }
+        i += wc;
+    }
+    int cambios = 0;
+    for (size_t i = 5; i < n; ) {   /* OpAccessChain / OpInBoundsAccessChain a la cull → a la clip */
+        uint32_t op = c[i] & 0xFFFF, wc = c[i] >> 16;
+        if ((op == 65 || op == 66) && wc >= 5)
+            for (int k = 0; k < nv; k++) {
+                if (vId[k] != c[i + 3]) continue;
+                int s = vS[k]; if (sCull[s] == 0xFFFFFFFF || sClip[s] == 0xFFFFFFFF) break;
+                int ki = -1; for (int q = 0; q < nk; q++) if (kId[q] == c[i + 4]) { ki = q; break; }
+                if (ki < 0 || kV[ki] != sCull[s]) break;
+                for (int q = 0; q < nk; q++) if (kT[q] == kT[ki] && kV[q] == sClip[s]) { c[i + 4] = kId[q]; cambios++; break; }
+                break;
+            }
+        i += wc;
+    }
+    return cambios;
+}
 static VkResult VKAPI_CALL hook_vkCreateShaderModule(VkDevice d, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *al, VkShaderModule *sm) {
     if (!ci || ci->codeSize < 20 || ci->pCode[0] != 0x07230203) return g_origVkCreateShaderModule(d, ci, al, sm);
     size_t n = ci->codeSize / 4; const uint32_t *w = ci->pCode;
     int usaCull = 0;
     for (size_t i = 5; i < n; ) {
         uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16; if (!wc || i + wc > n) break;
-        if ((op == 71 && wc >= 4 && w[i + 2] == 11 && w[i + 3] == 4) || (op == 72 && wc >= 5 && w[i + 3] == 11 && w[i + 4] == 4)) usaCull = 1;
+        if (op == 72 && wc >= 5 && w[i + 3] == 11 && w[i + 4] == 4) usaCull = 1;
         i += wc;
     }
     if (!usaCull) return g_origVkCreateShaderModule(d, ci, al, sm);
     uint32_t *c = (uint32_t *)malloc(ci->codeSize);
     if (!c) return g_origVkCreateShaderModule(d, ci, al, sm);
     memcpy(c, w, ci->codeSize);
-    for (size_t i = 5; i < n; ) {
-        uint32_t op = c[i] & 0xFFFF, wc = c[i] >> 16; if (!wc || i + wc > n) break;
-        uint32_t *v = NULL;
-        if (op == 71 && wc >= 4 && c[i + 2] == 11) v = &c[i + 3];
-        if (op == 72 && wc >= 5 && c[i + 3] == 11) v = &c[i + 4];
-        /* Todo CullDistance pasa a ser ClipDistance (sin intercambiar: si queda algún CullDistance en el bloque,
-         * aunque no se use, la traducción de MoltenVK igual se rompe; el ClipDistance que el juego no usa no molesta) */
-        if (v && *v == 4) *v = 3;
-        i += wc;
-    }
+    int cambios = spv_redirect_cull(c, n);
     VkShaderModuleCreateInfo c2 = *ci; c2.pCode = c;
-    VkResult r = g_origVkCreateShaderModule(d, &c2, al, sm);
-    {   /* (diagnóstico: los primeros, antes y después, para revisarlos) */
-        static LONG nd; LONG k = InterlockedIncrement(&nd);
-        if (k <= 3) {
-            CreateDirectoryA("C:\\questvrbridge\\shaders", NULL);
-            char nom[80]; FILE *fs;
-            snprintf(nom, sizeof nom, "C:\\questvrbridge\\shaders\\vk_%ld_antes.spv", k);
-            if ((fs = fopen(nom, "wb"))) { fwrite(w, 1, ci->codeSize, fs); fclose(fs); }
-            snprintf(nom, sizeof nom, "C:\\questvrbridge\\shaders\\vk_%ld_despues.spv", k);
-            if ((fs = fopen(nom, "wb"))) { fwrite(c, 1, ci->codeSize, fs); fclose(fs); }
-        }
-        if (k % 50 == 0) logmsg("Vulkan: %ld shaders con gl_CullDistance cambiados", k);
-    }
+    VkResult r = g_origVkCreateShaderModule(d, cambios ? &c2 : ci, al, sm);
     free(c);
-    static LONG avisado; if (InterlockedIncrement(&avisado) == 1) logmsg("Vulkan: shaders con gl_CullDistance cambiados a gl_ClipDistance (MoltenVK no los traduce)");
+    static LONG nd; LONG k = InterlockedIncrement(&nd);
+    if (k == 1 || k % 100 == 0) logmsg("Vulkan: %ld shaders con gl_CullDistance arreglados para MoltenVK (último: %d escrituras)", k, cambios);
     return r;
 }
 static VkResult VKAPI_CALL hook_vkCreateImage(VkDevice d, const VkImageCreateInfo *ci, const VkAllocationCallbacks *al, VkImage *im) {
