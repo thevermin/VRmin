@@ -518,7 +518,24 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
     @Override public boolean gameHidden() { return gameHidden; }
     @Override public void showGame() { if (gameHidden) { gameHidden = false; nativeSetGameHidden(false); } }
     @Override public void exitVR() { nativeExitVR(); }
-    @Override public void quitApp() { finishAffinity(); new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> System.exit(0), 300); }
+    /// «Cerrar VRmin» desde Studio: el panel (MainActivity) corre en otro proceso y quedaba abierto. Se cierran
+    /// todas las tareas de la app y los otros procesos suyos, y después este.
+    @Override public void quitApp() {
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            for (android.app.ActivityManager.AppTask t : am.getAppTasks()) t.finishAndRemoveTask();
+        } catch (Exception ignored) { }
+        finishAffinity();
+        new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
+            try {
+                android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+                int me = android.os.Process.myPid();
+                for (android.app.ActivityManager.RunningAppProcessInfo p : am.getRunningAppProcesses())
+                    if (p.pid != me && p.processName.startsWith(getPackageName())) android.os.Process.killProcess(p.pid);
+            } catch (Exception ignored) { }
+            System.exit(0);
+        }, 300);
+    }
     @Override public void set3DMode(int mode) { nativeSet3DMode(mode); if (tv3dPaint != null) tv3dPaint.run(); }
     @Override public void set3DStrength(float s) { nativeSet3DStrength(s * MAX_3D); if (tv3dPaint != null) tv3dPaint.run(); }
     @Override public void setLeds(boolean on) { nativeSetLeds(on); }

@@ -1681,9 +1681,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     func applicationWillTerminate(_ notification: Notification) {
-        // (si algo se traba al apagar, la app igual se cierra del todo a los 5 s: no queda en el Dock)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 5) { exit(0) }
+        // (si algo se traba al apagar, la app igual se cierra del todo a los 4 s: no queda en segundo plano.
+        //  _exit y no exit: exit corre los destructores, y alguno puede quedar esperando a otro hilo)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 4) { _exit(0) }
         model?.stopServer(wait: true)
+        _exit(0)
     }
 }
 
