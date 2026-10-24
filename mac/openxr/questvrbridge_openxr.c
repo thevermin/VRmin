@@ -1766,23 +1766,34 @@ static struct { uint32_t type, dev, button; } g_evq[64];
 static int g_evHead, g_evTail;
 static CRITICAL_SECTION g_evLock; static INIT_ONCE g_evOnce = INIT_ONCE_STATIC_INIT;
 static BOOL CALLBACK ev_init(PINIT_ONCE o, PVOID p, PVOID *c) { (void)o; (void)p; (void)c; InitializeCriticalSection(&g_evLock); return TRUE; }
-static int ev_synth(void *self, void *ev, uint32_t cb) {
+/* Cuando el juego pregunta el estado de un control, los cambios de botones quedan anotados como eventos.
+ * (No se le pregunta nada a OpenComposite desde adentro de PollNextEvent: ahí reinicia su sesión y se rompe.) */
+static unsigned char h_ocState(void *self, uint32_t dev, void *st, uint32_t cb) {
+    unsigned char r = o_ocState(self, dev, st, cb);
+    if (!r || g_ocSendsButtons || dev >= 8 || !st || cb < 24) return r;
     InitOnceExecuteOnce(&g_evOnce, ev_init, NULL, NULL);
+    uint64_t pr, tc; memcpy(&pr, (uint8_t *)st + 8, 8); memcpy(&tc, (uint8_t *)st + 16, 8);
     EnterCriticalSection(&g_evLock);
-    if (g_evHead == g_evTail && o_ocState) {
-        for (uint32_t d = 1; d < 8; d++) {
-            uint8_t st[64]; memset(st, 0, sizeof st);
-            if (!o_ocState(self, d, st, 64)) continue;
-            uint64_t pr, tc; memcpy(&pr, st + 8, 8); memcpy(&tc, st + 16, 8);
-            for (int bit = 0; bit < 64; bit++) {
-                uint64_t m = 1ULL << bit;
-                if ((pr ^ g_prevPressed[d]) & m) { g_evq[g_evTail].type = (pr & m) ? 200 : 201; g_evq[g_evTail].dev = d; g_evq[g_evTail].button = (uint32_t)bit; g_evTail = (g_evTail + 1) % 64; }
-                if ((tc ^ g_prevTouched[d]) & m) { g_evq[g_evTail].type = (tc & m) ? 202 : 203; g_evq[g_evTail].dev = d; g_evq[g_evTail].button = (uint32_t)bit; g_evTail = (g_evTail + 1) % 64; }
-            }
-            g_prevPressed[d] = pr; g_prevTouched[d] = tc;
+    for (int bit = 0; bit < 64; bit++) {
+        uint64_t m = 1ULL << bit;
+        for (int k = 0; k < 2; k++) {
+            uint64_t now = k ? tc : pr, before = k ? g_prevTouched[dev] : g_prevPressed[dev];
+            if (!((now ^ before) & m)) continue;
+            int next = (g_evTail + 1) % 64;
+            if (next == g_evHead) continue;   /* (cola llena) */
+            g_evq[g_evTail].type = k ? ((now & m) ? 202 : 203) : ((now & m) ? 200 : 201);
+            g_evq[g_evTail].dev = dev; g_evq[g_evTail].button = (uint32_t)bit; g_evTail = next;
         }
     }
+    g_prevPressed[dev] = pr; g_prevTouched[dev] = tc;
+    LeaveCriticalSection(&g_evLock);
+    return r;
+}
+static int ev_synth(void *self, void *ev, uint32_t cb) {
+    (void)self;
+    InitOnceExecuteOnce(&g_evOnce, ev_init, NULL, NULL);
     int got = 0;
+    EnterCriticalSection(&g_evLock);
     if (g_evHead != g_evTail && ev && cb >= 20) {
         uint8_t *e = (uint8_t *)ev; memset(e, 0, cb);
         memcpy(e + 0, &g_evq[g_evHead].type, 4); memcpy(e + 4, &g_evq[g_evHead].dev, 4);
@@ -1845,8 +1856,8 @@ static void fix_opencomposite_events(unsigned char *b) {
     void **sPose = oc_vtable_slot(b, "CVRSystem_017::PollNextEventWithPose");
     void **sState = oc_vtable_slot(b, "CVRSystem_017::GetControllerState");
     if (!sPoll || !sPose || !sState) { logmsg("OpenComposite: no encontré dónde armar los eventos de botones"); return; }
-    o_ocState = (PFN_ocState)*sState;
     void *o;
+    if (oc_patch_slot(sState, (void *)h_ocState, &o)) memcpy(&o_ocState, &o, sizeof o);
     if (oc_patch_slot(sPoll, (void *)h_ocPoll, &o)) memcpy(&o_ocPoll, &o, sizeof o);
     if (oc_patch_slot(sPose, (void *)h_ocPollPose, &o)) memcpy(&o_ocPollPose, &o, sizeof o);
     logmsg("OpenComposite: eventos de botones listos para armar si hacen falta");
