@@ -1935,7 +1935,7 @@ static void fix_opencomposite_models(const char *app) {
         ocm_replace(s, sz, "Oculus Quest2", "Oculus Rift S");
     }
     fix_opencomposite_events(b);
-    fix_opencomposite_connected(b);
+    (void)fix_opencomposite_connected;   /* (apagado: con los controles forzados Earth dejaba de dibujarlos) */
 }
 
 /* El wininet de Wine se rompe si el juego cierra una conexión mientras sus pedidos siguen abiertos en otros
@@ -2171,6 +2171,7 @@ static void fill_velocity(void *next, const Track *t, const Space *sp, XrPosef b
     }
 }
 
+static LONG g_dgLocOk, g_dgLocBad, g_dgPoseOn[3], g_dgPoseOff[3];   /* (diagnóstico de controles) */
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation *loc) {
     g_inside = "xrLocateSpace";
     Track t;
@@ -2180,6 +2181,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateSpace(XrSpace space, XrSpace baseSpace
     XrPosef a = space_world((Space *)space, &t, &v1);
     XrPosef b = space_world((Space *)baseSpace, &t, &v2);
     loc->pose = pmul(pinv(b), a);
+    if (((Space *)space)->action) { if (v1 && v2) InterlockedIncrement(&g_dgLocOk); else InterlockedIncrement(&g_dgLocBad); }
     if (v1 && v2)
         loc->locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT |
                              XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
@@ -3006,6 +3008,9 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
         logmsg("Juego: %.0f cuadros/s dibujados, %.0f/s enviados a la Mac, %.0f/s descartados (red ocupada)%s | sin conexión %ld, formato %ld, lectura GPU falló %ld (0x%08lx) | cuadros sin imagen 3D %ld, capas %ld",
                g_statSubmitted / secs, g_statSent / secs, g_statBusy / secs, g_sock == INVALID_SOCKET ? " [SIN CONEXIÓN]" : "",
                (long)g_skipNoSock, (long)g_skipFmt, (long)g_mapFail, (unsigned long)g_lastMapHr, (long)g_noProj, (long)g_layers);
+        logmsg("Diagnóstico controles: ubicaciones bien %ld / mal %ld · pose activa (sin mano/izq/der) %ld/%ld/%ld, inactiva %ld/%ld/%ld · manos válidas izq %d der %d",
+               g_dgLocOk, g_dgLocBad, g_dgPoseOn[0], g_dgPoseOn[1], g_dgPoseOn[2], g_dgPoseOff[0], g_dgPoseOff[1], g_dgPoseOff[2], g_track.handValid[0], g_track.handValid[1]);
+        g_dgLocOk = g_dgLocBad = 0; for (int q = 0; q < 3; q++) g_dgPoseOn[q] = g_dgPoseOff[q] = 0;
         g_statSubmitted = g_statSent = g_statBusy = 0;
         g_skipNoSock = g_skipFmt = g_mapFail = g_noProj = g_layers = 0;
         g_statT0 = tnow;
@@ -3201,6 +3206,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetActionStatePose(XrSession s, const XrActi
     int si = get_si(a, gi->subactionPath); if (si < 0) return XR_ERROR_PATH_UNSUPPORTED;
     EnterCriticalSection(&g_lock);
     st->isActive = a->active[si];
+    if (st->isActive) InterlockedIncrement(&g_dgPoseOn[si]); else InterlockedIncrement(&g_dgPoseOff[si]);
     LeaveCriticalSection(&g_lock);
     return XR_SUCCESS;
 }
