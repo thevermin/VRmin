@@ -431,9 +431,12 @@ final class AppModel: ObservableObject {
                     let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
                     ps.waitUntilExit()
                     for line in out.split(separator: "\n") {
-                        guard let r = line.range(of: "steamapps\\common\\", options: .caseInsensitive) else { continue }
-                        let rest = line[r.upperBound...]
-                        if let e = rest.firstIndex(of: "\\") { open.insert(String(rest[..<e]).lowercased()) }
+                        // (por Steam: ruta de Windows con «\»; abierto directo: ruta de la Mac con «/»)
+                        for sep: Character in ["\\", "/"] {
+                            guard let r = line.range(of: "steamapps\(sep)common\(sep)", options: .caseInsensitive) else { continue }
+                            let rest = line[r.upperBound...]
+                            if let e = rest.firstIndex(of: sep) { open.insert(String(rest[..<e]).lowercased()) }
+                        }
                     }
                 }
             }
