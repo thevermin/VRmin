@@ -3525,6 +3525,65 @@ static VkResult VKAPI_CALL hook_vkCreateDevice(VkPhysicalDevice pd, const VkDevi
     return r;
 }
 
+/* DOOM VFR en la Mac:
+ * - Sus shaders escriben gl_CullDistance, y la traducción de MoltenVK a Metal falla con eso (el shader no compila y
+ *   todo queda negro). Se cambia CullDistance por ClipDistance en el SPIR-V (la Mac sí lo tiene): los triángulos
+ *   que se iban a descartar enteros se recortan, que a la vista es casi lo mismo.
+ * - Usa profundidad de 24 bits (X8_D24), que las GPU de Apple no tienen: se usa 32 bits (D32_SFLOAT). */
+static PFN_vkCreateShaderModule g_origVkCreateShaderModule;
+static PFN_vkCreateImage g_origVkCreateImage;
+static PFN_vkCreateImageView g_origVkCreateImageView;
+static PFN_vkCreateRenderPass g_origVkCreateRenderPass;
+static VkFormat vk_fix_format(VkFormat f) {
+    if (f == VK_FORMAT_X8_D24_UNORM_PACK32) return VK_FORMAT_D32_SFLOAT;
+    if (f == VK_FORMAT_D24_UNORM_S8_UINT) return VK_FORMAT_D32_SFLOAT_S8_UINT;
+    return f;
+}
+static VkResult VKAPI_CALL hook_vkCreateShaderModule(VkDevice d, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *al, VkShaderModule *sm) {
+    if (!ci || ci->codeSize < 20 || ci->pCode[0] != 0x07230203) return g_origVkCreateShaderModule(d, ci, al, sm);
+    size_t n = ci->codeSize / 4; const uint32_t *w = ci->pCode;
+    int usaCull = 0;
+    for (size_t i = 5; i < n; ) {
+        uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16; if (!wc || i + wc > n) break;
+        if ((op == 71 && wc >= 4 && w[i + 2] == 11 && w[i + 3] == 4) || (op == 72 && wc >= 5 && w[i + 3] == 11 && w[i + 4] == 4)) usaCull = 1;
+        i += wc;
+    }
+    if (!usaCull) return g_origVkCreateShaderModule(d, ci, al, sm);
+    uint32_t *c = (uint32_t *)malloc(ci->codeSize);
+    if (!c) return g_origVkCreateShaderModule(d, ci, al, sm);
+    memcpy(c, w, ci->codeSize);
+    for (size_t i = 5; i < n; ) {
+        uint32_t op = c[i] & 0xFFFF, wc = c[i] >> 16; if (!wc || i + wc > n) break;
+        uint32_t *v = NULL;
+        if (op == 71 && wc >= 4 && c[i + 2] == 11) v = &c[i + 3];
+        if (op == 72 && wc >= 5 && c[i + 3] == 11) v = &c[i + 4];
+        if (v && (*v == 3 || *v == 4)) *v = 7 - *v;   /* ClipDistance (3) ↔ CullDistance (4) */
+        i += wc;
+    }
+    VkShaderModuleCreateInfo c2 = *ci; c2.pCode = c;
+    VkResult r = g_origVkCreateShaderModule(d, &c2, al, sm);
+    free(c);
+    static LONG avisado; if (InterlockedIncrement(&avisado) == 1) logmsg("Vulkan: shaders con gl_CullDistance cambiados a gl_ClipDistance (MoltenVK no los traduce)");
+    return r;
+}
+static VkResult VKAPI_CALL hook_vkCreateImage(VkDevice d, const VkImageCreateInfo *ci, const VkAllocationCallbacks *al, VkImage *im) {
+    if (ci && vk_fix_format(ci->format) != ci->format) { VkImageCreateInfo c = *ci; c.format = vk_fix_format(ci->format); return g_origVkCreateImage(d, &c, al, im); }
+    return g_origVkCreateImage(d, ci, al, im);
+}
+static VkResult VKAPI_CALL hook_vkCreateImageView(VkDevice d, const VkImageViewCreateInfo *ci, const VkAllocationCallbacks *al, VkImageView *iv) {
+    if (ci && vk_fix_format(ci->format) != ci->format) { VkImageViewCreateInfo c = *ci; c.format = vk_fix_format(ci->format); return g_origVkCreateImageView(d, &c, al, iv); }
+    return g_origVkCreateImageView(d, ci, al, iv);
+}
+static VkResult VKAPI_CALL hook_vkCreateRenderPass(VkDevice d, const VkRenderPassCreateInfo *ci, const VkAllocationCallbacks *al, VkRenderPass *rp) {
+    if (!ci || !ci->attachmentCount || ci->attachmentCount > 32) return g_origVkCreateRenderPass(d, ci, al, rp);
+    VkAttachmentDescription a[32]; int cambia = 0;
+    for (uint32_t i = 0; i < ci->attachmentCount; i++) { a[i] = ci->pAttachments[i]; VkFormat f = vk_fix_format(a[i].format); if (f != a[i].format) { a[i].format = f; cambia = 1; } }
+    if (!cambia) return g_origVkCreateRenderPass(d, ci, al, rp);
+    VkRenderPassCreateInfo c = *ci; c.pAttachments = a;
+    static LONG avisado; if (InterlockedIncrement(&avisado) == 1) logmsg("Vulkan: profundidad de 24 bits cambiada a 32 bits (la GPU de la Mac no tiene la de 24)");
+    return g_origVkCreateRenderPass(d, &c, al, rp);
+}
+
 /* MoltenVK contesta VK_SUBOPTIMAL_KHR cuando la ventana del juego no tiene justo el tamaño de su swapchain (pasa con
  * las pantallas Retina), y DOOM VFR lo toma como error fatal y se cierra. Es un aviso, no un error: se pasa como
  * VK_SUCCESS (la imagen se puede usar igual). */
@@ -3579,6 +3638,10 @@ static void install_vulkan_hook(void) {
     else g_origVkGDPA = (PFN_vkGetDeviceProcAddr)(void (*)(void))GetProcAddress(vk1, "vkGetDeviceProcAddr");
     if (patch_iat(exe, "vulkan-1.dll", "vkAcquireNextImageKHR", (void *)hook_vkAcquireNextImageKHR, &o)) g_origVkAcquire = (PFN_vkAcquireNextImageKHR)o;
     if (patch_iat(exe, "vulkan-1.dll", "vkQueuePresentKHR", (void *)hook_vkQueuePresentKHR, &o)) g_origVkPresent = (PFN_vkQueuePresentKHR)o;
+    if (patch_iat(exe, "vulkan-1.dll", "vkCreateShaderModule", (void *)hook_vkCreateShaderModule, &o)) g_origVkCreateShaderModule = (PFN_vkCreateShaderModule)o;
+    if (patch_iat(exe, "vulkan-1.dll", "vkCreateImage", (void *)hook_vkCreateImage, &o)) g_origVkCreateImage = (PFN_vkCreateImage)o;
+    if (patch_iat(exe, "vulkan-1.dll", "vkCreateImageView", (void *)hook_vkCreateImageView, &o)) g_origVkCreateImageView = (PFN_vkCreateImageView)o;
+    if (patch_iat(exe, "vulkan-1.dll", "vkCreateRenderPass", (void *)hook_vkCreateRenderPass, &o)) g_origVkCreateRenderPass = (PFN_vkCreateRenderPass)o;
     logmsg("Vulkan: ajuste de funciones de la GPU instalado (vkCreateDevice %s, vkGetInstanceProcAddr %s)", a ? "sí" : "no", b ? "sí" : "no");
 }
 
