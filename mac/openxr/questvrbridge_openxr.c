@@ -3558,10 +3558,28 @@ static VkResult VKAPI_CALL hook_vkCreateShaderModule(VkDevice d, const VkShaderM
         if (op == 71 && wc >= 4 && c[i + 2] == 11) v = &c[i + 3];
         if (op == 72 && wc >= 5 && c[i + 3] == 11) v = &c[i + 4];
         if (v && (*v == 3 || *v == 4)) *v = 7 - *v;   /* ClipDistance (3) ↔ CullDistance (4) */
+        /* (y los nombres de depuración, que MoltenVK usa para nombrar las salidas: mismo largo, se cambian en el lugar) */
+        if ((op == 5 && wc >= 3) || (op == 6 && wc >= 4)) {
+            char *s = (char *)&c[i + (op == 5 ? 2 : 3)]; size_t max = (wc - (op == 5 ? 2 : 3)) * 4;
+            if (max >= 16 && !strncmp(s, "gl_CullDistance", 16)) memcpy(s, "gl_ClipDistance", 15);
+            else if (max >= 16 && !strncmp(s, "gl_ClipDistance", 16)) memcpy(s, "gl_CullDistance", 15);
+        }
         i += wc;
     }
     VkShaderModuleCreateInfo c2 = *ci; c2.pCode = c;
     VkResult r = g_origVkCreateShaderModule(d, &c2, al, sm);
+    {   /* (diagnóstico: los primeros, antes y después, para revisarlos) */
+        static LONG nd; LONG k = InterlockedIncrement(&nd);
+        if (k <= 3) {
+            CreateDirectoryA("C:\\questvrbridge\\shaders", NULL);
+            char nom[80]; FILE *fs;
+            snprintf(nom, sizeof nom, "C:\\questvrbridge\\shaders\\vk_%ld_antes.spv", k);
+            if ((fs = fopen(nom, "wb"))) { fwrite(w, 1, ci->codeSize, fs); fclose(fs); }
+            snprintf(nom, sizeof nom, "C:\\questvrbridge\\shaders\\vk_%ld_despues.spv", k);
+            if ((fs = fopen(nom, "wb"))) { fwrite(c, 1, ci->codeSize, fs); fclose(fs); }
+        }
+        if (k % 50 == 0) logmsg("Vulkan: %ld shaders con gl_CullDistance cambiados", k);
+    }
     free(c);
     static LONG avisado; if (InterlockedIncrement(&avisado) == 1) logmsg("Vulkan: shaders con gl_CullDistance cambiados a gl_ClipDistance (MoltenVK no los traduce)");
     return r;
