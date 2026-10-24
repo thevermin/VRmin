@@ -567,6 +567,13 @@ final class AppModel: ObservableObject {
         if p.isRunning { p.terminate() }
     }
 
+    /// Al cerrar la app: nada de lo que vive dentro de ella queda corriendo (renderizador, servidor, grabación)
+    func killAllHelpers() {
+        let b = Bundle.main.bundlePath.replacingOccurrences(of: "'", with: "'\\''")
+        // («Resource[s]»: así el propio comando no coincide consigo mismo)
+        shell("pkill -f '\(b)/Contents/Resource[s]/'; pkill -f 'qvb/server[.]py'; pkill -f 'qvb/QuestRendere[r]'; sleep 0.2; pkill -9 -f '\(b)/Contents/Resource[s]/'", timeout: 2)
+    }
+
     private func killLeftovers() {
         shell("pkill -f 'qvb/server.py'; pkill -f 'qvb/QuestRenderer'; pkill -f 'QuestVRBridge/server.py'; pkill -f 'renderer/QuestRenderer'; sleep 0.3")
     }
@@ -1685,6 +1692,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         //  _exit y no exit: exit corre los destructores, y alguno puede quedar esperando a otro hilo)
         DispatchQueue.global().asyncAfter(deadline: .now() + 4) { _exit(0) }
         model?.stopServer(wait: true)
+        // El renderizador está dentro de esta app: si sigue vivo, macOS muestra VRmin Host «en segundo plano»
+        model?.killAllHelpers()
         _exit(0)
     }
 }
