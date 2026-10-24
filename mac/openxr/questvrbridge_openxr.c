@@ -1863,6 +1863,28 @@ static void fix_opencomposite_events(unsigned char *b) {
     logmsg("OpenComposite: eventos de botones listos para armar si hacen falta");
 }
 
+/* (diagnóstico: qué estado de los controles recibe el juego por OpenVR; solo se anotan los cambios) */
+static PFN_ocState o_diagState;
+static unsigned char h_diagState(void *self, uint32_t dev, void *st, uint32_t cb) {
+    unsigned char r = o_diagState(self, dev, st, cb);
+    static uint64_t lp[8], lt[8]; static int la[8]; static LONG n;
+    if (r && dev < 8 && st && cb >= 64) {
+        uint64_t pr, tc; float ax[5][2];
+        memcpy(&pr, (uint8_t *)st + 8, 8); memcpy(&tc, (uint8_t *)st + 16, 8); memcpy(ax, (uint8_t *)st + 24, 40);
+        int a1 = (int)(ax[1][0] * 10 + 0.5f);
+        if ((pr != lp[dev] || tc != lt[dev] || a1 != la[dev]) && InterlockedIncrement(&n) < 400)
+            logmsg("Controles (OpenVR) disp %u: apretados 0x%llx tocados 0x%llx · ejes %.2f,%.2f %.2f %.2f",
+                   dev, (unsigned long long)pr, (unsigned long long)tc, ax[0][0], ax[0][1], ax[1][0], ax[2][0]);
+        lp[dev] = pr; lt[dev] = tc; la[dev] = a1;
+    }
+    return r;
+}
+static void diag_opencomposite_state(unsigned char *b) {
+    void **s = oc_vtable_slot(b, "CVRSystem_017::GetControllerState");
+    void *o;
+    if (s && oc_patch_slot(s, (void *)h_diagState, &o)) { memcpy(&o_diagState, &o, sizeof o); logmsg("Diagnóstico: anotando el estado de los controles que ve el juego"); }
+}
+
 static void fix_opencomposite_models(const char *app) {
     if (!app || !strstr(app, "Earth")) return;
     unsigned char *b = (unsigned char *)GetModuleHandleA("vrclient_x64.dll");
@@ -1877,6 +1899,7 @@ static void fix_opencomposite_models(const char *app) {
         ocm_replace(s, sz, "Oculus Quest2", "Oculus Rift S");
     }
     (void)fix_opencomposite_events;   /* (apagado: con los eventos armados Earth dejaba de mostrar los controles) */
+    diag_opencomposite_state(b);
 }
 
 /* El wininet de Wine se rompe si el juego cierra una conexión mientras sus pedidos siguen abiertos en otros
