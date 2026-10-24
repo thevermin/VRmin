@@ -33,9 +33,30 @@ escribir_vrpath() {
 JSON
 }
 
-# openxr_activo RUTA_JSON (ruta de Windows)
+# openxr_activo RUTA_JSON [RUTA_JSON_32] (rutas de Windows; la segunda, para juegos de 32 bits)
 openxr_activo() {
   "$WINE" reg add 'HKLM\Software\Khronos\OpenXR\1' /v ActiveRuntime /t REG_SZ /d "$1" /f >/dev/null 2>&1
+  [ -n "$2" ] && "$WINE" reg add 'HKLM\Software\Wow6432Node\Khronos\OpenXR\1' /v ActiveRuntime /t REG_SZ /d "$2" /f >/dev/null 2>&1
+  return 0
+}
+
+# Juegos de 32 bits (Half-Life 2: VR Mod): nuestro runtime de 32 bits registrado y OpenComposite de 32 bits
+# (vrclient.dll, al lado del de 64). Una sola vez; OpenComposite se baja si falta.
+OC_URL_32="https://znix.xyz/OpenComposite/download.php?arch=x86&branch=openxr"
+asegurar_32bits() {
+  [ -f "$Q/questvrbridge_openxr32.dll" ] || return 0
+  if [ ! -f "$Q/.runtime32" ]; then
+    "$WINE" reg add 'HKLM\Software\Wow6432Node\Khronos\OpenXR\1' /v ActiveRuntime /t REG_SZ /d 'C:\questvrbridge\questvrbridge_openxr32.json' /f >/dev/null 2>&1 \
+      && touch "$Q/.runtime32"
+  fi
+  local oc="$P/descargas/opencomposite_x86.dll"
+  if [ ! -f "$Q/opencomposite/bin/vrclient.dll" ]; then
+    mkdir -p "$P/descargas" "$Q/opencomposite/bin"
+    file -b "$oc" 2>/dev/null | grep -q 'PE32 .*DLL' || curl -fsL -o "$oc" "$OC_URL_32" || true
+    file -b "$oc" 2>/dev/null | grep -q 'PE32 .*DLL' && cp "$oc" "$Q/opencomposite/bin/vrclient.dll" \
+      && echo "OpenComposite de 32 bits instalado"
+  fi
+  return 0
 }
 
 # Copia directa (texturas compartidas de DXMT): DXMT reconoce la GPU por su número de Metal (registryID, dado vuelta),
@@ -77,7 +98,8 @@ preparar_runtime() {
   case "$modo" in
     openxr|openvr)
       escribir_vrpath 'C:\questvrbridge\opencomposite'
-      [ "$antes" = "openxr" ] || openxr_activo 'C:\questvrbridge\questvrbridge_openxr.json'
+      [ "$antes" = "openxr" ] || { openxr_activo 'C:\questvrbridge\questvrbridge_openxr.json' 'C:\questvrbridge\questvrbridge_openxr32.json'; rm -f "$Q/.runtime32"; }
+      asegurar_32bits
       echo "openxr" > "$Q/.runtime"
       echo "Runtime: OpenXR → VRmin · OpenVR → OpenComposite → VRmin"
       ;;
@@ -90,7 +112,7 @@ preparar_runtime() {
     plano)
       mkdir -p "$Q/sin_vr"
       escribir_vrpath 'C:\questvrbridge\sin_vr'
-      [ "$antes" = "plano" ] || openxr_activo 'C:\questvrbridge\sin_vr\no_hay.json'
+      [ "$antes" = "plano" ] || { openxr_activo 'C:\questvrbridge\sin_vr\no_hay.json' 'C:\questvrbridge\sin_vr\no_hay.json'; rm -f "$Q/.runtime32"; }
       echo "plano" > "$Q/.runtime"
       say "Runtime: ninguno (el juego no ve el visor y abre en pantalla plana si puede)" "Runtime: none (the game doesn't see the headset and opens flat if it can)"
       ;;

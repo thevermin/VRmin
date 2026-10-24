@@ -73,7 +73,7 @@ jobs:
         run: |
           softwareupdate --install-rosetta --agree-to-license > /dev/null 2>&1 || true
           export QVB_DATA="$RUNNER_TEMP/datos" VRMIN_LANG=es
-          mkdir -p mac/app/recursos/openxr && cp mac/openxr/questvrbridge_openxr.dll mac/openxr/questvrbridge_openxr.json mac/app/recursos/openxr/
+          mkdir -p mac/app/recursos/openxr && cp mac/openxr/questvrbridge_openxr.dll mac/openxr/questvrbridge_openxr.json mac/openxr/questvrbridge_openxr32.json mac/app/recursos/openxr/ && cp mac/openxr/questvrbridge_openxr32.dll mac/app/recursos/openxr/ 2>/dev/null || true
           bash mac/app/recursos/instalar_motor.sh || echo "::warning::instalar_motor.sh terminó con error"
           tail -15 "$QVB_DATA/logs/instalar_motor.log" 2>/dev/null | while read -r l; do echo "::warning::im: $l"; done
           tail -8 "$QVB_DATA/logs/wineboot.log" | while read -r l; do echo "::warning::wb: $l"; done

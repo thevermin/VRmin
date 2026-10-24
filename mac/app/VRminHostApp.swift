@@ -1668,7 +1668,11 @@ struct SettingsView: View {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var model: AppModel?
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
-    func applicationWillTerminate(_ notification: Notification) { model?.stopServer(wait: true) }
+    func applicationWillTerminate(_ notification: Notification) {
+        // (si algo se traba al apagar, la app igual se cierra del todo a los 5 s: no queda en el Dock)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5) { exit(0) }
+        model?.stopServer(wait: true)
+    }
 }
 
 @main
@@ -1683,6 +1687,7 @@ struct VRminHostApp: App {
                 .frame(minWidth: 820, minHeight: 640)
                 .preferredColorScheme(.dark)
                 .onAppear { delegate.model = model }
+                .onDisappear { NSApp.terminate(nil) }   // cerrar la ventana cierra la app (no queda en segundo plano)
         }
         .windowStyle(.hiddenTitleBar)
     }

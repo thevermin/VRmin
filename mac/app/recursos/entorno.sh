@@ -18,6 +18,8 @@ export DYLD_FALLBACK_LIBRARY_PATH="$WINEDIR/lib:$FW:$FW/GStreamer.framework/Vers
 export GST_PLUGIN_PATH="$FW/GStreamer.framework/Versions/1.0/lib/gstreamer-1.0"
 export GST_PLUGIN_SYSTEM_PATH="$GST_PLUGIN_PATH"
 export WINEMSYNC=1
+# (MoltenVK, para juegos Vulkan: traduce los shaders en varios núcleos a la vez, menos tirones al aparecer cosas nuevas)
+export MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION=1
 # La capa de Steam dentro de los juegos (gameoverlayrenderer) traba juegos y a Steam en Wine: desactivada
 export WINEDLLOVERRIDES="dxgi,d3d11,d3d10core=b;winemenubuilder.exe=d;gameoverlayrenderer,gameoverlayrenderer64=d"
 # Juegos Unity: Mono lee mal el último error de Windows en hilos nuevos (archivos que no existen "existen").
