@@ -799,6 +799,8 @@ typedef struct Session {
     VkCommandPool vkPool; VkCommandBuffer vkCb[STAGES]; VkFence vkFence[STAGES];
     VkBuffer vkBuf[STAGES]; VkDeviceMemory vkBufMem[STAGES]; void *vkMap[STAGES];
     int vkWarned;
+    /* (la espera de la GPU y el paso a la memoria compartida los hace un hilo aparte: el juego no se frena) */
+    HANDLE vkThread, vkEv; volatile LONG vkPend[STAGES]; volatile LONG vkStop; int vkRp;
     /* OpenGL: el contexto del juego, y para leer la imagen un framebuffer y dos PBO */
     int gl; HDC gldc; HGLRC glrc;
     GLuint glFbo, glPbo[STAGES]; GLsync glSync[STAGES];
@@ -1241,7 +1243,14 @@ static int vk_initial_layout(Session *s, VkImage img, VkImageAspectFlags aspect,
     return ok;
 }
 
+/* Espera que el hilo de lectura termine con la memoria de lectura k (hasta ms milisegundos) */
+static int vk_stage_idle(Session *s, int k, int ms) {
+    for (int i = 0; s->vkPend[k] && i < ms; i++) Sleep(1);
+    return !s->vkPend[k];
+}
+
 static void vk_free_buffers(Session *s) {
+    for (int k = 0; k < STAGES; k++) vk_stage_idle(s, k, 2000);
     for (int k = 0; k < STAGES; k++) {
         if (s->vkMap[k]) vk.UnmapMemory(s->vkDev, s->vkBufMem[k]);
         if (s->vkBuf[k]) vk.DestroyBuffer(s->vkDev, s->vkBuf[k], NULL);
@@ -1271,6 +1280,11 @@ static int vk_session_setup(Session *s, const XrGraphicsBindingVulkanKHR *vb) {
 static void vk_session_release(Session *s) {
     if (!s->vkDev) return;
     if (s->vkQueue) vk.QueueWaitIdle(s->vkQueue);
+    if (s->vkThread) {
+        s->vkStop = 1; SetEvent(s->vkEv);
+        WaitForSingleObject(s->vkThread, 3000);
+        CloseHandle(s->vkThread); CloseHandle(s->vkEv); s->vkThread = s->vkEv = NULL;
+    }
     vk_free_buffers(s);
     for (int k = 0; k < STAGES; k++) if (s->vkFence[k]) vk.DestroyFence(s->vkDev, s->vkFence[k], NULL);
     if (s->vkPool) vk.DestroyCommandPool(s->vkDev, s->vkPool, NULL);
@@ -2279,11 +2293,11 @@ static void fill_velocity(void *next, const Track *t, const Space *sp, XrPosef b
 }
 
 static LONG g_dgLocOk, g_dgLocBad, g_dgPoseOn[3], g_dgPoseOff[3];
-static LONG g_dgPoseHit, g_dgPoseMiss, g_dgSnap;   /* (diagnóstico: cuadros con la pose con la que se dibujaron / sin ella) */   /* (diagnóstico de controles) */
-static Track track_for_time(XrTime *time);
+static LONG g_dgPoseHit, g_dgPoseMiss;   /* (diagnóstico: cuadros con la pose con la que se dibujaron / sin ella) */   /* (diagnóstico de controles) */
+static Track track_for_time(XrTime time);
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation *loc) {
     g_inside = "xrLocateSpace";
-    Track t = track_for_time(&time);
+    Track t = track_for_time(time);
     predict(&t, time);
     int v1, v2;
     XrPosef a = space_world((Space *)space, &t, &v1);
@@ -2334,23 +2348,11 @@ static Track g_poseTrack[POSE_HIST];
  * después se le informa a la Mac para corregir la imagen; si no, al mover la cabeza la imagen temblaba (DOOM VFR
  * pide la cabeza y las vistas en momentos distintos del cuadro). */
 static volatile XrTime g_frameTimes[4];   /* los últimos momentos de cuadro que dio xrWaitFrame */
-/* Si piden un momento cercano a un cuadro (hasta 40 ms) pero no exactamente el suyo, se usa el del cuadro: DOOM VFR
- * calcula la cabeza con su propia predicción (otro momento) y dibujaba con una pose distinta de la que se le
- * informaba a la Mac; en el visor la imagen temblaba al mover la cabeza (en la ventana de la Mac no). */
-static Track track_for_time(XrTime *ptime) {
+static Track track_for_time(XrTime time) {
     Track t;
-    XrTime time = *ptime;
     EnterCriticalSection(&g_lock);
     int esCuadro = 0;
-    XrTime cerca = 0, dmin = 40000000;
-    for (int q = 0; q < 4; q++) {
-        XrTime ft = g_frameTimes[q];
-        if (!ft) continue;
-        if (ft == time) esCuadro = 1;
-        XrTime d = ft > time ? ft - time : time - ft;
-        if (d < dmin) { dmin = d; cerca = ft; }
-    }
-    if (!esCuadro && cerca) { time = *ptime = cerca; esCuadro = 1; g_dgSnap++; }
+    for (int q = 0; q < 4; q++) if (g_frameTimes[q] == time) esCuadro = 1;
     if (!esCuadro) { t = g_track; LeaveCriticalSection(&g_lock); return t; }   /* (otro momento: la pose de ahora) */
     int ya = -1;
     for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].time == time) { ya = hh; break; }
@@ -2372,9 +2374,8 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateViews(XrSession s, const XrViewLocateI
     *count = 2;
     if (cap == 0) return XR_SUCCESS;
     if (cap < 2) return XR_ERROR_SIZE_INSUFFICIENT;
-    XrTime vt = info->displayTime;
-    Track t = track_for_time(&vt);
-    predict(&t, vt);
+    Track t = track_for_time(info->displayTime);
+    predict(&t, info->displayTime);
     int vb;
     XrPosef base = space_world((Space *)info->space, &t, &vb);
     XrPosef binv = pinv(base);
@@ -2841,6 +2842,52 @@ static void readback(Session *s, const XrCompositionLayerProjection *pl, XrTime 
     SetEvent(g_frameEvent);
 }
 
+static void vk_send_stage(Session *s, int r) {
+    if (!s->stValid[r]) return;
+    int64_t c0 = now_ns();
+    if (vk.WaitForFences(s->vkDev, 1, &s->vkFence[r], VK_TRUE, 1000000000ULL) != VK_SUCCESS) {
+        s->stValid[r] = 0; InterlockedIncrement(&g_mapFail); return;
+    }
+    g_sumMap += (now_ns() - c0) / 1e6;
+    ShmHdr *sh = (ShmHdr *)g_shm;
+    int ss = -1;
+    for (int i = 0; i < SHM_SLOTS; i++) if (InterlockedCompareExchange(&sh->state[i], 2, 0) == 0) { ss = i; break; }
+    if (ss < 0) {
+        if (!g_shmFullSince) g_shmFullSince = now_ns();
+        else if (now_ns() - g_shmFullSince > 1500000000LL) {
+            g_shmFullSince = 0;
+            closesocket(g_fsock); g_fsock = INVALID_SOCKET; g_fsockRetry = 0; g_shmMode = 0;
+            logmsg("La Mac no libera los cuadros: rearmando la conexión de imágenes");
+        }
+        InterlockedIncrement(&g_statBusy); s->stValid[r] = 0; return;
+    }
+    g_shmFullSince = 0;
+    uint32_t rb = s->stW * 2 * 4;
+    uint8_t *dst = g_shm + SHM_HDR + (size_t)ss * SHM_SLOT_MAX;
+    const uint8_t *src = (const uint8_t *)s->vkMap[r];
+    if (!s->stFlip[r]) memcpy(dst, src, (size_t)rb * s->stH);
+    else for (uint32_t y = 0; y < s->stH; y++) memcpy(dst + (size_t)y * rb, src + (size_t)(s->stH - 1 - y) * rb, rb);
+    g_sumCopy += (now_ns() - c0) / 1e6; g_nCopy++;
+    s->stValid[r] = 0;
+    MemoryBarrier();
+    sh->state[ss] = 1;
+    shm_notify(ss, s->stPose[r], fmt_code(s->stFmt), s->stW, s->stH);
+}
+
+static DWORD WINAPI vk_reader(void *arg) {
+    Session *s = (Session *)arg;
+    while (!s->vkStop) {
+        WaitForSingleObject(s->vkEv, 100);
+        while (!s->vkStop && s->vkPend[s->vkRp]) {
+            vk_send_stage(s, s->vkRp);
+            MemoryBarrier();
+            InterlockedExchange(&s->vkPend[s->vkRp], 0);
+            s->vkRp = (s->vkRp + 1) % STAGES;
+        }
+    }
+    return 0;
+}
+
 /* Vulkan: copia los dos ojos (en la GPU) a memoria que se puede leer, lado a lado; lee la del cuadro
    anterior (ya terminó en la GPU) y la pasa a la memoria compartida con la Mac */
 static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, XrTime displayTime) {
@@ -2884,6 +2931,7 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, XrTi
     /* 1) Copiar los dos ojos a la memoria de lectura actual */
     g_inside = "xrEndFrame: copiando ojos en la GPU (Vulkan)";
     int k = s->stNext;
+    if (!vk_stage_idle(s, k, 30)) { InterlockedIncrement(&g_statBusy); return; }   /* (el hilo de lectura todavía la usa) */
     vk.WaitForFences(s->vkDev, 1, &s->vkFence[k], VK_TRUE, 1000000000ULL);
     VkImage imgs[2]; uint32_t layers[2]; VkBufferImageCopy reg[2];
     for (int e = 0; e < 2; e++) {
@@ -2956,40 +3004,16 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, XrTi
     s->stPose[k] = id; s->stValid[k] = 1; s->stFlip[k] = flip;
     s->stNext = (k + 1) % STAGES;
 
-    /* 2) Leer la copia y pasarla a la memoria compartida. Se espera la de este mismo cuadro (no la del anterior): un
-     *    cuadro menos de atraso entre mover la cabeza y verlo, que con Vulkan mareaba (DOOM VFR) */
-    int r = k;
-    if (!s->stValid[r]) return;
-    ShmHdr *sh = (ShmHdr *)g_shm;
-    int ss = -1;
-    for (int i = 0; i < SHM_SLOTS; i++) if (InterlockedCompareExchange(&sh->state[i], 2, 0) == 0) { ss = i; break; }
-    if (ss < 0) {
-        if (!g_shmFullSince) g_shmFullSince = now_ns();
-        else if (now_ns() - g_shmFullSince > 1500000000LL) {
-            g_shmFullSince = 0;
-            closesocket(g_fsock); g_fsock = INVALID_SOCKET; g_fsockRetry = 0; g_shmMode = 0;
-            logmsg("La Mac no libera los cuadros: rearmando la conexión de imágenes");
-        }
-        InterlockedIncrement(&g_statBusy); s->stValid[r] = 0; return;
+    /* 2) Leer la copia y pasarla a la memoria compartida: apenas la GPU termina este mismo cuadro (no el anterior:
+     *    un cuadro menos de atraso al mover la cabeza, DOOM VFR mareaba), pero en un hilo aparte, para que el juego
+     *    no se quede esperando a la GPU (con DOOM eso le bajaba los cuadros por segundo y la imagen temblaba) */
+    if (!s->vkThread) {
+        s->vkEv = CreateEventA(NULL, FALSE, FALSE, NULL);
+        s->vkRp = k; s->vkStop = 0;
+        s->vkThread = CreateThread(NULL, 0, vk_reader, s, 0, NULL);
     }
-    g_shmFullSince = 0;
-    int64_t c0 = now_ns();
-    g_inside = "xrEndFrame: esperando la copia de la GPU (Vulkan)";
-    if (vk.WaitForFences(s->vkDev, 1, &s->vkFence[r], VK_TRUE, 1000000000ULL) != VK_SUCCESS) {
-        sh->state[ss] = 0; s->stValid[r] = 0; InterlockedIncrement(&g_mapFail); return;
-    }
-    g_sumMap += (now_ns() - c0) / 1e6;
-    g_inside = "xrEndFrame: copiando imagen a la memoria compartida (Vulkan)";
-    uint32_t rb = s->stW * 2 * 4;
-    uint8_t *dst = g_shm + SHM_HDR + (size_t)ss * SHM_SLOT_MAX;
-    const uint8_t *src = (const uint8_t *)s->vkMap[r];
-    if (!s->stFlip[r]) memcpy(dst, src, (size_t)rb * s->stH);
-    else for (uint32_t y = 0; y < s->stH; y++) memcpy(dst + (size_t)y * rb, src + (size_t)(s->stH - 1 - y) * rb, rb);
-    g_sumCopy += (now_ns() - c0) / 1e6; g_nCopy++;
-    s->stValid[r] = 0;
-    MemoryBarrier();
-    sh->state[ss] = 1;
-    shm_notify(ss, s->stPose[r], fmt_code(s->stFmt), s->stW, s->stH);
+    InterlockedExchange(&s->vkPend[k], 1);
+    SetEvent(s->vkEv);
 }
 
 /* OpenGL: lee los dos ojos lado a lado con PBO (el del cuadro anterior ya terminó en la GPU) y los pasa a la
@@ -3154,9 +3178,9 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
         logmsg("Diagnóstico controles: ubicaciones bien %ld / mal %ld · pose activa (sin mano/izq/der) %ld/%ld/%ld, inactiva %ld/%ld/%ld · manos válidas izq %d der %d",
                g_dgLocOk, g_dgLocBad, g_dgPoseOn[0], g_dgPoseOn[1], g_dgPoseOn[2], g_dgPoseOff[0], g_dgPoseOff[1], g_dgPoseOff[2], g_track.handValid[0], g_track.handValid[1]);
         g_dgLocOk = g_dgLocBad = 0; for (int q = 0; q < 3; q++) g_dgPoseOn[q] = g_dgPoseOff[q] = 0;
-        if (g_dgPoseHit + g_dgPoseMiss) logmsg("Diagnóstico poses: %ld cuadros con su pose, %ld sin ella · %ld pedidos en otro momento (ajustados al cuadro) · espera de la copia %.1f ms promedio",
-                                               g_dgPoseHit, g_dgPoseMiss, g_dgSnap, g_nCopy ? g_sumMap / g_nCopy : 0.0);
-        g_dgPoseHit = g_dgPoseMiss = g_dgSnap = 0;
+        if (g_dgPoseHit + g_dgPoseMiss) logmsg("Diagnóstico poses: %ld cuadros con su pose, %ld sin ella · espera de la copia %.1f ms promedio",
+                                               g_dgPoseHit, g_dgPoseMiss, g_nCopy ? g_sumMap / g_nCopy : 0.0);
+        g_dgPoseHit = g_dgPoseMiss = 0;
         g_statSubmitted = g_statSent = g_statBusy = 0;
         g_skipNoSock = g_skipFmt = g_mapFail = g_noProj = g_layers = 0;
         g_statT0 = tnow;

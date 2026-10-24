@@ -42,7 +42,9 @@ openxr_activo() {
 
 # Juegos de 32 bits (Half-Life 2: VR Mod): nuestro runtime de 32 bits registrado y OpenComposite de 32 bits
 # (vrclient.dll, al lado del de 64). Una sola vez; OpenComposite se baja si falta.
-OC_URL_32="https://znix.xyz/OpenComposite/download.php?arch=x86&branch=openxr"
+# (32 bits: la versión de GameNative, con las interfaces de OpenVR nuevas que pide Half-Life 2: VR Mod; GPLv3)
+OC_URL_32="https://github.com/GameNative/opencomposite/releases/download/v10/opencomposite_x86.dll"
+OC_SHA_32="86a77b58c817ed0b14f4e7963c1364d47f86b53cc75fed0ba6d04e87d1040059"
 asegurar_32bits() {
   [ -f "$Q/questvrbridge_openxr32.dll" ] || return 0
   if [ ! -f "$Q/.runtime32" ]; then
@@ -56,12 +58,16 @@ asegurar_32bits() {
     "$WINE" reg add 'HKCU\Software\Wine\AppDefaults\hl2.exe\Direct3D' /v renderer /t REG_SZ /d vulkan /f >/dev/null 2>&1 \
       && "$WINE" reg add 'HKCU\Software\Wine\AppDefaults\hl2.exe\Direct3D' /v csmt /t REG_DWORD /d 0 /f >/dev/null 2>&1 && touch "$Q/.hl2vk2"
   fi
-  local oc="$P/descargas/opencomposite_x86.dll"
-  if [ ! -f "$Q/opencomposite/bin/vrclient.dll" ]; then
+  local oc="$P/descargas/opencomposite_x86_v10.dll"
+  if [ "$(cat "$Q/opencomposite/.version32" 2>/dev/null)" != "$OC_SHA_32" ]; then
     mkdir -p "$P/descargas" "$Q/opencomposite/bin"
-    file -b "$oc" 2>/dev/null | grep -q 'PE32 .*DLL' || curl -fsL -o "$oc" "$OC_URL_32" || true
-    file -b "$oc" 2>/dev/null | grep -q 'PE32 .*DLL' && cp "$oc" "$Q/opencomposite/bin/vrclient.dll" \
-      && echo "OpenComposite de 32 bits instalado"
+    [ "$(shasum -a 256 "$oc" 2>/dev/null | cut -d' ' -f1)" = "$OC_SHA_32" ] || curl -fsL -o "$oc" "$OC_URL_32" || true
+    if [ "$(shasum -a 256 "$oc" 2>/dev/null | cut -d' ' -f1)" = "$OC_SHA_32" ]; then
+      cp "$oc" "$Q/opencomposite/bin/vrclient.dll" && echo "$OC_SHA_32" > "$Q/opencomposite/.version32" \
+        && echo "OpenComposite de 32 bits instalado"
+    else
+      echo "No se pudo descargar OpenComposite de 32 bits"
+    fi
   fi
   return 0
 }
