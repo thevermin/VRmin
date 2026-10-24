@@ -1860,6 +1860,33 @@ static int oc_patch_slot(void **slot, void *nuevo, void **orig) {
     VirtualProtect(slot, sizeof(void *), viejo, &viejo);
     return 1;
 }
+/* Earth pregunta en cada cuadro si cada control está conectado, y OpenComposite contesta que el izquierdo casi
+ * nunca y el derecho un cuadro sí y otro no: Earth dibuja los controles pero no les hace caso. Para Earth, los
+ * controles 1 y 2 cuentan siempre como conectados. */
+typedef unsigned char (*PFN_ocConn)(void *self, uint32_t dev);
+typedef int (*PFN_ocClass)(void *self, uint32_t dev);
+static PFN_ocConn o_ocConn; static PFN_ocClass o_ocClass;
+static LONG g_connForced;
+static unsigned char h_ocConn(void *self, uint32_t dev) {
+    unsigned char r = o_ocConn(self, dev);
+    if (!r && (dev == 1 || dev == 2)) {
+        if (InterlockedIncrement(&g_connForced) == 1) logmsg("OpenComposite decía que el control %u no estaba conectado: se lo cuenta como conectado", dev);
+        return 1;
+    }
+    return r;
+}
+static int h_ocClass(void *self, uint32_t dev) {
+    int r = o_ocClass(self, dev);
+    return (r == 0 && (dev == 1 || dev == 2)) ? 2 : r;   /* 2 = TrackedDeviceClass_Controller */
+}
+static void fix_opencomposite_connected(unsigned char *b) {
+    void **sConn = oc_vtable_slot(b, "CVRSystem_017::IsTrackedDeviceConnected");
+    void **sClass = oc_vtable_slot(b, "CVRSystem_017::GetTrackedDeviceClass");
+    if (!sConn || !sClass) { logmsg("OpenComposite: no encontré dónde arreglar los controles conectados"); return; }
+    void *o;
+    if (oc_patch_slot(sConn, (void *)h_ocConn, &o)) memcpy(&o_ocConn, &o, sizeof o);
+    if (oc_patch_slot(sClass, (void *)h_ocClass, &o)) memcpy(&o_ocClass, &o, sizeof o);
+}
 static void fix_opencomposite_events(unsigned char *b) {
     void **sPoll = oc_vtable_slot(b, "CVRSystem_017::PollNextEvent");
     void **sPose = oc_vtable_slot(b, "CVRSystem_017::PollNextEventWithPose");
@@ -1908,6 +1935,7 @@ static void fix_opencomposite_models(const char *app) {
         ocm_replace(s, sz, "Oculus Quest2", "Oculus Rift S");
     }
     fix_opencomposite_events(b);
+    fix_opencomposite_connected(b);
 }
 
 /* El wininet de Wine se rompe si el juego cierra una conexión mientras sus pedidos siguen abiertos en otros
