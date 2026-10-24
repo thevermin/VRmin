@@ -871,7 +871,7 @@ final class Renderer {
 /// los juegos ("") y cada juego guarda solo lo que se cambió para él. Se guardan en perfiles_juegos.json.
 final class GameProfiles {
     static let shared = GameProfiles()
-    struct P: Codable { var scale: Double?; var auto: Bool?; var fovk: Double?; var index: Bool?
+    struct P: Codable { var scale: Double?; var auto: Bool?; var fovk: Double?; var index: Bool?; var vive: Bool?
                         var eye: Int?; var fps: Int?; var mbps: Int?; var fov: String? }   // (calidad propia del juego)
     private let lock = NSLock()
     private var data: [String: P] = [:]
@@ -893,11 +893,11 @@ final class GameProfiles {
         mtime = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.modificationDate] as? Date
     }
     /// Lo que vale para un juego: lo de todos los juegos con lo suyo encima
-    func effective(_ key: String) -> (scale: Double, auto: Bool, fovk: Double, index: Bool) {
+    func effective(_ key: String) -> (scale: Double, auto: Bool, fovk: Double, index: Bool, vive: Bool) {
         lock.lock(); defer { lock.unlock() }
         reload()
         let a = data[""] ?? P(), g = key.isEmpty ? P() : (data[key] ?? P())
-        return (min(1, max(0.5, g.scale ?? a.scale ?? 1)), g.auto ?? a.auto ?? false, min(1, max(0.75, g.fovk ?? a.fovk ?? 1)), g.index ?? a.index ?? false)
+        return (min(1, max(0.5, g.scale ?? a.scale ?? 1)), g.auto ?? a.auto ?? false, min(1, max(0.75, g.fovk ?? a.fovk ?? 1)), g.index ?? a.index ?? false, g.vive ?? a.vive ?? false)
     }
     func hasOwn(_ key: String) -> Bool { lock.lock(); defer { lock.unlock() }; return !key.isEmpty && data[key] != nil }
     /// El juego que se abrió: por la carpeta de Steam (si se encuentra) o por el nombre que da el juego
@@ -906,18 +906,18 @@ final class GameProfiles {
         lock.lock(); current = key; autoN = 0; autoFps = 0; autoGame = 0; autoSince = Date().timeIntervalSince1970; lock.unlock()
         let e = effective(key)
         lock.lock(); activeK = e.fovk; lock.unlock()
-        print("[juego] Ajustes de «\(key)»: escala \(Int(e.scale * 100)) %\(e.auto ? " (automática)" : ""), campo de visión \(Int(e.fovk * 100)) %\(e.index ? ", controles de Index" : "")")
+        print("[juego] Ajustes de «\(key)»: escala \(Int(e.scale * 100)) %\(e.auto ? " (automática)" : ""), campo de visión \(Int(e.fovk * 100)) %\(e.index ? ", controles de Index" : "")\(e.vive ? ", controles de Vive" : "")")
     }
     /// La línea "config" para el runtime (con «pv»: son los ajustes de este juego)
     func configLine(fps: Int, hello: Bool) -> String {
         let e = effective(current)
         let eye = max(256, Int((Double(EYE) * e.scale * e.fovk / 8).rounded()) * 8)
         // «vg»: Modo Centinela (el runtime adelanta las poses al momento en que se ve el cuadro: no hay reproyección)
-        return "{\"type\":\"config\",\"eye\":\(eye),\"fps\":\(fps),\"fovk\":\(String(format: "%.3f", e.fovk)),\"index\":\(e.index ? 1 : 0),\"vg\":\(Vigia.shared.on ? 1 : 0)\(hello ? ",\"pv\":1" : "")}"
+        return "{\"type\":\"config\",\"eye\":\(eye),\"fps\":\(fps),\"fovk\":\(String(format: "%.3f", e.fovk)),\"index\":\(e.index ? 1 : 0),\"vive\":\(e.vive ? 1 : 0),\"vg\":\(Vigia.shared.on ? 1 : 0)\(hello ? ",\"pv\":1" : "")}"
     }
     /// Desde el Quest: cambiar lo de un juego ("game": el abierto; "key:<carpeta>": cualquiera) o lo de todos ("all"),
     /// o volver a lo de todos
-    func apply(scope: String, scale: Double?, auto: Bool?, fovk: Double?, index: Bool?, reset: Bool,
+    func apply(scope: String, scale: Double?, auto: Bool?, fovk: Double?, index: Bool?, vive: Bool? = nil, reset: Bool,
                eye: Int? = nil, fps: Int? = nil, mbps: Int? = nil, fov: String? = nil) {
         lock.lock()
         reload()
@@ -930,6 +930,7 @@ final class GameProfiles {
             if let v = auto { p.auto = v }
             if let v = fovk { p.fovk = min(1, max(0.75, v)) }
             if let v = index { p.index = v }
+            if let v = vive { p.vive = v }
             if !key.isEmpty {   // (la calidad de «todos» es la general de VRmin Host, no va acá)
                 if let v = eye, (512...2560).contains(v) { p.eye = v }
                 if let v = fps, [72, 80, 90, 120].contains(v) { p.fps = v }
@@ -945,14 +946,14 @@ final class GameProfiles {
     /// Lo que ve el Quest en Ajustes › Avanzado
     func state() -> [String: Any] {
         let a = effective("")
-        var o: [String: Any] = ["all": ["scale": a.scale, "auto": a.auto, "fovk": a.fovk, "index": a.index]]
+        var o: [String: Any] = ["all": ["scale": a.scale, "auto": a.auto, "fovk": a.fovk, "index": a.index, "vive": a.vive]]
         // Los juegos con ajustes propios (lo que eligió el usuario para cada uno; lo demás sale de «all»)
         lock.lock()
         var own: [String: Any] = [:]
         for (k, p) in data where !k.isEmpty {
             var g: [String: Any] = [:]
             if let v = p.scale { g["scale"] = v }; if let v = p.auto { g["auto"] = v }
-            if let v = p.fovk { g["fovk"] = v }; if let v = p.index { g["index"] = v }
+            if let v = p.fovk { g["fovk"] = v }; if let v = p.index { g["index"] = v }; if let v = p.vive { g["vive"] = v }
             if let v = p.eye { g["eye"] = v }; if let v = p.fps { g["fps"] = v }; if let v = p.mbps { g["mbps"] = v }; if let v = p.fov { g["fov"] = v }
             own[k] = g
         }
@@ -960,7 +961,7 @@ final class GameProfiles {
         o["own"] = own
         if !current.isEmpty {
             let g = effective(current)
-            o["game"] = ["name": current, "scale": g.scale, "auto": g.auto, "fovk": g.fovk, "index": g.index, "own": hasOwn(current)]
+            o["game"] = ["name": current, "scale": g.scale, "auto": g.auto, "fovk": g.fovk, "index": g.index, "vive": g.vive, "own": hasOwn(current)]
         }
         return o
     }
@@ -3885,7 +3886,7 @@ struct InMsg: Decodable {
     let fov: String?   // foveated encoding: "nivel,centro,cx izq,cx der,cy"
     let codec: String?   // "hevc" o "h264"
     // Ajustes avanzados de los juegos
-    let scope: String?; let scale: Double?; let auto: Bool?; let fovk: Double?; let index: Bool?; let reset: Bool?
+    let scope: String?; let scale: Double?; let auto: Bool?; let fovk: Double?; let index: Bool?; let vive: Bool?; let reset: Bool?
     // Teclado del visor: texto a escribir, o una tecla especial («return», «delete»…) con modificadores («cmd», «shift»…)
     let text: String?; let k: String?; let mods: [String]?
     /// Cambiar de monitor: a qué pantalla (id con el bit de pantalla, o sin él)
@@ -3952,7 +3953,7 @@ func handleQuestMessage(_ line: Data) {
         if let on = m.on { Vigia.shared.set(on); if on { shared.requestKey() } }
         if let t = m.msg { Vigia.shared.say(t) }
     } else if m.type == "gamecfg" {   // Ajustes › Avanzado (desde el Quest)
-        GameProfiles.shared.apply(scope: m.scope ?? "all", scale: m.scale, auto: m.auto, fovk: m.fovk, index: m.index, reset: m.reset ?? false,
+        GameProfiles.shared.apply(scope: m.scope ?? "all", scale: m.scale, auto: m.auto, fovk: m.fovk, index: m.index, vive: m.vive, reset: m.reset ?? false,
                                   eye: m.eye, fps: m.fps, mbps: m.mbps, fov: m.fov)
         // Calidad propia del juego abierto (desde su menú): VRmin Host reinicia con esa, sin volver a abrir el juego
         let cur = GameProfiles.shared.current

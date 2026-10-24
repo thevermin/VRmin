@@ -72,6 +72,8 @@ private let EN: [String: String] = [
     "Las esquinas casi no se ven por las lentes: si el juego no las dibuja, rinde más": "The corners are barely visible through the lenses: if the game doesn't draw them, it runs faster",
     "Escala automática": "Automatic scale",
     "Emular controles de Valve Index": "Emulate Valve Index controllers",
+    "Emular controles de HTC Vive": "Emulate HTC Vive controllers",
+    "Para juegos hechos para los controles de Vive: el stick hace de trackpad (moverlo es deslizar el dedo, hundirlo es hacer clic)": "For games made for Vive controllers: the thumbstick acts as the trackpad (move it to slide, press it to click)",
     "Hay que volver a abrir el juego para que se aplique.": "The game has to be reopened for this to apply.",
     "También el visor": "Headset too",
     "Con el visor por cable (adb) se graba también lo que ves en el visor. Apagado: solo el escritorio de la Mac.": "With the headset on the cable (adb), what you see in the headset is recorded too. Off: only the Mac desktop.",

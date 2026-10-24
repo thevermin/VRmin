@@ -722,7 +722,7 @@ final class AppModel: ObservableObject {
     @Published var recSince = Date()
     /// Ajustes avanzados de cada juego (los mismos que en el Quest): perfiles_juegos.json en la carpeta de datos.
     /// "" = todos los juegos; si no, la carpeta de Steam del juego. El renderizador lo vuelve a leer cuando cambia.
-    struct AdvP: Codable, Equatable { var scale: Double?; var auto: Bool?; var fovk: Double?; var index: Bool?
+    struct AdvP: Codable, Equatable { var scale: Double?; var auto: Bool?; var fovk: Double?; var index: Bool?; var vive: Bool?
                                       var eye: Int?; var fps: Int?; var mbps: Int?; var fov: String? }   // (calidad propia, se elige en el Quest)
     @Published var adv: [String: AdvP] = [:]
     private var advFile: URL { data.appendingPathComponent("perfiles_juegos.json") }
@@ -1522,7 +1522,7 @@ struct SettingsView: View {
         let vrGames = m.games.filter { $0.inLibrary && m.vr[$0.id]?.vr != false }
         let all = m.adv[""] ?? AppModel.AdvP(), own = advKey.isEmpty ? nil : m.adv[advKey]
         let scale = own?.scale ?? all.scale ?? 1, fovk = own?.fovk ?? all.fovk ?? 1
-        let auto = own?.auto ?? all.auto ?? false, index = own?.index ?? all.index ?? false
+        let auto = own?.auto ?? all.auto ?? false, index = own?.index ?? all.index ?? false, vive = own?.vive ?? all.vive ?? false
         let again = L("Hay que volver a abrir el juego para que se aplique.")
         return Card(title: L("Avanzado"), icon: "slider.horizontal.3") {
             group(L("Configurando"), L("Si un juego tiene ajustes propios, siempre se usan esos. Si no, usa los de «Todos los juegos». Para que vuelva a usar los generales: «Usar los de todos los juegos».")) {
@@ -1547,7 +1547,10 @@ struct SettingsView: View {
                 }.pickerStyle(.segmented).labelsHidden()
             }
             Toggle(L("Escala automática"), isOn: Binding(get: { auto }, set: { v in m.setAdv(advKey) { $0.auto = v } })).toggleStyle(.switch)
-            Toggle(L("Emular controles de Valve Index"), isOn: Binding(get: { index }, set: { v in m.setAdv(advKey) { $0.index = v } })).toggleStyle(.switch)
+            Toggle(L("Emular controles de Valve Index"), isOn: Binding(get: { index }, set: { v in m.setAdv(advKey) { $0.index = v; if v { $0.vive = false } } })).toggleStyle(.switch)
+            // (para juegos hechos para los controles de Vive, como DOOM VFR: el stick hace de trackpad)
+            Toggle(L("Emular controles de HTC Vive"), isOn: Binding(get: { vive }, set: { v in m.setAdv(advKey) { $0.vive = v; if v { $0.index = false } } })).toggleStyle(.switch)
+                .help(L("Para juegos hechos para los controles de Vive: el stick hace de trackpad (moverlo es deslizar el dedo, hundirlo es hacer clic)"))
             Text(again).font(.caption).foregroundStyle(Theme.text2)
         }
         .onAppear { m.loadAdv() }

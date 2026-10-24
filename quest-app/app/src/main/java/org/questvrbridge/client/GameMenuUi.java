@@ -287,6 +287,8 @@ final class GameMenuUi implements Link.Listener {
                 v.optBoolean("auto"), on -> MenuUi.sendAdv(scope, "auto", String.valueOf(on)));
         toggle(I18n.t("Emular controles de Valve Index"), I18n.t("Para juegos que funcionan mejor con Index: los dedos se mueven según cómo tocás los botones") + again,
                 v.optBoolean("index"), on -> MenuUi.sendAdv(scope, "index", String.valueOf(on)));
+        toggle(I18n.t("Emular controles de HTC Vive"), I18n.t("Para juegos hechos para los controles de Vive: el stick hace de trackpad (moverlo es deslizar el dedo, hundirlo es hacer clic)") + again,
+                v.optBoolean("vive"), on -> MenuUi.sendAdv(scope, "vive", String.valueOf(on)));
         right.addView(Ui.section(ctx, I18n.t("Rendimiento")));
         int sc = (int) Math.round(v.optDouble("scale", 1) * 100), fk = (int) Math.round(v.optDouble("fovk", 1) * 100);
         String[] sn = new String[MenuUi.ADV_SCALES.length];
