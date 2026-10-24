@@ -1671,6 +1671,15 @@ struct SettingsView: View {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var model: AppModel?
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // (por si macOS no la cierra sola al cerrar la ventana: cuando no queda ninguna ventana visible, se cierra)
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { n in
+            let w = n.object as? NSWindow
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                if !NSApp.windows.contains(where: { $0 !== w && $0.isVisible && $0.canBecomeMain }) { NSApp.terminate(nil) }
+            }
+        }
+    }
     func applicationWillTerminate(_ notification: Notification) {
         // (si algo se traba al apagar, la app igual se cierra del todo a los 5 s: no queda en el Dock)
         DispatchQueue.global().asyncAfter(deadline: .now() + 5) { exit(0) }

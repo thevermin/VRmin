@@ -49,6 +49,11 @@ asegurar_32bits() {
     "$WINE" reg add 'HKLM\Software\Wow6432Node\Khronos\OpenXR\1' /v ActiveRuntime /t REG_SZ /d 'C:\questvrbridge\questvrbridge_openxr32.json' /f >/dev/null 2>&1 \
       && touch "$Q/.runtime32"
   fi
+  # OpenComposite arranca siempre con una sesión D3D11 provisoria, y el D3D11 de 32 bits de Wine (con OpenGL) no la
+  # puede crear en una Mac: para hl2.exe (Half-Life 2: VR Mod) se le pide a Wine que lo haga con Vulkan
+  if [ ! -f "$Q/.hl2vk" ]; then
+    "$WINE" reg add 'HKCU\Software\Wine\AppDefaults\hl2.exe\Direct3D' /v renderer /t REG_SZ /d vulkan /f >/dev/null 2>&1 && touch "$Q/.hl2vk"
+  fi
   local oc="$P/descargas/opencomposite_x86.dll"
   if [ ! -f "$Q/opencomposite/bin/vrclient.dll" ]; then
     mkdir -p "$P/descargas" "$Q/opencomposite/bin"

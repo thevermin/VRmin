@@ -2278,7 +2278,8 @@ static void fill_velocity(void *next, const Track *t, const Space *sp, XrPosef b
     }
 }
 
-static LONG g_dgLocOk, g_dgLocBad, g_dgPoseOn[3], g_dgPoseOff[3];   /* (diagnóstico de controles) */
+static LONG g_dgLocOk, g_dgLocBad, g_dgPoseOn[3], g_dgPoseOff[3];
+static LONG g_dgPoseHit, g_dgPoseMiss;   /* (diagnóstico: cuadros con la pose con la que se dibujaron / sin ella) */   /* (diagnóstico de controles) */
 static Track track_for_time(XrTime time);
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation *loc) {
     g_inside = "xrLocateSpace";
@@ -2936,7 +2937,8 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, XrTi
     uint32_t id = 0;
     EnterCriticalSection(&g_lock);
     id = g_track.id;
-    for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].time == displayTime) { id = g_poseHist[hh].id; break; }
+    { int hit = 0; for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].time == displayTime) { id = g_poseHist[hh].id; hit = 1; break; }
+      InterlockedIncrement(hit ? &g_dgPoseHit : &g_dgPoseMiss); }
     LeaveCriticalSection(&g_lock);
     s->stPose[k] = id; s->stValid[k] = 1; s->stFlip[k] = flip;
     s->stNext = (k + 1) % STAGES;
@@ -3139,6 +3141,9 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
         logmsg("Diagnóstico controles: ubicaciones bien %ld / mal %ld · pose activa (sin mano/izq/der) %ld/%ld/%ld, inactiva %ld/%ld/%ld · manos válidas izq %d der %d",
                g_dgLocOk, g_dgLocBad, g_dgPoseOn[0], g_dgPoseOn[1], g_dgPoseOn[2], g_dgPoseOff[0], g_dgPoseOff[1], g_dgPoseOff[2], g_track.handValid[0], g_track.handValid[1]);
         g_dgLocOk = g_dgLocBad = 0; for (int q = 0; q < 3; q++) g_dgPoseOn[q] = g_dgPoseOff[q] = 0;
+        if (g_dgPoseHit + g_dgPoseMiss) logmsg("Diagnóstico poses: %ld cuadros con su pose, %ld sin ella · espera de la copia %.1f ms promedio",
+                                               g_dgPoseHit, g_dgPoseMiss, g_nCopy ? g_sumMap / g_nCopy : 0.0);
+        g_dgPoseHit = g_dgPoseMiss = 0;
         g_statSubmitted = g_statSent = g_statBusy = 0;
         g_skipNoSock = g_skipFmt = g_mapFail = g_noProj = g_layers = 0;
         g_statT0 = tnow;
