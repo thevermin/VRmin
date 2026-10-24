@@ -2279,11 +2279,11 @@ static void fill_velocity(void *next, const Track *t, const Space *sp, XrPosef b
 }
 
 static LONG g_dgLocOk, g_dgLocBad, g_dgPoseOn[3], g_dgPoseOff[3];
-static LONG g_dgPoseHit, g_dgPoseMiss;   /* (diagnóstico: cuadros con la pose con la que se dibujaron / sin ella) */   /* (diagnóstico de controles) */
-static Track track_for_time(XrTime time);
+static LONG g_dgPoseHit, g_dgPoseMiss, g_dgSnap;   /* (diagnóstico: cuadros con la pose con la que se dibujaron / sin ella) */   /* (diagnóstico de controles) */
+static Track track_for_time(XrTime *time);
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation *loc) {
     g_inside = "xrLocateSpace";
-    Track t = track_for_time(time);
+    Track t = track_for_time(&time);
     predict(&t, time);
     int v1, v2;
     XrPosef a = space_world((Space *)space, &t, &v1);
@@ -2334,11 +2334,23 @@ static Track g_poseTrack[POSE_HIST];
  * después se le informa a la Mac para corregir la imagen; si no, al mover la cabeza la imagen temblaba (DOOM VFR
  * pide la cabeza y las vistas en momentos distintos del cuadro). */
 static volatile XrTime g_frameTimes[4];   /* los últimos momentos de cuadro que dio xrWaitFrame */
-static Track track_for_time(XrTime time) {
+/* Si piden un momento cercano a un cuadro (hasta 40 ms) pero no exactamente el suyo, se usa el del cuadro: DOOM VFR
+ * calcula la cabeza con su propia predicción (otro momento) y dibujaba con una pose distinta de la que se le
+ * informaba a la Mac; en el visor la imagen temblaba al mover la cabeza (en la ventana de la Mac no). */
+static Track track_for_time(XrTime *ptime) {
     Track t;
+    XrTime time = *ptime;
     EnterCriticalSection(&g_lock);
     int esCuadro = 0;
-    for (int q = 0; q < 4; q++) if (g_frameTimes[q] == time) esCuadro = 1;
+    XrTime cerca = 0, dmin = 40000000;
+    for (int q = 0; q < 4; q++) {
+        XrTime ft = g_frameTimes[q];
+        if (!ft) continue;
+        if (ft == time) esCuadro = 1;
+        XrTime d = ft > time ? ft - time : time - ft;
+        if (d < dmin) { dmin = d; cerca = ft; }
+    }
+    if (!esCuadro && cerca) { time = *ptime = cerca; esCuadro = 1; g_dgSnap++; }
     if (!esCuadro) { t = g_track; LeaveCriticalSection(&g_lock); return t; }   /* (otro momento: la pose de ahora) */
     int ya = -1;
     for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].time == time) { ya = hh; break; }
@@ -2360,8 +2372,9 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateViews(XrSession s, const XrViewLocateI
     *count = 2;
     if (cap == 0) return XR_SUCCESS;
     if (cap < 2) return XR_ERROR_SIZE_INSUFFICIENT;
-    Track t = track_for_time(info->displayTime);
-    predict(&t, info->displayTime);
+    XrTime vt = info->displayTime;
+    Track t = track_for_time(&vt);
+    predict(&t, vt);
     int vb;
     XrPosef base = space_world((Space *)info->space, &t, &vb);
     XrPosef binv = pinv(base);
@@ -3141,9 +3154,9 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
         logmsg("Diagnóstico controles: ubicaciones bien %ld / mal %ld · pose activa (sin mano/izq/der) %ld/%ld/%ld, inactiva %ld/%ld/%ld · manos válidas izq %d der %d",
                g_dgLocOk, g_dgLocBad, g_dgPoseOn[0], g_dgPoseOn[1], g_dgPoseOn[2], g_dgPoseOff[0], g_dgPoseOff[1], g_dgPoseOff[2], g_track.handValid[0], g_track.handValid[1]);
         g_dgLocOk = g_dgLocBad = 0; for (int q = 0; q < 3; q++) g_dgPoseOn[q] = g_dgPoseOff[q] = 0;
-        if (g_dgPoseHit + g_dgPoseMiss) logmsg("Diagnóstico poses: %ld cuadros con su pose, %ld sin ella · espera de la copia %.1f ms promedio",
-                                               g_dgPoseHit, g_dgPoseMiss, g_nCopy ? g_sumMap / g_nCopy : 0.0);
-        g_dgPoseHit = g_dgPoseMiss = 0;
+        if (g_dgPoseHit + g_dgPoseMiss) logmsg("Diagnóstico poses: %ld cuadros con su pose, %ld sin ella · %ld pedidos en otro momento (ajustados al cuadro) · espera de la copia %.1f ms promedio",
+                                               g_dgPoseHit, g_dgPoseMiss, g_dgSnap, g_nCopy ? g_sumMap / g_nCopy : 0.0);
+        g_dgPoseHit = g_dgPoseMiss = g_dgSnap = 0;
         g_statSubmitted = g_statSent = g_statBusy = 0;
         g_skipNoSock = g_skipFmt = g_mapFail = g_noProj = g_layers = 0;
         g_statT0 = tnow;
@@ -3708,7 +3721,7 @@ static PFN_vkVoidFunction VKAPI_CALL hook_vkGetInstanceProcAddr(VkInstance inst,
 
 /* OpenComposite arranca siempre con una sesión D3D11 provisoria. En juegos de 32 bits el D3D11 de Wine (sin DXMT)
  * no llega al nivel 11_0 que pide en una Mac (OpenGL 4.1), y OpenComposite se cerraba («createDeviceRes»). Si falla,
- * se reintenta pidiendo el 10_1/10_0: esa sesión es solo de paso, el juego después dibuja con Vulkan. */
+ * se reintenta con niveles más bajos: esa sesión es solo de paso, el juego después dibuja con Vulkan. */
 #ifndef _WIN64
 typedef HRESULT (WINAPI *PFN_D3D11CreateDeviceX)(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL *, UINT, UINT,
                                                 ID3D11Device **, D3D_FEATURE_LEVEL *, ID3D11DeviceContext **);
@@ -3717,10 +3730,19 @@ static HRESULT WINAPI h_ocD3D11CreateDevice(IDXGIAdapter *ad, D3D_DRIVER_TYPE dt
                                             ID3D11Device **dev, D3D_FEATURE_LEVEL *got, ID3D11DeviceContext **ctx) {
     HRESULT hr = o_ocD3D11CreateDevice(ad, dt, sw, fl, lv, nl, sdk, dev, got, ctx);
     if (SUCCEEDED(hr)) return hr;
-    static const D3D_FEATURE_LEVEL bajos[] = { D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
-    HRESULT hr2 = o_ocD3D11CreateDevice(ad, dt, sw, fl & ~(UINT)D3D11_CREATE_DEVICE_DEBUG, bajos, 2, sdk, dev, got, ctx);
-    if (FAILED(hr2)) hr2 = o_ocD3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, bajos, 2, sdk, dev, got, ctx);
-    logmsg("OpenComposite: D3D11 provisorio (32 bits) 0x%08lx → reintento con nivel 10: 0x%08lx", (unsigned long)hr, (unsigned long)hr2);
+    /* Se prueba cada nivel por separado (y el «que elija Wine») y se anota cuál responde */
+    static const D3D_FEATURE_LEVEL bajos[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0,
+                                              D3D_FEATURE_LEVEL_9_3, D3D_FEATURE_LEVEL_9_2, D3D_FEATURE_LEVEL_9_1 };
+    HRESULT hr2 = o_ocD3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, sdk, dev, got, ctx);
+    logmsg("OpenComposite: D3D11 provisorio (32 bits) 0x%08lx → nivel automático: 0x%08lx", (unsigned long)hr, (unsigned long)hr2);
+    for (int i = 0; FAILED(hr2) && i < 6; i++) {
+        hr2 = o_ocD3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, &bajos[i], 1, sdk, dev, got, ctx);
+        logmsg("OpenComposite: D3D11 nivel %x: 0x%08lx", (unsigned)bajos[i], (unsigned long)hr2);
+    }
+    for (int i = 0; FAILED(hr2) && i < 2; i++) {   /* último recurso: los otros tipos de dispositivo de Wine */
+        hr2 = o_ocD3D11CreateDevice(NULL, i ? D3D_DRIVER_TYPE_REFERENCE : D3D_DRIVER_TYPE_WARP, NULL, 0, NULL, 0, sdk, dev, got, ctx);
+        logmsg("OpenComposite: D3D11 tipo %s: 0x%08lx", i ? "REFERENCE" : "WARP", (unsigned long)hr2);
+    }
     return hr2;
 }
 #endif

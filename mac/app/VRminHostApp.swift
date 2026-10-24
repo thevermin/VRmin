@@ -570,6 +570,10 @@ final class AppModel: ObservableObject {
     /// Al cerrar la app: nada de lo que vive dentro de ella queda corriendo (renderizador, servidor, grabación)
     func killAllHelpers() {
         let b = Bundle.main.bundlePath.replacingOccurrences(of: "'", with: "'\\''")
+        let a = adbPath.path.replacingOccurrences(of: "'", with: "'\\''")
+        let h = data.path.replacingOccurrences(of: "'", with: "'\\''")
+        // (adb deja su servidor corriendo para siempre, y como lo lanzó esta app macOS la sigue mostrando abierta)
+        shell("'\(a)' kill-server; pkill -f '\(h)/herramienta[s]/'", timeout: 2)
         // («Resource[s]»: así el propio comando no coincide consigo mismo)
         shell("pkill -f '\(b)/Contents/Resource[s]/'; pkill -f 'qvb/server[.]py'; pkill -f 'qvb/QuestRendere[r]'; sleep 0.2; pkill -9 -f '\(b)/Contents/Resource[s]/'", timeout: 2)
     }
