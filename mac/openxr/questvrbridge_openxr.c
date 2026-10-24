@@ -1484,6 +1484,26 @@ static void APIENTRY emu_glCopyImageSubData(GLuint src, GLenum srcTarget, GLint 
         glx_attach(GL_DRAW_FRAMEBUFFER, dst, dstTarget, dstLevel, dstZ + z, &m2);
         glx.BlitFramebuffer(srcX, srcY, srcX + w, srcY + h, dstX, dstY, dstX + w, dstY + h, m1 & m2, GL_NEAREST);
     }
+    {   /* (diagnóstico cada ~5 s: qué textura manda el juego y si la copia dio error) */
+        static int64_t ult;
+        GLenum err = glx.GetError();
+        if (err != GL_NO_ERROR || now_ns() - ult > 5000000000LL) {
+            ult = now_ns();
+            GLint fmt = 0, sw = 0, shh = 0, ss = 0, p2d = 0;
+            gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &p2d);
+            if (srcTarget == GL_TEXTURE_2D || srcTarget == GL_TEXTURE_2D_MULTISAMPLE) {
+                gl.BindTexture(srcTarget, src);
+                glx.GetTexLevelParameteriv(srcTarget, srcLevel, GL_TEXTURE_INTERNAL_FORMAT, &fmt);
+                glx.GetTexLevelParameteriv(srcTarget, srcLevel, GL_TEXTURE_WIDTH, &sw);
+                glx.GetTexLevelParameteriv(srcTarget, srcLevel, GL_TEXTURE_HEIGHT, &shh);
+                glx.GetTexLevelParameteriv(srcTarget, srcLevel, GL_TEXTURE_SAMPLES, &ss);
+                gl.BindTexture(GL_TEXTURE_2D, (GLuint)p2d);
+            }
+            while (glx.GetError() != GL_NO_ERROR) {}
+            logmsg("Diagnóstico copia: textura %u tipo 0x%x formato 0x%x %dx%d muestras %d, copia %dx%d desde %d,%d · error 0x%x",
+                   src, srcTarget, fmt, sw, shh, ss, w, h, srcX, srcY, err);
+        }
+    }
     gl.BindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)rfb); gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)dfb);
     if (sc) glx.Enable(GL_SCISSOR_TEST);
     if (srgb) glx.Enable(GL_FRAMEBUFFER_SRGB);
@@ -2546,6 +2566,16 @@ static void gl_readback(Session *s, const XrCompositionLayerProjection *pl, XrTi
                 uint8_t *dst = g_shm + SHM_HDR + (size_t)ss * SHM_SLOT_MAX;
                 if (!s->stFlip[r]) memcpy(dst, src, (size_t)rb * s->stH);
                 else for (uint32_t yy = 0; yy < s->stH; yy++) memcpy(dst + (size_t)yy * rb, src + (size_t)(s->stH - 1 - yy) * rb, rb);
+                {   /* (diagnóstico: brillo medio de lo que llega, cada ~5 s) */
+                    static int64_t ult;
+                    if (now_ns() - ult > 5000000000LL) {
+                        ult = now_ns();
+                        uint64_t sum = 0, n = 0; uint32_t mx = 0;
+                        size_t tot = (size_t)rb * s->stH;
+                        for (size_t o = 0; o + 3 < tot; o += 4 * 61) { uint32_t v = dst[o] + dst[o + 1] + dst[o + 2]; sum += v; n++; if (v > mx) mx = v; }
+                        logmsg("Diagnóstico: brillo medio de la imagen %.1f (máx %u, alfa al medio %u)", n ? sum / (3.0 * n) : 0.0, mx / 3, dst[((tot / 2) & ~(size_t)3) + 3]);
+                    }
+                }
                 gl.UnmapBuffer(GL_PIXEL_PACK_BUFFER);
                 g_sumCopy += (now_ns() - c0) / 1e6; g_nCopy++;
                 MemoryBarrier();
