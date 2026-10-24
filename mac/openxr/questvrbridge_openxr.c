@@ -1760,6 +1760,8 @@ typedef unsigned char (*PFN_ocPoll)(void *self, void *ev, uint32_t cb);
 typedef unsigned char (*PFN_ocPollPose)(void *self, int origin, void *ev, uint32_t cb, void *pose);
 typedef unsigned char (*PFN_ocState)(void *self, uint32_t dev, void *st, uint32_t cb);
 static PFN_ocPoll o_ocPoll; static PFN_ocPollPose o_ocPollPose; static PFN_ocState o_ocState;
+typedef void (*PFN_ocDevPoses)(void *self, int origin, float secs, void *poses, uint32_t count);
+static PFN_ocDevPoses o_ocDevPoses;
 static volatile LONG g_ocSendsButtons;
 static volatile int64_t g_realBindingsAt;   /* cuándo OpenComposite cargó los controles de verdad (0: todavía no) */
 static uint64_t g_prevPressed[8], g_prevTouched[8];
@@ -1824,7 +1826,11 @@ static unsigned char h_ocPoll(void *self, void *ev, uint32_t cb) {
 static unsigned char h_ocPollPose(void *self, int origin, void *ev, uint32_t cb, void *pose) {
     if (o_ocPollPose(self, origin, ev, cb, pose)) { if (ev) ev_seen(ev); return 1; }
     if (g_ocSendsButtons || !ev_synth(self, ev, cb)) return 0;
-    if (pose) memset(pose, 0, 80);   /* (TrackedDevicePose_t sin pose válida) */
+    if (pose) {   /* la pose del control en el momento del evento (Earth apunta con ella) */
+        uint8_t poses[16][80]; uint32_t dev; memcpy(&dev, (uint8_t *)ev + 4, 4);
+        memset(pose, 0, 80);
+        if (o_ocDevPoses && dev < 16) { memset(poses, 0, sizeof poses); o_ocDevPoses(self, origin, 0.0f, poses, 16); memcpy(pose, poses[dev], 80); }
+    }
     return 1;
 }
 /* La función de OpenComposite que usa ese nombre (para sus registros) y el lugar de su tabla de métodos */
@@ -1946,6 +1952,21 @@ static void fix_opencomposite_devices(unsigned char *b) {
     else logmsg("OpenComposite: no encontré XrBackend::GetDevice");
 }
 
+/* Earth decide el tipo de visor por el modelo del visor (propiedad 1001 del dispositivo 0), y OpenComposite no la
+ * conoce: Earth recibe un texto vacío y probablemente no elige ningún esquema de controles. Se le contesta «Rift». */
+typedef uint32_t (*PFN_ocStrProp)(void *self, uint32_t dev, int prop, char *val, uint32_t size, int *err);
+static PFN_ocStrProp o_ocStrProp;
+static uint32_t h_ocStrProp(void *self, uint32_t dev, int prop, char *val, uint32_t size, int *err) {
+    uint32_t r = o_ocStrProp(self, dev, prop, val, size, err);
+    if (dev == 0 && prop == 1001 && r <= 1) {
+        static const char modelo[] = "Oculus Rift CV1";
+        if (val && size >= sizeof modelo) memcpy(val, modelo, sizeof modelo);
+        if (err) *err = (val && size >= sizeof modelo) ? 0 : 3;   /* 0 = éxito, 3 = búfer chico */
+        static LONG avisado; if (InterlockedIncrement(&avisado) == 1) logmsg("OpenComposite: modelo del visor presentado como «%s»", modelo);
+        return sizeof modelo;
+    }
+    return r;
+}
 static void fix_opencomposite_events(unsigned char *b) {
     void **sPoll = oc_vtable_slot(b, "CVRSystem_017::PollNextEvent");
     void **sPose = oc_vtable_slot(b, "CVRSystem_017::PollNextEventWithPose");
@@ -1953,6 +1974,8 @@ static void fix_opencomposite_events(unsigned char *b) {
     if (!sPoll || !sPose || !sState) { logmsg("OpenComposite: no encontré dónde armar los eventos de botones"); return; }
     void *o;
     if (oc_patch_slot(sState, (void *)h_ocState, &o)) memcpy(&o_ocState, &o, sizeof o);
+    void **sPoses = oc_vtable_slot(b, "CVRSystem_017::GetDeviceToAbsoluteTrackingPose");
+    if (sPoses) memcpy(&o_ocDevPoses, sPoses, sizeof o_ocDevPoses);
     if (oc_patch_slot(sPoll, (void *)h_ocPoll, &o)) memcpy(&o_ocPoll, &o, sizeof o);
     if (oc_patch_slot(sPose, (void *)h_ocPollPose, &o)) memcpy(&o_ocPollPose, &o, sizeof o);
     logmsg("OpenComposite: eventos de botones listos para armar si hacen falta");
@@ -1996,6 +2019,8 @@ static void fix_opencomposite_models(const char *app) {
     fix_opencomposite_events(b);
     (void)fix_opencomposite_connected;   /* (reemplazado por fix_opencomposite_devices: arregla el parpadeo en el origen) */
     fix_opencomposite_devices(b);
+    void **sStr = oc_vtable_slot(b, "CVRSystem_017::GetStringTrackedDeviceProperty"); void *o;
+    if (sStr && oc_patch_slot(sStr, (void *)h_ocStrProp, &o)) memcpy(&o_ocStrProp, &o, sizeof o);
 }
 
 /* El wininet de Wine se rompe si el juego cierra una conexión mientras sus pedidos siguen abiertos en otros
