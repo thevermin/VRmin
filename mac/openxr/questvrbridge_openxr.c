@@ -1543,6 +1543,73 @@ static void shader_loaders(void) {
     q = g_origWglGPA("glGetProgramiv"); memcpy(&p_glGetProgramiv, &q, sizeof q);
     q = g_origWglGPA("glGetProgramInfoLog"); memcpy(&p_glGetProgramInfoLog, &q, sizeof q);
 }
+/* Earth (y otros juegos viejos) escriben shaders en GLSL de OpenGL ES / OpenGL 2 (#version 100–130: attribute,
+ * varying, gl_FragColor, texture2D, precision…). La Mac, en el perfil moderno, solo acepta GLSL 1.50 o más nuevo:
+ * se traducen al vuelo con unas definiciones al principio. */
+static PFNGLSHADERSOURCEPROC o_glShaderSource;
+static LONG g_shTrad;
+static int es_palabra(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+static void APIENTRY hook_glShaderSource(GLuint sh, GLsizei count, const GLchar *const *strs, const GLint *lens) {
+    size_t total = 0;
+    for (GLsizei i = 0; i < count; i++) total += (lens && lens[i] >= 0) ? (size_t)lens[i] : strlen(strs[i]);
+    char *src = (char *)malloc(total + 1);
+    if (!src) { o_glShaderSource(sh, count, strs, lens); return; }
+    size_t o = 0;
+    for (GLsizei i = 0; i < count; i++) { size_t l = (lens && lens[i] >= 0) ? (size_t)lens[i] : strlen(strs[i]); memcpy(src + o, strs[i], l); o += l; }
+    src[o] = 0;
+    /* ¿Qué versión pide? (la primera línea #version; sin ella es 110) */
+    int ver = 110, es = 0;
+    char *vl = strstr(src, "#version");
+    if (vl) { ver = atoi(vl + 8); const char *e = vl + 8; while (*e && *e != '\n') { if (!strncmp(e, " es", 3)) es = 1; e++; } }
+    if (ver >= 330 && !es) { free(src); o_glShaderSource(sh, count, strs, lens); return; }
+    shader_loaders();
+    GLint tipo = 0;
+    if (p_glGetShaderiv) p_glGetShaderiv(sh, GL_SHADER_TYPE, &tipo);
+    if (tipo != GL_VERTEX_SHADER && tipo != GL_FRAGMENT_SHADER) { free(src); o_glShaderSource(sh, count, strs, lens); return; }
+    char *out = (char *)malloc(total * 2 + 4096);
+    if (!out) { free(src); o_glShaderSource(sh, count, strs, lens); return; }
+    size_t n = 0;
+#define ADD(s) do { size_t l_ = strlen(s); memcpy(out + n, s, l_); n += l_; } while (0)
+    ADD("#version 150\n");
+    /* Las #extension van arriba (antes de cualquier declaración); «require» → «enable» */
+    for (char *p = src; (p = strstr(p, "#extension")) != NULL; ) {
+        char *fin = strchr(p, '\n'); size_t l = fin ? (size_t)(fin - p) : strlen(p);
+        char *r = strstr(p, "require");
+        if (r && r < p + l) { memcpy(out + n, p, (size_t)(r - p)); n += (size_t)(r - p); ADD("enable"); memcpy(out + n, r + 7, l - (size_t)(r + 7 - p)); n += l - (size_t)(r + 7 - p); }
+        else { memcpy(out + n, p, l); n += l; }
+        out[n++] = '\n';
+        memset(p, ' ', l);   /* (en su lugar original queda vacía) */
+        p += l;
+    }
+    if (vl) { char *fin = strchr(vl, '\n'); memset(vl, ' ', fin ? (size_t)(fin - vl) : strlen(vl)); }
+    ADD("#define lowp\n#define mediump\n#define highp\n"
+        "#define texture2D texture\n#define texture2DProj textureProj\n#define texture2DLod textureLod\n"
+        "#define texture2DLodEXT textureLod\n#define texture2DGradEXT textureGrad\n#define textureCube texture\n"
+        "#define textureCubeLod textureLod\n#define textureCubeLodEXT textureLod\n#define texture3D texture\n");
+    if (tipo == GL_VERTEX_SHADER) ADD("#define attribute in\n#define varying out\n");
+    else {
+        ADD("#define varying in\n");
+        if (strstr(src, "gl_FragData")) ADD("out vec4 vrmin_FragData[4];\n#define gl_FragData vrmin_FragData\n");
+        else if (strstr(src, "gl_FragColor")) ADD("out vec4 vrmin_FragColor;\n#define gl_FragColor vrmin_FragColor\n");
+    }
+    ADD("#line 1\n");
+    /* El resto, sin las sentencias «precision …;» (en GLSL de escritorio no hacen nada y la Mac se queja) */
+    for (char *p = src; *p; ) {
+        if (!strncmp(p, "precision", 9) && (p == src || !es_palabra(p[-1])) && (p[9] == ' ' || p[9] == '\t')) {
+            char *pc = p + 9;
+            while (*pc == ' ' || *pc == '\t' || es_palabra(*pc)) pc++;
+            if (*pc == ';') { p = pc + 1; continue; }
+        }
+        out[n++] = *p++;
+    }
+    out[n] = 0;
+#undef ADD
+    const GLchar *one = out;
+    o_glShaderSource(sh, 1, &one, NULL);
+    free(out); free(src);
+    if (InterlockedIncrement(&g_shTrad) == 1) logmsg("OpenGL: traduciendo shaders viejos del juego a GLSL 1.50 (el primero era #version %d%s)", ver, es ? " es" : "");
+}
+
 static void APIENTRY hook_glCompileShader(GLuint sh) {
     o_glCompileShader(sh);
     shader_loaders();
@@ -1574,6 +1641,7 @@ static void APIENTRY hook_glLinkProgram(GLuint pr) {
 
 static PROC WINAPI hook_wglGetProcAddress(LPCSTR name) {
     PROC p = g_origWglGPA(name);
+    if (p && name && !strcmp(name, "glShaderSource")) { memcpy(&o_glShaderSource, &p, sizeof p); return (PROC)(void (*)(void))hook_glShaderSource; }
     if (p && name && !strcmp(name, "glCompileShader")) { memcpy(&o_glCompileShader, &p, sizeof p); return (PROC)(void (*)(void))hook_glCompileShader; }
     if (p && name && !strcmp(name, "glLinkProgram")) { memcpy(&o_glLinkProgram, &p, sizeof p); return (PROC)(void (*)(void))hook_glLinkProgram; }
     if (!p && name && !strcmp(name, "glGetTextureLevelParameteriv")) return (PROC)(void (*)(void))emu_glGetTextureLevelParameteriv;
