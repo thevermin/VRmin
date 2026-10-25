@@ -2301,7 +2301,8 @@ static void fill_velocity(void *next, const Track *t, const Space *sp, XrPosef b
 }
 
 static LONG g_dgLocOk, g_dgLocBad, g_dgPoseOn[3], g_dgPoseOff[3];
-static LONG g_dgPoseHit, g_dgPoseMiss, g_dgPoseFix;   /* (diagnóstico: cuadros con la pose con la que se dibujaron / sin ella) */   /* (diagnóstico de controles) */
+static LONG g_dgPoseHit, g_dgPoseMiss, g_dgPoseFix;
+static XrFovf g_dgLayerFov, g_dgOurFov;   /* (diagnóstico: campo de visión con que el juego dice que dibujó / el nuestro) */   /* (diagnóstico: cuadros con la pose con la que se dibujaron / sin ella) */   /* (diagnóstico de controles) */
 static Track track_for_time(XrTime time);
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation *loc) {
     g_inside = "xrLocateSpace";
@@ -2906,6 +2907,7 @@ static uint32_t pose_id_for_layer(const XrCompositionLayerProjection *pl, XrTime
     int hit = -1;
     for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].time == displayTime) { id = g_poseHist[hh].id; hit = hh; break; }
     InterlockedIncrement(hit >= 0 ? &g_dgPoseHit : &g_dgPoseMiss);
+    g_dgLayerFov = pl->views[0].fov; g_dgOurFov = g_track.fov[0];
     if (!g_vigia && pl->space) {
         int best = -1; float bd = 1e9f, dHit = 1e9f;
         for (int hh = 0; hh < POSE_HIST; hh++) {
@@ -3215,6 +3217,11 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
         g_dgLocOk = g_dgLocBad = 0; for (int q = 0; q < 3; q++) g_dgPoseOn[q] = g_dgPoseOff[q] = 0;
         if (g_dgPoseHit + g_dgPoseMiss) logmsg("Diagnóstico poses: %ld cuadros con su pose, %ld sin ella · %ld corregidos con la pose de la capa · espera de la copia %.1f ms promedio",
                                                g_dgPoseHit, g_dgPoseMiss, g_dgPoseFix, g_nCopy ? g_sumMap / g_nCopy : 0.0);
+        if (g_dgPoseHit + g_dgPoseMiss) {
+            const float r = 57.29578f; const XrFovf a = g_dgLayerFov, b = g_dgOurFov;
+            logmsg("Diagnóstico campo de visión (ojo izq., grados): juego %.1f/%.1f/%.1f/%.1f · visor %.1f/%.1f/%.1f/%.1f · recorte %.2f",
+                   a.angleLeft * r, a.angleRight * r, a.angleUp * r, a.angleDown * r, b.angleLeft * r, b.angleRight * r, b.angleUp * r, b.angleDown * r, g_fovK);
+        }
         g_dgPoseHit = g_dgPoseMiss = g_dgPoseFix = 0;
         g_statSubmitted = g_statSent = g_statBusy = 0;
         g_skipNoSock = g_skipFmt = g_mapFail = g_noProj = g_layers = 0;
@@ -3817,8 +3824,8 @@ static void fix_opencomposite_32(void) {
 }
 
 /* --- DXVK (Half-Life 2: VR Mod trae el suyo: DirectX 9 → Vulkan) ---
- * DXVK 2 se niega a arrancar si la GPU no tiene «geometryShader», y las de Apple (MoltenVK) no lo tienen. Half-Life 2
- * no lo necesita: se le dice a DXVK que sí está (vkGetPhysicalDeviceFeatures/2) y al crear el dispositivo se apaga
+ * DXVK 2 se niega a arrancar si la GPU no tiene «geometryShader» ni «shaderCullDistance», y las de Apple (MoltenVK)
+ * no los tienen. Half-Life 2 (DirectX 9) no los necesita: se le dice a DXVK que sí están (vkGetPhysicalDeviceFeatures/2) y al crear el dispositivo se apagan
  * de nuevo (vkCreateDevice), así MoltenVK no lo rechaza. DXVK carga el Vulkan de Wine (winevulkan.dll) por su cuenta,
  * sin pasar por las importaciones del juego, así que se intervienen esas funciones directamente: empiezan todas con
  * los mismos 5 bytes («mov edi,edi»/«push ebp; mov ebp,esp» de Wine), que se cambian por un salto (y se guardan,
@@ -3843,11 +3850,11 @@ static PFN_vkGetPhysicalDeviceFeatures2 g_dxRealFeat2;
 static PFN_vkCreateDevice g_dxRealCreate;
 static void VKAPI_CALL dx_GetPhysicalDeviceFeatures(VkPhysicalDevice pd, VkPhysicalDeviceFeatures *f) {
     g_dxRealFeat(pd, f);
-    if (f) f->geometryShader = VK_TRUE;
+    if (f) f->geometryShader = f->shaderCullDistance = VK_TRUE;
 }
 static void VKAPI_CALL dx_GetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f) {
     g_dxRealFeat2(pd, f);
-    if (f) f->features.geometryShader = VK_TRUE;
+    if (f) f->features.geometryShader = f->features.shaderCullDistance = VK_TRUE;
 }
 static VkResult VKAPI_CALL dx_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, const VkAllocationCallbacks *al, VkDevice *dev) {
     if (!ci) return g_dxRealCreate(pd, ci, al, dev);
