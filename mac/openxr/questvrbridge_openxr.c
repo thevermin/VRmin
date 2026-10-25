@@ -3814,11 +3814,13 @@ static HRESULT WINAPI h_ocD3D11CreateDevice(IDXGIAdapter *ad, D3D_DRIVER_TYPE dt
 #endif
 static void fix_opencomposite_32(void) {
 #ifndef _WIN64
-    static int done;
-    if (done) return;
-    done = 1;
+    /* (por cada vez que se carga OpenComposite: Half-Life 2 lo carga, lo descarga y lo vuelve a cargar en otro lugar) */
+    static HMODULE hecho;
+    HMODULE m = GetModuleHandleA("vrclient.dll");
+    if (!m || m == hecho) return;
+    hecho = m;
     void *o;
-    if (patch_iat(GetModuleHandleA("vrclient.dll"), "d3d11.dll", "D3D11CreateDevice", (void *)h_ocD3D11CreateDevice, &o))
+    if (patch_iat(m, "d3d11.dll", "D3D11CreateDevice", (void *)h_ocD3D11CreateDevice, &o))
         memcpy(&o_ocD3D11CreateDevice, &o, sizeof o);
 #endif
 }
