@@ -801,6 +801,9 @@ typedef struct Session {
     int vkWarned;
     /* (la espera de la GPU y el paso a la memoria compartida los hace un hilo aparte: el juego no se frena) */
     HANDLE vkThread, vkEv; volatile LONG vkPend[STAGES]; volatile LONG vkStop; int vkRp;
+    /* panel flotante (capa «quad»: el menú de Half-Life 2, por ejemplo): se lee y se pega sobre la imagen de cada ojo */
+    VkBuffer vkQBuf[STAGES]; VkDeviceMemory vkQMem[STAGES]; void *vkQMap[STAGES]; uint32_t vkQW, vkQH;
+    struct { int on, rgba, blend, premul; uint32_t w, h; XrPosef pose; XrExtent2Df size; XrPosef eye[2]; XrFovf fov[2]; } vkQ[STAGES];
     /* OpenGL: el contexto del juego, y para leer la imagen un framebuffer y dos PBO */
     int gl; HDC gldc; HGLRC glrc;
     GLuint glFbo, glPbo[STAGES]; GLsync glSync[STAGES];
@@ -1251,6 +1254,16 @@ static int vk_initial_layout(Session *s, VkImage img, VkImageAspectFlags aspect,
     return ok;
 }
 
+static void vk_free_quad(Session *s) {
+    for (int k = 0; k < STAGES; k++) {
+        if (s->vkQMap[k]) vk.UnmapMemory(s->vkDev, s->vkQMem[k]);
+        if (s->vkQBuf[k]) vk.DestroyBuffer(s->vkDev, s->vkQBuf[k], NULL);
+        if (s->vkQMem[k]) vk.FreeMemory(s->vkDev, s->vkQMem[k], NULL);
+        s->vkQMap[k] = NULL; s->vkQBuf[k] = VK_NULL_HANDLE; s->vkQMem[k] = VK_NULL_HANDLE; s->vkQ[k].on = 0;
+    }
+    s->vkQW = s->vkQH = 0;
+}
+
 /* Espera que el hilo de lectura termine con la memoria de lectura k (hasta ms milisegundos) */
 static int vk_stage_idle(Session *s, int k, int ms) {
     for (int i = 0; s->vkPend[k] && i < ms; i++) Sleep(1);
@@ -1265,6 +1278,7 @@ static void vk_free_buffers(Session *s) {
         if (s->vkBufMem[k]) vk.FreeMemory(s->vkDev, s->vkBufMem[k], NULL);
         s->vkMap[k] = NULL; s->vkBuf[k] = VK_NULL_HANDLE; s->vkBufMem[k] = VK_NULL_HANDLE; s->stValid[k] = 0;
     }
+    vk_free_quad(s);
 }
 
 static int vk_session_setup(Session *s, const XrGraphicsBindingVulkanKHR *vb) {
@@ -2851,6 +2865,100 @@ static void readback(Session *s, const XrCompositionLayerProjection *pl, XrTime 
     SetEvent(g_frameEvent);
 }
 
+/* Memoria de lectura (visible desde la CPU) para el panel flotante, del tamaño w×h */
+static int vk_quad_buffers(Session *s, uint32_t w, uint32_t h) {
+    if (s->vkQBuf[0] && s->vkQW == w && s->vkQH == h) return 1;
+    vk.QueueWaitIdle(s->vkQueue);
+    for (int k = 0; k < STAGES; k++) vk_stage_idle(s, k, 2000);
+    vk_free_quad(s);
+    VkBufferCreateInfo bc = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bc.size = (VkDeviceSize)w * h * 4; bc.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; bc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    for (int k = 0; k < STAGES; k++) {
+        VkMemoryRequirements mr;
+        VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        int ok = vk.CreateBuffer(s->vkDev, &bc, NULL, &s->vkQBuf[k]) == VK_SUCCESS;
+        if (ok) {
+            vk.GetBufferMemoryRequirements(s->vkDev, s->vkQBuf[k], &mr);
+            int mt = vk_memtype(s, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+            ma.allocationSize = mr.size; ma.memoryTypeIndex = (uint32_t)mt;
+            ok = mt >= 0 && vk.AllocateMemory(s->vkDev, &ma, NULL, &s->vkQMem[k]) == VK_SUCCESS
+                 && vk.BindBufferMemory(s->vkDev, s->vkQBuf[k], s->vkQMem[k], 0) == VK_SUCCESS
+                 && vk.MapMemory(s->vkDev, s->vkQMem[k], 0, VK_WHOLE_SIZE, 0, &s->vkQMap[k]) == VK_SUCCESS;
+        }
+        if (!ok) { logmsg("Vulkan: no se pudo crear la memoria del panel flotante"); vk_free_quad(s); return 0; }
+    }
+    s->vkQW = w; s->vkQH = h;
+    logmsg("Panel flotante (menú) del juego: %ux%u, se pega sobre la imagen", w, h);
+    return 1;
+}
+
+/* Pega el panel flotante sobre la imagen de los dos ojos (ya en la memoria compartida, filas de arriba hacia abajo):
+ * por cada píxel del ojo, el rayo desde el ojo se cruza con el plano del panel y se toma el color de ese punto */
+static void vk_composite_quad(Session *s, int r, uint8_t *dst, uint32_t ew, uint32_t eh, int dstRgba) {
+    const uint8_t *src = (const uint8_t *)s->vkQMap[r];
+    uint32_t qw = s->vkQ[r].w, qh = s->vkQ[r].h;
+    if (!src || !qw || !qh) return;
+    const float hw = s->vkQ[r].size.width * 0.5f, hh = s->vkQ[r].size.height * 0.5f;
+    if (hw <= 0 || hh <= 0) return;
+    const int swap = s->vkQ[r].rgba != dstRgba;
+    const size_t rb = (size_t)ew * 2 * 4;
+    for (int e = 0; e < 2; e++) {
+        XrPosef qe = pmul(pinv(s->vkQ[r].eye[e]), s->vkQ[r].pose);
+        XrVector3f c = qe.position;
+        XrVector3f ux = qrot(qe.orientation, (XrVector3f){1, 0, 0}), uy = qrot(qe.orientation, (XrVector3f){0, 1, 0});
+        XrVector3f n = qrot(qe.orientation, (XrVector3f){0, 0, 1});
+        const XrFovf fv = s->vkQ[r].fov[e];
+        float tl = tanf(fv.angleLeft), tr = tanf(fv.angleRight), tu = tanf(fv.angleUp), td = tanf(fv.angleDown);
+        if (tr - tl < 1e-4f || tu - td < 1e-4f) continue;
+        /* zona de la imagen que puede tocar el panel (sus 4 esquinas; si alguna queda detrás del ojo, toda) */
+        int x0 = 0, y0 = 0, x1 = (int)ew, y1 = (int)eh, front = 1;
+        float mnx = 1e9f, mxx = -1e9f, mny = 1e9f, mxy = -1e9f;
+        for (int q = 0; q < 4; q++) {
+            float sx = (q & 1) ? hw : -hw, sy = (q & 2) ? hh : -hh;
+            XrVector3f p = { c.x + ux.x * sx + uy.x * sy, c.y + ux.y * sx + uy.y * sy, c.z + ux.z * sx + uy.z * sy };
+            if (p.z > -1e-3f) { front = 0; break; }
+            float tx = p.x / -p.z, ty = p.y / -p.z;
+            if (tx < mnx) mnx = tx;
+            if (tx > mxx) mxx = tx;
+            if (ty < mny) mny = ty;
+            if (ty > mxy) mxy = ty;
+        }
+        if (front) {
+            x0 = (int)floorf((mnx - tl) / (tr - tl) * ew) - 1; x1 = (int)ceilf((mxx - tl) / (tr - tl) * ew) + 1;
+            y0 = (int)floorf((tu - mxy) / (tu - td) * eh) - 1; y1 = (int)ceilf((tu - mny) / (tu - td) * eh) + 1;
+            if (x0 < 0) x0 = 0;
+            if (y0 < 0) y0 = 0;
+            if (x1 > (int)ew) x1 = (int)ew;
+            if (y1 > (int)eh) y1 = (int)eh;
+            if (x0 >= x1 || y0 >= y1) continue;
+        }
+        const float cn = c.x * n.x + c.y * n.y + c.z * n.z;
+        for (int py = y0; py < y1; py++) {
+            float ty = tu - ((float)py + 0.5f) / eh * (tu - td);
+            uint8_t *row = dst + (size_t)py * rb + (size_t)e * ew * 4;
+            for (int px = x0; px < x1; px++) {
+                float tx = tl + ((float)px + 0.5f) / ew * (tr - tl);
+                float den = tx * n.x + ty * n.y - n.z;
+                if (den > -1e-6f && den < 1e-6f) continue;
+                float k = cn / den;
+                if (k <= 0) continue;
+                float rx = tx * k - c.x, ry = ty * k - c.y, rz = -k - c.z;
+                float u = (rx * ux.x + ry * ux.y + rz * ux.z) / (2 * hw) + 0.5f;
+                float v = 0.5f - (rx * uy.x + ry * uy.y + rz * uy.z) / (2 * hh);
+                if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
+                const uint8_t *sp = src + ((size_t)(v * qh) * qw + (size_t)(u * qw)) * 4;
+                uint8_t *dp = row + (size_t)px * 4;
+                int sr = swap ? sp[2] : sp[0], sg = sp[1], sb = swap ? sp[0] : sp[2], a = sp[3];
+                if (!s->vkQ[r].blend) { dp[0] = (uint8_t)sr; dp[1] = (uint8_t)sg; dp[2] = (uint8_t)sb; continue; }
+                if (!s->vkQ[r].premul) { sr = sr * a / 255; sg = sg * a / 255; sb = sb * a / 255; }
+                int ia = 255 - a;
+                dp[0] = (uint8_t)(sr + dp[0] * ia / 255); dp[1] = (uint8_t)(sg + dp[1] * ia / 255); dp[2] = (uint8_t)(sb + dp[2] * ia / 255);
+            }
+        }
+    }
+}
+
 static void vk_send_stage(Session *s, int r) {
     if (!s->stValid[r]) return;
     int64_t c0 = now_ns();
@@ -2876,6 +2984,7 @@ static void vk_send_stage(Session *s, int r) {
     const uint8_t *src = (const uint8_t *)s->vkMap[r];
     if (!s->stFlip[r]) memcpy(dst, src, (size_t)rb * s->stH);
     else for (uint32_t y = 0; y < s->stH; y++) memcpy(dst + (size_t)y * rb, src + (size_t)(s->stH - 1 - y) * rb, rb);
+    if (s->vkQ[r].on) vk_composite_quad(s, r, dst, s->stW, s->stH, fmt_code(s->stFmt) != 0);
     g_sumCopy += (now_ns() - c0) / 1e6; g_nCopy++;
     s->stValid[r] = 0;
     MemoryBarrier();
@@ -2931,11 +3040,11 @@ static uint32_t pose_id_for_layer(const XrCompositionLayerProjection *pl, XrTime
 }
 
 /* Vulkan por OpenComposite: OpenComposite copia la imagen del juego apenas este llama a Submit, y DOOM VFR y DXVK
- * (Half-Life 2) mandan a la GPU el dibujo del cuadro recién después: la copia se queda con el cuadro anterior. Se le
- * informa al visor la pose de hace «lag» cuadros (por defecto 1; se puede cambiar sin recompilar escribiendo 0, 1 o 2
+ * (Half-Life 2) podrían mandar a la GPU el dibujo del cuadro recién después (sin confirmar: con 1 no cambió). Se le
+ * informa al visor la pose de hace «lag» cuadros (por defecto 0: probar 1 o 2 sin recompilar escribiéndolo
  * en C:\questvrbridge\vk_lag.txt, se relee cada 2 s). Si no, el visor corrige con otra pose y tiembla al mover la cabeza. */
 static uint32_t vk_lagged_id(uint32_t id) {
-    static uint32_t hist[3]; static int lag = 1; static DWORD leido;
+    static uint32_t hist[3]; static int lag = 0; static DWORD leido;
     DWORD now = GetTickCount();
     if (now - leido > 2000) {
         leido = now;
@@ -2948,7 +3057,7 @@ static uint32_t vk_lagged_id(uint32_t id) {
 
 /* Vulkan: copia los dos ojos (en la GPU) a memoria que se puede leer, lado a lado; lee la del cuadro
    anterior (ya terminó en la GPU) y la pasa a la memoria compartida con la Mac */
-static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, XrTime displayTime) {
+static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, const XrCompositionLayerQuad *ql, XrTime displayTime) {
     Swapchain *sc0 = (Swapchain *)pl->views[0].subImage.swapchain;
     if (!sc0 || !sc0->vimg[0]) return;
     if (sc0->dxgi != DXGI_FORMAT_R8G8B8A8_TYPELESS && sc0->dxgi != DXGI_FORMAT_B8G8R8A8_TYPELESS) return;
@@ -3017,7 +3126,7 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, XrTi
         reg[e].imageExtent.width = (uint32_t)w; reg[e].imageExtent.height = (uint32_t)h; reg[e].imageExtent.depth = 1;
     }
     int nb = (imgs[1] == imgs[0] && layers[1] == layers[0]) ? 1 : 2;   /* (los dos ojos en la misma imagen y capa: un solo cambio) */
-    VkImageMemoryBarrier toSrc[2], back[2];
+    VkImageMemoryBarrier toSrc[3], back[3];
     for (int e = 0; e < nb; e++) {
         VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -3030,19 +3139,60 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, XrTi
         back[e].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; back[e].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         back[e].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; back[e].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     }
+    /* panel flotante: su imagen también se copia a memoria que se puede leer, y se anota dónde está */
+    s->vkQ[k].on = 0;
+    VkBufferImageCopy qreg; VkImage qimg = VK_NULL_HANDLE;
+    if (ql) {
+        Swapchain *qs = (Swapchain *)ql->subImage.swapchain;
+        int qx = ql->subImage.imageRect.offset.x, qy = ql->subImage.imageRect.offset.y;
+        int qw = ql->subImage.imageRect.extent.width, qh = ql->subImage.imageRect.extent.height;
+        if (qs && qs->vimg[0] && (qs->dxgi == DXGI_FORMAT_R8G8B8A8_TYPELESS || qs->dxgi == DXGI_FORMAT_B8G8R8A8_TYPELESS)
+            && qx >= 0 && qy >= 0 && qw > 0 && qh > 0 && qx + qw <= (int)qs->w && qy + qh <= (int)qs->h && qw <= 4096 && qh <= 4096
+            && vk_quad_buffers(s, (uint32_t)qw, (uint32_t)qh)) {
+            qimg = qs->vimg[qs->released];
+            memset(&qreg, 0, sizeof qreg);
+            qreg.bufferRowLength = (uint32_t)qw; qreg.bufferImageHeight = (uint32_t)qh;
+            qreg.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            qreg.imageSubresource.baseArrayLayer = ql->subImage.imageArrayIndex; qreg.imageSubresource.layerCount = 1;
+            qreg.imageOffset.x = qx; qreg.imageOffset.y = qy;
+            qreg.imageExtent.width = (uint32_t)qw; qreg.imageExtent.height = (uint32_t)qh; qreg.imageExtent.depth = 1;
+            VkImageMemoryBarrier b = toSrc[0];
+            b.image = qimg; b.subresourceRange.baseArrayLayer = ql->subImage.imageArrayIndex;
+            toSrc[nb] = b;
+            back[nb] = back[0]; back[nb].image = qimg; back[nb].subresourceRange.baseArrayLayer = ql->subImage.imageArrayIndex;
+            /* dónde está el panel respecto de la capa de la imagen 3D (y cada ojo, con la pose y el campo de visión de la capa) */
+            Track tk; EnterCriticalSection(&g_lock); tk = g_track; LeaveCriticalSection(&g_lock);
+            int v1, v2;
+            XrPosef pw = space_world((const Space *)pl->space, &tk, &v1), qw0 = space_world((const Space *)ql->space, &tk, &v2);
+            s->vkQ[k].pose = pmul(pinv(pw), pmul(qw0, ql->pose));
+            s->vkQ[k].size = ql->size;
+            for (int e = 0; e < 2; e++) { s->vkQ[k].eye[e] = pl->views[e].pose; s->vkQ[k].fov[e] = pl->views[e].fov; }
+            s->vkQ[k].w = (uint32_t)qw; s->vkQ[k].h = (uint32_t)qh;
+            s->vkQ[k].rgba = fmt_code(qs->dxgi) != 0;
+            s->vkQ[k].blend = (ql->layerFlags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT) != 0;
+            s->vkQ[k].premul = (ql->layerFlags & XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT) == 0;
+            s->vkQ[k].on = 1;
+        }
+    }
+    int nbq = nb + (qimg != VK_NULL_HANDLE);
     VkCommandBuffer cb = s->vkCb[k];
     vk.ResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vk.BeginCommandBuffer(cb, &bi);
-    vk.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, (uint32_t)nb, toSrc);
+    vk.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, (uint32_t)nbq, toSrc);
     for (int e = 0; e < 2; e++) vk.CmdCopyImageToBuffer(cb, imgs[e], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->vkBuf[k], 1, &reg[e]);
-    VkBufferMemoryBarrier hb = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
-    hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; hb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    hb.srcQueueFamilyIndex = hb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    hb.buffer = s->vkBuf[k]; hb.size = VK_WHOLE_SIZE;
+    if (qimg) vk.CmdCopyImageToBuffer(cb, qimg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->vkQBuf[k], 1, &qreg);
+    VkBufferMemoryBarrier hb[2];
+    for (int q = 0; q < 2; q++) {
+        VkBufferMemoryBarrier x = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+        x.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; x.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        x.srcQueueFamilyIndex = x.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        x.buffer = q ? s->vkQBuf[k] : s->vkBuf[k]; x.size = VK_WHOLE_SIZE;
+        hb[q] = x;
+    }
     vk.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
-                          0, NULL, 1, &hb, (uint32_t)nb, back);
+                          0, NULL, qimg ? 2u : 1u, hb, (uint32_t)nbq, back);
     vk.EndCommandBuffer(cb);
     vk.ResetFences(s->vkDev, 1, &s->vkFence[k]);
     VkSubmitInfo sub = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -3195,7 +3345,12 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
                     }
                     logmsg("Ajuste multi-pass consultado por el juego %ld veces", (long)g_hookHits);
                 }
-                if (s->vk) vk_readback(s, pl, info->displayTime);
+                if (s->vk) {
+                    const XrCompositionLayerQuad *ql = NULL;   /* (el primer panel flotante, si hay) */
+                    for (uint32_t j = 0; j < info->layerCount && !ql; j++)
+                        if (info->layers[j] && info->layers[j]->type == XR_TYPE_COMPOSITION_LAYER_QUAD) ql = (const XrCompositionLayerQuad *)info->layers[j];
+                    vk_readback(s, pl, ql, info->displayTime);
+                }
                 else if (s->gl) gl_readback(s, pl, info->displayTime);
                 else {
                     EnterCriticalSection(&g_gpuLock);
