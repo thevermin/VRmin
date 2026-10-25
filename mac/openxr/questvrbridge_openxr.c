@@ -2930,6 +2930,22 @@ static uint32_t pose_id_for_layer(const XrCompositionLayerProjection *pl, XrTime
     return id;
 }
 
+/* Vulkan por OpenComposite: OpenComposite copia la imagen del juego apenas este llama a Submit, y DOOM VFR y DXVK
+ * (Half-Life 2) mandan a la GPU el dibujo del cuadro recién después: la copia se queda con el cuadro anterior. Se le
+ * informa al visor la pose de hace «lag» cuadros (por defecto 1; se puede cambiar sin recompilar escribiendo 0, 1 o 2
+ * en C:\questvrbridge\vk_lag.txt, se relee cada 2 s). Si no, el visor corrige con otra pose y tiembla al mover la cabeza. */
+static uint32_t vk_lagged_id(uint32_t id) {
+    static uint32_t hist[3]; static int lag = 1; static DWORD leido;
+    DWORD now = GetTickCount();
+    if (now - leido > 2000) {
+        leido = now;
+        FILE *fp = fopen("C:\\questvrbridge\\vk_lag.txt", "r");
+        if (fp) { int v; if (fscanf(fp, "%d", &v) == 1 && v >= 0 && v <= 2 && v != lag) { lag = v; logmsg("Vulkan: pose de %d cuadro(s) antes", lag); } fclose(fp); }
+    }
+    hist[2] = hist[1]; hist[1] = hist[0]; hist[0] = id;
+    return hist[lag] ? hist[lag] : id;
+}
+
 /* Vulkan: copia los dos ojos (en la GPU) a memoria que se puede leer, lado a lado; lee la del cuadro
    anterior (ya terminó en la GPU) y la pasa a la memoria compartida con la Mac */
 static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, XrTime displayTime) {
@@ -3037,7 +3053,7 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, XrTi
         vk.DestroyFence(s->vkDev, s->vkFence[k], NULL); vk.CreateFence(s->vkDev, &fi, NULL, &s->vkFence[k]);
         InterlockedIncrement(&g_mapFail); return;
     }
-    uint32_t id = pose_id_for_layer(pl, displayTime);
+    uint32_t id = vk_lagged_id(pose_id_for_layer(pl, displayTime));
     s->stPose[k] = id; s->stValid[k] = 1; s->stFlip[k] = flip;
     s->stNext = (k + 1) % STAGES;
 
