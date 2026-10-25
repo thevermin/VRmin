@@ -2315,7 +2315,8 @@ static void fill_velocity(void *next, const Track *t, const Space *sp, XrPosef b
 }
 
 static LONG g_dgLocOk, g_dgLocBad, g_dgPoseOn[3], g_dgPoseOff[3];
-static LONG g_dgPoseHit, g_dgPoseMiss, g_dgPoseFix;
+static LONG g_dgPoseHit, g_dgPoseMiss, g_dgPoseFix, g_dgAhead;
+static uint32_t g_newestId;   /* (la pose del momento de cuadro más nuevo ya pedido, para vk_lag.txt = -1) */
 static XrFovf g_dgLayerFov, g_dgOurFov;   /* (diagnóstico: campo de visión con que el juego dice que dibujó / el nuestro) */   /* (diagnóstico: cuadros con la pose con la que se dibujaron / sin ella) */   /* (diagnóstico de controles) */
 static Track track_for_time(XrTime time);
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation *loc) {
@@ -2896,9 +2897,15 @@ static int vk_quad_buffers(Session *s, uint32_t w, uint32_t h) {
 /* Pega el panel flotante sobre la imagen de los dos ojos (ya en la memoria compartida, filas de arriba hacia abajo):
  * por cada píxel del ojo, el rayo desde el ojo se cruza con el plano del panel y se toma el color de ese punto */
 static void vk_composite_quad(Session *s, int r, uint8_t *dst, uint32_t ew, uint32_t eh, int dstRgba) {
-    const uint8_t *src = (const uint8_t *)s->vkQMap[r];
     uint32_t qw = s->vkQ[r].w, qh = s->vkQ[r].h;
-    if (!src || !qw || !qh) return;
+    if (!s->vkQMap[r] || !qw || !qh) return;
+    /* (primero se copia entero y en orden: leer salteado de la memoria de la GPU en Wine de 32 bits tardaba segundos) */
+    static uint8_t *local; static size_t localSz;
+    size_t need = (size_t)qw * qh * 4;
+    if (need > localSz) { free(local); local = (uint8_t *)malloc(need); localSz = local ? need : 0; }
+    if (!local) return;
+    memcpy(local, s->vkQMap[r], need);
+    const uint8_t *src = local;
     const float hw = s->vkQ[r].size.width * 0.5f, hh = s->vkQ[r].size.height * 0.5f;
     if (hw <= 0 || hh <= 0) return;
     const int swap = s->vkQ[r].rgba != dstRgba;
@@ -3016,6 +3023,11 @@ static uint32_t pose_id_for_layer(const XrCompositionLayerProjection *pl, XrTime
     int hit = -1;
     for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].time == displayTime) { id = g_poseHist[hh].id; hit = hh; break; }
     InterlockedIncrement(hit >= 0 ? &g_dgPoseHit : &g_dgPoseMiss);
+    {   /* ¿el juego ya pidió un cuadro posterior antes de entregar este? (OpenComposite adelantado un cuadro) */
+        XrTime newest = displayTime; g_newestId = id;
+        for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].time > newest) { newest = g_poseHist[hh].time; g_newestId = g_poseHist[hh].id; }
+        if (newest > displayTime) InterlockedIncrement(&g_dgAhead);
+    }
     g_dgLayerFov = pl->views[0].fov; g_dgOurFov = g_track.fov[0];
     if (!g_vigia && pl->space) {
         int best = -1; float bd = 1e9f, dHit = 1e9f;
@@ -3049,9 +3061,10 @@ static uint32_t vk_lagged_id(uint32_t id) {
     if (now - leido > 2000) {
         leido = now;
         FILE *fp = fopen("C:\\questvrbridge\\vk_lag.txt", "r");
-        if (fp) { int v; if (fscanf(fp, "%d", &v) == 1 && v >= 0 && v <= 2 && v != lag) { lag = v; logmsg("Vulkan: pose de %d cuadro(s) antes", lag); } fclose(fp); }
+        if (fp) { int v; if (fscanf(fp, "%d", &v) == 1 && v >= -1 && v <= 2 && v != lag) { lag = v; logmsg("Vulkan: pose de %d cuadro(s) antes", lag); } fclose(fp); }
     }
     hist[2] = hist[1]; hist[1] = hist[0]; hist[0] = id;
+    if (lag < 0) return g_newestId ? g_newestId : id;   /* (-1: la del cuadro más nuevo ya pedido) */
     return hist[lag] ? hist[lag] : id;
 }
 
@@ -3386,14 +3399,14 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
         logmsg("Diagnóstico controles: ubicaciones bien %ld / mal %ld · pose activa (sin mano/izq/der) %ld/%ld/%ld, inactiva %ld/%ld/%ld · manos válidas izq %d der %d",
                g_dgLocOk, g_dgLocBad, g_dgPoseOn[0], g_dgPoseOn[1], g_dgPoseOn[2], g_dgPoseOff[0], g_dgPoseOff[1], g_dgPoseOff[2], g_track.handValid[0], g_track.handValid[1]);
         g_dgLocOk = g_dgLocBad = 0; for (int q = 0; q < 3; q++) g_dgPoseOn[q] = g_dgPoseOff[q] = 0;
-        if (g_dgPoseHit + g_dgPoseMiss) logmsg("Diagnóstico poses: %ld cuadros con su pose, %ld sin ella · %ld corregidos con la pose de la capa · espera de la copia %.1f ms promedio",
-                                               g_dgPoseHit, g_dgPoseMiss, g_dgPoseFix, g_nCopy ? g_sumMap / g_nCopy : 0.0);
+        if (g_dgPoseHit + g_dgPoseMiss) logmsg("Diagnóstico poses: %ld cuadros con su pose, %ld sin ella · %ld corregidos con la pose de la capa · %ld con un cuadro posterior ya pedido · espera de la copia %.1f ms promedio",
+                                               g_dgPoseHit, g_dgPoseMiss, g_dgPoseFix, g_dgAhead, g_nCopy ? g_sumMap / g_nCopy : 0.0);
         if (g_dgPoseHit + g_dgPoseMiss) {
             const float r = 57.29578f; const XrFovf a = g_dgLayerFov, b = g_dgOurFov;
             logmsg("Diagnóstico campo de visión (ojo izq., grados): juego %.1f/%.1f/%.1f/%.1f · visor %.1f/%.1f/%.1f/%.1f · recorte %.2f",
                    a.angleLeft * r, a.angleRight * r, a.angleUp * r, a.angleDown * r, b.angleLeft * r, b.angleRight * r, b.angleUp * r, b.angleDown * r, g_fovK);
         }
-        g_dgPoseHit = g_dgPoseMiss = g_dgPoseFix = 0;
+        g_dgPoseHit = g_dgPoseMiss = g_dgPoseFix = g_dgAhead = 0;
         g_statSubmitted = g_statSent = g_statBusy = 0;
         g_skipNoSock = g_skipFmt = g_mapFail = g_noProj = g_layers = 0;
         g_statT0 = tnow;
