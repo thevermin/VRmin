@@ -3824,9 +3824,10 @@ static void fix_opencomposite_32(void) {
 }
 
 /* --- DXVK (Half-Life 2: VR Mod trae el suyo: DirectX 9 → Vulkan) ---
- * DXVK 2 se niega a arrancar si la GPU no tiene «geometryShader» ni «shaderCullDistance», y las de Apple (MoltenVK)
- * no los tienen. Half-Life 2 (DirectX 9) no los necesita: se le dice a DXVK que sí están (vkGetPhysicalDeviceFeatures/2) y al crear el dispositivo se apagan
- * de nuevo (vkCreateDevice), así MoltenVK no lo rechaza. DXVK carga el Vulkan de Wine (winevulkan.dll) por su cuenta,
+ * DXVK 2 se niega a arrancar si la GPU no tiene algunas funciones (geometryShader, shaderCullDistance, robustness2,
+ * VK_KHR_pipeline_library…) que las de Apple (MoltenVK) no tienen. Half-Life 2 (DirectX 9) no las necesita: se le dice
+ * a DXVK que sí están (vkGetPhysicalDeviceFeatures/2, vkEnumerateDeviceExtensionProperties) y al crear el dispositivo
+ * se apagan de nuevo (vkCreateDevice), así MoltenVK no lo rechaza. DXVK carga el Vulkan de Wine (winevulkan.dll) por su cuenta,
  * sin pasar por las importaciones del juego, así que se intervienen esas funciones directamente: empiezan todas con
  * los mismos 5 bytes («mov edi,edi»/«push ebp; mov ebp,esp» de Wine), que se cambian por un salto (y se guardan,
  * con un salto de vuelta, para llamar a la original). Nuestro runtime se carga cuando DXVK inicia OpenVR, antes de
@@ -3848,25 +3849,124 @@ static void *hot_hook(void *fn, void *hook) {
 static PFN_vkGetPhysicalDeviceFeatures g_dxRealFeat;
 static PFN_vkGetPhysicalDeviceFeatures2 g_dxRealFeat2;
 static PFN_vkCreateDevice g_dxRealCreate;
+static PFN_vkEnumerateDeviceExtensionProperties g_dxRealExt;
+/* Lo que DXVK 2.7 exige (dxvk_device_info.cpp, «required»): se presenta como disponible; al crear el dispositivo se
+ * apaga lo que la GPU no tiene de verdad. A Half-Life 2 (DirectX 9) le alcanza con lo que sí hay. */
+static void dx_fake_core(VkPhysicalDeviceFeatures *f) {
+    f->depthBiasClamp = f->depthClamp = f->dualSrcBlend = f->fillModeNonSolid = f->fullDrawIndexUint32 = VK_TRUE;
+    f->geometryShader = f->imageCubeArray = f->independentBlend = f->multiDrawIndirect = f->multiViewport = VK_TRUE;
+    f->occlusionQueryPrecise = f->robustBufferAccess = f->sampleRateShading = f->shaderClipDistance = VK_TRUE;
+    f->shaderCullDistance = f->shaderImageGatherExtended = f->shaderInt64 = f->shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    f->textureCompressionBC = VK_TRUE;
+}
 static void VKAPI_CALL dx_GetPhysicalDeviceFeatures(VkPhysicalDevice pd, VkPhysicalDeviceFeatures *f) {
     g_dxRealFeat(pd, f);
-    if (f) f->geometryShader = f->shaderCullDistance = VK_TRUE;
+    if (f) dx_fake_core(f);
 }
 static void VKAPI_CALL dx_GetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f) {
     g_dxRealFeat2(pd, f);
-    if (f) f->features.geometryShader = f->features.shaderCullDistance = VK_TRUE;
+    if (!f) return;
+    dx_fake_core(&f->features);
+    for (VkBaseOutStructure *n = (VkBaseOutStructure *)f->pNext; n; n = n->pNext) {
+        switch (n->sType) {
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
+            ((VkPhysicalDeviceVulkan11Features *)n)->shaderDrawParameters = VK_TRUE; break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: {
+            VkPhysicalDeviceVulkan12Features *v = (VkPhysicalDeviceVulkan12Features *)n;
+            v->bufferDeviceAddress = v->descriptorIndexing = v->descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+            v->descriptorBindingUpdateUnusedWhilePending = v->descriptorBindingPartiallyBound = v->hostQueryReset = VK_TRUE;
+            v->runtimeDescriptorArray = v->samplerMirrorClampToEdge = v->timelineSemaphore = VK_TRUE;
+            v->uniformBufferStandardLayout = v->vulkanMemoryModel = VK_TRUE;
+            break; }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: {
+            VkPhysicalDeviceVulkan13Features *v = (VkPhysicalDeviceVulkan13Features *)n;
+            v->dynamicRendering = v->maintenance4 = v->shaderDemoteToHelperInvocation = VK_TRUE;
+            v->shaderZeroInitializeWorkgroupMemory = v->synchronization2 = VK_TRUE;
+            break; }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT:
+            ((VkPhysicalDeviceRobustness2FeaturesEXT *)n)->robustBufferAccess2 = VK_TRUE;
+            ((VkPhysicalDeviceRobustness2FeaturesEXT *)n)->nullDescriptor = VK_TRUE; break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR:
+            ((VkPhysicalDeviceMaintenance5FeaturesKHR *)n)->maintenance5 = VK_TRUE; break;
+        default: break;
+        }
+    }
+}
+static size_t dx_feat_size(VkStructureType t) {
+    switch (t) {
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES: return sizeof(VkPhysicalDeviceVulkan11Features);
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: return sizeof(VkPhysicalDeviceVulkan12Features);
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: return sizeof(VkPhysicalDeviceVulkan13Features);
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT: return sizeof(VkPhysicalDeviceRobustness2FeaturesEXT);
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR: return sizeof(VkPhysicalDeviceMaintenance5FeaturesKHR);
+    default: return 0;
+    }
+}
+static const char g_plib[] = "VK_KHR_pipeline_library";
+static int dx_has_plib(VkPhysicalDevice pd) {
+    if (!g_dxRealExt) return 1;   /* (sin el gancho de extensiones no se inventó nada) */
+    uint32_t n = 0;
+    if (g_dxRealExt(pd, NULL, &n, NULL) < 0 || !n) return 0;
+    VkExtensionProperties *e = (VkExtensionProperties *)calloc(n, sizeof *e);
+    int has = 0;
+    if (e && g_dxRealExt(pd, NULL, &n, e) >= 0)
+        for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, g_plib)) has = 1;
+    free(e);
+    return has;
+}
+/* VK_KHR_pipeline_library: DXVK la exige y MoltenVK no la tiene (sin VK_EXT_graphics_pipeline_library no se usa) */
+static VkResult VKAPI_CALL dx_EnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char *layer, uint32_t *count, VkExtensionProperties *out) {
+    if (layer || !count || dx_has_plib(pd)) return g_dxRealExt(pd, layer, count, out);
+    uint32_t n = 0;
+    VkResult r = g_dxRealExt(pd, NULL, &n, NULL);
+    if (r < 0) return r;
+    if (!out) { *count = n + 1; return VK_SUCCESS; }
+    VkExtensionProperties *e = (VkExtensionProperties *)calloc(n + 1, sizeof *e);
+    if (!e) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    r = g_dxRealExt(pd, NULL, &n, e);
+    if (r < 0) { free(e); return r; }
+    strcpy(e[n].extensionName, g_plib); e[n].specVersion = 1;
+    uint32_t m = *count < n + 1 ? *count : n + 1;
+    memcpy(out, e, m * sizeof *e);
+    free(e);
+    *count = m;
+    return m < n + 1 ? VK_INCOMPLETE : VK_SUCCESS;
 }
 static VkResult VKAPI_CALL dx_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, const VkAllocationCallbacks *al, VkDevice *dev) {
     if (!ci) return g_dxRealCreate(pd, ci, al, dev);
     VkPhysicalDeviceFeatures has; g_dxRealFeat(pd, &has);
     VkDeviceCreateInfo c = *ci; VkPhysicalDeviceFeatures f;
     if (ci->pEnabledFeatures) { f = *ci->pEnabledFeatures; vk_mask_features(&f, &has); c.pEnabledFeatures = &f; }
-    VkPhysicalDeviceFeatures2 *f2 = NULL; VkPhysicalDeviceFeatures saved;
-    for (VkBaseOutStructure *n = (VkBaseOutStructure *)ci->pNext; n; n = n->pNext)
-        if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) { f2 = (VkPhysicalDeviceFeatures2 *)n; break; }
-    if (f2) { saved = f2->features; vk_mask_features(&f2->features, &has); }
+    /* las estructuras de funciones de la cadena: se guarda la original, se apaga lo que no hay y después se restaura */
+    enum { MAXS = 8 };
+    VkBaseOutStructure *ns[MAXS]; unsigned char saved[MAXS][512]; size_t sz[MAXS]; int nn = 0;
+    VkPhysicalDeviceFeatures2 *f2 = NULL; VkPhysicalDeviceFeatures savedCore;
+    for (VkBaseOutStructure *n = (VkBaseOutStructure *)ci->pNext; n; n = n->pNext) {
+        if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) { f2 = (VkPhysicalDeviceFeatures2 *)n; continue; }
+        size_t s = dx_feat_size(n->sType);
+        if (!s || s > sizeof saved[0] || nn >= MAXS) continue;
+        unsigned char real[512]; memset(real, 0, s);
+        ((VkBaseOutStructure *)real)->sType = n->sType;
+        VkPhysicalDeviceFeatures2 q = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 }; q.pNext = real;
+        g_dxRealFeat2(pd, &q);
+        ns[nn] = n; sz[nn] = s; memcpy(saved[nn], n, s); nn++;
+        VkBool32 *w = (VkBool32 *)((unsigned char *)n + sizeof(VkBaseOutStructure));
+        const VkBool32 *h = (const VkBool32 *)(real + sizeof(VkBaseOutStructure));
+        for (size_t i = 0; i < (s - sizeof(VkBaseOutStructure)) / sizeof(VkBool32); i++) if (!h[i]) w[i] = VK_FALSE;
+    }
+    if (f2) { savedCore = f2->features; vk_mask_features(&f2->features, &has); }
+    /* y la extensión inventada no se le pide a MoltenVK */
+    const char *exts[256]; uint32_t ne = 0;
+    if (ci->enabledExtensionCount <= 256 && !dx_has_plib(pd)) {
+        for (uint32_t i = 0; i < ci->enabledExtensionCount; i++)
+            if (strcmp(ci->ppEnabledExtensionNames[i], g_plib)) exts[ne++] = ci->ppEnabledExtensionNames[i];
+        c.enabledExtensionCount = ne; c.ppEnabledExtensionNames = exts;
+    }
     VkResult r = g_dxRealCreate(pd, &c, al, dev);
-    if (f2) f2->features = saved;
+    if (f2) f2->features = savedCore;
+    for (int i = 0; i < nn; i++) {   /* (sin pisar el pNext, por las dudas) */
+        void *nx = ns[i]->pNext; memcpy(ns[i], saved[i], sz[i]); ns[i]->pNext = nx;
+    }
     logmsg("DXVK: vkCreateDevice → %d", (int)r);
     return r;
 }
@@ -3877,16 +3977,19 @@ static void install_dxvk_hooks(void) {
     HMODULE wv = LoadLibraryA("winevulkan.dll");
     if (!wv) return;
     done = 1;
-    static const char *fn[] = { "vkGetPhysicalDeviceFeatures", "vkGetPhysicalDeviceFeatures2", "vkCreateDevice" };
-    for (int i = 0; i < 3; i++) {   /* (las tres o ninguna) */
+    static const char *fn[] = { "vkGetPhysicalDeviceFeatures", "vkGetPhysicalDeviceFeatures2", "vkCreateDevice", "vkEnumerateDeviceExtensionProperties" };
+    for (int i = 0; i < 3; i++) {   /* (las tres primeras o ninguna; la de extensiones, si se puede) */
         unsigned char *p = (unsigned char *)GetProcAddress(wv, fn[i]);
         if (!p || memcmp(p, "\x66\x90\x55\x89\xe5", 5)) { logmsg("DXVK: %s no tiene el comienzo esperado: no se toca", fn[i]); return; }
     }
     void *a = hot_hook((void *)GetProcAddress(wv, "vkGetPhysicalDeviceFeatures"), (void *)dx_GetPhysicalDeviceFeatures);
     void *b = hot_hook((void *)GetProcAddress(wv, "vkGetPhysicalDeviceFeatures2"), (void *)dx_GetPhysicalDeviceFeatures2);
     void *c = hot_hook((void *)GetProcAddress(wv, "vkCreateDevice"), (void *)dx_CreateDevice);
+    void *d = hot_hook((void *)GetProcAddress(wv, "vkEnumerateDeviceExtensionProperties"), (void *)dx_EnumerateDeviceExtensionProperties);
     memcpy(&g_dxRealFeat, &a, sizeof a); memcpy(&g_dxRealFeat2, &b, sizeof b); memcpy(&g_dxRealCreate, &c, sizeof c);
-    logmsg("DXVK: GPU presentada con geometryShader (%s, %s, %s)", a ? "sí" : "no", b ? "sí" : "no", c ? "sí" : "no");
+    memcpy(&g_dxRealExt, &d, sizeof d);
+    if (!d) logmsg("DXVK: vkEnumerateDeviceExtensionProperties no tiene el comienzo esperado: VK_KHR_pipeline_library no se presenta");
+    logmsg("DXVK: GPU presentada con lo que DXVK exige (%s, %s, %s, %s)", a ? "sí" : "no", b ? "sí" : "no", c ? "sí" : "no", d ? "sí" : "no");
 }
 #else
 static void install_dxvk_hooks(void) {}
