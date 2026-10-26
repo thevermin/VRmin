@@ -2969,6 +2969,43 @@ static void vk_composite_quad(Session *s, int r, uint8_t *dst, uint32_t ew, uint
     }
 }
 
+/* Diagnóstico del temblor con Vulkan: a los ~20 s de juego se guardan 120 cuadros seguidos (ojo izquierdo, achicado
+ * a la cuarta parte) en C:\questvrbridge\cuadros_diag, con la pose de cada uno y la de ese momento, para comparar
+ * cuánto se corre la imagen entre cuadros con cuánto giró la cabeza. Solo una vez por sesión. */
+static void vk_dump_frame(Session *s, int r, const uint8_t *img, uint32_t ew, uint32_t eh) {
+    static int n = -1, frames;
+    if (n >= 120) return;
+    if (++frames < 1200) return;
+    if (n < 0) { CreateDirectoryA("C:\\questvrbridge\\cuadros_diag", NULL); n = 0; logmsg("Diagnóstico: guardando 120 cuadros en C:\\questvrbridge\\cuadros_diag"); }
+    uint32_t w = ew / 4, h = eh / 4;
+    char name[96]; snprintf(name, sizeof name, "C:\\questvrbridge\\cuadros_diag\\c%03d.ppm", n);
+    FILE *fp = fopen(name, "wb");
+    if (!fp) { n = 120; return; }
+    fprintf(fp, "P6\n%u %u\n255\n", w, h);
+    const size_t rb = (size_t)ew * 2 * 4;
+    int rgba = fmt_code(s->stFmt) != 0;
+    unsigned char *line = (unsigned char *)malloc((size_t)w * 3);
+    for (uint32_t y = 0; y < h && line; y++) {
+        const uint8_t *row = img + (size_t)(y * 4) * rb;
+        for (uint32_t x = 0; x < w; x++) {
+            const uint8_t *p = row + (size_t)(x * 4) * 4;
+            line[x * 3] = rgba ? p[0] : p[2]; line[x * 3 + 1] = p[1]; line[x * 3 + 2] = rgba ? p[2] : p[0];
+        }
+        fwrite(line, 1, (size_t)w * 3, fp);
+    }
+    free(line); fclose(fp);
+    /* pose con la que se informó el cuadro, y la pose más nueva en este momento */
+    XrQuaternionf qf = { 0, 0, 0, 1 }, qn;
+    uint32_t idn;
+    EnterCriticalSection(&g_lock);
+    for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].id == s->stPose[r]) { qf = g_poseTrack[hh].eye[0].orientation; break; }
+    qn = g_track.eye[0].orientation; idn = g_track.id;
+    LeaveCriticalSection(&g_lock);
+    logmsg("diag %03d t=%.1f id=%u q=%.5f,%.5f,%.5f,%.5f ahora id=%u q=%.5f,%.5f,%.5f,%.5f", n, now_ns() / 1e6, s->stPose[r],
+           qf.x, qf.y, qf.z, qf.w, idn, qn.x, qn.y, qn.z, qn.w);
+    n++;
+}
+
 static void vk_send_stage(Session *s, int r) {
     if (!s->stValid[r]) return;
     int64_t c0 = now_ns();
@@ -2995,6 +3032,7 @@ static void vk_send_stage(Session *s, int r) {
     if (!s->stFlip[r]) memcpy(dst, src, (size_t)rb * s->stH);
     else for (uint32_t y = 0; y < s->stH; y++) memcpy(dst + (size_t)y * rb, src + (size_t)(s->stH - 1 - y) * rb, rb);
     if (s->vkQ[r].on) vk_composite_quad(s, r, dst, s->stW, s->stH, fmt_code(s->stFmt) != 0);
+    vk_dump_frame(s, r, dst, s->stW, s->stH);
     g_sumCopy += (now_ns() - c0) / 1e6; g_nCopy++;
     s->stValid[r] = 0;
     MemoryBarrier();
