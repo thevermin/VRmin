@@ -927,14 +927,12 @@ final class Renderer {
 final class GameProfiles {
     static let shared = GameProfiles()
     struct P: Codable { var scale: Double?; var auto: Bool?; var fovk: Double?; var index: Bool?; var vive: Bool?
-                        var eye: Int?; var fps: Int?; var mbps: Int?; var fov: String?   // (calidad propia del juego)
-                        var mirror: Bool? }   // (mostrar en una ventana de la Mac lo que ve el ojo izquierdo)
+                        var eye: Int?; var fps: Int?; var mbps: Int?; var fov: String? }   // (calidad propia del juego)
     private let lock = NSLock()
     private var data: [String: P] = [:]
     private let file = URL(fileURLWithPath: "perfiles_juegos.json")
     private(set) var current = ""          // el juego abierto ("" = ninguno)
     private(set) var activeK = 1.0         // campo de visión del juego abierto (lo que se le pidió)
-    private(set) var activeMirror = false  // ventana de la Mac con lo que se ve en el visor
     private var autoN = 0, autoFps = 0.0, autoGame = 0.0, autoHz = 0.0, autoSince = 0.0
     private var mtime: Date?
     init() { reload() }
@@ -962,7 +960,7 @@ final class GameProfiles {
         let key = GameProfiles.steamFolder() ?? app
         lock.lock(); current = key; autoN = 0; autoFps = 0; autoGame = 0; autoSince = Date().timeIntervalSince1970; lock.unlock()
         let e = effective(key)
-        lock.lock(); activeK = e.fovk; activeMirror = (data[key]?.mirror ?? data[""]?.mirror) ?? false; lock.unlock()
+        lock.lock(); activeK = e.fovk; lock.unlock()
         print("[juego] Ajustes de «\(key)»: escala \(Int(e.scale * 100)) %\(e.auto ? " (automática)" : ""), campo de visión \(Int(e.fovk * 100)) %\(e.index ? ", controles de Index" : "")\(e.vive ? ", controles de Vive" : "")")
     }
     /// La línea "config" para el runtime (con «pv»: son los ajustes de este juego)
@@ -1022,7 +1020,7 @@ final class GameProfiles {
         }
         return o
     }
-    func end() { lock.lock(); current = ""; activeK = 1; activeMirror = false; lock.unlock(); GameMirror.shared.hide() }
+    func end() { lock.lock(); current = ""; activeK = 1; lock.unlock() }
     /// La calidad que quiere un juego (la suya o la general) y si es distinta de la que corre ahora
     func quality(for key: String) -> (eye: Int, fps: Int, mbps: Int, fov: String, differs: Bool) {
         lock.lock(); reload(); let p = key.isEmpty ? P() : (data[key] ?? P()); lock.unlock()
@@ -1095,6 +1093,35 @@ final class GameLink {
     /// mandar, así el visor muestra el juego quieto y no se va a la sala
     private let holdLock = NSLock()
     private var holdPB: CVPixelBuffer?, holdPose: UInt32 = 0, holdAt: UInt64 = 0
+    private var loadingPB: CVPixelBuffer?, loadingFor: UInt64 = 0
+    /// El cuadro dado, más oscuro y con «Cargando…» en el centro de cada ojo
+    private func loadingFrame(from src: CVPixelBuffer) -> CVPixelBuffer? {
+        var po: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &po)
+        guard let dst = po else { return nil }
+        CVPixelBufferLockBaseAddress(src, .readOnly); CVPixelBufferLockBaseAddress(dst, [])
+        defer { CVPixelBufferUnlockBaseAddress(dst, []); CVPixelBufferUnlockBaseAddress(src, .readOnly) }
+        let w = CVPixelBufferGetWidth(dst), h = CVPixelBufferGetHeight(dst)
+        guard CVPixelBufferGetWidth(src) == w, CVPixelBufferGetHeight(src) == h,
+              let sb = CVPixelBufferGetBaseAddress(src), let db = CVPixelBufferGetBaseAddress(dst) else { return nil }
+        let sbpr = CVPixelBufferGetBytesPerRow(src), dbpr = CVPixelBufferGetBytesPerRow(dst)
+        for y in 0..<h { memcpy(db + y * dbpr, sb + y * sbpr, min(sbpr, dbpr)) }
+        guard let ctx = CGContext(data: db, width: w, height: h, bitsPerComponent: 8, bytesPerRow: dbpr, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(gray: 0, alpha: 0.55)); ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        // (con Core Text: este hilo no es el principal)
+        guard let font = CTFontCreateUIFontForLanguage(.emphasizedSystem, CGFloat(h) * 0.045, nil) else { return dst }
+        let attrs: [NSAttributedString.Key: Any] = [NSAttributedString.Key(kCTFontAttributeName as String): font,
+                                                    NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 1, alpha: 1)]
+        let line = CTLineCreateWithAttributedString(NSAttributedString(string: tr("Cargando…", "Loading…"), attributes: attrs))
+        let bounds = CTLineGetBoundsWithOptions(line, [])
+        for e in 0..<2 {
+            let cx = CGFloat(w) * (CGFloat(e) * 0.5 + 0.25)
+            ctx.textPosition = CGPoint(x: cx - bounds.width / 2, y: CGFloat(h) / 2 - bounds.height / 2)
+            CTLineDraw(line, ctx)
+        }
+        return dst
+    }
     private func hold(_ pb: CVPixelBuffer, _ pose: UInt32) {
         holdLock.lock(); holdPB = pb; holdPose = pose; holdAt = DispatchTime.now().uptimeNanoseconds; holdLock.unlock()
     }
@@ -1126,8 +1153,11 @@ final class GameLink {
                 let now = DispatchTime.now().uptimeNanoseconds, age = now - at
                 guard age > 300_000_000, age < 120_000_000_000, shared.beginFrame() else { continue }
                 shared.markGameFrame()
+                // (la primera vez: una copia oscurecida con «Cargando…» en cada ojo, para que no parezca colgado)
+                if loadingFor != at { loadingPB = loadingFrame(from: pb); loadingFor = at }
+                let show = loadingPB ?? pb
                 let fn = shared.nextFrameNo(), enc = encoder
-                encodeQueue.async { enc.encode(pb, frameNo: fn, poseId: pose, forceKey: false, start: now) }
+                encodeQueue.async { enc.encode(show, frameNo: fn, poseId: pose, forceKey: false, start: now) }
             }
         }
         // Vigilante: cada 3 s avisa si el lector del juego quedó trabado en algún paso
@@ -1413,10 +1443,6 @@ final class GameLink {
             vigiaSkip += 1
             if vigiaSkip % 20 != 0 { shared.endFrame(); return }
         }
-        // Ventana de la Mac con el ojo izquierdo (para juegos cuya propia ventana se apagó o se ve mal), ~30 por segundo
-        if GameProfiles.shared.activeMirror && !Vigia.shared.on, GameMirror.shared.due(), let f = vigiaFrame(srcPtr, isRGBA: isRGBA, ew: ew, eh: eh) {
-            GameMirror.shared.show(f)
-        }
         if let fv = Foveator.shared, FOVEA.on || ew != EYE || eh != SH || GameProfiles.shared.activeK < 0.999 || !quads.isEmpty {
             var po: CVPixelBuffer?
             CVPixelBufferPoolCreatePixelBuffer(nil, pool, &po)
@@ -1663,66 +1689,6 @@ final class HeadCam: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 // MARK: - Modo Centinela
 // El visor queda apoyado en el escritorio mirándote y sigue los controles; el juego se ve acá, a pantalla completa
 // (el ojo izquierdo de lo que dibuja el juego), con indicaciones encima. Esc o «Salir» lo terminan.
-/// Una ventana común que muestra el ojo izquierdo de lo que el juego le manda al visor (sin los paneles flotantes)
-final class GameMirror: NSObject, NSWindowDelegate {
-    static let shared = GameMirror()
-    private let lock = NSLock()
-    private var pending: CVPixelBuffer?, held: CVPixelBuffer?, scheduled = false, last: UInt64 = 0, closedByUser = false
-    private var win: NSWindow?, layer: CALayer?
-    func due() -> Bool {
-        let now = DispatchTime.now().uptimeNanoseconds
-        lock.lock(); defer { lock.unlock() }
-        if closedByUser || now - last < 33_000_000 { return false }
-        last = now; return true
-    }
-    func show(_ pb: CVPixelBuffer) {
-        lock.lock(); pending = pb; let go = !scheduled; scheduled = true; lock.unlock()
-        guard go else { return }
-        DispatchQueue.main.async { [self] in
-            lock.lock(); let p = pending; pending = nil; scheduled = false; lock.unlock()
-            guard let p, let surf = CVPixelBufferGetIOSurface(p)?.takeUnretainedValue() else { return }
-            if win == nil { open() }
-            CATransaction.begin(); CATransaction.setDisableActions(true)
-            layer?.contents = surf
-            CATransaction.commit()
-            held = p
-        }
-    }
-    func hide() {
-        DispatchQueue.main.async { [self] in
-            win?.orderOut(nil); win = nil; layer = nil; held = nil
-            lock.lock(); closedByUser = false; lock.unlock()
-        }
-    }
-    func windowWillClose(_ notification: Notification) {
-        win = nil; layer = nil; held = nil
-        lock.lock(); closedByUser = true; lock.unlock()   // (cerrada a mano: no se vuelve a abrir hasta el próximo juego)
-    }
-    private func open() {
-        let size = NSSize(width: 960, height: 960 / 1.54)
-        let w = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        w.title = tr("VRmin · Lo que ves en el visor", "VRmin · What you see in the headset")
-        w.backgroundColor = .black
-        w.isReleasedWhenClosed = false
-        w.delegate = self
-        w.center()
-        w.setFrameAutosaveName("VRminEspejo")
-        let v = NSView(frame: NSRect(origin: .zero, size: size))
-        v.wantsLayer = true
-        v.layer?.backgroundColor = NSColor.black.cgColor
-        let l = CALayer()
-        l.frame = v.bounds
-        l.contentsGravity = .resize   // (cada ojo es cuadrado pero con campo de visión de pantalla: igual que el Modo Centinela)
-        l.minificationFilter = .trilinear; l.magnificationFilter = .linear
-        l.contentsRect = CGRect(x: 0, y: 0, width: 0.5, height: 1)   // ojo izquierdo
-        l.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-        v.layer?.addSublayer(l)
-        w.contentView = v
-        w.orderFrontRegardless()
-        win = w; layer = l
-    }
-}
-
 final class VigiaWindow: NSWindow {
     var onEsc: () -> Void = {}
     override var canBecomeKey: Bool { true }
