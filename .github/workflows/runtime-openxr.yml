@@ -23,8 +23,9 @@ jobs:
             -ld3d11 -ldxgi -ldxguid -luuid -lws2_32 -lwinmm -static-libgcc -Wl,--kill-at > build.log 2>&1 || true
           grep -E "error" build.log | head -20 | while IFS= read -r l; do echo "::error::$l"; done
           test -f "$RUNNER_TEMP/questvrbridge_openxr.dll"
-          # (y el de 32 bits, para juegos de 32 bits como Half-Life 2: VR Mod)
-          i686-w64-mingw32-gcc -O2 -shared -o "$RUNNER_TEMP/questvrbridge_openxr32.dll" mac/openxr/questvrbridge_openxr.c \
+          # (y el de 32 bits, para juegos de 32 bits como Half-Life 2: VR Mod; con SSE: en la Mac, Rosetta emula las
+          #  cuentas con decimales viejas (x87) muy lento)
+          i686-w64-mingw32-gcc -O2 -msse2 -mfpmath=sse -shared -o "$RUNNER_TEMP/questvrbridge_openxr32.dll" mac/openxr/questvrbridge_openxr.c \
             mac/openxr/questvrbridge_openxr.def -I"$RUNNER_TEMP/openxr/include" -I"$RUNNER_TEMP/vulkan/include" \
             -ld3d11 -ldxgi -ldxguid -luuid -lws2_32 -lwinmm -static-libgcc -Wl,--kill-at -Wl,--enable-stdcall-fixup > build32.log 2>&1 || true
           grep -E "error" build32.log | head -20 | while IFS= read -r l; do echo "::error::$l"; done
