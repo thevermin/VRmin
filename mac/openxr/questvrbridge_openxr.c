@@ -2935,6 +2935,36 @@ static int vk_quad_buffers(Session *s, int j, uint32_t w, uint32_t h) {
 
 /* Pega el panel flotante sobre la imagen de los dos ojos (ya en la memoria compartida, filas de arriba hacia abajo):
  * por cada píxel del ojo, el rayo desde el ojo se cruza con el plano del panel y se toma el color de ese punto */
+/* Los giros reales de los paneles: OpenComposite los pierde al armar la capa (solo copia la posición), así que se
+ * anotan cuando el juego los fija (SetOverlayTransformAbsolute) y se buscan después por esa misma posición */
+typedef struct { float pos[3]; float m[12]; DWORD at; } OvXf;
+static OvXf g_ovXf[32];
+static int g_ovXfNext;
+static void __attribute__((unused)) ovxf_note(const float *m34) {
+    if (!m34) return;
+    float p[3] = { m34[3], m34[7], m34[11] };
+    int k = -1;
+    for (int i = 0; i < 32; i++) if (g_ovXf[i].at && !memcmp(g_ovXf[i].pos, p, sizeof p)) { k = i; break; }
+    if (k < 0) { k = g_ovXfNext; g_ovXfNext = (g_ovXfNext + 1) % 32; }
+    memcpy(g_ovXf[k].pos, p, sizeof p); memcpy(g_ovXf[k].m, m34, sizeof g_ovXf[k].m); g_ovXf[k].at = GetTickCount();
+}
+static const OvXf *ovxf_find(XrVector3f p) {
+    for (int i = 0; i < 32; i++)
+        if (g_ovXf[i].at && fabsf(g_ovXf[i].pos[0] - p.x) < 1e-4f && fabsf(g_ovXf[i].pos[1] - p.y) < 1e-4f && fabsf(g_ovXf[i].pos[2] - p.z) < 1e-4f)
+            return &g_ovXf[i];
+    return NULL;
+}
+/* Cuaternión de una rotación dada por sus ejes (columnas x, y, z, ya normalizados) */
+static XrQuaternionf quat_from_axes(XrVector3f x, XrVector3f y, XrVector3f z) {
+    float m00 = x.x, m11 = y.y, m22 = z.z, tr = m00 + m11 + m22;
+    XrQuaternionf q;
+    if (tr > 0) { float sq = sqrtf(tr + 1.0f) * 2; q.w = 0.25f * sq; q.x = (y.z - z.y) / sq; q.y = (z.x - x.z) / sq; q.z = (x.y - y.x) / sq; }
+    else if (m00 > m11 && m00 > m22) { float sq = sqrtf(1.0f + m00 - m11 - m22) * 2; q.w = (y.z - z.y) / sq; q.x = 0.25f * sq; q.y = (y.x + x.y) / sq; q.z = (z.x + x.z) / sq; }
+    else if (m11 > m22) { float sq = sqrtf(1.0f + m11 - m00 - m22) * 2; q.w = (z.x - x.z) / sq; q.x = (y.x + x.y) / sq; q.y = 0.25f * sq; q.z = (z.y + y.z) / sq; }
+    else { float sq = sqrtf(1.0f + m22 - m00 - m11) * 2; q.w = (x.y - y.x) / sq; q.x = (z.x + x.z) / sq; q.y = (z.y + y.z) / sq; q.z = 0.25f * sq; }
+    return q;
+}
+
 /* Un panel flotante para la Mac: tamaño, banderas (1 mezcla con alfa, 2 alfa premultiplicado, 4 dado vuelta, 8 RGBA)
  * y sus 4 esquinas en cada ojo como posiciones de recorte (x, y, z, w) dentro del rectángulo de ese ojo (w <= 0: no se
  * ve en ese ojo). Esquinas: abajo-izq., abajo-der., arriba-izq., arriba-der. Después vienen w×h píxeles. */
@@ -3318,9 +3348,26 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
         /* dónde está el panel respecto de la capa de la imagen 3D (y cada ojo, con la pose y el campo de visión de la capa) */
         int v1, v2;
         XrPosef pw = space_world((const Space *)pl->space, &tk, &v1), qw0 = space_world((const Space *)ql->space, &tk, &v2);
-        s->vkQ[k][j].pose = pmul(pinv(pw), pmul(qw0, ql->pose));
-        {   /* OpenComposite pierde el giro de los paneles (los deja siempre mirando hacia el mismo lado del mundo, y se
-             * veían de costado): se los gira para que miren a la cabeza, con el «arriba» del mundo */
+        /* el giro: el que fijó el juego (si se lo vio fijarlo), o si no, mirando a la cabeza con el «arriba» del mundo */
+        XrPosef qpose = ql->pose; XrExtent2Df qsize = ql->size; int real = 0;
+        const OvXf *xf = ovxf_find(ql->pose.position);
+        if (xf) {
+            const float *m = xf->m;
+            XrVector3f cx = { m[0], m[4], m[8] }, cy = { m[1], m[5], m[9] }, cz = { m[2], m[6], m[10] };
+            float lx = sqrtf(cx.x * cx.x + cx.y * cx.y + cx.z * cx.z), ly = sqrtf(cy.x * cy.x + cy.y * cy.y + cy.z * cy.z);
+            float lz = sqrtf(cz.x * cz.x + cz.y * cz.y + cz.z * cz.z);
+            if (lx > 1e-4f && ly > 1e-4f && lz > 1e-4f && fabsf(m[0]) > 0.05f && fabsf(m[5]) > 0.05f) {
+                cx.x /= lx; cx.y /= lx; cx.z /= lx; cy.x /= ly; cy.y /= ly; cy.z /= ly; cz.x /= lz; cz.y /= lz; cz.z /= lz;
+                qpose.orientation = quat_from_axes(cx, cy, cz);
+                /* (OpenComposite multiplicó el tamaño por m[0] y m[5]; con giro, lo correcto es el largo de cada eje) */
+                qsize.width = ql->size.width / m[0] * lx; qsize.height = ql->size.height / m[5] * ly;
+                if (qsize.width < 0) qsize.width = -qsize.width;
+                if (qsize.height < 0) qsize.height = -qsize.height;
+                real = 1;
+            }
+        }
+        s->vkQ[k][j].pose = pmul(pinv(pw), pmul(qw0, qpose));
+        if (!real) {
             XrVector3f P = s->vkQ[k][j].pose.position;
             XrVector3f H = { (pl->views[0].pose.position.x + pl->views[1].pose.position.x) * 0.5f,
                              (pl->views[0].pose.position.y + pl->views[1].pose.position.y) * 0.5f,
@@ -3334,18 +3381,11 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
                 if (xl > 1e-4f) {
                     x.x /= xl; x.z /= xl;
                     XrVector3f y = { z.y * x.z - z.z * x.y, z.z * x.x - z.x * x.z, z.x * x.y - z.y * x.x };
-                    /* matriz de columnas x, y, z → cuaternión */
-                    float m00 = x.x, m11 = y.y, m22 = z.z, tr = m00 + m11 + m22;
-                    XrQuaternionf q;
-                    if (tr > 0) { float sq = sqrtf(tr + 1.0f) * 2; q.w = 0.25f * sq; q.x = (y.z - z.y) / sq; q.y = (z.x - x.z) / sq; q.z = (x.y - y.x) / sq; }
-                    else if (m00 > m11 && m00 > m22) { float sq = sqrtf(1.0f + m00 - m11 - m22) * 2; q.w = (y.z - z.y) / sq; q.x = 0.25f * sq; q.y = (y.x + x.y) / sq; q.z = (z.x + x.z) / sq; }
-                    else if (m11 > m22) { float sq = sqrtf(1.0f + m11 - m00 - m22) * 2; q.w = (z.x - x.z) / sq; q.x = (y.x + x.y) / sq; q.y = 0.25f * sq; q.z = (z.y + y.z) / sq; }
-                    else { float sq = sqrtf(1.0f + m22 - m00 - m11) * 2; q.w = (x.y - y.x) / sq; q.x = (z.x + x.z) / sq; q.y = (z.y + y.z) / sq; q.z = 0.25f * sq; }
-                    s->vkQ[k][j].pose.orientation = q;
+                    s->vkQ[k][j].pose.orientation = quat_from_axes(x, y, z);
                 }
             }
         }
-        s->vkQ[k][j].size = ql->size;
+        s->vkQ[k][j].size = qsize;
         for (int e = 0; e < 2; e++) { s->vkQ[k][j].eye[e] = pl->views[e].pose; s->vkQ[k][j].fov[e] = pl->views[e].fov; }
         s->vkQ[k][j].w = (uint32_t)qw; s->vkQ[k][j].h = (uint32_t)qh;
         s->vkQ[k][j].rgba = fmt_code(qs->dxgi) != 0;
@@ -3383,7 +3423,19 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
         InterlockedIncrement(&g_mapFail); return;
     }
     uint32_t id = vk_lagged_id(pose_id_for_layer(pl, displayTime));
-    s->stPose[k] = id; s->stValid[k] = 1; s->stFlip[k] = flip;
+    s->stPose[k] = id;
+    /* los paneles se proyectan con los ojos de la pose que se le informa al visor (la de la imagen): si no, temblaban
+     * igual que antes la imagen */
+    if (qn) {
+        Track tr; int found = 0;
+        EnterCriticalSection(&g_lock);
+        for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].id == id && g_poseTrack[hh].valid) { tr = g_poseTrack[hh]; found = 1; break; }
+        LeaveCriticalSection(&g_lock);
+        if (found) {
+            int vb; XrPosef pinvw = pinv(space_world((const Space *)pl->space, &tr, &vb));
+            if (vb) for (int j = 0; j < qn; j++) for (int e = 0; e < 2; e++) s->vkQ[k][j].eye[e] = pmul(pinvw, tr.eye[e]);
+        }
+    } s->stValid[k] = 1; s->stFlip[k] = flip;
     s->stNext = (k + 1) % STAGES;
 
     /* 2) Leer la copia y pasarla a la memoria compartida: apenas la GPU termina este mismo cuadro (no el anterior:
@@ -4163,6 +4215,41 @@ static HRESULT WINAPI h_ocD3D11CreateDevice(IDXGIAdapter *ad, D3D_DRIVER_TYPE dt
     return hr2;
 }
 #endif
+#ifndef _WIN64
+/* Como oc_vtable_slot, para OpenComposite de 32 bits: el nombre se usa con su dirección absoluta (no relativa) y los
+ * lugares de la tabla de métodos son de 4 bytes */
+static void **oc_vtable_slot32(unsigned char *b, const char *nombreMetodo) {
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    unsigned char *text = NULL, *rd = NULL; DWORD textSize = 0, rdSize = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (!memcmp(sec[i].Name, ".text", 6)) { text = b + sec[i].VirtualAddress; textSize = sec[i].Misc.VirtualSize; }
+        if (!memcmp(sec[i].Name, ".rdata", 7)) { rd = b + sec[i].VirtualAddress; rdSize = sec[i].Misc.VirtualSize; }
+    }
+    if (!text || !rd) return NULL;
+    size_t ln = strlen(nombreMetodo) + 1; unsigned char *lit = NULL; int nLit = 0;
+    for (DWORD k = 1; k + ln <= rdSize; k++) if (rd[k - 1] == 0 && !memcmp(rd + k, nombreMetodo, ln)) { lit = rd + k; nLit++; }
+    if (nLit != 1) return NULL;
+    unsigned char *fn = NULL; int nRef = 0;
+    for (DWORD k = 0; k + 4 <= textSize; k++) {
+        unsigned char *p = text + k;
+        if (*(unsigned char **)p == lit) {
+            nRef++;
+            for (unsigned char *q = p; q > p - 0x100 && q > text; q--) if (q[-1] == 0xCC) { fn = q; break; }
+        }
+    }
+    if (nRef != 1 || !fn) return NULL;
+    void **slot = NULL; int nSlot = 0;
+    for (DWORD k = 0; k + 4 <= rdSize; k += 4) if (*(unsigned char **)(rd + k) == fn) { slot = (void **)(rd + k); nSlot++; }
+    return nSlot == 1 ? slot : NULL;
+}
+typedef int (__attribute__((thiscall)) *PFN_ocSetOvAbs)(void *self, uint64_t h, int origin, const float *m34);
+static PFN_ocSetOvAbs o_ocSetOvAbs;
+static int __attribute__((thiscall)) h_ocSetOvAbs(void *self, uint64_t h, int origin, const float *m34) {
+    ovxf_note(m34);
+    return o_ocSetOvAbs(self, h, origin, m34);
+}
+#endif
 static void fix_opencomposite_32(void) {
 #ifndef _WIN64
     /* (por cada vez que se carga OpenComposite: Half-Life 2 lo carga, lo descarga y lo vuelve a cargar en otro lugar) */
@@ -4173,6 +4260,10 @@ static void fix_opencomposite_32(void) {
     void *o;
     if (patch_iat(m, "d3d11.dll", "D3D11CreateDevice", (void *)h_ocD3D11CreateDevice, &o))
         memcpy(&o_ocD3D11CreateDevice, &o, sizeof o);
+    /* el giro de los paneles flotantes: se anota cuando el juego lo fija */
+    void **slot = oc_vtable_slot32((unsigned char *)m, "CVROverlay_028::SetOverlayTransformAbsolute");
+    if (slot && oc_patch_slot(slot, (void *)h_ocSetOvAbs, &o)) { memcpy(&o_ocSetOvAbs, &o, sizeof o); logmsg("OpenComposite: giro de los paneles flotantes anotado"); }
+    else logmsg("OpenComposite: no encontré dónde se fija el giro de los paneles flotantes");
 #endif
 }
 
