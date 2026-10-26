@@ -94,10 +94,15 @@ let H = FOVEA.on ? round16(Double(EYE) * FOVEA.ratio(FOVEA.cy)) : SH
 
 /// Achica el borde de cada ojo (foveated encoding) en la GPU: de la imagen completa (con mipmaps, para que lo
 /// achicado no titile) a la imagen codificada
+/// Un panel flotante del juego (menú, HUD) tal como lo manda el runtime: su imagen y sus 4 esquinas en cada ojo
+/// (posiciones de recorte: abajo-izq., abajo-der., arriba-izq., arriba-der.). flags: 1 mezcla, 2 premult., 4 dado vuelta, 8 RGBA
+struct GameQuad { let w: Int, h: Int, flags: UInt32, clip: [[SIMD4<Float>]], pixels: UnsafeRawPointer }
+struct QuadVertex { var pos: SIMD4<Float>; var uv: SIMD2<Float>; var pad: SIMD2<Float> }
+
 final class Foveator {
     /// (siempre: también agranda con MetalFX la imagen del juego dibujada más chica y la ubica si se recortó el campo de visión)
     static let shared: Foveator? = Foveator()
-    let dev: MTLDevice, queue: MTLCommandQueue, pipe: MTLRenderPipelineState, copyPipe: MTLRenderPipelineState, blendPipe: MTLRenderPipelineState, lut: MTLTexture
+    let dev: MTLDevice, queue: MTLCommandQueue, pipe: MTLRenderPipelineState, copyPipe: MTLRenderPipelineState, quadPipe: MTLRenderPipelineState, lut: MTLTexture
     let cache: CVMetalTextureCache
     private var src: MTLTexture?
     init?() {
@@ -126,6 +131,18 @@ final class Foveator {
             constexpr sampler smp(filter::linear, address::clamp_to_edge);
             return src.sample(smp, in.uv);
         }
+        // panel flotante del juego (menú, HUD): 4 esquinas ya proyectadas en el ojo; fl: 1 mezcla, 2 premultiplicado
+        struct QV { float4 pos; float2 uv; float2 pad; };
+        vertex FC qvert(uint vid [[vertex_id]], constant QV *v [[buffer(0)]]) {
+            FC o; o.pos = v[vid].pos; o.uv = v[vid].uv; return o;
+        }
+        fragment float4 fquad(FC in [[stage_in]], texture2d<float> src [[texture(0)]], constant uint &fl [[buffer(0)]]) {
+            constexpr sampler smp(filter::linear, address::clamp_to_edge);
+            float4 c = src.sample(smp, in.uv);
+            if ((fl & 1u) == 0u) return float4(c.rgb, 1.0);
+            if ((fl & 2u) == 0u) c.rgb *= c.a;
+            return c;
+        }
         // p: ancho y alto codificados de un ojo, ancho y alto de un ojo en la imagen del juego
         fragment float4 ffov(FO in [[stage_in]], texture2d<float> src [[texture(0)]], texture2d<float, access::read> lut [[texture(1)]],
                              constant float4 &p [[buffer(0)]]) {
@@ -153,11 +170,15 @@ final class Foveator {
             cd.fragmentFunction = lib.makeFunction(name: "fcopy")
             cd.colorAttachments[0].pixelFormat = .bgra8Unorm
             copyPipe = try d.makeRenderPipelineState(descriptor: cd)
-            // (la capa de paneles flotantes del juego, encima: viene con alfa premultiplicado)
-            cd.colorAttachments[0].isBlendingEnabled = true
-            cd.colorAttachments[0].sourceRGBBlendFactor = .one; cd.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-            cd.colorAttachments[0].sourceAlphaBlendFactor = .one; cd.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
-            blendPipe = try d.makeRenderPipelineState(descriptor: cd)
+            // (los paneles flotantes del juego, encima: alfa premultiplicado)
+            let qd = MTLRenderPipelineDescriptor()
+            qd.vertexFunction = lib.makeFunction(name: "qvert")
+            qd.fragmentFunction = lib.makeFunction(name: "fquad")
+            qd.colorAttachments[0].pixelFormat = .bgra8Unorm
+            qd.colorAttachments[0].isBlendingEnabled = true
+            qd.colorAttachments[0].sourceRGBBlendFactor = .one; qd.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            qd.colorAttachments[0].sourceAlphaBlendFactor = .one; qd.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            quadPipe = try d.makeRenderPipelineState(descriptor: qd)
         } catch { print("ERROR (foveated encoding): \(error)"); return nil }
         let ld = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: 1024, height: 3, mipmapped: false)
         ld.usage = .shaderRead
@@ -226,27 +247,23 @@ final class Foveator {
     /// MetalFX; si se recortó el campo de visión lo ubica en su lugar (con el borde negro); y le achica el borde
     /// (foveated encoding, si está activado). Lo deja en pb, listo para codificar.
     /// rects: dónde va cada ojo dentro de la imagen completa de un ojo (x, y, ancho, alto, en 0..1)
-    /// ov: capa aparte de paneles flotantes (menú, HUD), a más resolución que el juego: se pone encima ya agrandado
+    /// quads: paneles flotantes del juego (menú, HUD) que se dibujan encima, ya a la resolución del visor
     func warpPixels(_ ptr: UnsafeRawPointer, ew: Int, eh: Int, isRGBA: Bool, rects: [SIMD4<Float>], into pb: CVPixelBuffer,
-                    ov: (UnsafeRawPointer, Int, Int)? = nil) -> Bool {
+                    quads: [GameQuad] = []) -> Bool {
         let fmt: MTLPixelFormat = isRGBA ? .rgba8Unorm : .bgra8Unorm
-        var ovTex: [MTLTexture]? = nil
-        if let o = ov {
-            let (op, ow, oh) = o
-            var l: [MTLTexture] = []
-            for e in 0..<2 {
-                guard let t = tex(ow, oh, fmt, [.shaderRead], .shared, reuse: eyeOv[e]) else { break }
-                eyeOv[e] = t
-                t.replace(region: MTLRegionMake2D(0, 0, ow, oh), mipmapLevel: 0, withBytes: op + e * ow * 4, bytesPerRow: ow * 2 * 4)
-                l.append(t)
-            }
-            if l.count == 2 { ovTex = l }
+        var qt: [(MTLTexture, GameQuad)] = []
+        for (i, q) in quads.enumerated() where i < 8 {
+            let qf: MTLPixelFormat = q.flags & 8 != 0 ? .rgba8Unorm : .bgra8Unorm
+            guard let tx = tex(q.w, q.h, qf, [.shaderRead], .shared, reuse: quadTex[i]) else { continue }
+            quadTex[i] = tx
+            tx.replace(region: MTLRegionMake2D(0, 0, q.w, q.h), mipmapLevel: 0, withBytes: q.pixels, bytesPerRow: q.w * 4)
+            qt.append((tx, q))
         }
-        return warpCore(ew: ew, eh: eh, store: fmt, view: fmt, inMode: .shared, rects: rects, into: pb, overlay: ovTex) { _, e, inT in
+        return warpCore(ew: ew, eh: eh, store: fmt, view: fmt, inMode: .shared, rects: rects, into: pb, quads: qt) { _, e, inT in
             inT.replace(region: MTLRegionMake2D(0, 0, ew, eh), mipmapLevel: 0, withBytes: ptr + e * ew * 4, bytesPerRow: ew * 2 * 4)
         }
     }
-    private var eyeOv: [MTLTexture?] = [nil, nil]
+    private var quadTex: [MTLTexture?] = Array(repeating: nil, count: 8)
     /// Lo mismo, con el cuadro ya en la GPU (copia directa: una textura compartida con el juego, los dos ojos lado a lado)
     func warpTexture(_ src: MTLTexture, ew: Int, eh: Int, rects: [SIMD4<Float>], into pb: CVPixelBuffer) -> Bool {
         // (se lee como colores sin convertir, igual que los píxeles por memoria)
@@ -262,7 +279,7 @@ final class Foveator {
     /// store: formato de la imagen de cada ojo · view: cómo se lee (sin pasar de sRGB a lineal) · fill: la llena (en cb)
     /// inMode: memoria de la imagen de cada ojo (compartida si la llena la CPU; privada si la llena la GPU)
     private func warpCore(ew: Int, eh: Int, store: MTLPixelFormat, view: MTLPixelFormat, inMode: MTLStorageMode, rects: [SIMD4<Float>], into pb: CVPixelBuffer,
-                          overlay: [MTLTexture]? = nil, fill: (MTLCommandBuffer, Int, MTLTexture) -> Void) -> Bool {
+                          quads: [(MTLTexture, GameQuad)] = [], fill: (MTLCommandBuffer, Int, MTLTexture) -> Void) -> Bool {
         let fmt = view
         guard let full = source(SW, SH, .bgra8Unorm) else { fail("no se pudo crear la imagen completa"); return false }
         var cvt: CVMetalTexture?
@@ -307,12 +324,22 @@ final class Foveator {
                 enc.setFragmentTexture(t, index: 0)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             }
-            if let ov = overlay {   // los paneles flotantes, en el mismo lugar que cada ojo
-                enc.setRenderPipelineState(blendPipe)
-                for (e, (_, vp)) in draw.enumerated() where e < ov.count {
+            if !quads.isEmpty {   // los paneles flotantes, proyectados en cada ojo (en su rectángulo)
+                enc.setRenderPipelineState(quadPipe)
+                for (e, (_, vp)) in draw.enumerated() {
                     enc.setViewport(vp)
-                    enc.setFragmentTexture(ov[e], index: 0)
-                    enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                    for (tx, q) in quads {
+                        let c = q.clip[e]
+                        guard c.allSatisfy({ $0.w > 1e-3 }) else { continue }   // (alguna esquina detrás del ojo)
+                        let v0: Float = q.flags & 4 != 0 ? 0 : 1, v1: Float = 1 - v0
+                        var vs: [QuadVertex] = [QuadVertex(pos: c[0], uv: SIMD2(0, v0), pad: .zero), QuadVertex(pos: c[1], uv: SIMD2(1, v0), pad: .zero),
+                                                QuadVertex(pos: c[2], uv: SIMD2(0, v1), pad: .zero), QuadVertex(pos: c[3], uv: SIMD2(1, v1), pad: .zero)]
+                        var fl = q.flags
+                        enc.setVertexBytes(&vs, length: MemoryLayout<QuadVertex>.stride * 4, index: 0)
+                        enc.setFragmentBytes(&fl, length: 4, index: 0)
+                        enc.setFragmentTexture(tx, index: 0)
+                        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+                    }
                 }
             }
             enc.endEncoding()
@@ -1224,7 +1251,7 @@ final class GameLink {
                 if h[0] == 0x31535256 && h[1] == nonce {
                     shm = mm; shmLen = total; shmSlot = slot
                     OSMemoryBarrier()
-                    h[7] = 0x31564F50   // reserved[2] «POV1»: sé poner la capa aparte de paneles flotantes (tipo 12)
+                    h[7] = 0x32564F50   // reserved[2] «POV2»: sé dibujar los paneles flotantes del juego (tipo 12)
                     OSMemoryBarrier()
                     h[2] = nonce   // confirmación: el runtime pasa a usarla
                     print("[juego] Memoria compartida activa (los cuadros ya no pasan por la red)")
@@ -1233,23 +1260,33 @@ final class GameLink {
                     print("[juego] Memoria compartida: el archivo no coincide; sigue por la red")
                 }
             case 6, 12:
-                // Cuadro listo en la memoria compartida (12: con la capa de paneles flotantes después de la imagen)
-                guard n >= (buf[0] == 12 ? 15 : 10), let m = shm else { break }
+                // Cuadro listo en la memoria compartida (12: con paneles flotantes después de la imagen)
+                guard n >= (buf[0] == 12 ? 12 : 10), let m = shm else { break }
                 let slot = Int(buf[1])
                 guard slot < 3 else { break }
                 let state = (m + 32 + slot * 4).assumingMemoryBound(to: Int32.self)
                 OSMemoryBarrier()
                 let ew = Int(buf[7]) << 8 | Int(buf[8]), eh = Int(buf[9]) << 8 | Int(buf[10])
                 let poseId = UInt32(buf[2]) << 24 | UInt32(buf[3]) << 16 | UInt32(buf[4]) << 8 | UInt32(buf[5])
-                let ow = buf[0] == 12 ? Int(buf[11]) << 8 | Int(buf[12]) : 0, oh = buf[0] == 12 ? Int(buf[13]) << 8 | Int(buf[14]) : 0
-                if ew * 2 * eh * 4 + ow * 2 * oh * 4 <= shmSlot {
+                let nq = buf[0] == 12 ? Int(buf[11]) : 0
+                if ew * 2 * eh * 4 <= shmSlot {
                     setStage("esperando turno")
                     frameLock.lock()
                     setStage("procesando imagen")
                     let base = UnsafeRawPointer(m + 64 + slot * shmSlot)
-                    var ovArg: (UnsafeRawPointer, Int, Int)? = nil
-                    if ow > 0 && oh > 0 { ovArg = (base + ew * 2 * eh * 4, ow, oh) }
-                    handlePixels(base, poseId: poseId, isRGBA: buf[6] == 1, ew: ew, eh: eh, ov: ovArg)
+                    // cada panel: w, h, banderas, (relleno), 2 ojos × 4 esquinas × (x, y, z, w), y después sus píxeles
+                    var quads: [GameQuad] = [], off = ew * 2 * eh * 4
+                    for _ in 0..<nq {
+                        guard off + 144 <= shmSlot else { break }
+                        let hp = (base + off).assumingMemoryBound(to: UInt32.self)
+                        let qw = Int(hp[0]), qh = Int(hp[1]), fl = hp[2]
+                        guard qw > 0, qh > 0, off + 144 + qw * qh * 4 <= shmSlot else { break }
+                        let fp = (base + off + 16).assumingMemoryBound(to: Float.self)
+                        let clip = (0..<2).map { e in (0..<4).map { k in SIMD4<Float>(fp[e * 16 + k * 4], fp[e * 16 + k * 4 + 1], fp[e * 16 + k * 4 + 2], fp[e * 16 + k * 4 + 3]) } }
+                        quads.append(GameQuad(w: qw, h: qh, flags: fl, clip: clip, pixels: base + off + 144))
+                        off += 144 + qw * qh * 4
+                    }
+                    handlePixels(base, poseId: poseId, isRGBA: buf[6] == 1, ew: ew, eh: eh, quads: quads)
                     frameLock.unlock()
                 }
                 OSMemoryBarrier()
@@ -1337,7 +1374,7 @@ final class GameLink {
         handlePixels(p + 10, poseId: poseId, isRGBA: isRGBA, ew: ew, eh: eh)
     }
 
-    private func handlePixels(_ srcPtr: UnsafeRawPointer, poseId: UInt32, isRGBA: Bool, ew: Int, eh: Int, ov: (UnsafeRawPointer, Int, Int)? = nil) {
+    private func handlePixels(_ srcPtr: UnsafeRawPointer, poseId: UInt32, isRGBA: Bool, ew: Int, eh: Int, quads: [GameQuad] = []) {
         guard ew > 0, eh > 0 else { return }
         frames += 1
         if frames == 1 { print("[juego] Primer cuadro recibido: \(ew)x\(eh) por ojo, \(isRGBA ? "RGBA" : "BGRA") · GPU \(Foveator.shared != nil ? "lista" : "NO disponible") · se manda \(W)x\(H)") }
@@ -1352,10 +1389,10 @@ final class GameLink {
             vigiaSkip += 1
             if vigiaSkip % 20 != 0 { shared.endFrame(); return }
         }
-        if let fv = Foveator.shared, FOVEA.on || ew != EYE || eh != SH || GameProfiles.shared.activeK < 0.999 || ov != nil {
+        if let fv = Foveator.shared, FOVEA.on || ew != EYE || eh != SH || GameProfiles.shared.activeK < 0.999 || !quads.isEmpty {
             var po: CVPixelBuffer?
             CVPixelBufferPoolCreatePixelBuffer(nil, pool, &po)
-            guard let pb = po, fv.warpPixels(srcPtr, ew: ew, eh: eh, isRGBA: isRGBA, rects: eyeRects(), into: pb, ov: ov) else { shared.endFrame(); return }
+            guard let pb = po, fv.warpPixels(srcPtr, ew: ew, eh: eh, isRGBA: isRGBA, rects: eyeRects(), into: pb, quads: quads) else { shared.endFrame(); return }
             Perf.shared.addMac(Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
             let fn = shared.nextFrameNo(), key = shared.takeKey(), enc = encoder
             encodeQueue.async { enc.encode(pb, frameNo: fn, poseId: poseId, forceKey: key, start: start) }

@@ -460,7 +460,7 @@ typedef struct {
 static HANDLE g_shmFile = INVALID_HANDLE_VALUE, g_shmMap;
 static uint8_t *g_shm;
 static int g_shmMode;               /* 0 esperando confirmación · 1 activa · -1 no disponible (TCP) */
-#define OV_MAGIC 0x31564F50u   /* "POV1" en reserved[2]: la Mac sabe poner la capa aparte de paneles flotantes */
+#define OV_MAGIC 0x32564F50u   /* "POV2" en reserved[2]: la Mac sabe dibujar los paneles flotantes ella misma (tipo 12) */
 static volatile int g_ovMac;
 static int64_t g_shmAsked;
 static int g_shmGen = -1;           /* conexión de imágenes donde se ofreció */
@@ -528,7 +528,7 @@ static int shm_active(void) {
         ShmHdr *h = (ShmHdr *)g_shm;
         if (h->ack == h->nonce) {
             g_shmMode = 1; g_ovMac = h->reserved[2] == OV_MAGIC;
-            logmsg("Memoria compartida activa: los cuadros ya no pasan por la red%s", g_ovMac ? " (con capa de paneles)" : "");
+            logmsg("Memoria compartida activa: los cuadros ya no pasan por la red%s", g_ovMac ? " (la Mac dibuja los paneles flotantes)" : "");
             return 1;
         }
         if (now_ns() - g_shmAsked > 3000000000LL) {
@@ -562,16 +562,16 @@ static void shm_notify_t(uint8_t type, int slot, uint32_t pid, uint8_t fmt, uint
     InterlockedIncrement(&g_statSent);
 }
 static void shm_notify(int slot, uint32_t pid, uint8_t fmt, uint32_t ew, uint32_t eh) { shm_notify_t(6, slot, pid, fmt, ew, eh); }
-/* Igual, con la capa aparte de paneles flotantes (ow×oh por ojo, justo después de la imagen del juego en el lugar) */
-static void shm_notify_ov(int slot, uint32_t pid, uint8_t fmt, uint32_t ew, uint32_t eh, uint32_t ow, uint32_t oh) {
-    uint8_t p[4 + 15];
-    uint32_t len = 15;
+/* Igual, con nq paneles flotantes después de la imagen del juego en el lugar (cada uno: QuadHdr + sus píxeles) */
+static void shm_notify_quads(int slot, uint32_t pid, uint8_t fmt, uint32_t ew, uint32_t eh, uint32_t nq) {
+    uint8_t p[4 + 12];
+    uint32_t len = 12;
     p[0] = 0; p[1] = 0; p[2] = 0; p[3] = (uint8_t)len; p[4] = 12;
     p[5] = (uint8_t)slot;
     p[6] = (uint8_t)(pid >> 24); p[7] = (uint8_t)(pid >> 16); p[8] = (uint8_t)(pid >> 8); p[9] = (uint8_t)pid;
     p[10] = fmt;
     p[11] = (uint8_t)(ew >> 8); p[12] = (uint8_t)ew; p[13] = (uint8_t)(eh >> 8); p[14] = (uint8_t)eh;
-    p[15] = (uint8_t)(ow >> 8); p[16] = (uint8_t)ow; p[17] = (uint8_t)(oh >> 8); p[18] = (uint8_t)oh;
+    p[15] = (uint8_t)nq;
     if (!send_all(g_fsock, (const char *)p, 4 + (int)len)) {
         closesocket(g_fsock); g_fsock = INVALID_SOCKET; g_shmMode = 0;
         ((ShmHdr *)g_shm)->state[slot] = 0;
@@ -2935,8 +2935,34 @@ static int vk_quad_buffers(Session *s, int j, uint32_t w, uint32_t h) {
 
 /* Pega el panel flotante sobre la imagen de los dos ojos (ya en la memoria compartida, filas de arriba hacia abajo):
  * por cada píxel del ojo, el rayo desde el ojo se cruza con el plano del panel y se toma el color de ese punto */
-/* ov: dst es la capa aparte de paneles (transparente, con alfa premultiplicado) en vez de la imagen del juego */
-static void vk_composite_quad(Session *s, int r, int j, uint8_t *dst, uint32_t ew, uint32_t eh, int dstRgba, int ov) {
+/* Un panel flotante para la Mac: tamaño, banderas (1 mezcla con alfa, 2 alfa premultiplicado, 4 dado vuelta, 8 RGBA)
+ * y sus 4 esquinas en cada ojo como posiciones de recorte (x, y, z, w) dentro del rectángulo de ese ojo (w <= 0: no se
+ * ve en ese ojo). Esquinas: abajo-izq., abajo-der., arriba-izq., arriba-der. Después vienen w×h píxeles. */
+typedef struct { uint32_t w, h, flags, pad; float c[2][4][4]; } QuadHdr;
+static void vk_quad_header(Session *s, int r, int j, QuadHdr *q) {
+    q->w = s->vkQ[r][j].w; q->h = s->vkQ[r][j].h; q->pad = 0;
+    q->flags = (s->vkQ[r][j].blend ? 1 : 0) | (s->vkQ[r][j].premul ? 2 : 0) | (s->vkQ[r][j].flip ? 4 : 0) | (s->vkQ[r][j].rgba ? 8 : 0);
+    const float hw = s->vkQ[r][j].size.width * 0.5f, hh = s->vkQ[r][j].size.height * 0.5f;
+    for (int e = 0; e < 2; e++) {
+        XrPosef qe = pmul(pinv(s->vkQ[r][j].eye[e]), s->vkQ[r][j].pose);
+        XrVector3f c = qe.position;
+        XrVector3f ux = qrot(qe.orientation, (XrVector3f){1, 0, 0}), uy = qrot(qe.orientation, (XrVector3f){0, 1, 0});
+        const XrFovf fv = s->vkQ[r][j].fov[e];
+        float tl = tanf(fv.angleLeft), tr = tanf(fv.angleRight), tu = tanf(fv.angleUp), td = tanf(fv.angleDown);
+        for (int k = 0; k < 4; k++) {
+            float sx = (k & 1) ? hw : -hw, sy = (k & 2) ? hh : -hh;
+            XrVector3f p = { c.x + ux.x * sx + uy.x * sy, c.y + ux.y * sx + uy.y * sy, c.z + ux.z * sx + uy.z * sy };
+            float w = -p.z;
+            /* ndc = 2·(tangente − borde)/(ancho) − 1, multiplicado por w para que la GPU corrija la perspectiva */
+            q->c[e][k][0] = (2.0f * (p.x - tl * w) / (tr - tl)) - w;
+            q->c[e][k][1] = (2.0f * (p.y - td * w) / (tu - td)) - w;
+            q->c[e][k][2] = 0.0f;
+            q->c[e][k][3] = w;
+        }
+    }
+}
+
+static void vk_composite_quad(Session *s, int r, int j, uint8_t *dst, uint32_t ew, uint32_t eh, int dstRgba) {
     uint32_t qw = s->vkQ[r][j].w, qh = s->vkQ[r][j].h;
     if (!s->vkQMap[r][j] || !qw || !qh) return;
     /* (primero se copia entero y en orden: leer salteado de la memoria de la GPU en Wine de 32 bits tardaba segundos) */
@@ -3010,11 +3036,10 @@ static void vk_composite_quad(Session *s, int r, int j, uint8_t *dst, uint32_t e
                 const uint8_t *sp = src + ((size_t)sy * qw + (size_t)sx) * 4;
                 uint8_t *dp = row + (size_t)px * 4;
                 int sr = swap ? sp[2] : sp[0], sg = sp[1], sb = swap ? sp[0] : sp[2], a = sp[3];
-                if (!s->vkQ[r][j].blend) { dp[0] = (uint8_t)sr; dp[1] = (uint8_t)sg; dp[2] = (uint8_t)sb; if (ov) dp[3] = 255; continue; }
+                if (!s->vkQ[r][j].blend) { dp[0] = (uint8_t)sr; dp[1] = (uint8_t)sg; dp[2] = (uint8_t)sb; continue; }
                 if (!s->vkQ[r][j].premul) { sr = sr * a / 255; sg = sg * a / 255; sb = sb * a / 255; }
                 int ia = 255 - a;
                 dp[0] = (uint8_t)(sr + dp[0] * ia / 255); dp[1] = (uint8_t)(sg + dp[1] * ia / 255); dp[2] = (uint8_t)(sb + dp[2] * ia / 255);
-                if (ov) dp[3] = (uint8_t)(a + dp[3] * ia / 255);
             }
         }
     }
@@ -3083,21 +3108,21 @@ static void vk_send_stage(Session *s, int r) {
     const uint8_t *src = (const uint8_t *)s->vkMap[r];
     if (!s->stFlip[r]) memcpy(dst, src, (size_t)rb * s->stH);
     else for (uint32_t y = 0; y < s->stH; y++) memcpy(dst + (size_t)y * rb, src + (size_t)(s->stH - 1 - y) * rb, rb);
-    /* Paneles flotantes (menú, HUD): en una capa aparte al doble de resolución (hasta 2048), que la Mac pone encima
-     * después de agrandar la imagen del juego: así se leen aunque el juego se dibuje a menos resolución */
-    uint32_t ow = 0, oh = 0;
+    /* Paneles flotantes (menú, HUD): si la Mac sabe, se le mandan aparte (su imagen y dónde cae en cada ojo) y los
+     * dibuja ella en la GPU, a la resolución del visor, después de agrandar la imagen del juego. Si no, se pegan acá. */
+    uint32_t nqSent = 0;
     { int64_t q0 = now_ns(), any = 0;
       for (int j = 0; j < NQ; j++) any += s->vkQ[r][j].on;
       if (any) {
-          float f = 2048.0f / (float)s->stW; if (f > 2.0f) f = 2.0f; if (f < 1.0f) f = 1.0f;
-          ow = (uint32_t)(s->stW * f) & ~7u; oh = (uint32_t)(s->stH * f) & ~7u;
-          size_t eyeBytes = (size_t)rb * s->stH, ovBytes = (size_t)ow * 2 * oh * 4;
-          if (!g_ovMac || eyeBytes + ovBytes > SHM_SLOT_MAX || ow > 4095 || oh > 4095) ow = oh = 0;
-          uint8_t *ovp = dst + eyeBytes;
-          if (ow) memset(ovp, 0, ovBytes);
+          size_t used = (size_t)rb * s->stH;
           for (int j = 0; j < NQ; j++) if (s->vkQ[r][j].on) {
-              if (ow) vk_composite_quad(s, r, j, ovp, ow, oh, fmt_code(s->stFmt) != 0, 1);
-              else vk_composite_quad(s, r, j, dst, s->stW, s->stH, fmt_code(s->stFmt) != 0, 0);
+              if (!g_ovMac) { vk_composite_quad(s, r, j, dst, s->stW, s->stH, fmt_code(s->stFmt) != 0); continue; }
+              size_t px = (size_t)s->vkQ[r][j].w * s->vkQ[r][j].h * 4;
+              if (used + sizeof(QuadHdr) + px > SHM_SLOT_MAX || !s->vkQMap[r][j]) break;
+              QuadHdr *qh = (QuadHdr *)(dst + used);
+              vk_quad_header(s, r, j, qh);
+              memcpy(dst + used + sizeof(QuadHdr), s->vkQMap[r][j], px);
+              used += sizeof(QuadHdr) + px; nqSent++;
           }
           g_dgQuadMs += (now_ns() - q0) / 1e6; g_dgQuadN++;
       } }
@@ -3106,7 +3131,7 @@ static void vk_send_stage(Session *s, int r) {
     s->stValid[r] = 0;
     MemoryBarrier();
     sh->state[ss] = 1;
-    if (ow) shm_notify_ov(ss, s->stPose[r], fmt_code(s->stFmt), s->stW, s->stH, ow, oh);
+    if (nqSent) shm_notify_quads(ss, s->stPose[r], fmt_code(s->stFmt), s->stW, s->stH, nqSent);
     else shm_notify(ss, s->stPose[r], fmt_code(s->stFmt), s->stW, s->stH);
 }
 
@@ -3294,6 +3319,32 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
         int v1, v2;
         XrPosef pw = space_world((const Space *)pl->space, &tk, &v1), qw0 = space_world((const Space *)ql->space, &tk, &v2);
         s->vkQ[k][j].pose = pmul(pinv(pw), pmul(qw0, ql->pose));
+        {   /* OpenComposite pierde el giro de los paneles (los deja siempre mirando hacia el mismo lado del mundo, y se
+             * veían de costado): se los gira para que miren a la cabeza, con el «arriba» del mundo */
+            XrVector3f P = s->vkQ[k][j].pose.position;
+            XrVector3f H = { (pl->views[0].pose.position.x + pl->views[1].pose.position.x) * 0.5f,
+                             (pl->views[0].pose.position.y + pl->views[1].pose.position.y) * 0.5f,
+                             (pl->views[0].pose.position.z + pl->views[1].pose.position.z) * 0.5f };
+            XrVector3f z = { H.x - P.x, H.y - P.y, H.z - P.z };
+            float zl = sqrtf(z.x * z.x + z.y * z.y + z.z * z.z);
+            if (zl > 1e-4f) {
+                z.x /= zl; z.y /= zl; z.z /= zl;
+                XrVector3f x = { z.z, 0, -z.x };   /* arriba (0,1,0) × z */
+                float xl = sqrtf(x.x * x.x + x.z * x.z);
+                if (xl > 1e-4f) {
+                    x.x /= xl; x.z /= xl;
+                    XrVector3f y = { z.y * x.z - z.z * x.y, z.z * x.x - z.x * x.z, z.x * x.y - z.y * x.x };
+                    /* matriz de columnas x, y, z → cuaternión */
+                    float m00 = x.x, m11 = y.y, m22 = z.z, tr = m00 + m11 + m22;
+                    XrQuaternionf q;
+                    if (tr > 0) { float sq = sqrtf(tr + 1.0f) * 2; q.w = 0.25f * sq; q.x = (y.z - z.y) / sq; q.y = (z.x - x.z) / sq; q.z = (x.y - y.x) / sq; }
+                    else if (m00 > m11 && m00 > m22) { float sq = sqrtf(1.0f + m00 - m11 - m22) * 2; q.w = (y.z - z.y) / sq; q.x = 0.25f * sq; q.y = (y.x + x.y) / sq; q.z = (z.x + x.z) / sq; }
+                    else if (m11 > m22) { float sq = sqrtf(1.0f + m11 - m00 - m22) * 2; q.w = (z.x - x.z) / sq; q.x = (y.x + x.y) / sq; q.y = 0.25f * sq; q.z = (z.y + y.z) / sq; }
+                    else { float sq = sqrtf(1.0f + m22 - m00 - m11) * 2; q.w = (x.y - y.x) / sq; q.x = (z.x + x.z) / sq; q.y = (z.y + y.z) / sq; q.z = 0.25f * sq; }
+                    s->vkQ[k][j].pose.orientation = q;
+                }
+            }
+        }
         s->vkQ[k][j].size = ql->size;
         for (int e = 0; e < 2; e++) { s->vkQ[k][j].eye[e] = pl->views[e].pose; s->vkQ[k][j].fov[e] = pl->views[e].fov; }
         s->vkQ[k][j].w = (uint32_t)qw; s->vkQ[k][j].h = (uint32_t)qh;
