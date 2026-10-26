@@ -2301,6 +2301,9 @@ static void fill_velocity(void *next, const Track *t, const Space *sp, XrPosef b
             memset(&v->linearVelocity, 0, sizeof v->linearVelocity);
             memset(&v->angularVelocity, 0, sizeof v->angularVelocity);
             v->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+            /* Vulkan (DOOM VFR, Half-Life 2 por OpenComposite): la cabeza sin velocidad. Si el juego la usa para adelantar
+             * la pose por su cuenta, dibuja con una pose distinta de la que se le informa al visor (y tiembla al moverla) */
+            if (k == 2 && g_session && g_session->vk) k = -1;
             if (k >= 0 && valid) {
                 /* expresar la velocidad en los ejes del espacio base */
                 XrQuaternionf inv = qconj(baseWorld.orientation);
