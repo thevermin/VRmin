@@ -97,7 +97,7 @@ let H = FOVEA.on ? round16(Double(EYE) * FOVEA.ratio(FOVEA.cy)) : SH
 final class Foveator {
     /// (siempre: también agranda con MetalFX la imagen del juego dibujada más chica y la ubica si se recortó el campo de visión)
     static let shared: Foveator? = Foveator()
-    let dev: MTLDevice, queue: MTLCommandQueue, pipe: MTLRenderPipelineState, copyPipe: MTLRenderPipelineState, lut: MTLTexture
+    let dev: MTLDevice, queue: MTLCommandQueue, pipe: MTLRenderPipelineState, copyPipe: MTLRenderPipelineState, blendPipe: MTLRenderPipelineState, lut: MTLTexture
     let cache: CVMetalTextureCache
     private var src: MTLTexture?
     init?() {
@@ -153,6 +153,11 @@ final class Foveator {
             cd.fragmentFunction = lib.makeFunction(name: "fcopy")
             cd.colorAttachments[0].pixelFormat = .bgra8Unorm
             copyPipe = try d.makeRenderPipelineState(descriptor: cd)
+            // (la capa de paneles flotantes del juego, encima: viene con alfa premultiplicado)
+            cd.colorAttachments[0].isBlendingEnabled = true
+            cd.colorAttachments[0].sourceRGBBlendFactor = .one; cd.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            cd.colorAttachments[0].sourceAlphaBlendFactor = .one; cd.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            blendPipe = try d.makeRenderPipelineState(descriptor: cd)
         } catch { print("ERROR (foveated encoding): \(error)"); return nil }
         let ld = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: 1024, height: 3, mipmapped: false)
         ld.usage = .shaderRead
@@ -221,12 +226,27 @@ final class Foveator {
     /// MetalFX; si se recortó el campo de visión lo ubica en su lugar (con el borde negro); y le achica el borde
     /// (foveated encoding, si está activado). Lo deja en pb, listo para codificar.
     /// rects: dónde va cada ojo dentro de la imagen completa de un ojo (x, y, ancho, alto, en 0..1)
-    func warpPixels(_ ptr: UnsafeRawPointer, ew: Int, eh: Int, isRGBA: Bool, rects: [SIMD4<Float>], into pb: CVPixelBuffer) -> Bool {
+    /// ov: capa aparte de paneles flotantes (menú, HUD), a más resolución que el juego: se pone encima ya agrandado
+    func warpPixels(_ ptr: UnsafeRawPointer, ew: Int, eh: Int, isRGBA: Bool, rects: [SIMD4<Float>], into pb: CVPixelBuffer,
+                    ov: (UnsafeRawPointer, Int, Int)? = nil) -> Bool {
         let fmt: MTLPixelFormat = isRGBA ? .rgba8Unorm : .bgra8Unorm
-        return warpCore(ew: ew, eh: eh, store: fmt, view: fmt, inMode: .shared, rects: rects, into: pb) { _, e, inT in
+        var ovTex: [MTLTexture]? = nil
+        if let o = ov {
+            let (op, ow, oh) = o
+            var l: [MTLTexture] = []
+            for e in 0..<2 {
+                guard let t = tex(ow, oh, fmt, [.shaderRead], .shared, reuse: eyeOv[e]) else { break }
+                eyeOv[e] = t
+                t.replace(region: MTLRegionMake2D(0, 0, ow, oh), mipmapLevel: 0, withBytes: op + e * ow * 4, bytesPerRow: ow * 2 * 4)
+                l.append(t)
+            }
+            if l.count == 2 { ovTex = l }
+        }
+        return warpCore(ew: ew, eh: eh, store: fmt, view: fmt, inMode: .shared, rects: rects, into: pb, overlay: ovTex) { _, e, inT in
             inT.replace(region: MTLRegionMake2D(0, 0, ew, eh), mipmapLevel: 0, withBytes: ptr + e * ew * 4, bytesPerRow: ew * 2 * 4)
         }
     }
+    private var eyeOv: [MTLTexture?] = [nil, nil]
     /// Lo mismo, con el cuadro ya en la GPU (copia directa: una textura compartida con el juego, los dos ojos lado a lado)
     func warpTexture(_ src: MTLTexture, ew: Int, eh: Int, rects: [SIMD4<Float>], into pb: CVPixelBuffer) -> Bool {
         // (se lee como colores sin convertir, igual que los píxeles por memoria)
@@ -242,7 +262,7 @@ final class Foveator {
     /// store: formato de la imagen de cada ojo · view: cómo se lee (sin pasar de sRGB a lineal) · fill: la llena (en cb)
     /// inMode: memoria de la imagen de cada ojo (compartida si la llena la CPU; privada si la llena la GPU)
     private func warpCore(ew: Int, eh: Int, store: MTLPixelFormat, view: MTLPixelFormat, inMode: MTLStorageMode, rects: [SIMD4<Float>], into pb: CVPixelBuffer,
-                          fill: (MTLCommandBuffer, Int, MTLTexture) -> Void) -> Bool {
+                          overlay: [MTLTexture]? = nil, fill: (MTLCommandBuffer, Int, MTLTexture) -> Void) -> Bool {
         let fmt = view
         guard let full = source(SW, SH, .bgra8Unorm) else { fail("no se pudo crear la imagen completa"); return false }
         var cvt: CVMetalTexture?
@@ -286,6 +306,14 @@ final class Foveator {
                 enc.setViewport(vp)
                 enc.setFragmentTexture(t, index: 0)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            }
+            if let ov = overlay {   // los paneles flotantes, en el mismo lugar que cada ojo
+                enc.setRenderPipelineState(blendPipe)
+                for (e, (_, vp)) in draw.enumerated() where e < ov.count {
+                    enc.setViewport(vp)
+                    enc.setFragmentTexture(ov[e], index: 0)
+                    enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                }
             }
             enc.endEncoding()
         }
@@ -1196,26 +1224,32 @@ final class GameLink {
                 if h[0] == 0x31535256 && h[1] == nonce {
                     shm = mm; shmLen = total; shmSlot = slot
                     OSMemoryBarrier()
+                    h[7] = 0x31564F50   // reserved[2] «POV1»: sé poner la capa aparte de paneles flotantes (tipo 12)
+                    OSMemoryBarrier()
                     h[2] = nonce   // confirmación: el runtime pasa a usarla
                     print("[juego] Memoria compartida activa (los cuadros ya no pasan por la red)")
                 } else {
                     munmap(mm, total)
                     print("[juego] Memoria compartida: el archivo no coincide; sigue por la red")
                 }
-            case 6:
-                // Cuadro listo en la memoria compartida
-                guard n >= 10, let m = shm else { break }
+            case 6, 12:
+                // Cuadro listo en la memoria compartida (12: con la capa de paneles flotantes después de la imagen)
+                guard n >= (buf[0] == 12 ? 15 : 10), let m = shm else { break }
                 let slot = Int(buf[1])
                 guard slot < 3 else { break }
                 let state = (m + 32 + slot * 4).assumingMemoryBound(to: Int32.self)
                 OSMemoryBarrier()
                 let ew = Int(buf[7]) << 8 | Int(buf[8]), eh = Int(buf[9]) << 8 | Int(buf[10])
                 let poseId = UInt32(buf[2]) << 24 | UInt32(buf[3]) << 16 | UInt32(buf[4]) << 8 | UInt32(buf[5])
-                if ew * 2 * eh * 4 <= shmSlot {
+                let ow = buf[0] == 12 ? Int(buf[11]) << 8 | Int(buf[12]) : 0, oh = buf[0] == 12 ? Int(buf[13]) << 8 | Int(buf[14]) : 0
+                if ew * 2 * eh * 4 + ow * 2 * oh * 4 <= shmSlot {
                     setStage("esperando turno")
                     frameLock.lock()
                     setStage("procesando imagen")
-                    handlePixels(UnsafeRawPointer(m + 64 + slot * shmSlot), poseId: poseId, isRGBA: buf[6] == 1, ew: ew, eh: eh)
+                    let base = UnsafeRawPointer(m + 64 + slot * shmSlot)
+                    var ovArg: (UnsafeRawPointer, Int, Int)? = nil
+                    if ow > 0 && oh > 0 { ovArg = (base + ew * 2 * eh * 4, ow, oh) }
+                    handlePixels(base, poseId: poseId, isRGBA: buf[6] == 1, ew: ew, eh: eh, ov: ovArg)
                     frameLock.unlock()
                 }
                 OSMemoryBarrier()
@@ -1303,7 +1337,7 @@ final class GameLink {
         handlePixels(p + 10, poseId: poseId, isRGBA: isRGBA, ew: ew, eh: eh)
     }
 
-    private func handlePixels(_ srcPtr: UnsafeRawPointer, poseId: UInt32, isRGBA: Bool, ew: Int, eh: Int) {
+    private func handlePixels(_ srcPtr: UnsafeRawPointer, poseId: UInt32, isRGBA: Bool, ew: Int, eh: Int, ov: (UnsafeRawPointer, Int, Int)? = nil) {
         guard ew > 0, eh > 0 else { return }
         frames += 1
         if frames == 1 { print("[juego] Primer cuadro recibido: \(ew)x\(eh) por ojo, \(isRGBA ? "RGBA" : "BGRA") · GPU \(Foveator.shared != nil ? "lista" : "NO disponible") · se manda \(W)x\(H)") }
@@ -1318,10 +1352,10 @@ final class GameLink {
             vigiaSkip += 1
             if vigiaSkip % 20 != 0 { shared.endFrame(); return }
         }
-        if let fv = Foveator.shared, FOVEA.on || ew != EYE || eh != SH || GameProfiles.shared.activeK < 0.999 {
+        if let fv = Foveator.shared, FOVEA.on || ew != EYE || eh != SH || GameProfiles.shared.activeK < 0.999 || ov != nil {
             var po: CVPixelBuffer?
             CVPixelBufferPoolCreatePixelBuffer(nil, pool, &po)
-            guard let pb = po, fv.warpPixels(srcPtr, ew: ew, eh: eh, isRGBA: isRGBA, rects: eyeRects(), into: pb) else { shared.endFrame(); return }
+            guard let pb = po, fv.warpPixels(srcPtr, ew: ew, eh: eh, isRGBA: isRGBA, rects: eyeRects(), into: pb, ov: ov) else { shared.endFrame(); return }
             Perf.shared.addMac(Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
             let fn = shared.nextFrameNo(), key = shared.takeKey(), enc = encoder
             encodeQueue.async { enc.encode(pb, frameNo: fn, poseId: poseId, forceKey: key, start: start) }
