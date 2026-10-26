@@ -791,7 +791,7 @@ typedef struct Space {
     XrPosef offset;
 } Space;
 
-#define NQ 4   /* (paneles flotantes que se pegan sobre la imagen, en el orden del juego) */
+#define NQ 6   /* (paneles flotantes que se pegan sobre la imagen, en el orden del juego) */
 typedef struct Session {
     ID3D11Device *dev;
     ID3D11DeviceContext *ctx;
@@ -813,7 +813,7 @@ typedef struct Session {
     HANDLE vkThread, vkEv; volatile LONG vkPend[STAGES]; volatile LONG vkStop; int vkRp;
     /* panel flotante (capa «quad»: el menú de Half-Life 2, por ejemplo): se lee y se pega sobre la imagen de cada ojo */
     VkBuffer vkQBuf[STAGES][NQ]; VkDeviceMemory vkQMem[STAGES][NQ]; void *vkQMap[STAGES][NQ]; size_t vkQCap[NQ];
-    struct { int on, rgba, blend, premul; uint32_t w, h; XrPosef pose; XrExtent2Df size; XrPosef eye[2]; XrFovf fov[2]; } vkQ[STAGES][NQ];
+    struct { int on, rgba, blend, premul, flip; uint32_t w, h; XrPosef pose; XrExtent2Df size; XrPosef eye[2]; XrFovf fov[2]; } vkQ[STAGES][NQ];
     /* OpenGL: el contexto del juego, y para leer la imagen un framebuffer y dos PBO */
     int gl; HDC gldc; HGLRC glrc;
     GLuint glFbo, glPbo[STAGES]; GLsync glSync[STAGES];
@@ -2953,8 +2953,19 @@ static void vk_composite_quad(Session *s, int r, int j, uint8_t *dst, uint32_t e
             if (y0 < 0) y0 = 0;
             if (x1 > (int)ew) x1 = (int)ew;
             if (y1 > (int)eh) y1 = (int)eh;
-            if (x0 >= x1 || y0 >= y1) continue;
         }
+        {   /* (diagnóstico, cada 5 s por panel: dónde queda respecto del ojo izquierdo y cuánto se ve) */
+            static int64_t last[NQ];
+            int64_t now = now_ns();
+            if (e == 0 && now - last[j] > 5000000000LL) {
+                last[j] = now;
+                unsigned long asum = 0; for (size_t i = 3; i < need; i += 4 * 61) asum += src[i];
+                logmsg("Panel %d: %ux%u, %.2fx%.2f m, centro en el ojo (%.2f, %.2f, %.2f) m, normal (%.2f, %.2f, %.2f), %s, zona %d..%d x %d..%d, opacidad media %lu, mezcla %d premult %d",
+                       j + 1, qw, qh, hw * 2, hh * 2, c.x, c.y, c.z, n.x, n.y, n.z, front ? "delante" : "con esquinas detrás",
+                       x0, x1, y0, y1, asum / (need / (4 * 61) + 1), s->vkQ[r][j].blend, s->vkQ[r][j].premul);
+            }
+        }
+        if (x0 >= x1 || y0 >= y1) continue;
         const float cn = c.x * n.x + c.y * n.y + c.z * n.z;
         for (int py = y0; py < y1; py++) {
             float ty = tu - ((float)py + 0.5f) / eh * (tu - td);
@@ -2970,6 +2981,7 @@ static void vk_composite_quad(Session *s, int r, int j, uint8_t *dst, uint32_t e
                 float v = 0.5f - (rx * uy.x + ry * uy.y + rz * uy.z) / (2 * hh);
                 if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
                 int sy = (int)(v * (float)qh), sx = (int)(u * (float)qw);
+                if (s->vkQ[r][j].flip) sy = (int)qh - 1 - sy;
                 const uint8_t *sp = src + ((size_t)sy * qw + (size_t)sx) * 4;
                 uint8_t *dp = row + (size_t)px * 4;
                 int sr = swap ? sp[2] : sp[0], sg = sp[1], sb = swap ? sp[0] : sp[2], a = sp[3];
@@ -3219,6 +3231,9 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
         Swapchain *qs = (Swapchain *)ql->subImage.swapchain;
         int qx = ql->subImage.imageRect.offset.x, qy = ql->subImage.imageRect.offset.y;
         int qw = ql->subImage.imageRect.extent.width, qh = ql->subImage.imageRect.extent.height;
+        int qflip = qh < 0;   /* (alto negativo: la imagen viene dada vuelta) */
+        if (qw < 0) { qx += qw; qw = -qw; }
+        if (qh < 0) { qy += qh; qh = -qh; }
         if (!qs || !qs->vimg[0] || (qs->dxgi != DXGI_FORMAT_R8G8B8A8_TYPELESS && qs->dxgi != DXGI_FORMAT_B8G8R8A8_TYPELESS)
             || qx < 0 || qy < 0 || qw <= 0 || qh <= 0 || qx + qw > (int)qs->w || qy + qh > (int)qs->h || qw > 4096 || qh > 4096
             || !vk_quad_buffers(s, qn, (uint32_t)qw, (uint32_t)qh)) continue;
@@ -3243,6 +3258,7 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
         s->vkQ[k][j].rgba = fmt_code(qs->dxgi) != 0;
         s->vkQ[k][j].blend = (ql->layerFlags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT) != 0;
         s->vkQ[k][j].premul = (ql->layerFlags & XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT) == 0;
+        s->vkQ[k][j].flip = qflip;
         s->vkQ[k][j].on = 1;
     }
     VkCommandBuffer cb = s->vkCb[k];
