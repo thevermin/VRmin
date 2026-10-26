@@ -460,6 +460,8 @@ typedef struct {
 static HANDLE g_shmFile = INVALID_HANDLE_VALUE, g_shmMap;
 static uint8_t *g_shm;
 static int g_shmMode;               /* 0 esperando confirmación · 1 activa · -1 no disponible (TCP) */
+#define OV_MAGIC 0x31564F50u   /* "POV1" en reserved[2]: la Mac sabe poner la capa aparte de paneles flotantes */
+static volatile int g_ovMac;
 static int64_t g_shmAsked;
 static int g_shmGen = -1;           /* conexión de imágenes donde se ofreció */
 static volatile LONG g_shmSentStat;
@@ -483,7 +485,7 @@ static int shm_create(void) {
 static void shm_offer(void) {
     if (!shm_create()) { g_shmMode = -1; return; }
     ShmHdr *h = (ShmHdr *)g_shm;
-    h->magic = SHM_MAGIC; h->nslots = SHM_SLOTS; h->slotSize = (uint32_t)SHM_SLOT_MAX; h->ack = 0;
+    h->magic = SHM_MAGIC; h->nslots = SHM_SLOTS; h->slotSize = (uint32_t)SHM_SLOT_MAX; h->ack = 0; h->reserved[2] = 0;
     for (int i = 0; i < SHM_SLOTS; i++) h->state[i] = 0;
     uint32_t nonce = (uint32_t)GetTickCount() ^ ((uint32_t)GetCurrentProcessId() << 16) ^ 0x5a5a1234u;
     if (!nonce) nonce = 1;
@@ -524,7 +526,11 @@ static int shm_active(void) {
     if (g_shmMode == 1) return 1;
     if (g_shmMode == 0 && g_shm) {
         ShmHdr *h = (ShmHdr *)g_shm;
-        if (h->ack == h->nonce) { g_shmMode = 1; logmsg("Memoria compartida activa: los cuadros ya no pasan por la red"); return 1; }
+        if (h->ack == h->nonce) {
+            g_shmMode = 1; g_ovMac = h->reserved[2] == OV_MAGIC;
+            logmsg("Memoria compartida activa: los cuadros ya no pasan por la red%s", g_ovMac ? " (con capa de paneles)" : "");
+            return 1;
+        }
         if (now_ns() - g_shmAsked > 3000000000LL) {
             if (session_needs_shm()) {
                 /* (Vulkan y OpenGL no tienen otro camino: se vuelve a conectar y a ofrecer; la Mac pudo estar reiniciándose) */
@@ -556,6 +562,24 @@ static void shm_notify_t(uint8_t type, int slot, uint32_t pid, uint8_t fmt, uint
     InterlockedIncrement(&g_statSent);
 }
 static void shm_notify(int slot, uint32_t pid, uint8_t fmt, uint32_t ew, uint32_t eh) { shm_notify_t(6, slot, pid, fmt, ew, eh); }
+/* Igual, con la capa aparte de paneles flotantes (ow×oh por ojo, justo después de la imagen del juego en el lugar) */
+static void shm_notify_ov(int slot, uint32_t pid, uint8_t fmt, uint32_t ew, uint32_t eh, uint32_t ow, uint32_t oh) {
+    uint8_t p[4 + 15];
+    uint32_t len = 15;
+    p[0] = 0; p[1] = 0; p[2] = 0; p[3] = (uint8_t)len; p[4] = 12;
+    p[5] = (uint8_t)slot;
+    p[6] = (uint8_t)(pid >> 24); p[7] = (uint8_t)(pid >> 16); p[8] = (uint8_t)(pid >> 8); p[9] = (uint8_t)pid;
+    p[10] = fmt;
+    p[11] = (uint8_t)(ew >> 8); p[12] = (uint8_t)ew; p[13] = (uint8_t)(eh >> 8); p[14] = (uint8_t)eh;
+    p[15] = (uint8_t)(ow >> 8); p[16] = (uint8_t)ow; p[17] = (uint8_t)(oh >> 8); p[18] = (uint8_t)oh;
+    if (!send_all(g_fsock, (const char *)p, 4 + (int)len)) {
+        closesocket(g_fsock); g_fsock = INVALID_SOCKET; g_shmMode = 0;
+        ((ShmHdr *)g_shm)->state[slot] = 0;
+        logmsg("Se cortó la conexión de imágenes; reintentando");
+        return;
+    }
+    InterlockedIncrement(&g_statSent);
+}
 
 /* ------------------------------------------------------------------ */
 /* Copia directa: el cuadro no sale de la GPU. Se copia (en la GPU) a     */
@@ -2911,7 +2935,8 @@ static int vk_quad_buffers(Session *s, int j, uint32_t w, uint32_t h) {
 
 /* Pega el panel flotante sobre la imagen de los dos ojos (ya en la memoria compartida, filas de arriba hacia abajo):
  * por cada píxel del ojo, el rayo desde el ojo se cruza con el plano del panel y se toma el color de ese punto */
-static void vk_composite_quad(Session *s, int r, int j, uint8_t *dst, uint32_t ew, uint32_t eh, int dstRgba) {
+/* ov: dst es la capa aparte de paneles (transparente, con alfa premultiplicado) en vez de la imagen del juego */
+static void vk_composite_quad(Session *s, int r, int j, uint8_t *dst, uint32_t ew, uint32_t eh, int dstRgba, int ov) {
     uint32_t qw = s->vkQ[r][j].w, qh = s->vkQ[r][j].h;
     if (!s->vkQMap[r][j] || !qw || !qh) return;
     /* (primero se copia entero y en orden: leer salteado de la memoria de la GPU en Wine de 32 bits tardaba segundos) */
@@ -2985,10 +3010,11 @@ static void vk_composite_quad(Session *s, int r, int j, uint8_t *dst, uint32_t e
                 const uint8_t *sp = src + ((size_t)sy * qw + (size_t)sx) * 4;
                 uint8_t *dp = row + (size_t)px * 4;
                 int sr = swap ? sp[2] : sp[0], sg = sp[1], sb = swap ? sp[0] : sp[2], a = sp[3];
-                if (!s->vkQ[r][j].blend) { dp[0] = (uint8_t)sr; dp[1] = (uint8_t)sg; dp[2] = (uint8_t)sb; continue; }
+                if (!s->vkQ[r][j].blend) { dp[0] = (uint8_t)sr; dp[1] = (uint8_t)sg; dp[2] = (uint8_t)sb; if (ov) dp[3] = 255; continue; }
                 if (!s->vkQ[r][j].premul) { sr = sr * a / 255; sg = sg * a / 255; sb = sb * a / 255; }
                 int ia = 255 - a;
                 dp[0] = (uint8_t)(sr + dp[0] * ia / 255); dp[1] = (uint8_t)(sg + dp[1] * ia / 255); dp[2] = (uint8_t)(sb + dp[2] * ia / 255);
+                if (ov) dp[3] = (uint8_t)(a + dp[3] * ia / 255);
             }
         }
     }
@@ -3057,15 +3083,31 @@ static void vk_send_stage(Session *s, int r) {
     const uint8_t *src = (const uint8_t *)s->vkMap[r];
     if (!s->stFlip[r]) memcpy(dst, src, (size_t)rb * s->stH);
     else for (uint32_t y = 0; y < s->stH; y++) memcpy(dst + (size_t)y * rb, src + (size_t)(s->stH - 1 - y) * rb, rb);
+    /* Paneles flotantes (menú, HUD): en una capa aparte al doble de resolución (hasta 2048), que la Mac pone encima
+     * después de agrandar la imagen del juego: así se leen aunque el juego se dibuje a menos resolución */
+    uint32_t ow = 0, oh = 0;
     { int64_t q0 = now_ns(), any = 0;
-      for (int j = 0; j < NQ; j++) if (s->vkQ[r][j].on) { vk_composite_quad(s, r, j, dst, s->stW, s->stH, fmt_code(s->stFmt) != 0); any++; }
-      if (any) { g_dgQuadMs += (now_ns() - q0) / 1e6; g_dgQuadN++; } }
+      for (int j = 0; j < NQ; j++) any += s->vkQ[r][j].on;
+      if (any) {
+          float f = 2048.0f / (float)s->stW; if (f > 2.0f) f = 2.0f; if (f < 1.0f) f = 1.0f;
+          ow = (uint32_t)(s->stW * f) & ~7u; oh = (uint32_t)(s->stH * f) & ~7u;
+          size_t eyeBytes = (size_t)rb * s->stH, ovBytes = (size_t)ow * 2 * oh * 4;
+          if (!g_ovMac || eyeBytes + ovBytes > SHM_SLOT_MAX || ow > 4095 || oh > 4095) ow = oh = 0;
+          uint8_t *ovp = dst + eyeBytes;
+          if (ow) memset(ovp, 0, ovBytes);
+          for (int j = 0; j < NQ; j++) if (s->vkQ[r][j].on) {
+              if (ow) vk_composite_quad(s, r, j, ovp, ow, oh, fmt_code(s->stFmt) != 0, 1);
+              else vk_composite_quad(s, r, j, dst, s->stW, s->stH, fmt_code(s->stFmt) != 0, 0);
+          }
+          g_dgQuadMs += (now_ns() - q0) / 1e6; g_dgQuadN++;
+      } }
     vk_dump_frame(s, r, dst, s->stW, s->stH);
     g_sumCopy += (now_ns() - c0) / 1e6; g_nCopy++;
     s->stValid[r] = 0;
     MemoryBarrier();
     sh->state[ss] = 1;
-    shm_notify(ss, s->stPose[r], fmt_code(s->stFmt), s->stW, s->stH);
+    if (ow) shm_notify_ov(ss, s->stPose[r], fmt_code(s->stFmt), s->stW, s->stH, ow, oh);
+    else shm_notify(ss, s->stPose[r], fmt_code(s->stFmt), s->stW, s->stH);
 }
 
 static DWORD WINAPI vk_reader(void *arg) {
