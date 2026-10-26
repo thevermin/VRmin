@@ -510,6 +510,7 @@ static void shm_offer(void) {
     logmsg("Memoria compartida ofrecida a la Mac (%s)", unixPath);
 }
 
+static int session_needs_shm(void);
 /* Devuelve 1 si hay que usar la memoria compartida para este cuadro */
 static int shm_active(void) {
     /* La Mac se reconectó (por ejemplo, al cambiar la calidad se reinicia): cerrar la conexión de imágenes vieja */
@@ -524,7 +525,15 @@ static int shm_active(void) {
     if (g_shmMode == 0 && g_shm) {
         ShmHdr *h = (ShmHdr *)g_shm;
         if (h->ack == h->nonce) { g_shmMode = 1; logmsg("Memoria compartida activa: los cuadros ya no pasan por la red"); return 1; }
-        if (now_ns() - g_shmAsked > 3000000000LL) { g_shmMode = -1; logmsg("La Mac no confirmó la memoria compartida: sigo por la red"); }
+        if (now_ns() - g_shmAsked > 3000000000LL) {
+            if (session_needs_shm()) {
+                /* (Vulkan y OpenGL no tienen otro camino: se vuelve a conectar y a ofrecer; la Mac pudo estar reiniciándose) */
+                closesocket(g_fsock); g_fsock = INVALID_SOCKET; g_fsockRetry = 0;
+                logmsg("La Mac no confirmó la memoria compartida: vuelvo a intentar");
+                return 0;
+            }
+            g_shmMode = -1; logmsg("La Mac no confirmó la memoria compartida: sigo por la red");
+        }
     }
     return 0;
 }
@@ -811,6 +820,7 @@ typedef struct Session {
 
 static Instance g_instance;
 static Session *g_session;
+static int session_needs_shm(void) { return g_session && (g_session->vk || g_session->gl); }
 static XrPosef g_localOrigin; static int g_localSet;
 
 /* Cola de eventos */
@@ -2301,9 +2311,6 @@ static void fill_velocity(void *next, const Track *t, const Space *sp, XrPosef b
             memset(&v->linearVelocity, 0, sizeof v->linearVelocity);
             memset(&v->angularVelocity, 0, sizeof v->angularVelocity);
             v->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
-            /* Vulkan (DOOM VFR, Half-Life 2 por OpenComposite): la cabeza sin velocidad. Si el juego la usa para adelantar
-             * la pose por su cuenta, dibuja con una pose distinta de la que se le informa al visor (y tiembla al moverla) */
-            if (k == 2 && g_session && g_session->vk) k = -1;
             if (k >= 0 && valid) {
                 /* expresar la velocidad en los ejes del espacio base */
                 XrQuaternionf inv = qconj(baseWorld.orientation);
@@ -2969,12 +2976,13 @@ static void vk_composite_quad(Session *s, int r, uint8_t *dst, uint32_t ew, uint
     }
 }
 
-/* Diagnóstico del temblor con Vulkan: a los ~20 s de juego se guardan 120 cuadros seguidos (ojo izquierdo, achicado
- * a la cuarta parte) en C:\questvrbridge\cuadros_diag, con la pose de cada uno y la de ese momento, para comparar
- * cuánto se corre la imagen entre cuadros con cuánto giró la cabeza. Solo una vez por sesión. */
+/* Diagnóstico del temblor con Vulkan (solo si existe C:\questvrbridge\diag_cuadros.txt): a los ~20 s de juego se
+ * guardan 120 cuadros seguidos (ojo izquierdo, achicado a la cuarta parte) en C:\questvrbridge\cuadros_diag, con la
+ * pose de cada uno, para comparar cuánto se corre la imagen entre cuadros con cuánto giró la cabeza. Una vez por sesión. */
 static void vk_dump_frame(Session *s, int r, const uint8_t *img, uint32_t ew, uint32_t eh) {
-    static int n = -1, frames;
-    if (n >= 120) return;
+    static int n = -1, frames, on = -1;
+    if (on < 0) on = GetFileAttributesA("C:\\questvrbridge\\diag_cuadros.txt") != INVALID_FILE_ATTRIBUTES;
+    if (!on || n >= 120) return;
     if (++frames < 1200) return;
     if (n < 0) { CreateDirectoryA("C:\\questvrbridge\\cuadros_diag", NULL); n = 0; logmsg("Diagnóstico: guardando 120 cuadros en C:\\questvrbridge\\cuadros_diag"); }
     uint32_t w = ew / 4, h = eh / 4;
@@ -3093,11 +3101,12 @@ static uint32_t pose_id_for_layer(const XrCompositionLayerProjection *pl, XrTime
 }
 
 /* Vulkan por OpenComposite: OpenComposite copia la imagen del juego apenas este llama a Submit, y DOOM VFR y DXVK
- * (Half-Life 2) podrían mandar a la GPU el dibujo del cuadro recién después (sin confirmar: con 1 no cambió). Se le
- * informa al visor la pose de hace «lag» cuadros (por defecto 0: probar 1 o 2 sin recompilar escribiéndolo
+ * (Half-Life 2) mandan a la GPU el dibujo del cuadro recién después: la copia se queda con el cuadro anterior
+ * (confirmado comparando 120 cuadros de DOOM VFR con las poses: la imagen se corre como la pose de un cuadro antes). Se le
+ * informa al visor la pose de hace «lag» cuadros (por defecto 1; se puede probar 0 o 2 sin recompilar escribiéndolo
  * en C:\questvrbridge\vk_lag.txt, se relee cada 2 s). Si no, el visor corrige con otra pose y tiembla al mover la cabeza. */
 static uint32_t vk_lagged_id(uint32_t id) {
-    static uint32_t hist[3]; static int lag = 0; static DWORD leido;
+    static uint32_t hist[3]; static int lag = 1; static DWORD leido;
     DWORD now = GetTickCount();
     if (now - leido > 2000) {
         leido = now;
