@@ -1,0 +1,32 @@
+name: Publicar versión
+# Arma la versión en GitHub con lo último que compilaron «App de Mac» y «App del Quest» en main
+# (las notas salen de docs/releases/<etiqueta>.md)
+on:
+  workflow_dispatch:
+    inputs:
+      tag: { description: 'Etiqueta (por ejemplo v0.47)', required: true }
+      beta: { description: 'Beta (pre-release)', type: boolean, default: false }
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions: { contents: write, actions: read }
+    env: { GH_TOKEN: "${{ github.token }}" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bajar lo compilado
+        run: |
+          set -e
+          mac=$(gh run list -R "$GITHUB_REPOSITORY" --workflow mac.yml --branch main --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          apk=$(gh run list -R "$GITHUB_REPOSITORY" --workflow quest-app.yml --branch main --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          echo "App de Mac: $mac · App del Quest: $apk"
+          gh run download "$mac" -R "$GITHUB_REPOSITORY" -n VRmin-Host-mac -D out
+          gh run download "$apk" -R "$GITHUB_REPOSITORY" -n VRmin-quest-apk -D out
+          ls -la out
+      - name: Publicar
+        run: |
+          set -e
+          notes="docs/releases/${{ inputs.tag }}.md"
+          test -f "$notes"
+          title=$(head -1 "$notes" | sed 's/^## *//')
+          flag=""; [ "${{ inputs.beta }}" = "true" ] && flag="--prerelease"
+          gh release create "${{ inputs.tag }}" out/* -R "$GITHUB_REPOSITORY" --target main --title "$title" --notes-file "$notes" $flag
