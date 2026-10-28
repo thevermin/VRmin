@@ -31,7 +31,7 @@ jobs:
           [ -d "$app" ] || mal "El .zip no tiene «VRmin Host.app»"
           v=$(tr -d '\n\t ' < "$app/Contents/Info.plist" | grep -o 'CFBundleShortVersionString</key><string>[^<]*' | sed 's/.*<string>//')
           [ "v$v" = "$TAG" ] || mal "La app de Mac es la $v, no la ${TAG#v}"
-          for f in "$app/Contents/MacOS/VRminHost" "$app/Contents/Resources/QuestRenderer"; do
+          for f in "$app/Contents/MacOS/VRminHost" "$app/Contents/Resources/qvb/QuestRenderer"; do
             [ -f "$f" ] || mal "Falta $(basename "$f") en la app"
             grep -aq 'QuestVRBridge Local' "$f" || mal "$(basename "$f") no está firmado con el certificado de VRmin (¿se armó con VRMIN_ADHOC=1 o en GitHub?): armalo con «bash crear_app.sh --paquete» en la Mac de VRmin y reemplazalo"
           done
