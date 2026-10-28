@@ -7,6 +7,8 @@ mkdir -p "$DATA"
 cd "$DATA"
 mkdir -p logs
 # Todo lo que dicen el servidor y el renderizador queda también en logs/servidor.log
+# (el de la vez anterior queda como servidor_anterior.log: si algo falló, se puede ver después de reiniciar)
+[ -s logs/servidor.log ] && mv -f logs/servidor.log logs/servidor_anterior.log
 exec > >(tee logs/servidor.log) 2>&1
 if [ ! -f cert.pem ] || [ ! -f key.pem ]; then
   say "Creando certificado local (solo la primera vez)..." "Creating a local certificate (first time only)..."
