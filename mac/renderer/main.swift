@@ -1228,6 +1228,7 @@ final class GameLink {
                 sendTo(c, Data(configLine.utf8))
                 shared.requestKey()
                 Thread.detachNewThread { [self] in
+                    Thread.current.qualityOfService = .userInteractive   // (la GPU de Apple atiende antes el trabajo de hilos con más prioridad)
                     readLoop(c)
                     lock.lock(); clients[c] = nil; pending[c] = nil; let left = clients.count; lock.unlock()
                     Darwin.close(c)
@@ -4200,7 +4201,11 @@ timer.setEventHandler {
 }
 timer.resume()
 
+// VRmin es de tiempo real: que macOS no agrupe sus temporizadores ni lo trate como trabajo de fondo
+let tiempoReal = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical, .idleSystemSleepDisabled],
+                                                       reason: "VRmin: video en vivo para el visor")
 Thread.detachNewThread {
+    Thread.current.qualityOfService = .userInteractive
     var warned = false
     while true {
         if link.open(port: SERVER_PORT) {
