@@ -74,10 +74,12 @@ EN = {
     "ninguna conocida": "none known",
     " · gráficos: ": " · graphics: ",
     "otro": "other",
+    "Controles de Touch para OpenComposite: el grip agarra (%d botones arreglados)":
+        "Touch controls for OpenComposite: the grip grabs (%d buttons fixed)",
     "La vez anterior no arrancó con %s: ahora pruebo %s": "Last time it didn't start with %s: now trying %s",
     "Gráficos: se pide DirectX 11 (%s), lo único que entiende nuestro runtime": "Graphics: asking for DirectX 11 (%s), the only one our runtime understands",
-    "Half-Life 2: VR Mod usa Vulkan con «geometry shaders» (DXVK) y es de 32 bits: las Mac no tienen esos shaders en Vulkan, así que todavía no abre":
-        "Half-Life 2: VR Mod uses Vulkan with geometry shaders (DXVK) and is 32-bit: Macs don't have those shaders in Vulkan, so it doesn't open yet",
+    "Se abre directo (sin el lanzador hlvr.bat) con Vulkan y algunos efectos bajados para que ande fluido":
+        "Opens directly (without the hlvr.bat launcher) with Vulkan and a few effects lowered so it runs smoothly",
 }
 
 
@@ -446,6 +448,51 @@ def cmd_listar():
                       "opencomposite": opencomposite_instalado()}, ensure_ascii=False))
 
 
+def cmd_controles_oc(carpeta, *destinos):
+    """OpenComposite no entiende el modo «grab» de los controles de Touch (agarrar con el grip): ese botón quedaba sin
+    nada (en Half-Life 2: VR Mod no se podía agarrar). Se arma, a partir de los controles de Touch del propio juego, una
+    copia con el grip como botón común, donde OpenComposite busca controles propios (carpeta del juego/OpenComposite).
+    Si el usuario ya puso los suyos ahí (sin nuestra marca), no se tocan."""
+    origen = None
+    for raiz, dirs, archivos in os.walk(carpeta):
+        if raiz[len(carpeta):].count(os.sep) >= 4:
+            dirs[:] = []
+            continue
+        if "actions.json" in archivos:
+            m = leer_json(os.path.join(raiz, "actions.json"), {})
+            for b in m.get("default_bindings", []) if isinstance(m, dict) else []:
+                if b.get("controller_type") == "oculus_touch" and b.get("binding_url"):
+                    origen = os.path.join(raiz, b["binding_url"])
+                    break
+        if origen:
+            break
+    if not origen or not os.path.isfile(origen):
+        return
+    datos = leer_json(origen, None)
+    if not isinstance(datos, dict):
+        return
+    cambios = 0
+    for conjunto in (datos.get("bindings") or {}).values():
+        for src in conjunto.get("sources", []):
+            if src.get("mode") == "grab":
+                src["mode"] = "button"
+                ins = src.get("inputs", {})
+                if "grab" in ins:
+                    ins["click"] = ins.pop("grab")
+                ins.pop("held", None)
+                cambios += 1
+    if not cambios:
+        return
+    datos["vrmin"] = "armado por VRmin a partir de %s (agarrar con el grip)" % os.path.basename(origen)
+    for d in set(os.path.normpath(x) for x in (destinos or (carpeta,))):
+        ruta = os.path.join(d, "OpenComposite", "oculus_touch.json")
+        actual = leer_json(ruta, None)
+        if actual is not None and not (isinstance(actual, dict) and "vrmin" in actual):
+            continue
+        guardar_json(ruta, datos)
+        print(T("Controles de Touch para OpenComposite: el grip agarra (%d botones arreglados)") % cambios)
+
+
 def main(a):
     if len(a) >= 2 and a[0] == "detectar":
         cmd_detectar(a[1])
@@ -459,6 +506,8 @@ def main(a):
         cmd_intento(a[1], a[2])
     elif len(a) >= 2 and a[0] == "exito":
         cmd_exito(a[1])
+    elif len(a) >= 2 and a[0] == "controles_oc":
+        cmd_controles_oc(*a[1:])
     else:
         sys.exit(__doc__)
 

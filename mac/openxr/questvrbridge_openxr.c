@@ -920,6 +920,11 @@ static XrPosef space_world(const Space *sp, const Track *t, int *valid) {
         if (g_vive && g_session && g_session->profile == vivePath) {
             XrPosef adel = { {0, 0, 0, 1}, {0, 0, -0.08f} };
             base = pmul(base, adel);
+            /* DOOM VFR: con los controles de Quest las armas quedaban apuntando hacia arriba: las dos manos se inclinan 45° hacia abajo */
+            if (strstr(g_appName, "DOOMVFR")) {
+                XrPosef incl = { {-0.38268343f, 0, 0, 0.92387953f}, {0, 0, 0} };
+                base = pmul(base, incl);
+            }
         }
     }
     return pmul(base, sp->offset);
