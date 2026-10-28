@@ -243,6 +243,27 @@ static void parse_pose_line(const char *line) {
     const char *tq = strstr(line, "\"t\":");
     t.tms = tq ? strtod(tq + 4, NULL) : 0;
     t.rx = now_ns();
+    /* DOOM VFR con controles de Vive no tiene giro con el stick derecho: lo hace VRmin. Empujar el stick derecho a un
+     * costado gira 30° (como el giro por saltos): se gira todo lo que ve el juego (cabeza y manos) alrededor de tu cabeza */
+    static XrPosef giro = { {0, 0, 0, 1}, {0, 0, 0} };
+    static int giroArmado = 1;
+    int giroAhora = 0; XrQuaternionf qGiro = { 0, 0, 0, 1 };
+    if (g_vive && strstr(g_appName, "DOOMVFR") && t.valid) {
+        float x = t.in[1][IN_TX];
+        if (giroArmado && fabsf(x) > 0.8f) {
+            giroArmado = 0; giroAhora = 1;
+            float a = (x > 0 ? -1.0f : 1.0f) * 30.0f * 3.14159265f / 180.0f;
+            XrPosef hp = pmul(giro, head_pose(&t));
+            qGiro.y = sinf(a / 2); qGiro.w = cosf(a / 2);
+            XrVector3f rh = qrot(qGiro, hp.position);
+            XrPosef ra = { qGiro, { hp.position.x - rh.x, hp.position.y - rh.y, hp.position.z - rh.z } };
+            giro = pmul(ra, giro);
+        } else if (fabsf(x) < 0.3f) giroArmado = 1;
+    }
+    if (giro.orientation.w < 0.99999f || giro.position.x != 0 || giro.position.z != 0) {
+        for (int e = 0; e < 2; e++) t.eye[e] = pmul(giro, t.eye[e]);
+        for (int h = 0; h < 2; h++) { t.grip[h] = pmul(giro, t.grip[h]); t.aim[h] = pmul(giro, t.aim[h]); }
+    }
     EnterCriticalSection(&g_lock);
     {
         /* Velocidad por diferencia entre poses consecutivas, suavizada.
@@ -255,7 +276,8 @@ static void parse_pose_line(const char *line) {
         int okOld[3] = { o->handValid[0], o->handValid[1], o->valid };
         for (int k = 0; k < 3; k++) {
             XrVector3f lv = { 0, 0, 0 }, av = { 0, 0, 0 };
-            if (o->tms > 0 && dtms > 1.0 && dtms < 100.0 && okNow[k] && okOld[k]) {
+            if (giroAhora) { lv = qrot(qGiro, o->lin[k]); av = qrot(qGiro, o->ang[k]); }   /* (el salto del giro no es velocidad) */
+            else if (o->tms > 0 && dtms > 1.0 && dtms < 100.0 && okNow[k] && okOld[k]) {
                 float dt = (float)(dtms / 1000.0);
                 lv.x = (now3[k].position.x - old3[k].position.x) / dt;
                 lv.y = (now3[k].position.y - old3[k].position.y) / dt;
@@ -951,7 +973,9 @@ static int input_value(const Track *t, const char *b, float out[2], int *isPose)
      * hasta el borde ya es apretar el trackpad en esa dirección (menús, dash), sin hundir el stick; A/X es apretar el centro */
     if (g_vive && IS("trackpad")) {
         static int empujado[2];
-        float x = in[IN_TX], y = in[IN_TY], m = sqrtf(x * x + y * y);
+        float x = in[IN_TX], y = in[IN_TY];
+        if (hand == 1 && strstr(g_appName, "DOOMVFR")) x = 0;   /* (DOOM: el stick derecho a los costados gira; ver parse_pose_line) */
+        float m = sqrtf(x * x + y * y);
         empujado[hand] = empujado[hand] ? m > 0.55f : m > 0.8f;
         int centro = in[IN_A] > 0.5f && !empujado[hand];
         const char *rest = strchr(c, '/');
@@ -3099,7 +3123,7 @@ static void vk_composite_quad(Session *s, int r, int j, uint8_t *dst, uint32_t e
 
 /* Diagnóstico del temblor con Vulkan (solo si existe C:\questvrbridge\diag_cuadros.txt): a los ~20 s de juego se
  * guardan 120 cuadros seguidos (ojo izquierdo, achicado a la cuarta parte) en C:\questvrbridge\cuadros_diag, con la
- * pose de cada uno, para comparar cuánto se corre la imagen entre cuadros con cuánto giró la cabeza. Una vez por sesión. */
+ * pose de cada uno, para comparar cuánto se corre la imagen entre cuadros con cuánto giroAhora la cabeza. Una vez por sesión. */
 static void vk_dump_frame(Session *s, int r, const uint8_t *img, uint32_t ew, uint32_t eh) {
     static int n = -1, frames, on = -1;
     if (on < 0) on = GetFileAttributesA("C:\\questvrbridge\\diag_cuadros.txt") != INVALID_FILE_ATTRIBUTES;

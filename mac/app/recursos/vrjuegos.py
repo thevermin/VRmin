@@ -474,9 +474,10 @@ def cmd_controles_oc(carpeta, *destinos):
     cambios = 0
     for conjunto in (datos.get("bindings") or {}).values():
         for src in conjunto.get("sources", []):
-            if src.get("mode") == "grab":
+            ins = src.get("inputs", {})
+            # (el modo «grab», o un botón con la entrada «grab»: OpenComposite arma …/squeeze/grab, que no existe)
+            if src.get("mode") == "grab" or "grab" in ins:
                 src["mode"] = "button"
-                ins = src.get("inputs", {})
                 if "grab" in ins:
                     ins["click"] = ins.pop("grab")
                 ins.pop("held", None)
