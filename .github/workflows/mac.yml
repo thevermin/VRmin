@@ -4,9 +4,11 @@ on:
     branches: [main]   # (no al publicar una release: la etiqueta nueva no cambia el código)
     paths: ['mac/**', '.github/workflows/mac.yml']
   workflow_dispatch:
+    inputs:
+      runner: { description: 'Mac de GitHub (si macos-15 no tiene lugar, por ejemplo macos-26)', default: 'macos-15' }
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     steps:
       - uses: actions/checkout@v4
       - name: Renderizador
@@ -64,7 +66,7 @@ jobs:
     # Instala el motor de verdad (Wine 11 + DXMT), crea el Windows y prueba la copia directa de punta a punta:
     # un programa D3D11 bajo Wine comparte una textura y un programa de la Mac la abre por su nombre
     needs: d3dshare
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
