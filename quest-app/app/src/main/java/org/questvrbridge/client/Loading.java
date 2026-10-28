@@ -39,7 +39,7 @@ final class Loading {
     }
 
     private static final int OFF = 0, OPENING = 1, CLOSED = 2, FAILED = 3;
-    private static final long TIP_MS = 3000, CLOSED_MS = 3500, GIVE_UP_MS = 4 * 60_000;
+    private static final long TIP_MS = 5000, CLOSED_MS = 3500, GIVE_UP_MS = 4 * 60_000;
 
     private final Context app;
     private final Host host;
@@ -57,6 +57,9 @@ final class Loading {
     private int tipAt = 0;
 
     Loading(Context app, Host host) { this.app = app; this.host = host; }
+
+    /** Se está viendo la pantalla de carga (mientras tanto no se abre ningún menú). */
+    boolean active() { return phase != OFF; }
 
     /** Estado de la Mac (lobby2d). */
     void onState(JSONObject o) {
@@ -140,10 +143,11 @@ final class Loading {
         card.setOrientation(LinearLayout.VERTICAL);
         card.setGravity(Gravity.CENTER_HORIZONTAL);
         card.setPadding(dp16 * 2, dp16 * 2, dp16 * 2, dp16 + dp16 / 2);
+        // sin rectángulo: apenas una sombra que se desvanece hacia los bordes, para que el texto se lea sobre el vacío
         GradientDrawable bg = new GradientDrawable();
-        bg.setColor(Color.argb(235, 24, 24, 27));
-        bg.setStroke(Ui.dp(c, 1), Color.argb(70, 230, 168, 74));
-        bg.setCornerRadius(Ui.rad(c, 26));
+        bg.setGradientType(GradientDrawable.RADIAL_GRADIENT);
+        bg.setGradientRadius(Ui.dp(c, 400));
+        bg.setColors(new int[]{Color.argb(120, 4, 4, 5), Color.argb(70, 4, 4, 5), Color.argb(0, 4, 4, 5)});
         card.setBackground(bg);
         root.addView(card, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
@@ -196,13 +200,13 @@ final class Loading {
         View spacer = new View(c);
         card.addView(spacer, new LinearLayout.LayoutParams(1, 0, 1f));
 
-        // Consejo (cambia solo cada 3 s; la flecha pasa al siguiente)
+        // Consejo (cambia solo cada 5 s; la flecha pasa al siguiente)
         LinearLayout tipBox = new LinearLayout(c);
         tipBox.setOrientation(LinearLayout.HORIZONTAL);
         tipBox.setGravity(Gravity.CENTER_VERTICAL);
         tipBox.setPadding(dp16 + dp16 / 2, dp16, dp16 / 2, dp16);
         GradientDrawable tbg = new GradientDrawable();
-        tbg.setColor(Color.argb(255, 31, 29, 25));
+        tbg.setColor(Color.argb(40, 255, 255, 255));
         tbg.setCornerRadius(Ui.rad(c, 20));
         tipBox.setBackground(tbg);
         LinearLayout tipText = new LinearLayout(c);

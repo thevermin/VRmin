@@ -1133,9 +1133,17 @@ final class GameLink {
                                                     NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 1, alpha: 1)]
         let line = CTLineCreateWithAttributedString(NSAttributedString(string: tr("Cargando…", "Loading…"), attributes: attrs))
         let bounds = CTLineGetBoundsWithOptions(line, [])
+        // En cada ojo, donde se ve un punto a 2 m delante de tu cabeza (no en el centro de la imagen: los ojos del Quest
+        // no miran al centro de su imagen, y el cartel se veía doble)
+        let eyes = shared.pose?.eyes ?? []
         for e in 0..<2 {
-            let cx = CGFloat(w) * (CGFloat(e) * 0.5 + 0.25)
-            ctx.textPosition = CGPoint(x: cx - bounds.width / 2, y: CGFloat(h) / 2 - bounds.height / 2)
+            var u: CGFloat = 0.5, v: CGFloat = 0.5
+            if eyes.count == 2 {
+                let c = eyes[e].proj * simd_float4(e == 0 ? 0.032 : -0.032, 0, -2, 1)
+                if abs(c.w) > 1e-4 { u = CGFloat(min(max((c.x / c.w + 1) / 2, 0.1), 0.9)); v = CGFloat(min(max((c.y / c.w + 1) / 2, 0.1), 0.9)) }
+            }
+            let cx = CGFloat(w) * (CGFloat(e) * 0.5 + u * 0.5)
+            ctx.textPosition = CGPoint(x: cx - bounds.width / 2, y: CGFloat(h) * v - bounds.height / 2)
             CTLineDraw(line, ctx)
         }
         return dst

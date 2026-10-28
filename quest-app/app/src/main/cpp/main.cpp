@@ -1759,9 +1759,13 @@ struct App {
     PFN_xrPassthroughPauseFB ptPause = nullptr;
     bool ptRunning = false;
     double revealStart = 0, exitStart = 0;
-    double envSwitchStart = 0;   // cambio de sala: la que se va se cierra con el borde de la transición y la nueva se abre
-    int envSwitchTo = 0;
+    double envSwitchStart = 0;   // cambio de sala: la nueva aparece sobre la vieja con el borde de la transición
+    int envSwitchTo = 0, envFrom = 0;
     bool envSwitched = false;
+    bool envSwitchPT = false;    // (con el passthrough de por medio: la sala vieja se cierra a tu cuarto y se abre la nueva)
+    GLuint xTex[2] = {0, 0}, xFbo[2] = {0, 0}, xDepth[2] = {0, 0};   // la sala que se va, dibujada aparte
+    int xW[2] = {0, 0}, xH[2] = {0, 0};
+    GLuint blitProg = 0; GLint bTex = -1;
     double anchorAt = 0;   // cuándo se tomó el punto de referencia (la transición espera a que todo esté listo)
     float revealFwd[3] = {0, 0, -1};
     GLuint maskProg = 0;
@@ -5912,15 +5916,15 @@ vec3 spaceSky(vec3 d, vec3 rx, vec3 fz) {
 // Atardecer: cielo naranja y violeta, sol bajo y nubes suaves
 // Cielo de la sala de carga: casi negro, un brillo ámbar finito en el horizonte y polvo que titila
 vec3 voidSky(vec3 d, float t) {
-    vec3 c = mix(vec3(0.010, 0.010, 0.013), vec3(0.022, 0.021, 0.024), smoothstep(-0.3, 0.5, d.y));
-    c += vec3(0.90, 0.62, 0.27) * (0.30 * exp(-abs(d.y) * 26.0) + 0.06 * exp(-abs(d.y) * 5.0));
+    vec3 c = mix(vec3(0.004, 0.004, 0.005), vec3(0.010, 0.010, 0.012), smoothstep(-0.3, 0.5, d.y));
+    c += vec3(0.90, 0.62, 0.27) * (0.045 * exp(-abs(d.y) * 30.0) + 0.008 * exp(-abs(d.y) * 5.0));   // apenas un hilo ámbar
     vec3 q = d * 70.0;
     vec3 cell = floor(q);
     float h = fract(sin(dot(cell, vec3(127.1, 311.7, 74.7))) * 43758.5453);
-    if (h > 0.9965) {
+    if (h > 0.998) {
         vec3 fr = fract(q) - 0.5;
         float tw = 0.5 + 0.5 * sin(t * (0.6 + h * 1.7) + h * 40.0);
-        c += vec3(0.95, 0.75, 0.45) * smoothstep(0.22, 0.0, length(fr)) * 0.45 * tw;
+        c += vec3(0.75, 0.70, 0.62) * smoothstep(0.2, 0.0, length(fr)) * 0.16 * tw;
     }
     return c;
 }
@@ -6001,10 +6005,10 @@ void main() {
         vec2 q = vec2(lx, lz);
         vec2 gd = abs(fract(q - 0.5) - 0.5) / max(fwidth(q), vec2(1e-4));
         float line = 1.0 - min(min(gd.x, gd.y), 1.0);
-        float d = length(q);
+        float d = length(wp.xz - eye.xz);   // (la luz y la niebla van con vos: siempre estás en el medio)
         vec3 v = normalize(wp - eye);
-        vec3 pcol = vec3(0.014, 0.014, 0.017) + vec3(0.55, 0.40, 0.20) * line * 0.22 * exp(-d * 0.07);
-        pcol += vec3(0.9, 0.62, 0.27) * 0.05 * exp(-d * 0.35);   // un poco de luz bajo tus pies
+        vec3 pcol = vec3(0.006, 0.006, 0.007) + vec3(0.42, 0.41, 0.40) * line * 0.075 * exp(-d * 0.09);
+        pcol += vec3(0.9, 0.62, 0.27) * 0.010 * exp(-d * 0.5);   // apenas luz bajo tus pies
         pcol = mix(pcol, voidSky(normalize(vec3(v.x, 0.0, v.z)), time), smoothstep(6.0, 27.0, d));
         o = vec4(pcol, 1.0);
         return;
@@ -6814,7 +6818,7 @@ static bool hiddenByLoading(const UiPanel *p) {
     const UiPanel *top = p;
     if (p->parent) for (UiPanel *q : g_ui) if (q->id == p->parent) top = q;
     if (top->id == LOADING_ID) return !g_loadingNow;
-    return g_loadingNow && top->id != WRIST_MENU_ID && top->id != KEYBOARD_ID && !top->hud;
+    return g_loadingNow && !top->hud;   // (la pantalla de carga es solo eso: ni menús ni ventanas)
 }
 
 static bool panelShown(const UiPanel *p) {
@@ -7365,6 +7369,7 @@ static bool insideRoom(const App &app, float x, float z) {
 
 /// Teletransporte: con el joystick derecho hacia abajo se apunta al piso; al soltarlo, aparecés ahí
 static bool teleportInput(App &app, XrTime time, const XrView &head) {
+    if (g_loadingNow) { app.tpAim = false; return false; }   // en la pantalla de carga no te movés ni girás
     XrVector2f st = getVec2(app, app.aStick, 1);
     // Sin controles: el joystick virtual de la mano derecha (gestos de la sala)
     if (g_handMove && !g_ctlInUse && g_rh.h[1].active && g_rh.h[1].v.joy) st = {g_rh.h[1].v.sx, g_rh.h[1].v.sy};
@@ -7556,7 +7561,7 @@ static float revealAmount(App &app) {
     double t = nowMs();
     float r = app.revealStart > 0 ? (float)std::min(1.0, (t - app.revealStart) / 2000.0) : 0.f;
     if (app.exitStart > 0) r = std::min(r, (float)std::max(0.0, 1.0 - (t - app.exitStart) / 2000.0));
-    if (app.envSwitchStart > 0) {   // cambio de sala: se cierra (0,9 s) y se abre la nueva (0,9 s)
+    if (app.envSwitchStart > 0 && app.envSwitchPT) {   // cambio de/al passthrough: se cierra (0,9 s) y se abre la nueva (0,9 s)
         double k = (t - app.envSwitchStart) / 900.0;
         r = std::min(r, (float)std::min(1.0, std::max(0.0, k < 1.0 ? 1.0 - k : k - 1.0)));
     }
@@ -7573,6 +7578,70 @@ static void applyReveal(App &app, const XrView &view, float r) {
     glUniform1f(app.mAng, r * ((float)M_PI + 0.8f));
     glEnable(GL_BLEND);
     glBlendFunc(GL_ZERO, GL_SRC_COLOR);
+    glBindVertexArray(app.vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDisable(GL_BLEND);
+}
+
+/// Cambio de sala directo: cuánto de la sala nueva se ve (0 → 1 en 1,5 s), con aceleración suave
+static float crossAmount(App &app) {
+    if (app.envSwitchStart <= 0 || app.envSwitchPT) return 1.f;
+    float r = (float)std::min(1.0, (nowMs() - app.envSwitchStart) / 1500.0);
+    return r * r * r * (r * (6 * r - 15) + 10);
+}
+
+/// La sala que se va, encima de la nueva fuera del borde: se dibuja aparte (en una textura) y se mezcla con la máscara
+static void renderRoom(App &app, const XrView &view, const TvInfo *tv);
+static void crossFrom(App &app, int e, const XrView &view, const TvInfo *tv, GLuint dstFbo, int w, int h, float k) {
+    if (!app.blitProg) {
+        const char *vs = R"(#version 300 es
+out vec2 uv;
+void main() { vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)); uv = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); })";
+        const char *fs = R"(#version 300 es
+precision mediump float;
+uniform sampler2D tex;
+in vec2 uv;
+out vec4 o;
+void main() { o = vec4(texture(tex, uv).rgb, 1.0); })";
+        app.blitProg = glCreateProgram();
+        glAttachShader(app.blitProg, compileShader(GL_VERTEX_SHADER, vs));
+        glAttachShader(app.blitProg, compileShader(GL_FRAGMENT_SHADER, fs));
+        glLinkProgram(app.blitProg);
+        app.bTex = glGetUniformLocation(app.blitProg, "tex");
+    }
+    if (app.xW[e] != w || app.xH[e] != h) {
+        if (!app.xTex[e]) { glGenTextures(1, &app.xTex[e]); glGenFramebuffers(1, &app.xFbo[e]); glGenRenderbuffers(1, &app.xDepth[e]); }
+        glBindTexture(GL_TEXTURE_2D, app.xTex[e]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindRenderbuffer(GL_RENDERBUFFER, app.xDepth[e]);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+        glBindFramebuffer(GL_FRAMEBUFFER, app.xFbo[e]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, app.xTex[e], 0);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, app.xDepth[e]);
+        app.xW[e] = w; app.xH[e] = h;
+    }
+    // la sala vieja, en su textura
+    glBindFramebuffer(GL_FRAMEBUFFER, app.xFbo[e]);
+    glViewport(0, 0, w, h);
+    const int cur = g_env;
+    g_env = app.envFrom;
+    renderRoom(app, view, tv);
+    g_env = cur;
+    glDisable(GL_DEPTH_TEST);
+    // la nueva ya está dibujada: la máscara la deja solo dentro del borde (y su alfa dice cuánto), y afuera va la vieja
+    glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
+    glViewport(0, 0, w, h);
+    applyReveal(app, view, k);
+    glUseProgram(app.blitProg);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, app.xTex[e]);
+    glUniform1i(app.bTex, 0);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_ONE_MINUS_DST_ALPHA, GL_ONE, GL_ONE, GL_ZERO);
     glBindVertexArray(app.vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glDisable(GL_BLEND);
@@ -8001,7 +8070,7 @@ static void renderFrame(App &app) {
                 armed = false;
                 if (g_vigia) g_vigiaCalReq = true;   // Modo Centinela: el botón de menú izquierdo calibra
                 else if (showVideo) { g_gameMenu = !g_gameMenu; javaBool(g_jGameMenu, g_gameMenu); }
-                else if (!g_inputLock) {
+                else if (!g_inputLock && !g_loadingNow) {
                     // En la sala: abre o cierra el menú flotante delante tuyo (como mirar el borde de la mano)
                     float f[3] = {app.headFwd[0], 0, app.headFwd[2]};
                     float l = sqrtf(f[0] * f[0] + f[2] * f[2]);
@@ -8040,6 +8109,10 @@ static void renderFrame(App &app) {
             if (!animate) { g_env = want; g_envChanged = true; }
             else {
                 app.envSwitchStart = tNow; app.envSwitchTo = want; app.envSwitched = false;
+                // del passthrough (o hacia él) se pasa por tu cuarto; entre dos salas, la nueva aparece directo sobre la vieja
+                app.envSwitchPT = g_env == 3 || want == 3;
+                app.envFrom = g_env;
+                if (!app.envSwitchPT) { app.envSwitched = true; g_env = want; g_envChanged = true; }
                 // el borde avanza como al entrar: la sala nueva aparece desde atrás tuyo y termina adelante
                 float hm[9]; quatToMat(views[0].pose.orientation, hm);
                 float l = sqrtf(hm[6] * hm[6] + hm[8] * hm[8]);
@@ -8050,10 +8123,11 @@ static void renderFrame(App &app) {
         if (app.envSwitchStart > 0) {
             const double k = tNow - app.envSwitchStart;
             if (k >= 900 && !app.envSwitched) { app.envSwitched = true; g_env = app.envSwitchTo; g_envChanged = true; }
-            if (k >= 1800) app.envSwitchStart = 0;
+            if (k >= (app.envSwitchPT ? 1800 : 1500)) app.envSwitchStart = 0;
         }
     }
     float reveal = revealAmount(app);
+    const float cross = crossAmount(app);
     if (app.hasPassthrough) {
         // El cuarto real hace falta durante la transición, y en la sala para ver tus manos reales
         bool need = reveal < 1.f || (g_rh.ok && g_realHands && !showVideo && !g_camMode) || (g_env == 3 && !showVideo);
@@ -8138,6 +8212,7 @@ static void renderFrame(App &app) {
             glViewport(0, 0, rw, rh);
             renderRoom(app, views[e], haveTv ? &tvInfo : nullptr);
             if (reveal < 1.f) applyReveal(app, views[e], reveal);
+            else if (cross < 1.f && app.envFrom != 3) crossFrom(app, e, views[e], haveTv ? &tvInfo : nullptr, s.fbos[idx], rw, rh, cross);
         } else {
             // Sin video: gris oscuro con un pulso suave (para saber que la app está viva); al entrar, se ve tu cuarto
             float k = 0.04f + 0.03f * (float)(0.5 + 0.5 * sin(nowMs() / 400.0));

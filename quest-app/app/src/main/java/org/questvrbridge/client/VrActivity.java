@@ -214,6 +214,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
                 if (p == null) return;
                 p.pres.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
                 show(p, loading.build(p.pres.getContext()));
+                nativeSetFollow(LOADING_ID, true);   // siempre al frente: te sigue cuando girás
             } else {
                 Panel p = panels.remove(LOADING_ID);
                 if (p == null) return;
@@ -436,6 +437,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
 
     /// Mirar el reloj: abre el menú encima del reloj; si ya está, lo cierra; si estaba suelto, lo vuelve a traer al reloj
     private void toggleWristMenu() {
+        if (loading.active()) return;   // (la pantalla de carga es solo para esperar)
         if (panels.containsKey(WRIST_ID)) {
             if (wristFree) setWristMenuFree(false); else closeWristMenu();
             return;
