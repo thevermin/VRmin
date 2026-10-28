@@ -5921,10 +5921,10 @@ vec3 voidSky(vec3 d, float t) {
     vec3 q = d * 70.0;
     vec3 cell = floor(q);
     float h = fract(sin(dot(cell, vec3(127.1, 311.7, 74.7))) * 43758.5453);
-    if (h > 0.998) {
+    if (h > 0.9965) {   // polvo flotando: puntitos ámbar que titilan
         vec3 fr = fract(q) - 0.5;
-        float tw = 0.5 + 0.5 * sin(t * (0.6 + h * 1.7) + h * 40.0);
-        c += vec3(0.90, 0.62, 0.30) * smoothstep(0.2, 0.0, length(fr)) * 0.12 * tw;
+        float tw = 0.45 + 0.55 * sin(t * (0.6 + h * 1.7) + h * 40.0);
+        c += vec3(0.95, 0.65, 0.32) * smoothstep(0.34, 0.0, length(fr)) * 0.30 * tw;
     }
     return c;
 }
