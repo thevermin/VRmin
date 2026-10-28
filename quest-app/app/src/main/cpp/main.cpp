@@ -7469,8 +7469,16 @@ static bool teleportInput(App &app, XrTime time, const XrView &head) {
                 float d[3] = {(fx * mv.y + rx * mv.x) * k, 0, (fz * mv.y + rz * mv.x) * k};
                 if (insideRoom(app, head.pose.position.x + d[0], head.pose.position.z + d[2])) {
                     app.anc[0] -= d[0]; app.anc[2] -= d[2];
+                    // Cine: caminando por las gradas, el piso sube o baja de a poco (como una rampa), así no lo atravesás
+                    float dy = 0;
+                    if (g_env == 2) {
+                        float qx = head.pose.position.x - app.anc[0], qz = head.pose.position.z - app.anc[2];
+                        float row = std::max(-12.f, std::min(6.f, (qx * app.fwd[0] + qz * app.fwd[2]) / 1.1f));
+                        dy = app.worldY - 0.28f * row;   // (altura del piso donde estás ahora: tiene que quedar en 0)
+                        app.worldY -= dy;
+                    }
                     std::lock_guard<std::mutex> lk(g_uiLock);
-                    for (UiPanel *p : g_ui) { p->pose.position.x -= d[0]; p->pose.position.z -= d[2]; }
+                    for (UiPanel *p : g_ui) { p->pose.position.x -= d[0]; p->pose.position.z -= d[2]; p->pose.position.y -= dy; }
                 }
                 moving = true;
             }
