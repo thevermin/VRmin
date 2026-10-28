@@ -143,12 +143,7 @@ final class Loading {
         card.setOrientation(LinearLayout.VERTICAL);
         card.setGravity(Gravity.CENTER_HORIZONTAL);
         card.setPadding(dp16 * 2, dp16 * 2, dp16 * 2, dp16 + dp16 / 2);
-        // sin rectángulo: apenas una sombra que se desvanece hacia los bordes, para que el texto se lea sobre el vacío
-        GradientDrawable bg = new GradientDrawable();
-        bg.setGradientType(GradientDrawable.RADIAL_GRADIENT);
-        bg.setGradientRadius(Ui.dp(c, 400));
-        bg.setColors(new int[]{Color.argb(120, 4, 4, 5), Color.argb(70, 4, 4, 5), Color.argb(0, 4, 4, 5)});
-        card.setBackground(bg);
+        // sin fondo: solo la portada, el nombre, el estado y los consejos flotando en el vacío
         root.addView(card, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         cover = new ImageView(c);
@@ -205,10 +200,13 @@ final class Loading {
         tipBox.setOrientation(LinearLayout.HORIZONTAL);
         tipBox.setGravity(Gravity.CENTER_VERTICAL);
         tipBox.setPadding(dp16 + dp16 / 2, dp16, dp16 / 2, dp16);
-        GradientDrawable tbg = new GradientDrawable();
-        tbg.setColor(Color.argb(40, 255, 255, 255));
-        tbg.setCornerRadius(Ui.rad(c, 20));
-        tipBox.setBackground(tbg);
+        // (sin caja: una línea ámbar finita arriba separa el consejo)
+        View sep = new View(c);
+        sep.setBackgroundColor(Color.argb(90, 230, 168, 74));
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(Ui.dp(c, 120), Ui.dp(c, 1));
+        slp.gravity = Gravity.CENTER_HORIZONTAL;
+        slp.bottomMargin = dp16 / 2;
+        card.addView(sep, slp);
         LinearLayout tipText = new LinearLayout(c);
         tipText.setOrientation(LinearLayout.VERTICAL);
         tipText.addView(Ui.label(c, I18n.t("Consejo"), 14, Ui.ACCENT_TEXT, true));

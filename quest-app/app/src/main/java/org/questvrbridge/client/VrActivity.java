@@ -213,8 +213,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
                 Panel p = createPanel(LOADING_ID, 620, 780, 1.25f, false);
                 if (p == null) return;
                 p.pres.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-                show(p, loading.build(p.pres.getContext()));
-                nativeSetFollow(LOADING_ID, true);   // siempre al frente: te sigue cuando girás
+                show(p, loading.build(p.pres.getContext()));   // (queda fija delante de donde mirabas al empezar)
             } else {
                 Panel p = panels.remove(LOADING_ID);
                 if (p == null) return;

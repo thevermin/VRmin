@@ -5916,15 +5916,15 @@ vec3 spaceSky(vec3 d, vec3 rx, vec3 fz) {
 // Atardecer: cielo naranja y violeta, sol bajo y nubes suaves
 // Cielo de la sala de carga: casi negro, un brillo ámbar finito en el horizonte y polvo que titila
 vec3 voidSky(vec3 d, float t) {
-    vec3 c = mix(vec3(0.004, 0.004, 0.005), vec3(0.010, 0.010, 0.012), smoothstep(-0.3, 0.5, d.y));
-    c += vec3(0.90, 0.62, 0.27) * (0.045 * exp(-abs(d.y) * 30.0) + 0.008 * exp(-abs(d.y) * 5.0));   // apenas un hilo ámbar
+    vec3 c = vec3(0.0015, 0.0013, 0.0012);   // negro
+    c += vec3(0.90, 0.58, 0.22) * (0.035 * exp(-abs(d.y) * 40.0) + 0.004 * exp(-abs(d.y) * 6.0));   // apenas un hilo ámbar
     vec3 q = d * 70.0;
     vec3 cell = floor(q);
     float h = fract(sin(dot(cell, vec3(127.1, 311.7, 74.7))) * 43758.5453);
     if (h > 0.998) {
         vec3 fr = fract(q) - 0.5;
         float tw = 0.5 + 0.5 * sin(t * (0.6 + h * 1.7) + h * 40.0);
-        c += vec3(0.75, 0.70, 0.62) * smoothstep(0.2, 0.0, length(fr)) * 0.16 * tw;
+        c += vec3(0.90, 0.62, 0.30) * smoothstep(0.2, 0.0, length(fr)) * 0.12 * tw;
     }
     return c;
 }
@@ -6007,8 +6007,8 @@ void main() {
         float line = 1.0 - min(min(gd.x, gd.y), 1.0);
         float d = length(wp.xz - eye.xz);   // (la luz y la niebla van con vos: siempre estás en el medio)
         vec3 v = normalize(wp - eye);
-        vec3 pcol = vec3(0.006, 0.006, 0.007) + vec3(0.42, 0.41, 0.40) * line * 0.075 * exp(-d * 0.09);
-        pcol += vec3(0.9, 0.62, 0.27) * 0.010 * exp(-d * 0.5);   // apenas luz bajo tus pies
+        vec3 pcol = vec3(0.0012, 0.0011, 0.0010) + vec3(0.90, 0.58, 0.22) * line * 0.045 * exp(-d * 0.10);   // grilla ámbar tenue
+        pcol += vec3(0.9, 0.58, 0.22) * 0.006 * exp(-d * 0.6);   // apenas luz bajo tus pies
         pcol = mix(pcol, voidSky(normalize(vec3(v.x, 0.0, v.z)), time), smoothstep(6.0, 27.0, d));
         o = vec4(pcol, 1.0);
         return;
@@ -8407,7 +8407,7 @@ static void renderFrame(App &app) {
             q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
             q.next = chain;
             q.space = app.space;
-            if (p->parent || fading || p->id == GAME_MENU_ID) q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;   // barra de botones y menú del juego: bordes redondos
+            if (p->parent || fading || p->id == GAME_MENU_ID || p->id == LOADING_ID) q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;   // barra de botones y menú del juego: bordes redondos
             q.eyeVisibility = eye;
             q.subImage.swapchain = sc;
             q.subImage.imageRect = {{0, 0}, {p->w, p->h}};
