@@ -6330,31 +6330,62 @@ static void renderRoom(App &app, const XrView &view, const TvInfo *tv) {
             glUniform1i(app.rMat, mat);
             glDrawArrays(GL_TRIANGLES, 0, 36);
         };
-        // sala: 13 m de ancho, de z=-6 a z=9 (pantalla), 7 m de alto; el piso baja hacia la pantalla en gradas
-        cb(0, 2.5f, 1.5f, 13.0f, 9.0f, 15.0f, 0.10f, 0.07f, 0.07f, 5);          // paredes y techo (tela oscura)
-        for (int row = -4; row <= 6; row++) {
-            float z = row * 1.1f, y = -0.28f * row;                             // tu fila (0) está a la altura del piso real
-            cb(0, y - 0.15f, z, 12.9f, 0.3f, 1.1f, 0.12f, 0.06f, 0.05f, 2);    // grada alfombrada
+        // sala grande: 22 m de ancho, de z=-15,5 a z=10,5 (la pantalla, en z=8,6, del mismo tamaño), 11 m de alto;
+        // el piso baja hacia la pantalla en gradas (tu fila, la 0, está a la altura del piso real)
+        cb(0, 3.5f, -2.5f, 22.0f, 11.0f, 26.0f, 0.10f, 0.07f, 0.07f, 5);         // paredes y techo (tela oscura)
+        for (int row = -12; row <= 6; row++) {
+            float z = row * 1.1f, y = -0.28f * row;
+            cb(0, y - 0.15f, z, 21.9f, 0.3f, 1.1f, 0.12f, 0.06f, 0.05f, 2);    // grada alfombrada
             if (row > 4) continue;
-            for (int k = -5; k <= 5; k++) {
-                if (k == 0) continue;                                           // pasillo central
+            for (int k = -15; k <= 15; k++) {
+                if (k == 0 || k == 9 || k == -9) continue;                     // pasillos: el del medio y dos a los costados
                 float x = k * 0.62f + (k > 0 ? 0.2f : -0.2f);
                 cb(x, y + 0.24f, z - 0.05f, 0.52f, 0.12f, 0.5f, 0.42f, 0.05f, 0.06f, 6);   // asiento
                 cb(x, y + 0.55f, z - 0.32f, 0.52f, 0.65f, 0.1f, 0.40f, 0.05f, 0.06f, 6);   // respaldo
                 cb(x + 0.29f, y + 0.36f, z - 0.05f, 0.06f, 0.36f, 0.5f, 0.05f, 0.04f, 0.04f, 0);   // apoyabrazos
             }
-            cb(-0.2f, y + 0.02f, z + 0.5f, 0.1f, 0.01f, 0.05f, 0.1f, 0.25f, 0.6f, 4);   // lucecita del pasillo
-            cb(0.2f, y + 0.02f, z + 0.5f, 0.1f, 0.01f, 0.05f, 0.1f, 0.25f, 0.6f, 4);
+            for (int a = -1; a <= 1; a++) {                                     // lucecitas de los pasillos, en cada escalón
+                float ax = a * (9 * 0.62f + 0.2f);
+                cb(ax - 0.22f, y + 0.02f, z + 0.5f, 0.08f, 0.01f, 0.05f, 0.9f, 0.55f, 0.22f, 4);
+                cb(ax + 0.22f, y + 0.02f, z + 0.5f, 0.08f, 0.01f, 0.05f, 0.9f, 0.55f, 0.22f, 4);
+            }
         }
-        cb(0, -2.1f, 7.6f, 12.9f, 0.4f, 3.0f, 0.06f, 0.04f, 0.04f, 2);          // frente, debajo de la pantalla
-        cb(-5.6f, 2.6f, 8.6f, 1.6f, 6.0f, 0.3f, 0.45f, 0.04f, 0.05f, 6);        // telones
+        cb(0, -2.1f, 7.6f, 21.9f, 0.4f, 3.0f, 0.06f, 0.04f, 0.04f, 2);          // frente, debajo de la pantalla
+        cb(0, -1.75f, 8.25f, 12.0f, 0.3f, 1.3f, 0.08f, 0.05f, 0.05f, 6);        // escenario delante de la pantalla
+        cb(0, -1.59f, 7.62f, 12.0f, 0.02f, 0.03f, 0.9f, 0.5f, 0.2f, 4);         // su borde con luz
+        // marco de la pantalla: telones a los costados, cenefa arriba y paneles oscuros hasta las paredes
+        cb(-5.6f, 2.6f, 8.6f, 1.6f, 6.0f, 0.3f, 0.45f, 0.04f, 0.05f, 6);
         cb(5.6f, 2.6f, 8.6f, 1.6f, 6.0f, 0.3f, 0.45f, 0.04f, 0.05f, 6);
-        cb(0, 5.9f, 8.6f, 12.9f, 0.9f, 0.3f, 0.45f, 0.04f, 0.05f, 6);
-        for (int k = 0; k < 6; k++) {                                          // paneles en las paredes
-            cb(-6.45f, 2.2f, -4.0f + k * 2.2f, 0.06f, 3.2f, 1.6f, 0.16f, 0.09f, 0.08f, 6);
-            cb(6.45f, 2.2f, -4.0f + k * 2.2f, 0.06f, 3.2f, 1.6f, 0.16f, 0.09f, 0.08f, 6);
+        cb(0, 6.1f, 8.6f, 12.8f, 1.0f, 0.3f, 0.45f, 0.04f, 0.05f, 6);
+        cb(-8.6f, 3.5f, 9.0f, 4.8f, 11.0f, 0.4f, 0.07f, 0.05f, 0.05f, 6);
+        cb(8.6f, 3.5f, 9.0f, 4.8f, 11.0f, 0.4f, 0.07f, 0.05f, 0.05f, 6);
+        cb(0, 8.0f, 9.0f, 12.4f, 2.4f, 0.4f, 0.07f, 0.05f, 0.05f, 6);
+        // paredes de los costados: paneles acolchados con apliques de luz tenue entre ellos
+        for (int k = 0; k < 11; k++) {
+            float z = -14.0f + k * 2.1f;
+            cb(-10.95f, 2.6f, z, 0.06f, 3.6f, 1.7f, 0.16f, 0.09f, 0.08f, 6);
+            cb(10.95f, 2.6f, z, 0.06f, 3.6f, 1.7f, 0.16f, 0.09f, 0.08f, 6);
+            if (k < 10) {
+                cb(-10.9f, 4.9f, z + 1.05f, 0.08f, 0.35f, 0.16f, 0.55f, 0.32f, 0.14f, 4);
+                cb(10.9f, 4.9f, z + 1.05f, 0.08f, 0.35f, 0.16f, 0.55f, 0.32f, 0.14f, 4);
+            }
         }
-        cb(-6.4f, 3.3f, -5.9f, 0.6f, 0.25f, 0.04f, 0.1f, 0.9f, 0.3f, 4);        // cartel de salida
+        cb(-10.9f, 0.4f, -2.5f, 0.1f, 0.2f, 25.5f, 0.05f, 0.03f, 0.03f, 0);    // zócalos
+        cb(10.9f, 0.4f, -2.5f, 0.1f, 0.2f, 25.5f, 0.05f, 0.03f, 0.03f, 0);
+        // techo: vigas oscuras con una fila de lucecitas apagadas (como estrellas) entre ellas
+        for (int k = 0; k < 7; k++) {
+            float z = -13.5f + k * 3.6f;
+            cb(0, 8.75f, z, 21.8f, 0.5f, 0.35f, 0.06f, 0.04f, 0.04f, 0);
+            for (int j = -4; j <= 4; j++) cb(j * 2.3f, 8.97f, z + 1.8f, 0.06f, 0.02f, 0.06f, 0.35f, 0.3f, 0.25f, 4);
+        }
+        // atrás: la cabina de proyección, con su ventanita encendida
+        cb(0, 6.6f, -15.3f, 4.0f, 1.8f, 0.4f, 0.05f, 0.04f, 0.04f, 0);
+        cb(0, 6.6f, -15.08f, 1.0f, 0.5f, 0.02f, 0.85f, 0.8f, 0.65f, 4);
+        // carteles de salida: adelante y atrás, de los dos lados
+        cb(-10.9f, 3.3f, 7.4f, 0.04f, 0.25f, 0.6f, 0.1f, 0.9f, 0.3f, 4);
+        cb(10.9f, 3.3f, 7.4f, 0.04f, 0.25f, 0.6f, 0.1f, 0.9f, 0.3f, 4);
+        cb(-7.5f, 5.6f, -15.25f, 0.6f, 0.25f, 0.04f, 0.1f, 0.9f, 0.3f, 4);
+        cb(7.5f, 5.6f, -15.25f, 0.6f, 0.25f, 0.04f, 0.1f, 0.9f, 0.3f, 4);
         glBindVertexArray(0);
         glDisable(GL_DEPTH_TEST);
         return;
@@ -7353,7 +7384,7 @@ static float floorAt(App &app, float x, float z) {
     float qx = x - app.anc[0], qz = z - app.anc[2];
     float lz = qx * app.fwd[0] + qz * app.fwd[2];
     int row = (int)lroundf(lz / 1.1f);
-    row = std::max(-4, std::min(6, row));
+    row = std::max(-12, std::min(6, row));
     return app.worldY - 0.28f * row;
 }
 
@@ -7363,7 +7394,7 @@ static bool insideRoom(const App &app, float x, float z) {
     float lx = q[0] * -app.fwd[2] + q[2] * app.fwd[0], lz = q[0] * app.fwd[0] + q[2] * app.fwd[2];
     return g_env == 4 ? sqrtf(lx * lx + lz * lz) < 20.0f
          : g_env == 1 ? sqrtf(lx * lx + lz * lz) < 5.5f
-         : g_env == 2 ? (fabsf(lx) < 6.0f && lz > -4.5f && lz < 6.5f)
+         : g_env == 2 ? (fabsf(lx) < 10.5f && lz > -13.5f && lz < 6.5f)
          : (fabsf(lx) < 3.1f && lz > -2.5f && lz < 2.45f);
 }
 
