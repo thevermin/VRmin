@@ -1,13 +1,16 @@
 name: Publicar versión
-# Arma la versión en GitHub con lo último que compilaron «App de Mac» y «App del Quest» en main
-# (las notas salen de docs/releases/<etiqueta>.md)
+# Arma la versión en GitHub (como borrador) con la app del Quest que compiló «App del Quest» en main
+# (las notas salen de docs/releases/<etiqueta>.md).
+# La app de Mac NO sale de acá: se arma en la Mac de VRmin con «bash crear_app.sh --paquete» (firmada con el
+# certificado fijo de VRmin; el actualizador de VRmin Host rechaza otra firma) y se sube a mano al borrador antes
+# de publicarlo. Al publicarlo, «Revisar la versión publicada» comprueba que esté todo bien.
 on:
   workflow_dispatch:
     inputs:
       tag: { description: 'Etiqueta (por ejemplo v0.47)', required: true }
       beta: { description: 'Beta (pre-release)', type: boolean, default: false }
       draft: { description: 'Borrador (se revisa y se publica a mano)', type: boolean, default: true }
-      sin_mac: { description: 'Sin la app de Mac (se sube aparte, si GitHub no tiene Macs para compilarla)', type: boolean, default: false }
+      sin_mac: { description: 'Sin la app de Mac de GitHub (lo normal: la firmada se sube a mano)', type: boolean, default: true }
 jobs:
   release:
     runs-on: ubuntu-latest

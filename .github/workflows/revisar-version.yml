@@ -1,0 +1,38 @@
+name: Revisar la versión publicada
+# Al publicar una versión: que tenga una sola app de Mac y una del Quest, que la de Mac sea de esa versión y que esté
+# firmada con el certificado fijo de VRmin («QuestVRBridge Local»). Si no, el botón «Actualizar» de VRmin Host la
+# rechaza (así pasó con la 0.47). Si algo falla, este trabajo queda en rojo y GitHub avisa por mail.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag: { description: 'Etiqueta (por ejemplo v0.48)', required: true }
+permissions: { contents: read }
+jobs:
+  revisar:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Revisar
+        run: |
+          set -e
+          mal() { echo "::error::$1"; exit 1; }
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D r
+          ls -la r
+          zips=$(ls r | grep -c 'Host.*\.zip$' || true)
+          apks=$(ls r | grep -c '\.apk$' || true)
+          [ "$zips" = 1 ] || mal "Tiene que haber exactamente un .zip de VRmin Host (hay $zips): el actualizador usa el primero"
+          [ "$apks" = 1 ] || mal "Tiene que haber exactamente un .apk (hay $apks)"
+          cd r && unzip -q *Host*.zip -d x
+          app="x/VRmin Host.app"
+          [ -d "$app" ] || mal "El .zip no tiene «VRmin Host.app»"
+          v=$(grep -A1 CFBundleShortVersionString "$app/Contents/Info.plist" | grep -o '<string>[^<]*' | cut -c9-)
+          [ "v$v" = "$TAG" ] || mal "La app de Mac es la $v, no la ${TAG#v}"
+          for f in "$app/Contents/MacOS/VRminHost" "$app/Contents/Resources/QuestRenderer"; do
+            [ -f "$f" ] || mal "Falta $(basename "$f") en la app"
+            grep -aq 'QuestVRBridge Local' "$f" || mal "$(basename "$f") no está firmado con el certificado de VRmin (¿se armó con VRMIN_ADHOC=1 o en GitHub?): armalo con «bash crear_app.sh --paquete» en la Mac de VRmin y reemplazalo"
+          done
+          echo "::notice::$TAG: app de Mac $v firmada con el certificado de VRmin, una sola app del Quest ($(ls *.apk))"
