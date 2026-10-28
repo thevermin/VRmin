@@ -3292,7 +3292,7 @@ static uint32_t vk_lagged_id(uint32_t id) {
  * swapchain siempre tiene el cuadro anterior (por eso se le informaba al visor la pose de un cuadro antes). Ahora se
  * anota de qué imagen del juego copia OpenComposite (su vkCmdCopyImage), y nuestra copia se hace un poco después
  * (al empezar el cuadro siguiente, cuando el juego ya mandó el dibujo) directo desde esa imagen: un cuadro menos de
- * demora. Se puede apagar escribiendo 0 en C:\questvrbridge\vk_diferido.txt. */
+ * demora. Por ahora apagada (la imagen del juego todavía no estaba lista): se prueba con 1 en C:\questvrbridge\vk_diferido.txt. */
 typedef struct { uint64_t dst, src; uint32_t layer; int64_t at; } OcCopy;
 static OcCopy g_ocCopy[24];
 static PFN_vkCmdCopyImage o_ocCmdCopyImage;
@@ -3319,13 +3319,13 @@ static int oc_src_for(VkImage dst, VkImage *src, uint32_t *layer) {
     return ok;
 }
 static int vk_diferido(void) {
-    static int on = 1; static DWORD leido;
+    static int on = 0; static DWORD leido;   /* (apagada: en DOOM y Half-Life 2 la imagen tampoco está lista al empezar el cuadro siguiente y volvía el temblor) */
     DWORD now = GetTickCount();
     if (now - leido > 2000) {
         leido = now;
         FILE *fp = fopen("C:\\questvrbridge\\vk_diferido.txt", "r");
-        int v = 1;
-        if (fp) { if (fscanf(fp, "%d", &v) != 1) v = 1; fclose(fp); }
+        int v = 0;
+        if (fp) { if (fscanf(fp, "%d", &v) != 1) v = 0; fclose(fp); }
         if ((v != 0) != on) { on = v != 0; logmsg("Vulkan: copia sin cuadro de atraso %s", on ? "encendida" : "apagada"); }
     }
     return on && o_ocCmdCopyImage != NULL;
