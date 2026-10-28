@@ -942,6 +942,23 @@ static int input_value(const Track *t, const char *b, float out[2], int *isPose)
     if (IS("squeeze") || IS("grip/")) { out[0] = in[IN_SQUEEZE]; return 1; }
     if (IS("trackpad") && g_index) return 1;               /* Index: el Quest no tiene trackpad (queda en 0, no copia el joystick) */
     if (IS("select")) { out[0] = in[IN_TRIGGER] > 0.5f; return 1; }
+    /* Emulando Vive, el stick hace de trackpad «en cruz» (como los arreglos de la comunidad para DOOM VFR): empujarlo
+     * hasta el borde ya es apretar el trackpad en esa dirección (menús, dash), sin hundir el stick; A/X es apretar el centro */
+    if (g_vive && IS("trackpad")) {
+        static int empujado[2];
+        float x = in[IN_TX], y = in[IN_TY], m = sqrtf(x * x + y * y);
+        empujado[hand] = empujado[hand] ? m > 0.55f : m > 0.8f;
+        int centro = in[IN_A] > 0.5f && !empujado[hand];
+        const char *rest = strchr(c, '/');
+        if (!rest) { out[0] = centro ? 0 : x; out[1] = centro ? 0 : y; return 1; }
+        rest++;
+        if (!strcmp(rest, "x")) out[0] = centro ? 0 : x;
+        else if (!strcmp(rest, "y")) out[0] = centro ? 0 : y;
+        else if (!strncmp(rest, "click", 5)) out[0] = (in[IN_TCLICK] > 0.5f || empujado[hand] || centro) ? 1.0f : 0.0f;
+        else if (!strncmp(rest, "touch", 5)) out[0] = (in[IN_THTOUCH] > 0.5f || m > 0.1f || centro) ? 1.0f : 0.0f;
+        return 1;
+    }
+    if (g_vive && IS("menu")) { out[0] = in[IN_MENU] > in[IN_B] ? in[IN_MENU] : in[IN_B]; return 1; }   /* (B/Y: el ≡ abre el menú de VRmin) */
     if (IS("thumbstick") || IS("trackpad") || IS("joystick")) {
         const char *rest = strchr(c, '/');
         if (!rest) { out[0] = in[IN_TX]; out[1] = in[IN_TY]; return 1; }
