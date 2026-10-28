@@ -8,6 +8,25 @@ final class I18nEn {
 
     static void fill(Map<String, String> m) {
         m.put("Menú principal", "Main menu");
+        m.put("Carga\nEl vacío de la pantalla de carga", "Loading\nThe loading screen's void");
+        m.put("Entrando en VR…", "Entering VR…");
+        m.put("Abriendo el juego…", "Opening the game…");
+        m.put("El juego se cerró", "The game closed");
+        m.put("Volviendo a la sala…", "Going back to the room…");
+        m.put("Consejo", "Tip");
+        m.put("Volver a la sala", "Back to the room");
+        m.put("Mantené apretado el botón de menú del control izquierdo para abrir el menú de juego.", "Hold the menu button on the left controller to open the game menu.");
+        m.put("Si las manos del juego no coinciden con las tuyas: menú de juego › Manos y láser. Ahí podés calibrarlas y ajustar la inclinación y el giro de cada mano (se guarda para cada juego).", "If the game's hands don't match yours: game menu › Hands and laser. There you can calibrate them and adjust each hand's tilt and roll (saved for each game).");
+        m.put("Mantené apretado el botón de Meta para volver a centrar la vista.", "Hold the Meta button to recenter the view.");
+        m.put("Si el juego va lento, bajá la nitidez desde el menú de juego.", "If the game runs slowly, lower the sharpness from the game menu.");
+        m.put("Con un cable USB-C entre el Quest y la Mac hay menos demora que por Wi-Fi.", "A USB-C cable between the Quest and the Mac has less delay than Wi-Fi.");
+        m.put("Podés simular controles de Index o de Vive en los ajustes avanzados de VRmin Host.", "You can emulate Index or Vive controllers in VRmin Host's advanced settings.");
+        m.put("Si un juego se tilda, cerralo con «Forzar cierre» desde VRmin Host.", "If a game freezes, close it with “Force quit” in VRmin Host.");
+        m.put("La primera vez que abrís un juego tarda más: prepara sus gráficos y después abre más rápido.", "The first time you open a game it takes longer: it prepares its graphics and opens faster afterwards.");
+        m.put("Con el Modo Centinela jugás sin ponerte el visor: lo apoyás mirándote y el juego se ve en la Mac (menú de juego › Modo Centinela).", "With Sentinel Mode you play without wearing the headset: set it down facing you and the game shows on the Mac (game menu › Sentinel Mode).");
+        m.put("La lista de juegos que funcionan está en las Discusiones de VRmin en GitHub.", "The list of working games is in VRmin's Discussions on GitHub.");
+        m.put("¿Encontraste un problema? Contalo en github.com/thevermin/VRmin/issues", "Found a problem? Report it at github.com/thevermin/VRmin/issues");
+        m.put("VRmin es gratis: si te gusta, podés apoyarlo en ko-fi.com/thevermin", "VRmin is free: if you like it, you can support it at ko-fi.com/thevermin");
         m.put("Pausar controles y manos", "Pause controllers and hands");
         m.put("Para poner en pausa los controles y las manos (por ejemplo, para comer mirando una película): mantené A y B (o X e Y) un segundo, juntá el pulgar con el meñique derecho o tocá el botón de pausa en la barra de una pantalla. Para volver, el mismo atajo o el mismo gesto.", "To pause the controllers and hands (for example, to eat while watching a movie): hold A and B (or X and Y) for a second, touch your right thumb to your little finger, or tap the pause button on a screen's bar. To resume, use the same shortcut or gesture.");
         m.put("Con los controles en la mano: después, sin controles, el juego ve tus manos como si los tuvieras agarrados", "With the controllers in your hands: afterwards, without controllers, the game sees your hands as if you were holding them");
@@ -101,7 +120,7 @@ final class I18nEn {
         m.put("Jugar con las manos: apagado", "Play with your hands: off");
         m.put("Cámara", "Camera");
         m.put("Ángulo de las manos y el láser del juego", "Angle of the game's hands and laser");
-        m.put("Para cuando jugás con las manos: si la mano o el láser del juego no coinciden con tu mano, probá estas opciones mirando el juego.", "For when you play with your hands: if the game's hand or laser doesn't match your hand, try these options while looking at the game.");
+        m.put("Para cuando jugás con las manos: si la mano o el láser del juego no coinciden con tu mano, probá estas opciones mirando el juego. Se guardan para cada juego.", "For when you play with your hands: if the game's hand or laser doesn't match your hand, try these options while looking at the game. They are saved for each game.");
         m.put("Inclinación", "Tilt");
         m.put("Giro", "Roll");
         m.put("Volver a lo recomendado", "Back to recommended");

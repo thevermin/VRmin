@@ -2732,6 +2732,8 @@ final class Lobby {
     func gameList() -> [GameEntry] { games }
     private var lastScan: UInt64 = 0
     private var status = ""
+    private var launchingQ: (id: String, name: String, t: Int)?   // juego que se está abriendo desde el visor (para la pantalla de carga)
+    private var lastGameActive = Date.distantPast
     private var busy = false
     private var hover = -1
     private var drawnKey = ""
@@ -2836,8 +2838,8 @@ final class Lobby {
                 self.queue.async { self.gameName = n }
             }
         }
-        if !gameActive { gameName = "" }
-        let obj: [String: Any] = ["type": "lobby2d", "game": gameActive, "gameName": gameName, "macModel": macModel, "busy": b, "status": st, "desk": desktopOn, "deskErr": err,
+        if !gameActive { gameName = "" } else { lastGameActive = Date() }
+        let obj: [String: Any] = ["type": "lobby2d", "launching": launchingInfo(gameActive) ?? NSNull(), "game": gameActive, "gameName": gameName, "macModel": macModel, "busy": b, "status": st, "desk": desktopOn, "deskErr": err,
                                   "depth3d": depth3D.enabled, "depthStatus": depth3D.statusText,
                                   "cfg": ["eye": GEN_EYE, "fps": GEN_FPS, "mbps": GEN_MBPS, "audioMac": env["VR_AUDIO_MAC"] == "1", "fov": GEN_FOV,   // (los generales)
                                           "codec": env["VR_CODEC"] ?? "hevc", "run": "\(EYE) · \(FPS) Hz · \(BITRATE / 1_000_000) Mbps",
@@ -3254,10 +3256,29 @@ final class Lobby {
         return p.terminationStatus == 0
     }
 
+    /// Qué juego se está abriendo (pantalla de carga del visor): el abierto desde el visor, o el que abrió jugar.sh
+    /// (desde VRmin Host) hace menos de 90 s y todavía no arrancó
+    private func launchingInfo(_ gameActive: Bool) -> [String: Any]? {
+        lock.lock()
+        if gameActive || (launchingQ.map { Int(Date().timeIntervalSince1970) - $0.t > 240 } ?? false) { launchingQ = nil }
+        let q = launchingQ
+        lock.unlock()
+        if gameActive { return nil }
+        if let q { return ["id": q.id, "name": q.name, "t": q.t] }
+        let path = dataDir + "/lanzando.txt"
+        guard !dataDir.isEmpty, let m = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date,
+              Date().timeIntervalSince(m) < 90, m > lastGameActive,
+              let txt = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        let f = txt.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\t")
+        guard f.count >= 3 else { return nil }
+        return ["id": f[0], "name": f[1], "t": Int(f[2]) ?? 0]
+    }
+
     private func launch(_ g: GameEntry) {
         lock.lock()
         if busy { lock.unlock(); return }
         busy = true; status = "Preparando \(g.name)…"
+        launchingQ = (g.id, g.name, Int(Date().timeIntervalSince1970))
         lock.unlock()
         print("[sala] Abriendo \(g.name) desde el visor")
         DispatchQueue.global(qos: .userInitiated).async { [self] in
@@ -3277,7 +3298,7 @@ final class Lobby {
             if g.vr && q.differs {
                 setStatus(tr("Cambiando la calidad para \(g.name)… (se corta unos segundos)", "Switching quality for \(g.name)… (a few seconds' cut)"))
                 toHost(["qvb": "playgame", "id": g.id, "name": g.name, "eye": q.eye, "fps": q.fps, "mbps": q.mbps, "fov": q.fov])
-                lock.lock(); busy = false; lock.unlock()
+                lock.lock(); busy = false; lock.unlock()   // (launchingQ sigue: la app de la Mac lo abre)
                 print("[sala] \(g.name) usa otra calidad (\(q.eye) · \(q.fps) Hz · \(q.mbps) Mbps): la app de la Mac reinicia y lo abre")
                 return
             }
@@ -3285,7 +3306,7 @@ final class Lobby {
                 setStatus(tr("No se pudo abrir \(g.name). Mirá el registro en la Mac.", "Couldn't open \(g.name). Check the log on the Mac."))
             }
             sleep(40)
-            lock.lock(); busy = false; if status.hasPrefix("Abriendo") || status.hasPrefix("Preparando") { status = "" }; lock.unlock()
+            lock.lock(); busy = false; launchingQ = nil; if status.hasPrefix("Abriendo") || status.hasPrefix("Preparando") { status = "" }; lock.unlock()
         }
     }
 
