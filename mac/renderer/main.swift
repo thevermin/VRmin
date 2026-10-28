@@ -94,12 +94,11 @@ let H = FOVEA.on ? round16(Double(EYE) * FOVEA.ratio(FOVEA.cy)) : SH
 
 /// Achica el borde de cada ojo (foveated encoding) en la GPU: de la imagen completa (con mipmaps, para que lo
 /// achicado no titile) a la imagen codificada
-/// Un panel flotante del juego (menú, HUD) tal como lo manda el runtime: su imagen y sus 4 esquinas en cada ojo
-/// (posiciones de recorte: abajo-izq., abajo-der., arriba-izq., arriba-der.). flags: 1 mezcla, 2 premult., 4 dado vuelta, 8 RGBA
-struct GameQuad { let w: Int, h: Int, flags: UInt32, clip: [[SIMD4<Float>]], pixels: UnsafeRawPointer, offset: Int }   // (offset: en la memoria compartida)
-struct QuadVertex { var pos: SIMD4<Float>; var uv: SIMD2<Float>; var pad: SIMD2<Float> }
-
 final class Foveator {
+    /// Un panel flotante del juego (menú, HUD) tal como lo manda el runtime: su imagen y sus 4 esquinas en cada ojo
+    /// (posiciones de recorte: abajo-izq., abajo-der., arriba-izq., arriba-der.). flags: 1 mezcla, 2 premult., 4 dado vuelta, 8 RGBA
+    struct GameQuad { let w: Int, h: Int, flags: UInt32, clip: [[SIMD4<Float>]], pixels: UnsafeRawPointer, offset: Int }   // (offset: en la memoria compartida)
+    struct QuadVertex { var pos: SIMD4<Float>; var uv: SIMD2<Float>; var pad: SIMD2<Float> }
     /// (siempre: también agranda con MetalFX la imagen del juego dibujada más chica y la ubica si se recortó el campo de visión)
     static let shared: Foveator? = Foveator()
     let dev: MTLDevice, queue: MTLCommandQueue, pipe: MTLRenderPipelineState, copyPipe: MTLRenderPipelineState, quadPipe: MTLRenderPipelineState, lut: MTLTexture
@@ -1353,7 +1352,7 @@ final class GameLink {
                     setStage("procesando imagen")
                     let base = UnsafeRawPointer(m + 64 + slot * shmSlot)
                     // cada panel: w, h, banderas, (relleno), 2 ojos × 4 esquinas × (x, y, z, w), y después sus píxeles
-                    var quads: [GameQuad] = [], off = ew * 2 * eh * 4
+                    var quads: [Foveator.GameQuad] = [], off = ew * 2 * eh * 4
                     for _ in 0..<nq {
                         guard off + 144 <= shmSlot else { break }
                         let hp = (base + off).assumingMemoryBound(to: UInt32.self)
@@ -1361,7 +1360,7 @@ final class GameLink {
                         guard qw > 0, qh > 0, off + 144 + qw * qh * 4 <= shmSlot else { break }
                         let fp = (base + off + 16).assumingMemoryBound(to: Float.self)
                         let clip = (0..<2).map { e in (0..<4).map { k in SIMD4<Float>(fp[e * 16 + k * 4], fp[e * 16 + k * 4 + 1], fp[e * 16 + k * 4 + 2], fp[e * 16 + k * 4 + 3]) } }
-                        quads.append(GameQuad(w: qw, h: qh, flags: fl, clip: clip, pixels: base + off + 144, offset: 64 + slot * shmSlot + off + 144))
+                        quads.append(Foveator.GameQuad(w: qw, h: qh, flags: fl, clip: clip, pixels: base + off + 144, offset: 64 + slot * shmSlot + off + 144))
                         off += 144 + qw * qh * 4
                     }
                     handlePixels(base, poseId: poseId, isRGBA: buf[6] == 1, ew: ew, eh: eh, quads: quads,
@@ -1453,7 +1452,7 @@ final class GameLink {
         handlePixels(p + 10, poseId: poseId, isRGBA: isRGBA, ew: ew, eh: eh)
     }
 
-    private func handlePixels(_ srcPtr: UnsafeRawPointer, poseId: UInt32, isRGBA: Bool, ew: Int, eh: Int, quads: [GameQuad] = [], gpu: (MTLBuffer, Int)? = nil) {
+    private func handlePixels(_ srcPtr: UnsafeRawPointer, poseId: UInt32, isRGBA: Bool, ew: Int, eh: Int, quads: [Foveator.GameQuad] = [], gpu: (MTLBuffer, Int)? = nil) {
         guard ew > 0, eh > 0 else { return }
         frames += 1
         if frames == 1 { print("[juego] Primer cuadro recibido: \(ew)x\(eh) por ojo, \(isRGBA ? "RGBA" : "BGRA") · GPU \(Foveator.shared != nil ? "lista" : "NO disponible") · se manda \(W)x\(H)") }
