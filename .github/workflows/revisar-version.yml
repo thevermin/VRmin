@@ -29,7 +29,7 @@ jobs:
           cd r && unzip -q *Host*.zip -d x
           app="x/VRmin Host.app"
           [ -d "$app" ] || mal "El .zip no tiene «VRmin Host.app»"
-          v=$(grep -A1 CFBundleShortVersionString "$app/Contents/Info.plist" | grep -o '<string>[^<]*' | cut -c9-)
+          v=$(tr -d '\n\t ' < "$app/Contents/Info.plist" | grep -o 'CFBundleShortVersionString</key><string>[^<]*' | sed 's/.*<string>//')
           [ "v$v" = "$TAG" ] || mal "La app de Mac es la $v, no la ${TAG#v}"
           for f in "$app/Contents/MacOS/VRminHost" "$app/Contents/Resources/QuestRenderer"; do
             [ -f "$f" ] || mal "Falta $(basename "$f") en la app"
