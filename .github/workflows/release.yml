@@ -7,6 +7,7 @@ on:
       tag: { description: 'Etiqueta (por ejemplo v0.47)', required: true }
       beta: { description: 'Beta (pre-release)', type: boolean, default: false }
       draft: { description: 'Borrador (se revisa y se publica a mano)', type: boolean, default: true }
+      sin_mac: { description: 'Sin la app de Mac (se sube aparte, si GitHub no tiene Macs para compilarla)', type: boolean, default: false }
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -20,7 +21,7 @@ jobs:
           mac=$(gh run list -R "$GITHUB_REPOSITORY" --workflow mac.yml --branch main --status success --limit 1 --json databaseId -q '.[0].databaseId')
           apk=$(gh run list -R "$GITHUB_REPOSITORY" --workflow quest-app.yml --branch main --status success --limit 1 --json databaseId -q '.[0].databaseId')
           echo "App de Mac: $mac · App del Quest: $apk"
-          gh run download "$mac" -R "$GITHUB_REPOSITORY" -n VRmin-Host-mac -D out
+          [ "${{ inputs.sin_mac }}" = "true" ] || gh run download "$mac" -R "$GITHUB_REPOSITORY" -n VRmin-Host-mac -D out
           gh run download "$apk" -R "$GITHUB_REPOSITORY" -n VRmin-quest-apk -D out
           ls -la out
       - name: Publicar
