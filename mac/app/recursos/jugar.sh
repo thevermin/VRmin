@@ -37,6 +37,9 @@ mkdir -p "$WINEPREFIX/drive_c/questvrbridge"
 cp "$RES/openxr/questvrbridge_openxr.dll" "$RES/openxr/questvrbridge_openxr.json" "$WINEPREFIX/drive_c/questvrbridge/"
 [ -f "$RES/openxr/questvrbridge_openxr32.dll" ] && cp "$RES/openxr/questvrbridge_openxr32.dll" "$RES/openxr/questvrbridge_openxr32.json" "$WINEPREFIX/drive_c/questvrbridge/"
 preparar_runtime "$RUNTIME" 2>&1 | tee -a "$LOG"
+# (OpenComposite: el grip de Touch como botón donde el juego lo usa para agarrar; OpenComposite busca esos controles en
+#  la carpeta desde donde se abre el juego)
+[ "$RUNTIME" = "openvr" ] && /usr/bin/python3 "$RES/vrjuegos.py" controles_oc "$CARPETA" "$CARPETA/$(dirname "${EXE:-.}")" 2>&1 | tee -a "$LOG"
 gpu_luid_dxmt 2>&1 | tee -a "$LOG"
 
 if [ "$LANZAR" = "directo" ] && [ -n "$EXE" ] && [ -f "$CARPETA/$EXE" ]; then

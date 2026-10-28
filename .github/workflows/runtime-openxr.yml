@@ -8,7 +8,7 @@ permissions:
   contents: write
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # (mingw GCC 13, el probado: con el GCC 15 de ubuntu-latest Half-Life 2 se veía plano)
     steps:
       - uses: actions/checkout@v4
       - name: Herramientas (mingw-w64) y cabeceras de OpenXR y Vulkan
