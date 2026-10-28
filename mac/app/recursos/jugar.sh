@@ -26,6 +26,8 @@ LOG="$P/logs/juegos/$APPID.log"
   [ -n "$AVISO" ] && say "AVISO: $AVISO" "WARNING: $AVISO"
   [ ${#ARGS[@]} -gt 0 ] && say "Argumentos: ${ARGS[*]}" "Arguments: ${ARGS[*]}"
 } | tee -a "$LOG"
+# (para la pantalla de carga del visor: qué juego se está abriendo, aunque se abra desde VRmin Host)
+printf '%s\t%s\t%s\n' "$APPID" "$NOMBRE" "$(date +%s)" > "$P/lanzando.txt" 2>/dev/null
 
 # Ajustes vacíos (0 bytes): pasa si el juego se cerró a la fuerza mientras los guardaba, y algunos juegos (Beat Saber)
 # quedan en negro al leerlos. Se apartan (no se borran) para que el juego cree unos nuevos.

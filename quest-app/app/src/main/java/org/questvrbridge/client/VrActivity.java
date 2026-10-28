@@ -102,6 +102,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
     static native void nativeConnectTo(String name);
     static native void nativeDisconnect();
     static native void nativeSetEnvironment(int e);
+    static native void nativeSetLoading(boolean on);
     static native void nativeDeskRect(boolean visible, float x0, float y0, float x1, float y1);
     static native void nativeSetPanel3D(int id, int mode, float strength);
     static native void nativePanelRect(int id, float x0, float y0, float x1, float y1);
@@ -178,6 +179,9 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
                     if (o.optBoolean("vigia")) macVigia = true;
                     else if (macVigia) { macVigia = false; if (vigiaOn) setVigia(false); }
                 }
+                // Otro juego: sus propios ángulos de las manos
+                if (o != null) { String g = o.optString("gameName", ""); if (!g.equals(handGame)) { handGame = g; applyHandAngles(); } }
+                if (o != null) loading.onState(o);
                 if (o == null || !o.has("typing")) return;
                 boolean t = o.optBoolean("typing");
                 if (t != lastTyping) {
@@ -199,6 +203,26 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
     // ------------------------------------------------------------------ teclado
     private static final int KEYBOARD_ID = 0x2FFFFFC0;
     private boolean lastTyping = false, kbAutoOpened = false, inGameNow = false;
+    // Pantalla de carga mientras se abre un juego (y un momento al cerrarse)
+    private static final int LOADING_ID = 0x2FFFFFA0;
+    private final Loading loading = new Loading(this, new Loading.Host() {
+        @Override public void nativeLoading(boolean on) { nativeSetLoading(on); }
+        @Override public void loadingPanel(boolean on) {
+            if (on) {
+                if (panels.containsKey(LOADING_ID)) return;
+                Panel p = createPanel(LOADING_ID, 620, 780, 1.25f, false);
+                if (p == null) return;
+                p.pres.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                show(p, loading.build(p.pres.getContext()));
+            } else {
+                Panel p = panels.remove(LOADING_ID);
+                if (p == null) return;
+                release(p);
+                nativeDestroyPanel(LOADING_ID);
+            }
+        }
+    });
+    private String handGame = "";
     private long lastMacClick = 0, lastPanelOpen = 0;
     private int lastMacPanel = TV_ID;
 
@@ -222,7 +246,8 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
             if (pr.getInt("handPitchOffR", 0) == -85 && pr.getInt("handRollOffR", 0) == 80) ed.remove("handPitchOffR").remove("handRollOffR");
             ed.apply();
         }
-        nativeSetHandAngles(pr.getInt("handPitchOffL", 0), pr.getInt("handRollOffL", 0), pr.getInt("handPitchOffR", 0), pr.getInt("handRollOffR", 0));
+        nativeSetHandAngles(pr.getInt(GameMenuUi.handKey("handPitchOffL"), 0), pr.getInt(GameMenuUi.handKey("handRollOffL"), 0),
+                pr.getInt(GameMenuUi.handKey("handPitchOffR"), 0), pr.getInt(GameMenuUi.handKey("handRollOffR"), 0));   // (las de este juego)
         // Calibración de las manos (con los controles): por mano, de la palma al agarre y al rayo del control.
         // (la de antes, con las palmas hacia el visor, no se usa más)
         float[] q = new float[0];
@@ -282,6 +307,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
     /// Durante el juego, las ventanas de la sala dejan de recibir imagen (la Mac deja de mandarla) y vuelven al salir
     private void setGameState(boolean on) {
         inGameNow = on;
+        loading.onGameState(on);
         for (Panel p : panels.values()) {
             if (p.win == null || p.inGame) continue;
             if (on && !p.paused) { p.win.stop(); p.paused = true; }

@@ -128,7 +128,7 @@ final class GameMenuUi implements Link.Listener {
     private void render() {
         JSONObject st = Link.I.state();
         String key = (st == null ? "" : String.valueOf(st.optJSONArray("windows")) + st.optJSONArray("displays") + st.optJSONObject("mainDisplay")) + confirmQuit + showGestures + screensPage + advPage + (st == null ? "" : String.valueOf(st.optJSONObject("adv"))) + handsPage + advAll + gesturesPage + gestureProfile + showVigia + host.vigia()
-                + prefs().getBoolean("gameHands", false) + prefs().getBoolean("handGestures", true) + prefs().getBoolean("hud", false) + prefs().getInt("handPitchOffL", 0) + prefs().getInt("handRollOffL", 0) + prefs().getInt("handPitchOffR", 0) + prefs().getInt("handRollOffR", 0)
+                + prefs().getBoolean("gameHands", false) + prefs().getBoolean("handGestures", true) + prefs().getBoolean("hud", false) + prefs().getInt(handKey("handPitchOffL"), 0) + prefs().getInt(handKey("handRollOffL"), 0) + prefs().getInt(handKey("handPitchOffR"), 0) + prefs().getInt(handKey("handRollOffR"), 0) + handKey("")
                 + selEye + selFps + selMbps + selFov + selFovC + showDetail + applied + qAll + (st == null ? "" : String.valueOf(st.optJSONObject("cfg")))
                 + host.isWindowOpen(WindowUi.MONITOR_ID) + calMsg;
         if (key.equals(drawnKey)) return;
@@ -331,20 +331,20 @@ final class GameMenuUi implements Link.Listener {
 
         // Derecha: el ángulo de las manos (y del láser) del juego, que se nota al instante
         right.addView(Ui.section(ctx, I18n.t("Ángulo de las manos y el láser del juego")));
-        TextView hint = Ui.label(ctx, I18n.t("Para cuando jugás con las manos: si la mano o el láser del juego no coinciden con tu mano, probá estas opciones mirando el juego."), 13, Ui.TEXT2, false);
+        TextView hint = Ui.label(ctx, I18n.t("Para cuando jugás con las manos: si la mano o el láser del juego no coinciden con tu mano, probá estas opciones mirando el juego. Se guardan para cada juego."), 13, Ui.TEXT2, false);
         hint.setPadding(dp(ctx, 4), 0, 0, dp(ctx, 4));
         right.addView(hint);
         for (String side : new String[]{"L", "R"}) {
             TextView hs = Ui.label(ctx, I18n.t(side.equals("L") ? "Mano izquierda" : "Mano derecha"), 15, Ui.ACCENT_TEXT, true);
             hs.setPadding(dp(ctx, 4), dp(ctx, 14), 0, 0);
             right.addView(hs);
-            stepper(I18n.t("Inclinación"), I18n.t("Hacia abajo si apunta muy arriba; hacia arriba si apunta muy abajo"), "handPitchOff" + side, 90,
+            stepper(I18n.t("Inclinación"), I18n.t("Hacia abajo si apunta muy arriba; hacia arriba si apunta muy abajo"), handKey("handPitchOff" + side), 90,
                     I18n.t("abajo"), I18n.t("arriba"));
-            stepper(I18n.t("Giro"), I18n.t("Si la palma del juego mira a otro lado que la tuya"), "handRollOff" + side, 180,
+            stepper(I18n.t("Giro"), I18n.t("Si la palma del juego mira a otro lado que la tuya"), handKey("handRollOff" + side), 180,
                     I18n.t("izquierda"), I18n.t("derecha"));
         }
         TextView reset = Ui.pill(ctx, I18n.t("Volver a lo recomendado"));
-        reset.setOnClickListener(v -> { prefs().edit().remove("handPitchOffL").remove("handRollOffL").remove("handPitchOffR").remove("handRollOffR").apply(); host.resetHandCal(); applyAngles(); drawnKey = ""; render(); });
+        reset.setOnClickListener(v -> { prefs().edit().remove(handKey("handPitchOffL")).remove(handKey("handRollOffL")).remove(handKey("handPitchOffR")).remove(handKey("handRollOffR")).apply(); host.resetHandCal(); applyAngles(); drawnKey = ""; render(); });
         LinearLayout.LayoutParams rlp2 = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         rlp2.topMargin = dp(ctx, 12);
         right.addView(reset, rlp2);
@@ -429,6 +429,13 @@ final class GameMenuUi implements Link.Listener {
             render();
             left.postDelayed(() -> { calMsg = null; render(); }, 6000);
         });
+    }
+
+    /// El ángulo de las manos se guarda por juego (cada juego pone la mano a su manera): la clave lleva el nombre del juego abierto
+    static String handKey(String base) {
+        org.json.JSONObject st = Link.I.state();
+        String g = st == null ? "" : st.optString("gameName", "");
+        return g.isEmpty() ? base : base + "@" + g;
     }
 
     private void applyAngles() { host.setHandAngles(0, 0); }   // (la parte VR lee los valores de cada mano)

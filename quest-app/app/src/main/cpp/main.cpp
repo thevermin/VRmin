@@ -1089,6 +1089,9 @@ Java_org_questvrbridge_client_VrActivity_nativeSetLocomotion(JNIEnv *, jclass, j
 }
 // «Traer todo al frente»: gira la sala y las ventanas para que queden delante de donde mirás
 static std::atomic<bool> g_recenter{false};
+// Recentrar con el botón de Meta: el espacio de la sala (STAGE) no gira con el recentrado, así que la sala quedaba
+// donde estaba (a veces a un costado): unos cuadros después (con la pose ya nueva) se trae todo al frente
+static std::atomic<int> g_recenterIn{0};
 extern "C" JNIEXPORT void JNICALL
 Java_org_questvrbridge_client_VrActivity_nativeRecenter(JNIEnv *, jclass) { g_recenter = true; }
 extern "C" JNIEXPORT void JNICALL
@@ -1196,18 +1199,27 @@ static std::atomic<uint32_t> g_imgVer{0};
 static std::atomic<float> g_3dStrength{0.008f};
 static std::atomic<bool> g_leds{true};
 static std::atomic<float> g_lightGain{1.0f};   // brillo de la pantalla y de las luces de atrás
-static std::atomic<int> g_env{0};              // 0 living, 1 espacio, 2 cine, 3 passthrough (tu cuarto real, sin moverte)
+static std::atomic<int> g_env{0};              // 0 living, 1 espacio, 2 cine, 3 passthrough (tu cuarto real, sin moverte), 4 carga (el vacío de la pantalla de carga)
 static std::atomic<bool> g_envChanged{false};
+static std::atomic<int> g_envUser{0};          // la sala elegida (g_env es la que se dibuja: cambia en la mitad de la transición)
+// Pantalla de carga: mientras se abre un juego (la pide la parte Java) se va a la sala «carga» con su panel adelante
+static std::atomic<bool> g_loading{false};
+static bool g_loadingNow = false;              // (hilo de dibujo) se está viendo la pantalla de carga
+static const int LOADING_ID = 0x2FFFFFA0;
 /// Ambientes con la pantalla principal fija (living: sobre su mueble; cine: la pantalla grande).
 /// Ahí la pantalla principal no se mueve, no cambia de tamaño y no se curva. Solo en el espacio flota libre.
 /// Cualquier ambiente nuevo es "fijo" salvo que se agregue acá.
-static bool fixedScreenEnv() { return g_env != 1 && g_env != 3; }
+static bool fixedScreenEnv() { return g_env != 1 && g_env != 3 && g_env != 4; }
 extern "C" JNIEXPORT void JNICALL
 Java_org_questvrbridge_client_VrActivity_nativeSetLight(JNIEnv *, jclass, jfloat g) { g_lightGain = std::min(2.f, std::max(0.f, (float)g)); }
 extern "C" JNIEXPORT void JNICALL
 Java_org_questvrbridge_client_VrActivity_nativeSetEnvironment(JNIEnv *, jclass, jint e) {
-    if (g_env.exchange(e) != e) g_envChanged = true;
+    g_envUser = std::max(0, std::min(4, (int)e));   // (el cambio, con su transición, lo hace el hilo de dibujo)
 }
+extern "C" JNIEXPORT void JNICALL
+Java_org_questvrbridge_client_VrActivity_nativeSetLoading(JNIEnv *, jclass, jboolean on) { g_loading = on; }
+/// Durante la pantalla de carga solo se ven su panel, el menú del reloj y el teclado (lo demás de la sala vuelve después)
+static bool hiddenByLoading(const UiPanel *p);
 extern "C" JNIEXPORT void JNICALL
 Java_org_questvrbridge_client_VrActivity_nativeSet3DStrength(JNIEnv *, jclass, jfloat s) { g_3dStrength = std::min(0.04f, std::max(0.f, (float)s)); }
 extern "C" JNIEXPORT void JNICALL
@@ -1747,6 +1759,9 @@ struct App {
     PFN_xrPassthroughPauseFB ptPause = nullptr;
     bool ptRunning = false;
     double revealStart = 0, exitStart = 0;
+    double envSwitchStart = 0;   // cambio de sala: la que se va se cierra con el borde de la transición y la nueva se abre
+    int envSwitchTo = 0;
+    bool envSwitched = false;
     double anchorAt = 0;   // cuándo se tomó el punto de referencia (la transición espera a que todo esté listo)
     float revealFwd[3] = {0, 0, -1};
     GLuint maskProg = 0;
@@ -5895,6 +5910,20 @@ vec3 spaceSky(vec3 d, vec3 rx, vec3 fz) {
 }
 
 // Atardecer: cielo naranja y violeta, sol bajo y nubes suaves
+// Cielo de la sala de carga: casi negro, un brillo ámbar finito en el horizonte y polvo que titila
+vec3 voidSky(vec3 d, float t) {
+    vec3 c = mix(vec3(0.010, 0.010, 0.013), vec3(0.022, 0.021, 0.024), smoothstep(-0.3, 0.5, d.y));
+    c += vec3(0.90, 0.62, 0.27) * (0.30 * exp(-abs(d.y) * 26.0) + 0.06 * exp(-abs(d.y) * 5.0));
+    vec3 q = d * 70.0;
+    vec3 cell = floor(q);
+    float h = fract(sin(dot(cell, vec3(127.1, 311.7, 74.7))) * 43758.5453);
+    if (h > 0.9965) {
+        vec3 fr = fract(q) - 0.5;
+        float tw = 0.5 + 0.5 * sin(t * (0.6 + h * 1.7) + h * 40.0);
+        c += vec3(0.95, 0.75, 0.45) * smoothstep(0.22, 0.0, length(fr)) * 0.45 * tw;
+    }
+    return c;
+}
 vec3 sunsetSky(vec3 d, vec3 rx, vec3 fz) {
     vec3 sun = normalize(fz + vec3(0.0, 0.06, 0.0));
     float y = d.y;
@@ -5966,6 +5995,20 @@ void main() {
     // Cuarto a oscuras: solo la pantalla de la TV y las tiras LED de atrás iluminan (como un cine en casa)
     if (mat == 8) { o = vec4(spaceSky(normalize(wp - eye), rx, fz), 1.0); return; }
     if (mat == 10) { o = vec4(sunsetSky(normalize(wp - eye), rx, fz), 1.0); return; }
+    if (mat == 12) { o = vec4(voidSky(normalize(wp - eye), time), 1.0); return; }
+    if (mat == 13) {
+        // piso de la sala de carga: grilla de 1 m que brilla apenas, se apaga con la distancia y se funde con el horizonte
+        vec2 q = vec2(lx, lz);
+        vec2 gd = abs(fract(q - 0.5) - 0.5) / max(fwidth(q), vec2(1e-4));
+        float line = 1.0 - min(min(gd.x, gd.y), 1.0);
+        float d = length(q);
+        vec3 v = normalize(wp - eye);
+        vec3 pcol = vec3(0.014, 0.014, 0.017) + vec3(0.55, 0.40, 0.20) * line * 0.22 * exp(-d * 0.07);
+        pcol += vec3(0.9, 0.62, 0.27) * 0.05 * exp(-d * 0.35);   // un poco de luz bajo tus pies
+        pcol = mix(pcol, voidSky(normalize(vec3(v.x, 0.0, v.z)), time), smoothstep(6.0, 27.0, d));
+        o = vec4(pcol, 1.0);
+        return;
+    }
     if (mat == 9) {
         // plataforma del espacio: vidrio oscuro en hexágonos con bordes que brillan suave
         vec2 p = vec2(lx, lz) * 1.6;
@@ -6312,6 +6355,25 @@ static void renderRoom(App &app, const XrView &view, const TvInfo *tv) {
         glDisable(GL_DEPTH_TEST);
         return;
     }
+    // Carga: un vacío oscuro con un piso de grilla que se pierde en un horizonte ámbar y polvo flotando
+    if (g_env == 4) {
+        auto boxW = [&](const float c[3], float sx, float sy, float sz, int mat) {
+            float M[16] = {r[0] * sx, r[1] * sx, r[2] * sx, 0, up[0] * sy, up[1] * sy, up[2] * sy, 0, f[0] * sz, f[1] * sz, f[2] * sz, 0, c[0], c[1], c[2], 1};
+            glUniformMatrix4fv(app.rM, 1, GL_FALSE, M);
+            glUniform3f(app.rCol, 1, 1, 1);
+            glUniform1i(app.rMat, mat);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+        };
+        glDepthMask(GL_FALSE);
+        float ec[3] = {view.pose.position.x, view.pose.position.y, view.pose.position.z};
+        boxW(ec, 60, 60, 60, 12);
+        glDepthMask(GL_TRUE);
+        float pc[3]; local(0, -0.05f, 0, pc);
+        boxW(pc, 56, 0.1f, 56, 13);
+        glBindVertexArray(0);
+        glDisable(GL_DEPTH_TEST);
+        return;
+    }
     // Espacio: cielo alrededor y una plataforma; sin habitación (la TV flota como una ventana más)
     if (g_env == 1) {
         auto boxW = [&](const float c[3], float sx, float sy, float sz, int mat) {
@@ -6479,6 +6541,19 @@ static void placePanel(App &app, UiPanel *p) {
         p->placed = true;
         return;
     }
+    if (p->id == LOADING_ID) {
+        // Pantalla de carga: delante de donde mirás, un poco lejos y a la altura de los ojos
+        float f[3] = {app.headFwd[0], 0, app.headFwd[2]};
+        float l = sqrtf(f[0] * f[0] + f[2] * f[2]);
+        if (l < 1e-3f) { f[0] = 0; f[2] = -1; l = 1; }
+        f[0] /= l; f[2] /= l;
+        float pos[3] = {app.headPos[0] + f[0] * 2.0f, app.headPos[1] - 0.05f, app.headPos[2] + f[2] * 2.0f};
+        float tgt[3] = {app.headPos[0], pos[1], app.headPos[2]};
+        p->pose.position = {pos[0], pos[1], pos[2]};
+        p->pose.orientation = facing(pos, tgt);
+        p->placed = true;
+        return;
+    }
     if (p->id == KEYBOARD_ID || p->id == LOCK_NOTE_ID) {
         // Debajo de la pantalla o ventana desde la que se abrió (el aviso de la pausa, donde aparece el teclado) (un poco hacia vos, inclinado como sobre una mesa)
         for (UiPanel *q : g_ui) if (q->id == g_kbAnchor.load() && q->placed && !q->dead && q != p && !q->hud) {
@@ -6538,7 +6613,7 @@ static void placePanel(App &app, UiPanel *p) {
     static const float angles[] = {40, -40, 75, -75, 20, -20, 55, -55};
     // La TV va sobre el mueble (que mide 48 cm), a la altura de los ojos si se puede
     // Living: sobre su pie, encima del mueble. Espacio: flotando delante tuyo, a la altura de los ojos
-    bool floating = g_env == 1 || g_env == 3;
+    bool floating = g_env == 1 || g_env == 3 || g_env == 4;
     if (p->tv) {
         // Tamaño de la TV según el lugar: pantalla de cine enorme, o TV de living
         float W = g_env == 2 ? 9.0f : 2.2f;
@@ -6733,6 +6808,13 @@ static bool panelInGame(const UiPanel *p) {
     if (p->inGame) return true;
     if (p->parent) for (UiPanel *q : g_ui) if (q->id == p->parent) return q->inGame;
     return false;
+}
+
+static bool hiddenByLoading(const UiPanel *p) {
+    const UiPanel *top = p;
+    if (p->parent) for (UiPanel *q : g_ui) if (q->id == p->parent) top = q;
+    if (top->id == LOADING_ID) return !g_loadingNow;
+    return g_loadingNow && top->id != WRIST_MENU_ID && top->id != KEYBOARD_ID && !top->hud;
 }
 
 static bool panelShown(const UiPanel *p) {
@@ -6955,6 +7037,7 @@ static int uiInput(App &app, XrTime time, const XrView &head, Ray rays[2], std::
         for (UiPanel *p : g_ui) {
             if (p->dead || p->closeAt > 0 || !p->ready || !p->placed || !panelShown(p) || p->hud) continue;   // (cerrándose: ya no se toca)
             if (g_inGameNow && !panelInGame(p)) continue;
+            if (hiddenByLoading(p)) continue;
             // (el menú de VRmin abierto sobre la pantalla principal es un menú: ahí el láser siempre toca)
             const bool menuOnTv = p->tv && !g_deskVisible;
             if (g_laserNoTouch && p->id != WRIST_MENU_ID && p->id != GAME_MENU_ID && p->id != KEYBOARD_ID && !menuOnTv) continue;   // solo el menú
@@ -7018,6 +7101,7 @@ static int uiInput(App &app, XrTime time, const XrView &head, Ray rays[2], std::
         if (p->dead || !p->ready || !p->placed || p->parent || p->hud || (p->tv && fixedScreenEnv())) continue;
         if (p->id == WRIST_MENU_ID && g_wristFollow) continue;
         if (g_inGameNow && (!p->inGame || p->id == GAME_MENU_ID)) continue;
+        if (hiddenByLoading(p) || p->id == LOADING_ID) continue;   // (la pantalla de carga no se mueve)
         Bar b;
         const float ex[3] = {1, 0, 0}, ey[3] = {0, 1, 0};
         rotate(p->pose.orientation, ex, b.ax); rotate(p->pose.orientation, ey, b.ay);
@@ -7273,7 +7357,8 @@ static float floorAt(App &app, float x, float z) {
 static bool insideRoom(const App &app, float x, float z) {
     float q[3] = {x - app.anc[0], 0, z - app.anc[2]};
     float lx = q[0] * -app.fwd[2] + q[2] * app.fwd[0], lz = q[0] * app.fwd[0] + q[2] * app.fwd[2];
-    return g_env == 1 ? sqrtf(lx * lx + lz * lz) < 5.5f
+    return g_env == 4 ? sqrtf(lx * lx + lz * lz) < 20.0f
+         : g_env == 1 ? sqrtf(lx * lx + lz * lz) < 5.5f
          : g_env == 2 ? (fabsf(lx) < 6.0f && lz > -4.5f && lz < 6.5f)
          : (fabsf(lx) < 3.1f && lz > -2.5f && lz < 2.45f);
 }
@@ -7308,6 +7393,7 @@ static bool teleportInput(App &app, XrTime time, const XrView &head) {
         }
     }
     // «Traer todo al frente»: el ángulo entre hacia dónde mira la sala y hacia dónde mirás vos
+    if (g_recenterIn > 0 && --g_recenterIn == 0) g_recenter = true;
     if (g_recenter.exchange(false)) {
         float m[9]; quatToMat(head.pose.orientation, m);
         float hx = -m[6], hz = -m[8];
@@ -7470,6 +7556,10 @@ static float revealAmount(App &app) {
     double t = nowMs();
     float r = app.revealStart > 0 ? (float)std::min(1.0, (t - app.revealStart) / 2000.0) : 0.f;
     if (app.exitStart > 0) r = std::min(r, (float)std::max(0.0, 1.0 - (t - app.exitStart) / 2000.0));
+    if (app.envSwitchStart > 0) {   // cambio de sala: se cierra (0,9 s) y se abre la nueva (0,9 s)
+        double k = (t - app.envSwitchStart) / 900.0;
+        r = std::min(r, (float)std::min(1.0, std::max(0.0, k < 1.0 ? 1.0 - k : k - 1.0)));
+    }
     return r * r * r * (r * (6 * r - 15) + 10);   // arranca y termina despacio
 }
 
@@ -7933,6 +8023,36 @@ static void renderFrame(App &app) {
     const bool fgFill = showVideo && fgMode == 1 && fgInit(app);                          // propio: completar hasta los Hz del visor
     if (fgOn || fgFill) fgUpdate(app, fgFill);
     g_frameGenOn = fgOn || fgFill;
+    // Pantalla de carga y cambio de sala (con la misma transición que al entrar: la sala que se va se cierra y la nueva se abre)
+    g_loadingNow = g_loading && !showVideo && !g_vigia;
+    {
+        const int want = g_loadingNow ? 4 : g_envUser.load();
+        static bool wasVideo = false;
+        const bool fromGame = wasVideo && !showVideo;   // (al cerrarse un juego no se ve la sala de antes: directo a la nueva)
+        wasVideo = showVideo;
+        const double tNow = nowMs();
+        if (app.envSwitchStart > 0 && (showVideo || !app.anchor)) {   // (un juego empezó en medio del cambio: se termina ya)
+            app.envSwitchStart = 0;
+            if (g_env != app.envSwitchTo) { g_env = app.envSwitchTo; g_envChanged = true; }
+        }
+        if (app.envSwitchStart == 0 && want != g_env) {
+            const bool animate = app.anchor && !showVideo && !fromGame && app.revealStart > 0 && tNow - app.revealStart > 2000 && app.exitStart == 0;
+            if (!animate) { g_env = want; g_envChanged = true; }
+            else {
+                app.envSwitchStart = tNow; app.envSwitchTo = want; app.envSwitched = false;
+                // el borde avanza como al entrar: la sala nueva aparece desde atrás tuyo y termina adelante
+                float hm[9]; quatToMat(views[0].pose.orientation, hm);
+                float l = sqrtf(hm[6] * hm[6] + hm[8] * hm[8]);
+                if (l > 1e-3f) { app.revealFwd[0] = hm[6] / l; app.revealFwd[1] = 0; app.revealFwd[2] = hm[8] / l; }
+                sendLog("Cambio de sala: %d → %d%s", g_env.load(), want, g_loadingNow ? " (pantalla de carga)" : "");
+            }
+        }
+        if (app.envSwitchStart > 0) {
+            const double k = tNow - app.envSwitchStart;
+            if (k >= 900 && !app.envSwitched) { app.envSwitched = true; g_env = app.envSwitchTo; g_envChanged = true; }
+            if (k >= 1800) app.envSwitchStart = 0;
+        }
+    }
     float reveal = revealAmount(app);
     if (app.hasPassthrough) {
         // El cuarto real hace falta durante la transición, y en la sala para ver tus manos reales
@@ -8246,6 +8366,7 @@ static void renderFrame(App &app) {
             if (p->dead || !p->ready || !p->placed || nLayers >= MAXL - 3 || !panelShown(p)) continue;
             if (p->hud) continue;   // el indicador va al final, encima de todo
             if (!showPanels && !(g_inGameNow && panelInGame(p))) continue;   // en un juego: solo su menú y sus ventanas
+            if (hiddenByLoading(p)) continue;
             if (update3D(app, p)) {
                 // TV o ventana en 3D: una imagen distinta para cada ojo
                 submit(p, p->sc3[0], XR_EYE_VISIBILITY_LEFT);
@@ -8385,7 +8506,7 @@ static void pollXrEvents(App &app) {
             // recentrado (botón de Meta): medir de nuevo la altura; en el Modo Centinela (visor apoyado) la altura no se
             // mide (es la elegida) y se recentra el juego hacia donde estás mirando
             if (g_vigia) { g_vg.needFrame = true; vigiaSay("recentrado"); }
-            else g_heightDirty = true;
+            else { g_heightDirty = true; g_recenterIn = 6; }
         } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
             app.exitRequested = true;
         }
