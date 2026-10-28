@@ -8,7 +8,8 @@ say() { if [ "$VRMIN_LANG" = es ]; then echo "$1"; else echo "${2:-$1}"; fi; }
 mkdir -p "$P/logs"
 MOTOR="$P/motor"
 WINEDIR="$MOTOR/wswine.bundle"
-WINE="$WINEDIR/bin/wine"
+WINE_REAL="$WINEDIR/bin/wine"
+WINE="$WINE_REAL"
 WINESERVER="$WINEDIR/bin/wineserver"
 FW="$MOTOR/Frameworks"
 MARCA_MOTOR="gcenx-11.8+dxmt-notpop1"
@@ -23,11 +24,15 @@ export MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION=1
 # La capa de Steam dentro de los juegos (gameoverlayrenderer) traba juegos y a Steam en Wine: desactivada
 export WINEDLLOVERRIDES="dxgi,d3d11,d3d10core=b;winemenubuilder.exe=d;gameoverlayrenderer,gameoverlayrenderer64=d"
 # Juegos Unity: Mono lee mal el último error de Windows en hilos nuevos (archivos que no existen "existen").
-# Este arreglo se carga en Wine y lo corrige sin tocar los juegos (ver arreglo_errores.c)
-[ -f "$RES/arreglo_errores.dylib" ] && export DYLD_INSERT_LIBRARIES="$RES/arreglo_errores.dylib"
+# Este arreglo se carga en Wine y lo corrige sin tocar los juegos (ver arreglo_errores.c). Solo en Wine (por wine.sh):
+# puesto para todo, macOS no abría sus propios programas de arm64e (curl, python…) en algunas Mac y el motor no se instalaba
+if [ -f "$RES/arreglo_errores.dylib" ] && [ -x "$RES/wine.sh" ]; then
+  export WINE_REAL QVB_ARREGLO="$RES/arreglo_errores.dylib"
+  WINE="$RES/wine.sh"
+fi
 STEAMDIR="$WINEPREFIX/drive_c/Program Files (x86)/Steam"
 STEAMLIB="$STEAMDIR/steamapps"
 
-motor_listo() { [ -x "$WINE" ] && [ -f "$WINEDIR/lib/wine/x86_64-unix/winemetal.so" ] && [ -d "$FW" ] \
+motor_listo() { [ -x "$WINE_REAL" ] && [ -f "$WINEDIR/lib/wine/x86_64-unix/winemetal.so" ] && [ -d "$FW" ] \
   && [ "$(cat "$WINEPREFIX/.wine_usado" 2>/dev/null)" = "$MARCA_MOTOR" ]; }
 steam_abierto() { pgrep -if "steam\.exe" >/dev/null; }
