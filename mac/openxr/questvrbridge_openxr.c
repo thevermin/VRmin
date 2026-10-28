@@ -1013,6 +1013,7 @@ static void init_once(void);
 static void install_gl_hook(void);
 static void install_dxvk_hooks(void);
 static void fix_opencomposite_32(void);
+static void hook_oc_vulkan(void);
 static void fix_opencomposite_stubs(void);
 static void fix_opencomposite_models(const char *app);
 static void install_wininet_fix(void);
@@ -1047,6 +1048,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateInstance(const XrInstanceCreateInfo *i
     install_gl_hook();   /* (solo hace algo si el juego usa OpenGL) */
     install_dxvk_hooks();   /* (solo si el juego trae DXVK, como Half-Life 2: VR Mod) */
     fix_opencomposite_32();
+    hook_oc_vulkan();
     fix_opencomposite_stubs();
     fix_opencomposite_models(info->applicationInfo.applicationName);
     install_wininet_fix();
@@ -2722,8 +2724,10 @@ static void gpu_poll(void) {
     LeaveCriticalSection(&g_gpuLock);
 }
 
+static void vk_flush_deferred(void);
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrWaitFrame(XrSession session, const XrFrameWaitInfo *i, XrFrameState *st) {
     g_inside = "xrWaitFrame";
+    vk_flush_deferred();   /* (Vulkan: la copia del cuadro anterior, ahora que el juego ya mandó su dibujo) */
     (void)i;
     Session *s = (Session *)session;
     int64_t period = 1000000000LL / g_fps;
@@ -3283,7 +3287,60 @@ static uint32_t vk_lagged_id(uint32_t id) {
 
 /* Vulkan: copia los dos ojos (en la GPU) a memoria que se puede leer, lado a lado; lee la del cuadro
    anterior (ya terminó en la GPU) y la pasa a la memoria compartida con la Mac */
-static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, const XrCompositionLayerQuad *const *qls, int nq, XrTime displayTime) {
+/* Copia sin cuadro de atraso (Vulkan por OpenComposite): OpenComposite copia la imagen del juego a nuestra
+ * swapchain apenas el juego llama a Submit, antes de que el juego mande a la GPU el dibujo de ese cuadro, así que la
+ * swapchain siempre tiene el cuadro anterior (por eso se le informaba al visor la pose de un cuadro antes). Ahora se
+ * anota de qué imagen del juego copia OpenComposite (su vkCmdCopyImage), y nuestra copia se hace un poco después
+ * (al empezar el cuadro siguiente, cuando el juego ya mandó el dibujo) directo desde esa imagen: un cuadro menos de
+ * demora. Se puede apagar escribiendo 0 en C:\questvrbridge\vk_diferido.txt. */
+typedef struct { uint64_t dst, src; uint32_t layer; int64_t at; } OcCopy;
+static OcCopy g_ocCopy[24];
+static PFN_vkCmdCopyImage o_ocCmdCopyImage;
+static void VKAPI_CALL h_ocCmdCopyImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageCopy *r) {
+    if (n == 1 && r && !r->srcOffset.x && !r->srcOffset.y && !r->dstOffset.x && !r->dstOffset.y && sl == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        EnterCriticalSection(&g_lock);
+        int k = -1, old = 0;
+        for (int i = 0; i < 24; i++) {
+            if (g_ocCopy[i].dst == (uint64_t)dst) { k = i; break; }
+            if (g_ocCopy[i].at < g_ocCopy[old].at) old = i;
+        }
+        if (k < 0) k = old;
+        g_ocCopy[k].dst = (uint64_t)dst; g_ocCopy[k].src = (uint64_t)src; g_ocCopy[k].layer = r->srcSubresource.baseArrayLayer; g_ocCopy[k].at = now_ns();
+        LeaveCriticalSection(&g_lock);
+    }
+    o_ocCmdCopyImage(cb, src, sl, dst, dl, n, r);
+}
+static int oc_src_for(VkImage dst, VkImage *src, uint32_t *layer) {
+    int ok = 0;
+    EnterCriticalSection(&g_lock);
+    for (int i = 0; i < 24; i++)
+        if (g_ocCopy[i].dst == (uint64_t)dst && now_ns() - g_ocCopy[i].at < 500000000LL) { *src = (VkImage)g_ocCopy[i].src; *layer = g_ocCopy[i].layer; ok = 1; break; }
+    LeaveCriticalSection(&g_lock);
+    return ok;
+}
+static int vk_diferido(void) {
+    static int on = 1; static DWORD leido;
+    DWORD now = GetTickCount();
+    if (now - leido > 2000) {
+        leido = now;
+        FILE *fp = fopen("C:\\questvrbridge\\vk_diferido.txt", "r");
+        int v = 1;
+        if (fp) { if (fscanf(fp, "%d", &v) != 1) v = 1; fclose(fp); }
+        if ((v != 0) != on) { on = v != 0; logmsg("Vulkan: copia sin cuadro de atraso %s", on ? "encendida" : "apagada"); }
+    }
+    return on && o_ocCmdCopyImage != NULL;
+}
+static void hook_oc_vulkan(void) {
+    static HMODULE hecho;
+    HMODULE m = GetModuleHandleA("vrclient_x64.dll");
+    if (!m) m = GetModuleHandleA("vrclient.dll");
+    if (!m || m == hecho) return;
+    hecho = m;
+    void *o;
+    if (patch_iat(m, "vulkan-1.dll", "vkCmdCopyImage", (void *)h_ocCmdCopyImage, &o)) { memcpy(&o_ocCmdCopyImage, &o, sizeof o); logmsg("OpenComposite: copias de imagen anotadas (Vulkan sin cuadro de atraso)"); }
+}
+
+static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, const XrCompositionLayerQuad *const *qls, int nq, XrTime displayTime, int diferido) {
     Swapchain *sc0 = (Swapchain *)pl->views[0].subImage.swapchain;
     if (!sc0 || !sc0->vimg[0]) return;
     if (sc0->dxgi != DXGI_FORMAT_R8G8B8A8_TYPELESS && sc0->dxgi != DXGI_FORMAT_B8G8R8A8_TYPELESS) return;
@@ -3327,6 +3384,7 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
     if (!vk_stage_idle(s, k, 30)) { InterlockedIncrement(&g_statBusy); return; }   /* (el hilo de lectura todavía la usa) */
     vk.WaitForFences(s->vkDev, 1, &s->vkFence[k], VK_TRUE, 1000000000ULL);
     VkImage imgs[2]; uint32_t layers[2]; VkBufferImageCopy reg[2];
+    int deJuego = diferido;   /* (los dos ojos se copian desde la imagen del juego) */
     for (int e = 0; e < 2; e++) {
         const XrSwapchainSubImage *si = &pl->views[e].subImage;
         Swapchain *sc = (Swapchain *)si->swapchain;
@@ -3343,6 +3401,11 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
         if (y + h > (int)sc->h) h = (int)sc->h - y;
         if (w <= 0 || h <= 0) { InterlockedIncrement(&g_skipFmt); return; }
         imgs[e] = sc->vimg[sc->released]; layers[e] = si->imageArrayIndex;
+        if (deJuego) {
+            VkImage src; uint32_t sl;
+            if (si->imageArrayIndex == 0 && oc_src_for(imgs[e], &src, &sl)) { imgs[e] = src; layers[e] = sl; }
+            else deJuego = 0;
+        }
         memset(&reg[e], 0, sizeof reg[e]);
         reg[e].bufferOffset = (VkDeviceSize)e * ew * 4;
         reg[e].bufferRowLength = ew * 2; reg[e].bufferImageHeight = eh;
@@ -3351,6 +3414,11 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
         reg[e].imageOffset.x = x; reg[e].imageOffset.y = y;
         reg[e].imageExtent.width = (uint32_t)w; reg[e].imageExtent.height = (uint32_t)h; reg[e].imageExtent.depth = 1;
     }
+    if (diferido && !deJuego)   /* (no se sabe de dónde copió OpenComposite: la de la swapchain, como antes) */
+        for (int e = 0; e < 2; e++) { Swapchain *sc = (Swapchain *)pl->views[e].subImage.swapchain; imgs[e] = sc->vimg[sc->released]; layers[e] = pl->views[e].subImage.imageArrayIndex; }
+    { static int dicho = -1; if (diferido && dicho != deJuego) { dicho = deJuego; logmsg(deJuego ? "Vulkan: se copia directo de la imagen del juego (sin cuadro de atraso)" : "Vulkan: no encontré la imagen del juego: copia con un cuadro de atraso"); } }
+    /* (la imagen del juego ya está lista para copiar —así la deja para OpenComposite— y queda igual) */
+    const VkImageLayout eyeL = deJuego ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     int nb = (imgs[1] == imgs[0] && layers[1] == layers[0]) ? 1 : 2;   /* (los dos ojos en la misma imagen y capa: un solo cambio) */
     VkImageMemoryBarrier toSrc[2 + NQ], back[2 + NQ];
     for (int e = 0; e < nb; e++) {
@@ -3361,9 +3429,9 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
         b.subresourceRange.levelCount = 1; b.subresourceRange.baseArrayLayer = layers[e]; b.subresourceRange.layerCount = 1;
         toSrc[e] = b; back[e] = b;
         toSrc[e].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT; toSrc[e].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        toSrc[e].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; toSrc[e].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toSrc[e].oldLayout = eyeL; toSrc[e].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         back[e].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; back[e].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        back[e].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; back[e].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        back[e].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; back[e].newLayout = eyeL;
     }
     /* paneles flotantes: su imagen también se copia a memoria que se puede leer, y se anota dónde está cada uno */
     VkBufferImageCopy qreg[NQ]; VkImage qimg[NQ]; int qn = 0, nbq = nb;
@@ -3382,14 +3450,17 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
             || !vk_quad_buffers(s, qn, (uint32_t)qw, (uint32_t)qh)) continue;
         int j = qn++;
         qimg[j] = qs->vimg[qs->released];
+        uint32_t qlay = ql->subImage.imageArrayIndex;
+        VkImageLayout qL = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        if (deJuego) { VkImage src; uint32_t sl; if (qlay == 0 && oc_src_for(qimg[j], &src, &sl)) { qimg[j] = src; qlay = sl; qL = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; } }
         memset(&qreg[j], 0, sizeof qreg[j]);
         qreg[j].bufferRowLength = (uint32_t)qw; qreg[j].bufferImageHeight = (uint32_t)qh;
         qreg[j].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        qreg[j].imageSubresource.baseArrayLayer = ql->subImage.imageArrayIndex; qreg[j].imageSubresource.layerCount = 1;
+        qreg[j].imageSubresource.baseArrayLayer = qlay; qreg[j].imageSubresource.layerCount = 1;
         qreg[j].imageOffset.x = qx; qreg[j].imageOffset.y = qy;
         qreg[j].imageExtent.width = (uint32_t)qw; qreg[j].imageExtent.height = (uint32_t)qh; qreg[j].imageExtent.depth = 1;
-        toSrc[nbq] = toSrc[0]; toSrc[nbq].image = qimg[j]; toSrc[nbq].subresourceRange.baseArrayLayer = ql->subImage.imageArrayIndex;
-        back[nbq] = back[0]; back[nbq].image = qimg[j]; back[nbq].subresourceRange.baseArrayLayer = ql->subImage.imageArrayIndex;
+        toSrc[nbq] = toSrc[0]; toSrc[nbq].image = qimg[j]; toSrc[nbq].subresourceRange.baseArrayLayer = qlay; toSrc[nbq].oldLayout = qL;
+        back[nbq] = back[0]; back[nbq].image = qimg[j]; back[nbq].subresourceRange.baseArrayLayer = qlay; back[nbq].newLayout = qL;
         nbq++;
         /* dónde está el panel respecto de la capa de la imagen 3D (y cada ojo, con la pose y el campo de visión de la capa) */
         int v1, v2;
@@ -3468,7 +3539,7 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
         vk.DestroyFence(s->vkDev, s->vkFence[k], NULL); vk.CreateFence(s->vkDev, &fi, NULL, &s->vkFence[k]);
         InterlockedIncrement(&g_mapFail); return;
     }
-    uint32_t id = vk_lagged_id(pose_id_for_layer(pl, displayTime));
+    uint32_t id = deJuego ? pose_id_for_layer(pl, displayTime) : vk_lagged_id(pose_id_for_layer(pl, displayTime));
     s->stPose[k] = id;
     /* los paneles se proyectan con los ojos de la pose que se le informa al visor (la de la imagen): si no, temblaban
      * igual que antes la imagen */
@@ -3494,6 +3565,33 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
     }
     InterlockedExchange(&s->vkPend[k], 1);
     SetEvent(s->vkEv);
+}
+
+/* La copia diferida: lo que mandó el juego en xrEndFrame (las capas, copiadas: sus punteros ya no valen después)
+ * se copia de la GPU al empezar el cuadro siguiente (xrWaitFrame) */
+static struct {
+    int on; Session *s; XrTime t; int nq;
+    XrCompositionLayerProjection pl; XrCompositionLayerProjectionView views[2];
+    XrCompositionLayerQuad q[NQ];
+} g_vkPend;
+static void vk_flush_deferred(void) {
+    if (!g_vkPend.on) return;
+    g_vkPend.on = 0;
+    if (!g_vkPend.s || !g_vkPend.s->vk) return;
+    const XrCompositionLayerQuad *qls[NQ];
+    for (int i = 0; i < g_vkPend.nq; i++) qls[i] = &g_vkPend.q[i];
+    g_vkPend.pl.views = g_vkPend.views;
+    vk_readback(g_vkPend.s, &g_vkPend.pl, qls, g_vkPend.nq, g_vkPend.t, 1);
+}
+static void vk_defer(Session *s, const XrCompositionLayerProjection *pl, const XrCompositionLayerQuad *const *qls, int nq, XrTime t) {
+    vk_flush_deferred();   /* (si el juego no llamó a xrWaitFrame entre dos cuadros) */
+    if (pl->viewCount < 2 || !pl->views) return;
+    g_vkPend.s = s; g_vkPend.t = t; g_vkPend.pl = *pl; g_vkPend.pl.next = NULL;
+    g_vkPend.views[0] = pl->views[0]; g_vkPend.views[1] = pl->views[1];
+    g_vkPend.views[0].next = g_vkPend.views[1].next = NULL;
+    g_vkPend.nq = nq;
+    for (int i = 0; i < nq; i++) { g_vkPend.q[i] = *qls[i]; g_vkPend.q[i].next = NULL; }
+    g_vkPend.on = 1;
 }
 
 /* OpenGL: lee los dos ojos lado a lado con PBO (el del cuadro anterior ya terminó en la GPU) y los pasa a la
@@ -3626,7 +3724,8 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
                     const XrCompositionLayerQuad *qls[NQ]; int nq = 0;   /* (los paneles flotantes, en orden) */
                     for (uint32_t j = 0; j < info->layerCount && nq < NQ; j++)
                         if (info->layers[j] && info->layers[j]->type == XR_TYPE_COMPOSITION_LAYER_QUAD) qls[nq++] = (const XrCompositionLayerQuad *)info->layers[j];
-                    vk_readback(s, pl, qls, nq, info->displayTime);
+                    if (vk_diferido()) vk_defer(s, pl, qls, nq, info->displayTime);   /* (se copia al empezar el cuadro siguiente) */
+                    else { vk_flush_deferred(); vk_readback(s, pl, qls, nq, info->displayTime, 0); }
                 }
                 else if (s->gl) gl_readback(s, pl, info->displayTime);
                 else {
