@@ -6351,15 +6351,16 @@ static void renderRoom(App &app, const XrView &view, const TvInfo *tv) {
             }
         }
         cb(0, -2.1f, 7.6f, 21.9f, 0.4f, 3.0f, 0.06f, 0.04f, 0.04f, 2);          // frente, debajo de la pantalla
-        cb(0, -1.75f, 8.25f, 12.0f, 0.3f, 1.3f, 0.08f, 0.05f, 0.05f, 6);        // escenario delante de la pantalla
-        cb(0, -1.59f, 7.62f, 12.0f, 0.02f, 0.03f, 0.9f, 0.5f, 0.2f, 4);         // su borde con luz
+        cb(0, -1.75f, 8.25f, 15.0f, 0.3f, 1.3f, 0.08f, 0.05f, 0.05f, 6);        // escenario delante de la pantalla
+        cb(0, -1.59f, 7.62f, 15.0f, 0.02f, 0.03f, 0.9f, 0.5f, 0.2f, 4);         // su borde con luz
         // marco de la pantalla: telones a los costados, cenefa arriba y paneles oscuros hasta las paredes
-        cb(-5.6f, 2.6f, 8.6f, 1.6f, 6.0f, 0.3f, 0.45f, 0.04f, 0.05f, 6);
-        cb(5.6f, 2.6f, 8.6f, 1.6f, 6.0f, 0.3f, 0.45f, 0.04f, 0.05f, 6);
-        cb(0, 6.1f, 8.6f, 12.8f, 1.0f, 0.3f, 0.45f, 0.04f, 0.05f, 6);
-        cb(-8.6f, 3.5f, 9.0f, 4.8f, 11.0f, 0.4f, 0.07f, 0.05f, 0.05f, 6);
-        cb(8.6f, 3.5f, 9.0f, 4.8f, 11.0f, 0.4f, 0.07f, 0.05f, 0.05f, 6);
-        cb(0, 8.0f, 9.0f, 12.4f, 2.4f, 0.4f, 0.07f, 0.05f, 0.05f, 6);
+        // (pantalla: 11,7 m de ancho, centrada a 3,3 m: de -0,36 a 6,96 de alto)
+        cb(-6.65f, 2.9f, 8.6f, 1.6f, 9.0f, 0.3f, 0.45f, 0.04f, 0.05f, 6);
+        cb(6.65f, 2.9f, 8.6f, 1.6f, 9.0f, 0.3f, 0.45f, 0.04f, 0.05f, 6);
+        cb(0, 7.5f, 8.6f, 14.9f, 1.0f, 0.3f, 0.45f, 0.04f, 0.05f, 6);
+        cb(-9.4f, 3.5f, 9.0f, 3.2f, 11.0f, 0.4f, 0.07f, 0.05f, 0.05f, 6);
+        cb(9.4f, 3.5f, 9.0f, 3.2f, 11.0f, 0.4f, 0.07f, 0.05f, 0.05f, 6);
+        cb(0, 8.5f, 9.0f, 15.6f, 1.0f, 0.4f, 0.07f, 0.05f, 0.05f, 6);
         // paredes de los costados: paneles acolchados con apliques de luz tenue entre ellos
         for (int k = 0; k < 11; k++) {
             float z = -14.0f + k * 2.1f;
@@ -6651,11 +6652,11 @@ static void placePanel(App &app, UiPanel *p) {
     bool floating = g_env == 1 || g_env == 3 || g_env == 4;
     if (p->tv) {
         // Tamaño de la TV según el lugar: pantalla de cine enorme, o TV de living
-        float W = g_env == 2 ? 9.0f : 2.2f;
+        float W = g_env == 2 ? 11.7f : 2.2f;
         p->hm = p->hm / p->wm * W; p->wm = W;
     }
     float ang = 0, dist = floating ? 2.6f : 2.85f, y = floating ? app.eyeH : 0.59f + p->hm / 2;
-    if (p->tv && g_env == 2) { dist = 8.6f; y = 2.6f; }
+    if (p->tv && g_env == 2) { dist = 8.6f; y = 3.3f; }
     if (!floating) y += app.worldY;
     if (!p->tv) { ang = angles[app.placedWindows % 8] * (float)M_PI / 180.f; dist = 2.0f; y = app.eyeH - 0.05f; app.placedWindows++; }
     float c = cosf(ang), sn = sinf(ang);
