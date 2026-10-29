@@ -8331,6 +8331,13 @@ static void renderFrame(App &app) {
         // el piso vuelve a estar a la altura real (por si estabas en otra fila del cine)
         for (UiPanel *p : g_ui) p->pose.position.y -= app.worldY;
         app.worldY = 0;
+        // y volvés al medio del lugar nuevo (si no, al haberte alejado mucho aparecías afuera y no te podías mover):
+        // el lugar se ubica donde estás, y las ventanas se mueven lo mismo
+        {
+            float dx = app.headPos[0] - app.anc[0], dz = app.headPos[2] - app.anc[2];
+            app.anc[0] += dx; app.anc[2] += dz;
+            for (UiPanel *p : g_ui) { p->pose.position.x += dx; p->pose.position.z += dz; }
+        }
         for (UiPanel *p : g_ui) if (p->tv) {   // la TV va a su lugar en el ambiente nuevo
             if (fixedScreenEnv()) { p->curved = false; p->radius = 0; p->curveAmt = 0; }   // y si es fija, plana
             placePanel(app, p);
