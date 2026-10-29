@@ -3971,6 +3971,7 @@ final class Perf {
         o["video"] = nEnc > 0 ? (sumEnc / Double(nEnc) * 100).rounded() / 100 : 0
         o["recibidos"] = nMac
         o["saltados"] = dropped
+        o["termico"] = ProcessInfo.processInfo.thermalState.rawValue   // (0 normal · 1 tibia · 2 caliente: baja la velocidad · 3 crítica)
         sumMac = 0; nMac = 0; sumEnc = 0; nEnc = 0; dropped = 0
         last = o; lastAt = now
         return o
