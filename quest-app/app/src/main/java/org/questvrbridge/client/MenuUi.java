@@ -1614,7 +1614,7 @@ final class MenuUi implements Link.Listener {
     /// Salas: el lugar donde estás (su propia sección del menú, separada de los ajustes)
     private void renderRoom() {
         header(I18n.t("Salas"), I18n.t("El lugar donde estás en el Modo Studio."));
-        choice(content, I18n.t("Lugar"), null, new String[]{I18n.t("Living\nCon TV y luces"), I18n.t("Espacio\nSin TV fija: todo flota"), I18n.t("Cine\nPantalla gigante"), I18n.t("Passthrough\nTu cuarto real: todo flota, sin moverte"), I18n.t("Carga\nEl vacío de la pantalla de carga")},
+        choice(content, I18n.t("Lugar"), null, new String[]{I18n.t("Living\nCon TV y luces"), I18n.t("Espacio\nFlotás entre planetas, sin moverte"), I18n.t("Cine\nPantalla gigante"), I18n.t("Passthrough\nTu cuarto real: todo flota, sin moverte"), I18n.t("Carga\nEl vacío de la pantalla de carga"), I18n.t("Autocine\nPantalla gigante bajo las estrellas")},
                 prefs().getInt("env", 0), i -> { prefs().edit().putInt("env", i).apply(); host.setEnvironment(i); }, true);
         content.addView(Ui.section(ctx, I18n.t("Luces")));
         toggle(content, null, I18n.t("Luces detrás de la TV"), I18n.t("Siguen los colores de la pantalla (solo en el living)"), prefs().getBoolean("leds", true),
