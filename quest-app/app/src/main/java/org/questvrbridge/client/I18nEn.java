@@ -399,7 +399,6 @@ final class I18nEn {
         m.put("El lugar donde estás en el Modo Studio.", "Where you are in Studio Mode.");
         m.put("Equilibrado\nRecomendado", "Balanced\nRecommended");
         m.put("Espacio\nFlotás entre planetas, sin moverte", "Space\nFloat among planets, without moving");
-        m.put("Avión\nAsiento de ventanilla, de noche", "Airplane\nWindow seat, at night");
         m.put("General", "General");
         m.put("IA\nLa Mac calcula la profundidad (también juegos planos)", "AI\nThe Mac works out the depth (flat games too)");
         m.put("Lado a lado (SBS)\nPara videos 3D lado a lado", "Side by side (SBS)\nFor side-by-side 3D videos");
