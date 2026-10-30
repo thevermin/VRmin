@@ -1199,7 +1199,7 @@ static std::atomic<uint32_t> g_imgVer{0};
 static std::atomic<float> g_3dStrength{0.008f};
 static std::atomic<bool> g_leds{true};
 static std::atomic<float> g_lightGain{1.0f};   // brillo de la pantalla y de las luces de atrás
-static std::atomic<int> g_env{0};              // 0 living, 1 espacio, 2 cine, 3 passthrough (tu cuarto real, sin moverte), 4 carga (el vacío de la pantalla de carga), 5 autocine
+static std::atomic<int> g_env{0};              // 0 living, 1 espacio, 2 cine, 3 passthrough (tu cuarto real, sin moverte), 4 carga (el vacío de la pantalla de carga), 5 avión (en tu asiento, sin moverte)
 static std::atomic<bool> g_envChanged{false};
 static std::atomic<int> g_envUser{0};          // la sala elegida (g_env es la que se dibuja: cambia en la mitad de la transición)
 // Pantalla de carga: mientras se abre un juego (la pide la parte Java) se va a la sala «carga» con su panel adelante
@@ -5856,11 +5856,13 @@ uniform float time;
 float h3(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
 float vnoise(vec3 p) {
     vec3 i = floor(p), f = fract(p);
-    f = f * f * (3.0 - 2.0 * f);
+    f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);   // (suave también en la curvatura: si no, se veían las aristas de la grilla del ruido)
     return mix(mix(mix(h3(i), h3(i + vec3(1, 0, 0)), f.x), mix(h3(i + vec3(0, 1, 0)), h3(i + vec3(1, 1, 0)), f.x), f.y),
                mix(mix(h3(i + vec3(0, 0, 1)), h3(i + vec3(1, 0, 1)), f.x), mix(h3(i + vec3(0, 1, 1)), h3(i + vec3(1, 1, 1)), f.x), f.y), f.z);
 }
-float fbm(vec3 p) { float a = 0.5, s = 0.0; for (int i = 0; i < 4; i++) { s += a * vnoise(p); p *= 2.03; a *= 0.5; } return s; }
+// (cada octava girada: así las grillas de las octavas no se alinean y no se ven líneas rectas en las nebulosas)
+const mat3 FBM_ROT = mat3(0.00, 0.80, 0.60, -0.80, 0.36, -0.48, -0.60, -0.48, 0.64);
+float fbm(vec3 p) { float a = 0.5, s = 0.0; for (int i = 0; i < 4; i++) { s += a * vnoise(p); p = FBM_ROT * p * 2.03; a *= 0.5; } return s; }
 
 // Espacio: nebulosas de colores, estrellas de varios tamaños, un planeta con atmósfera y anillo, y un sol lejano
 vec3 spaceSky(vec3 d, vec3 rx, vec3 fz) {
@@ -5898,56 +5900,36 @@ vec3 spaceSky(vec3 d, vec3 rx, vec3 fz) {
             c += vec3(0.75, 0.70, 0.95) * (exp(-rq * 5.0) * 1.2 + arms * exp(-rq * 2.2) * 0.25) * 0.35 * smoothstep(3.0, 1.8, rq);
         }
     }
-    // Planeta (una esfera de verdad: se ve redonda desde cualquier ángulo) con nubes que se mueven y un anillo
-    vec3 P = normalize(rx * 0.6 + fz * 0.75 + vec3(0.0, 0.18, 0.0)) * 3.0;
-    float R = 0.75;
-    float bq = dot(d, P), cq = dot(P, P) - R * R, disc = bq * bq - cq;
-    float tp = disc > 0.0 ? bq - sqrt(disc) : 1e9;           // distancia hasta la superficie (o nada)
-    vec3 ringN = normalize(vec3(0.18, 1.0, 0.28));
-    float dn = dot(d, ringN), tr = abs(dn) > 1e-4 ? dot(P, ringN) / dn : -1.0;
-    vec3 rp = d * tr - P;
-    float rr = length(rp) / R;
-    float ringA = 0.0; vec3 ringC = vec3(0.0);
-    if (tr > 0.0 && rr > 1.35 && rr < 2.25) {
-        float band = 0.55 + 0.45 * sin(rr * 41.0) * sin(rr * 13.0);
-        float gap = smoothstep(0.015, 0.04, abs(rr - 1.78));   // la división del anillo
-        // la sombra del planeta sobre el anillo
-        vec3 rw = d * tr;
-        vec3 toP = P - rw; float bs = dot(toP, sun), cs = dot(toP, toP) - R * R;
-        float shadow = (bs > 0.0 && bs * bs - cs > 0.0) ? 0.15 : 1.0;
-        ringA = 0.7 * gap * smoothstep(1.35, 1.45, rr) * smoothstep(2.25, 2.1, rr);
-        ringC = vec3(0.78, 0.70, 0.56) * band * 0.6 * shadow;
+    // planeta
+    vec3 pc = normalize(rx * 0.6 + fz * 0.75 + vec3(0.0, 0.18, 0.0));
+    float rad = 0.24, ca = dot(d, pc);
+    float ang = acos(clamp(ca, -1.0, 1.0));
+    // anillo inclinado
+    vec3 ringN = normalize(vec3(0.15, 1.0, 0.25));
+    vec3 o = -pc * 1.0;
+    float t = -dot(o, ringN) / dot(d, ringN);
+    if (t > 0.0) {
+        vec3 hp = o + d * t;
+        float rr = length(hp) / sin(rad);
+        if (rr > 1.35 && rr < 2.1 && !(ang < rad && t > 1.0)) {
+            float band = 0.55 + 0.45 * sin(rr * 40.0) * sin(rr * 13.0);
+            c = mix(c, vec3(0.75, 0.68, 0.55) * band * 0.55, 0.65 * smoothstep(1.35, 1.45, rr) * smoothstep(2.1, 1.95, rr));
+        }
     }
-    // el anillo de atrás (más lejos que el planeta) queda tapado por él
-    if (ringA > 0.0 && tr > tp) ringA = 0.0;
-    if (tp < 1e8) {
-        vec3 hp = d * tp, n = normalize(hp - P);
-        float lit = max(dot(n, sun), 0.0);
-        // bandas y nubes en coordenadas del planeta (giran despacio)
-        // (ruido en 3D sobre la esfera, girando: sin la costura que dejaba la longitud)
-        float ga = time * 0.01, gca = cos(ga), gsa = sin(ga);
-        vec3 nr = vec3(gca * n.x - gsa * n.z, n.y, gsa * n.x + gca * n.z);
-        float bands = fbm(vec3(nr.y * 9.0, nr.x * 1.2, nr.z * 1.2));
-        float cb2 = time * 0.02, cc = cos(cb2), cs2 = sin(cb2);
-        vec3 nc = vec3(cc * n.x - cs2 * n.z, n.y, cs2 * n.x + cc * n.z);
-        float clouds = smoothstep(0.55, 0.8, fbm(nc * vec3(3.0, 6.0, 3.0) + 2.0));
-        vec3 surf = mix(vec3(0.10, 0.18, 0.36), vec3(0.45, 0.62, 0.85), bands);
-        surf = mix(surf, vec3(0.9), clouds * 0.5);
-        // la sombra del anillo sobre el planeta
-        float dr = dot(sun, ringN), ts = abs(dr) > 1e-4 ? dot(P - hp, ringN) / dr : -1.0;
-        float rs = length(hp + sun * ts - P) / R;
-        float rsh = (ts > 0.0 && rs > 1.35 && rs < 2.25) ? 0.45 : 1.0;
-        float rim = pow(1.0 - max(dot(n, -d), 0.0), 3.0);
-        c = surf * (0.03 + 0.97 * lit * rsh) + vec3(0.25, 0.5, 1.0) * rim * (0.15 + 0.85 * lit) * 0.8;
-    } else if (disc > -0.06 && bq > 0.0) {
-        c += vec3(0.2, 0.45, 1.0) * smoothstep(-0.06, 0.0, disc) * 0.3;   // atmósfera alrededor
-    }
-    c = mix(c, ringC, ringA);
+    if (ang < rad) {
+        float x = ang / rad;
+        vec3 sn = normalize(d - pc * cos(rad));
+        float lit = clamp(dot(normalize(cross(cross(pc, sun), pc)), normalize(d - pc)) * 1.3 + 0.35, 0.0, 1.0);
+        float bands = fbm(vec3(d.y * 18.0, d.x * 3.0, d.z * 3.0));
+        vec3 surf = mix(vec3(0.10, 0.18, 0.36), vec3(0.45, 0.62, 0.85), bands) * (0.15 + 0.85 * lit);
+        surf += vec3(0.25, 0.5, 1.0) * pow(x, 6.0) * 0.6 * (0.3 + lit);     // atmósfera en el borde
+        c = surf;
+    } else if (ang < rad * 1.08) c += vec3(0.2, 0.45, 1.0) * (1.0 - (ang - rad) / (rad * 0.08)) * 0.35;
     // Una luna chica con cráteres
     {
         vec3 M = normalize(rx * 0.95 + fz * 0.15 + vec3(0.0, 0.42, 0.0)) * 3.0;
         float Rm = 0.12, bm = dot(d, M), dm = bm * bm - (dot(M, M) - Rm * Rm);
-        if (dm > 0.0 && (bm - sqrt(dm)) < tp) {
+        if (dm > 0.0 && !(ang < rad)) {   // (no delante del planeta)
             vec3 hm = d * (bm - sqrt(dm)), nm = normalize(hm - M);
             float cr = smoothstep(0.45, 0.75, fbm(nm * 9.0));
             c = vec3(0.62, 0.60, 0.57) * (0.85 - cr * 0.35) * (0.02 + max(dot(nm, sun), 0.0));
@@ -5993,16 +5975,35 @@ vec3 nightSky(vec3 d, vec3 rx, vec3 fz) {
     float md = acos(clamp(dot(d, mp), -1.0, 1.0));
     c += vec3(0.22, 0.24, 0.30) * exp(-md * 14.0) * 0.25;
     if (md < 0.032) c = vec3(0.86, 0.86, 0.80) * (0.72 + 0.28 * fbm(d * 160.0));
-    // El bosque alrededor, pintado: copas de pinos recortadas contra el cielo (no se ve el horizonte)
-    float az = atan(d.x, d.z);
-    vec2 ac = vec2(cos(az), sin(az));   // (sin costura al dar la vuelta)
-    float ridge = 0.13 + 0.06 * fbm(vec3(ac * 2.0, 0.0)) + 0.035 * fbm(vec3(ac * 9.0, 3.0));
-    float tips = abs(fract(az * 38.0 / 6.2832 * 6.0 + fbm(vec3(ac * 5.0, 7.0)) * 3.0) - 0.5) * 2.0;
-    ridge += 0.03 * (1.0 - tips) * (0.6 + 0.4 * fbm(vec3(ac * 20.0, 1.0)));
-    if (h < ridge) {
-        c = vec3(0.004, 0.006, 0.004) * (0.6 + 0.6 * fbm(d * 40.0));
-        c += vec3(0.010, 0.012, 0.016) * smoothstep(ridge - 0.012, ridge, h);   // el borde de las copas, con luz de luna
+    return c;
+}
+
+// Lo que se ve por la ventanilla del avión: de noche, a mucha altura, una ciudad iluminada a lo lejos, nubes y estrellas
+vec3 planeView(vec3 d, vec3 rx, vec3 fz) {
+    vec3 dl = vec3(dot(d, rx), d.y, dot(d, fz));
+    vec3 c = nightSky(d, rx, fz);
+    if (dl.y < 0.0) {
+        float t = 1.0 / max(-dl.y, 0.004);                    // (el suelo, muy abajo)
+        vec2 p = dl.xz * t + vec2(37.0, 11.0);
+        vec3 g = vec3(0.004, 0.005, 0.009);
+        // ciudades: manchas grandes donde hay luces, con calles en grilla y puntitos naranjas y blancos
+        float city = smoothstep(0.52, 0.72, fbm(vec3(p * 0.035, 4.0)));
+        vec2 cell = floor(p * 6.0), fr = fract(p * 6.0) - 0.5;
+        float hsh = h2(cell);
+        float dotL = smoothstep(0.22, 0.0, length(fr)) * step(0.55, hsh);
+        float street = (smoothstep(0.06, 0.0, abs(fr.x)) + smoothstep(0.06, 0.0, abs(fr.y))) * 0.25;
+        float far = clamp(t / 60.0, 0.0, 1.0);                 // a lo lejos, los puntitos se funden en un resplandor
+        vec3 lights = mix(vec3(1.0, 0.62, 0.28), vec3(0.95, 0.92, 0.85), step(0.85, hsh));
+        g += lights * city * mix(dotL * 1.6 + street, 0.35, far) * 0.9;
+        g = mix(g, vec3(0.05, 0.035, 0.03), smoothstep(0.0, 1.0, far) * 0.7);   // bruma del horizonte
+        c = g;
+        // nubes debajo del avión, apenas iluminadas por la luna y por la ciudad
+        float t2 = 0.45 / max(-dl.y, 0.004);
+        vec2 q = dl.xz * t2;
+        float cl = smoothstep(0.5, 0.78, fbm(vec3(q * 0.25, 9.0)));
+        c = mix(c, vec3(0.06, 0.065, 0.08) + g * 0.3, cl * 0.75 * (1.0 - far * 0.5));
     }
+    c += vec3(0.02, 0.022, 0.03) * exp(-abs(dl.y) * 25.0);  // (el horizonte, apenas más claro)
     return c;
 }
 
@@ -6072,23 +6073,10 @@ void main() {
     } else if (mat == 4) {
         o = vec4(col, 1.0);
         return;
-    } else if (mat == 19) {   // foquitos que se prenden en cadena (carteles del autocine)
-        o = vec4(col * (0.25 + 0.75 * step(0.5, fract(time * 1.2 + (lx + lz + y) * 0.9))), 1.0);
-        return;
     } else if (mat == 5) {
         c *= 0.96 + 0.04 * h2(floor(vec2(lx + lz, y) * 40.0));
     } else if (mat == 6) {
         c *= 0.92 + 0.08 * h2(floor(vec2(lx * 90.0, y * 90.0 + lz * 90.0)));
-    } else if (mat == 15) {
-        // campo del autocine: pasto oscuro y calles de ripio entre las filas de autos, que se apaga a lo lejos
-        vec2 p = vec2(lx, lz);
-        float n = vnoise(vec3(p * 3.0, 0.0)), n2 = vnoise(vec3(p * 0.35, 1.0));
-        vec3 grass = vec3(0.030, 0.045, 0.022) * (0.65 + 0.7 * n) * (0.8 + 0.4 * n2);
-        vec3 grav = vec3(0.070, 0.064, 0.058) * (0.75 + 0.5 * h2(floor(p * 45.0)));
-        float lane = 0.0;
-        for (int i = -2; i <= 1; i++) lane = max(lane, smoothstep(1.4, 1.0, abs(lz - (float(i) * 7.0 + 3.5))));
-        lane = max(lane, smoothstep(2.2, 1.8, abs(lx)) * step(-26.0, lz) * step(lz, 24.0));   // la calle del medio
-        c = mix(grass, grav, clamp(lane + (n2 - 0.6), 0.0, 1.0)) * exp(-length(p) * 0.012) * 3.0;
     } else if (mat == 7) {
         // cuadro abstracto
         vec2 a = vec2(lz, y) * 2.2;
@@ -6106,7 +6094,7 @@ void main() {
     if (mat == 8) { o = vec4(spaceSky(normalize(wp - eye), rx, fz), 1.0); return; }
     if (mat == 10) { o = vec4(sunsetSky(normalize(wp - eye), rx, fz), 1.0); return; }
     if (mat == 12) { o = vec4(voidSky(normalize(wp - eye), time, rx, fz), 1.0); return; }
-    if (mat == 14) { o = vec4(nightSky(normalize(wp - eye), rx, fz), 1.0); return; }
+    if (mat == 14) { o = vec4(planeView(normalize(wp - eye), rx, fz), 1.0); return; }
     if (mat == 13) {
         // piso de la sala de carga: grilla de 1 m que brilla apenas, se apaga con la distancia y se funde con el horizonte
         vec2 q = vec2(lx, lz);
@@ -6422,26 +6410,20 @@ static void renderRoom(App &app, const XrView &view, const TvInfo *tv) {
         glUniform3fv(app.rScrG, 9, &g[0][0]);
     }
     glUniform1f(app.rGain, g_lightGain.load());
-    glUniform1f(app.rScrK, g_env == 2 ? 0.035f : g_env == 5 ? 0.006f : 0.45f);   // en el cine la pantalla grande ilumina toda la sala
+    glUniform1f(app.rScrK, g_env == 2 ? 0.035f : g_env == 5 ? 2.5f : 0.45f);   // en el cine la pantalla grande ilumina toda la sala
 
     glUniform1f(app.rTime, (float)fmod(nowMs() / 1000.0, 1000.0));
-    // Autocine: de noche, en un claro del bosque; la pantalla gigante ilumina los autos, con estrellas y luna
+    // Avión de noche: estás en el asiento de la ventanilla; tu pantalla (la principal) es la del asiento de adelante,
+    // las demás están apagadas; por las ventanillas se ve una ciudad a lo lejos, nubes y estrellas
     if (g_env == 5) {
         glUniform1f(app.rLedOn, 0.f);
-        float am[3] = {0.010f, 0.012f, 0.020f}; glUniform3fv(app.rAmb, 1, am);   // (luz de luna)
-        // Una caja con su propio giro (en grados: alrededor de lo vertical, de lo lateral y de lo largo), en la sala
-        auto bx = [&](float x, float y, float z, float sx, float sy, float sz, float yaw, float pitch, float roll,
+        float am[3] = {0.028f, 0.032f, 0.050f}; glUniform3fv(app.rAmb, 1, am);   // (luz de cabina de noche, azulada)
+        auto bx = [&](float x, float y, float z, float sx, float sy, float sz, float pitch, float roll,
                       float cr, float cg, float cbl, int mat) {
             const float k = (float)M_PI / 180.f;
-            float cy = cosf(yaw * k), sy2 = sinf(yaw * k), cp = cosf(pitch * k), sp = sinf(pitch * k), cz = cosf(roll * k), sz2 = sinf(roll * k);
-            // R = Ry · Rx · Rz (columnas en coordenadas de la sala: x derecha, y arriba, z adelante)
-            float Rz[3][3] = {{cz, sz2, 0}, {-sz2, cz, 0}, {0, 0, 1}};
-            float L[3][3];
-            for (int i = 0; i < 3; i++) {
-                float vx = Rz[i][0], vy = Rz[i][1], vz = Rz[i][2];
-                float y1 = vy * cp - vz * sp, z1 = vy * sp + vz * cp;          // Rx
-                L[i][0] = vx * cy + z1 * sy2; L[i][1] = y1; L[i][2] = -vx * sy2 + z1 * cy;   // Ry
-            }
+            float cp = cosf(pitch * k), sp = sinf(pitch * k), cz = cosf(roll * k), sz2 = sinf(roll * k);
+            float Rz[3][3] = {{cz, sz2, 0}, {-sz2, cz, 0}, {0, 0, 1}}, L[3][3];
+            for (int i = 0; i < 3; i++) { L[i][0] = Rz[i][0]; L[i][1] = Rz[i][1] * cp - Rz[i][2] * sp; L[i][2] = Rz[i][1] * sp + Rz[i][2] * cp; }
             float W[3][3];
             for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) W[i][j] = r[j] * L[i][0] + up[j] * L[i][1] + f[j] * L[i][2];
             float c[3]; local(x, y, z, c);
@@ -6455,201 +6437,74 @@ static void renderRoom(App &app, const XrView &view, const TvInfo *tv) {
             glDrawArrays(GL_TRIANGLES, 0, 36);
         };
         auto cb = [&](float x, float y, float z, float sx, float sy, float sz, float cr, float cg, float cbl, int mat) {
-            bx(x, y, z, sx, sy, sz, 0, 0, 0, cr, cg, cbl, mat);
+            bx(x, y, z, sx, sy, sz, 0, 0, cr, cg, cbl, mat);
         };
-        // cielo (con el bosque pintado alrededor) y el piso del claro
-        glDepthMask(GL_FALSE);
-        {
-            float ec[3] = {view.pose.position.x, view.pose.position.y, view.pose.position.z};
-            float M[16] = {r[0] * 60, r[1] * 60, r[2] * 60, 0, 0, 60, 0, 0, f[0] * 60, f[1] * 60, f[2] * 60, 0, ec[0], ec[1], ec[2], 1};
-            glUniformMatrix4fv(app.rM, 1, GL_FALSE, M); glUniform3f(app.rCol, 1, 1, 1); glUniform1i(app.rMat, 14);
-            glDrawArrays(GL_TRIANGLES, 0, 36);
-        }
-        glDepthMask(GL_TRUE);
-        cb(0, -0.05f, 0, 140.0f, 0.1f, 140.0f, 1, 1, 1, 15);
-
-        // ---- La pantalla: 20 m, centrada a 8,2 m de alto y a 26 m; atrás, la torre de andamios
-        cb(0, 8.2f, 26.45f, 21.6f, 13.8f, 0.5f, 0.06f, 0.06f, 0.065f, 16);                 // marco
-        cb(0, 15.25f, 26.3f, 22.2f, 0.35f, 0.8f, 0.10f, 0.08f, 0.07f, 16);                 // cornisa
-        for (int k = -10; k <= 10; k++) cb(k * 1.05f, 1.12f, 26.1f, 0.12f, 0.12f, 0.06f, 0.95f, 0.72f, 0.35f, 19);   // foquitos de abajo
-        for (int k = -3; k <= 3; k++) {
-            cb(k * 3.5f, 7.6f, 27.8f, 0.3f, 15.2f, 0.3f, 0.09f, 0.09f, 0.095f, 16);        // postes
-            if (k < 3) for (int j = 0; j < 4; j++)                                            // diagonales
-                bx(k * 3.5f + 1.75f, 2.0f + j * 3.6f, 27.8f, 0.12f, 4.6f, 0.12f, 0, 0, (j & 1) ? 38.f : -38.f, 0.08f, 0.08f, 0.085f, 16);
-        }
-        for (int j = 0; j < 5; j++) cb(0, 0.4f + j * 3.6f, 27.8f, 21.2f, 0.16f, 0.16f, 0.09f, 0.09f, 0.095f, 16);   // travesaños
-        for (int j = 0; j < 14; j++) cb(10.6f, 0.5f + j * 1.0f, 28.4f, 0.8f, 0.06f, 0.25f, 0.12f, 0.12f, 0.12f, 16);  // escalera
-        cb(0, 0.55f, 26.6f, 22.4f, 1.1f, 1.6f, 0.14f, 0.10f, 0.08f, 5);                   // base de material
-        cb(0, 1.0f, 25.78f, 6.0f, 0.5f, 0.04f, 0.95f, 0.50f, 0.15f, 4);                   // cartel de la base
-        // juegos para chicos delante de la pantalla: hamacas y tobogán
-        for (int s2 = -1; s2 <= 1; s2 += 2) {
-            bx(-6.0f + s2 * 1.8f, 1.15f, 21.0f, 0.08f, 2.5f, 0.08f, 0, 12.f, 0, 0.5f, 0.12f, 0.1f, 16);
-            bx(-6.0f + s2 * 1.8f, 1.15f, 21.8f, 0.08f, 2.5f, 0.08f, 0, -12.f, 0, 0.5f, 0.12f, 0.1f, 16);
-        }
-        cb(-6.0f, 2.35f, 21.4f, 3.8f, 0.08f, 0.08f, 0.5f, 0.12f, 0.1f, 16);
-        for (int k = -1; k <= 1; k += 2) {
-            cb(-6.0f + k * 0.8f, 1.5f, 21.4f, 0.02f, 1.7f, 0.02f, 0.3f, 0.3f, 0.3f, 18);
-            cb(-6.0f + k * 0.8f, 0.62f, 21.4f, 0.5f, 0.05f, 0.22f, 0.15f, 0.12f, 0.1f, 6);
-        }
-        cb(6.0f, 1.0f, 22.2f, 0.9f, 0.08f, 0.9f, 0.6f, 0.5f, 0.1f, 16);
-        for (int j = 0; j < 4; j++) cb(6.0f, 0.25f + j * 0.25f, 22.9f + j * 0.12f, 0.8f, 0.04f, 0.18f, 0.3f, 0.3f, 0.3f, 18);
-        bx(6.0f, 0.55f, 20.8f, 0.8f, 0.04f, 2.2f, 0, 26.f, 0, 0.75f, 0.2f, 0.12f, 16);     // tobogán
-
-        // ---- Autos: cuatro filas mirando a la pantalla (en la tuya, el lugar del medio está libre: ahí estás vos)
-        static const float paint[10][3] = {{0.55f, 0.06f, 0.06f}, {0.08f, 0.24f, 0.45f}, {0.80f, 0.74f, 0.62f}, {0.06f, 0.34f, 0.28f},
-                                           {0.65f, 0.45f, 0.08f}, {0.12f, 0.12f, 0.14f}, {0.48f, 0.12f, 0.32f}, {0.62f, 0.78f, 0.80f},
-                                           {0.85f, 0.42f, 0.38f}, {0.30f, 0.45f, 0.20f}};
-        const float GL[3] = {0.015f, 0.022f, 0.032f}, CH[3] = {0.55f, 0.56f, 0.58f}, TR[3] = {0.02f, 0.02f, 0.022f};
-        for (int row = -2; row <= 1; row++) {
-            const float z = row * 7.0f;
-            for (int kk = -4; kk <= 4; kk++) {
-                if (kk == 0 && row == 0) continue;
-                if (abs(kk) == 4 && row == 1) continue;
-                const float x = kk * 3.6f;
-                const unsigned hsh = (unsigned)((row + 7) * 131 + (kk + 9) * 71);
-                // poste con el parlante (a la izquierda de cada lugar), con un cable
-                cb(x - 1.75f, 0.6f, z + 0.4f, 0.08f, 1.2f, 0.08f, 0.22f, 0.22f, 0.23f, 18);
-                cb(x - 1.75f, 1.25f, z + 0.4f, 0.3f, 0.22f, 0.16f, 0.10f, 0.10f, 0.11f, 16);
-                cb(x - 1.75f, 1.30f, z + 0.49f, 0.18f, 0.12f, 0.01f, 0.05f, 0.05f, 0.05f, 6);   // rejilla
-                cb(x - 1.75f, 1.40f, z + 0.49f, 0.04f, 0.04f, 0.01f, 0.1f, 0.8f, 0.3f, 4);
-                if (hsh % 9 == 4) continue;   // algunos lugares vacíos
-                const float *pc = paint[hsh % 10];
-                const int style = (hsh / 10) % 3;                     // 0 sedán con aletas · 1 camioneta · 2 rural
-                const bool twoTone = (hsh / 30) % 2 == 0;
-                const float roofC[3] = {twoTone ? 0.82f : pc[0] * 0.92f, twoTone ? 0.80f : pc[1] * 0.92f, twoTone ? 0.74f : pc[2] * 0.92f};
-                // carrocería: base, bordes biselados, capot y baúl inclinados, guardabarros
-                cb(x, 0.62f, z, 1.86f, 0.52f, 4.9f, pc[0], pc[1], pc[2], 16);
-                bx(x - 0.88f, 0.86f, z, 0.16f, 0.16f, 4.7f, 0, 0, 45.f, pc[0], pc[1], pc[2], 16);
-                bx(x + 0.88f, 0.86f, z, 0.16f, 0.16f, 4.7f, 0, 0, 45.f, pc[0], pc[1], pc[2], 16);
-                bx(x, 0.92f, z + 1.6f, 1.72f, 0.1f, 1.7f, 0, 4.f, 0, pc[0], pc[1], pc[2], 16);   // capot
-                cb(x, 0.32f, z + 2.42f, 1.9f, 0.18f, 0.2f, CH[0], CH[1], CH[2], 18);            // paragolpes
-                cb(x, 0.32f, z - 2.42f, 1.9f, 0.18f, 0.2f, CH[0], CH[1], CH[2], 18);
-                cb(x, 0.62f, z + 2.46f, 1.2f, 0.26f, 0.04f, 0.04f, 0.04f, 0.045f, 16);           // parrilla
-                for (int g = 0; g < 4; g++) cb(x, 0.53f + g * 0.06f, z + 2.48f, 1.2f, 0.015f, 0.02f, CH[0], CH[1], CH[2], 18);
-                for (int s2 = -1; s2 <= 1; s2 += 2) {
-                    cb(x + s2 * 0.72f, 0.66f, z + 2.46f, 0.26f, 0.2f, 0.04f, 0.32f, 0.32f, 0.30f, 17);   // faros (apagados)
-                    cb(x + s2 * 0.72f, 0.66f, z + 2.42f, 0.32f, 0.26f, 0.06f, CH[0], CH[1], CH[2], 18);  // su aro
-                    cb(x + s2 * 0.94f, 0.62f, z, 0.02f, 0.03f, 4.6f, CH[0], CH[1], CH[2], 18);            // moldura lateral
-                    cb(x + s2 * 0.94f, 1.18f, z + 0.85f, 0.14f, 0.08f, 0.04f, CH[0], CH[1], CH[2], 18);   // espejo
-                    for (int w = -1; w <= 1; w += 2) {                                                     // ruedas (octógonos)
-                        const float wx = x + s2 * 0.82f, wz = z + w * 1.5f;
-                        cb(wx, 0.34f, wz, 0.26f, 0.68f, 0.68f, TR[0], TR[1], TR[2], 6);
-                        bx(wx, 0.34f, wz, 0.26f, 0.68f, 0.68f, 0, 45.f, 0, TR[0], TR[1], TR[2], 6);
-                        cb(wx + s2 * 0.12f, 0.34f, wz, 0.04f, 0.3f, 0.3f, CH[0], CH[1], CH[2], 18);        // taza
-                        cb(wx - s2 * 0.02f, 0.58f, wz, 0.3f, 0.2f, 0.9f, 0.01f, 0.01f, 0.01f, 6);          // hueco del guardabarros
-                    }
-                }
-                if (style == 1) {   // camioneta: cabina corta y caja atrás
-                    cb(x, 1.25f, z + 0.35f, 1.7f, 0.62f, 1.3f, roofC[0], roofC[1], roofC[2], 16);
-                    bx(x, 1.22f, z + 1.06f, 1.55f, 0.5f, 0.04f, 0, -28.f, 0, GL[0], GL[1], GL[2], 17);
-                    cb(x - 0.86f, 1.25f, z + 0.35f, 0.02f, 0.42f, 1.0f, GL[0], GL[1], GL[2], 17);
-                    cb(x + 0.86f, 1.25f, z + 0.35f, 0.02f, 0.42f, 1.0f, GL[0], GL[1], GL[2], 17);
-                    cb(x, 0.95f, z - 1.4f, 1.8f, 0.1f, 2.1f, 0.06f, 0.05f, 0.04f, 6);                 // piso de la caja
-                    cb(x - 0.88f, 1.15f, z - 1.4f, 0.08f, 0.4f, 2.1f, pc[0], pc[1], pc[2], 16);
-                    cb(x + 0.88f, 1.15f, z - 1.4f, 0.08f, 0.4f, 2.1f, pc[0], pc[1], pc[2], 16);
-                    cb(x, 1.15f, z - 2.42f, 1.8f, 0.4f, 0.08f, pc[0], pc[1], pc[2], 16);
-                    cb(x, 1.05f, z - 1.2f, 1.2f, 0.12f, 0.9f, 0.35f, 0.18f, 0.08f, 6);                // una manta en la caja
-                } else {            // sedán o rural: cabina con parantes, parabrisas y luneta inclinados
-                    const float len = style == 2 ? 2.7f : 1.8f, cz0 = style == 2 ? z - 0.75f : z - 0.35f;
-                    cb(x, 1.52f, cz0, 1.52f, 0.08f, len, roofC[0], roofC[1], roofC[2], 16);           // techo
-                    bx(x, 1.2f, cz0 + len / 2 + 0.2f, 1.5f, 0.66f, 0.04f, 0, -32.f, 0, GL[0], GL[1], GL[2], 17);   // parabrisas
-                    if (style == 0) bx(x, 1.2f, cz0 - len / 2 - 0.2f, 1.5f, 0.66f, 0.04f, 0, 32.f, 0, GL[0], GL[1], GL[2], 17);   // luneta
-                    else cb(x, 1.2f, cz0 - len / 2 + 0.02f, 1.5f, 0.6f, 0.04f, GL[0], GL[1], GL[2], 17);
-                    for (int s2 = -1; s2 <= 1; s2 += 2) {
-                        cb(x + s2 * 0.76f, 1.2f, cz0, 0.02f, 0.56f, len - 0.1f, GL[0], GL[1], GL[2], 17);      // ventanillas
-                        cb(x + s2 * 0.76f, 1.2f, cz0 + 0.1f, 0.05f, 0.6f, 0.06f, roofC[0], roofC[1], roofC[2], 16);   // parante del medio
-                    }
-                    // adentro: asientos, volante y alguien mirando la película
-                    cb(x, 0.95f, cz0 + 0.1f, 1.4f, 0.12f, 0.5f, 0.25f, 0.12f, 0.08f, 6);
-                    cb(x, 1.15f, cz0 - 0.15f, 1.4f, 0.45f, 0.1f, 0.25f, 0.12f, 0.08f, 6);
-                    bx(x - 0.38f, 1.12f, cz0 + 0.6f, 0.34f, 0.34f, 0.03f, 0, -60.f, 0, 0.05f, 0.05f, 0.05f, 16);
-                    if (hsh % 3 != 0) {
-                        cb(x - 0.38f, 1.25f, cz0 + 0.05f, 0.3f, 0.42f, 0.22f, 0.03f, 0.03f, 0.035f, 6);       // hombros
-                        cb(x - 0.38f, 1.5f, cz0 + 0.05f, 0.2f, 0.24f, 0.22f, 0.05f, 0.035f, 0.03f, 6);         // cabeza
-                    }
-                    if (style == 0) {   // aletas atrás, con las luces
-                        for (int s2 = -1; s2 <= 1; s2 += 2) {
-                            bx(x + s2 * 0.82f, 1.02f, z - 1.75f, 0.12f, 0.34f, 1.3f, 0, -8.f, 0, pc[0], pc[1], pc[2], 16);
-                            cb(x + s2 * 0.82f, 1.0f, z - 2.43f, 0.1f, 0.22f, 0.04f, 0.6f, 0.03f, 0.02f, 4);
-                        }
-                    } else {
-                        for (int s2 = -1; s2 <= 1; s2 += 2) cb(x + s2 * 0.75f, 0.75f, z - 2.46f, 0.3f, 0.12f, 0.03f, 0.55f, 0.03f, 0.02f, 4);
-                    }
-                }
-                cb(x, 0.5f, z - 2.46f, 0.5f, 0.15f, 0.02f, 0.75f, 0.72f, 0.55f, 16);   // patente
-                if (hsh % 4 == 1) cb(x + 0.8f, 1.6f, z + 1.2f, 0.015f, 0.9f, 0.015f, CH[0], CH[1], CH[2], 18);   // antena
-                if (hsh % 5 == 2) {   // el parlante colgado de la ventanilla, con el cable
-                    cb(x - 0.98f, 1.22f, z + 0.3f, 0.08f, 0.2f, 0.26f, 0.10f, 0.10f, 0.11f, 16);
-                }
+        // Cabina: vos en el asiento A (x = 0, fila 0), la ventanilla a tu izquierda; tres asientos, el pasillo y otros tres.
+        // Todo se acomoda a la altura de tus ojos (como si estuvieras sentado, aunque estés parado)
+        const float WALL_L = -0.50f, WALL_R = 3.55f, ROW = 0.82f, Z0 = -3.75f, Z1 = 4.75f;
+        const float LEN = Z1 - Z0, ZC = (Z0 + Z1) / 2;
+        const float yo = app.eyeH - 1.15f;
+        auto cy = [&](float x, float y, float z, float sx, float sy, float sz, float cr, float cg, float cbl, int mat) { cb(x, y + yo, z, sx, sy, sz, cr, cg, cbl, mat); };
+        auto by = [&](float x, float y, float z, float sx, float sy, float sz, float pitch, float roll, float cr, float cg, float cbl, int mat) {
+            bx(x, y + yo, z, sx, sy, sz, pitch, roll, cr, cg, cbl, mat);
+        };
+        // afuera (detrás de las ventanillas): la noche
+        cy(WALL_L - 0.25f, 1.15f, ZC, 0.02f, 1.2f, LEN, 1, 1, 1, 14);
+        cy(WALL_R + 0.25f, 1.15f, ZC, 0.02f, 1.2f, LEN, 1, 1, 1, 14);
+        // piso (alfombra), con la línea de luces del pasillo
+        cy(1.52f, -0.02f, ZC, 4.1f, 0.04f, LEN, 0.06f, 0.07f, 0.11f, 2);
+        for (int i = 0; i < 18; i++) cy(1.27f, 0.005f, Z0 + 0.3f + i * 0.46f, 0.03f, 0.01f, 0.1f, 0.25f, 0.55f, 0.95f, 4);
+        // paredes: abajo derecha, arriba curvada hacia adentro, y una ventanilla en cada fila
+        for (int s2 = 0; s2 < 2; s2++) {
+            const float wx = s2 ? WALL_R : WALL_L, sg = s2 ? 1.f : -1.f;
+            cy(wx, 0.45f, ZC, 0.06f, 0.9f, LEN, 0.62f, 0.62f, 0.60f, 5);                                   // abajo
+            by(wx - sg * 0.04f, 1.55f, ZC, 0.06f, 0.5f, LEN, 0, sg * 14.f, 0.66f, 0.66f, 0.64f, 5);        // arriba (curva)
+            cy(wx - sg * 0.02f, 0.92f, ZC, 0.12f, 0.04f, LEN, 0.55f, 0.55f, 0.53f, 16);                   // repisa
+            for (int rw = -5; rw <= 5; rw++) {
+                const float zc = rw * ROW + 0.05f;   // (la ventanilla, al lado de cada fila)
+                cy(wx, 1.13f, zc + ROW / 2, 0.06f, 0.42f, ROW - 0.30f, 0.66f, 0.66f, 0.64f, 5);          // entre ventanillas
+                cy(wx - sg * 0.005f, 1.13f, zc - 0.16f, 0.07f, 0.40f, 0.03f, 0.74f, 0.74f, 0.72f, 16);  // marco
+                cy(wx - sg * 0.005f, 1.13f, zc + 0.16f, 0.07f, 0.40f, 0.03f, 0.74f, 0.74f, 0.72f, 16);
+                cy(wx - sg * 0.005f, 1.34f, zc, 0.07f, 0.04f, 0.32f, 0.74f, 0.74f, 0.72f, 16);
+                cy(wx - sg * 0.005f, 0.92f, zc, 0.07f, 0.04f, 0.32f, 0.74f, 0.74f, 0.72f, 16);
+                if (rw != 0 && ((rw + 9) * 7) % 4 == 1) cy(wx, 1.27f, zc, 0.065f, 0.13f, 0.30f, 0.78f, 0.78f, 0.76f, 16);   // cortina medio baja
             }
         }
-
-        // ---- El kiosco (comida y proyección), con toldo a rayas, mesas, cartel de neón y la cabina del proyector
-        cb(0, 2.0f, -24.0f, 12.0f, 4.0f, 6.0f, 0.42f, 0.30f, 0.20f, 5);
-        cb(0, 4.15f, -23.3f, 13.0f, 0.3f, 7.6f, 0.12f, 0.08f, 0.07f, 16);
-        for (int k = -6; k < 6; k++) bx(k * 1.0f + 0.5f, 3.1f, -20.3f, 1.0f, 0.05f, 1.6f, 0, -22.f, 0, (k & 1) ? 0.85f : 0.75f, (k & 1) ? 0.82f : 0.08f, (k & 1) ? 0.78f : 0.06f, 6);   // toldo
-        for (int k = -2; k <= 2; k++) cb(k * 2.2f, 1.6f, -20.98f, 1.5f, 1.2f, 0.04f, 0.95f, 0.70f, 0.38f, 4);   // ventanas
-        cb(0, 0.95f, -20.6f, 11.0f, 0.1f, 0.6f, 0.25f, 0.15f, 0.10f, 16);                          // mostrador
-        cb(3.5f, 2.6f, -20.96f, 2.0f, 0.9f, 0.03f, 0.10f, 0.10f, 0.09f, 16);                        // pizarra del menú
-        for (int j = 0; j < 4; j++) cb(3.2f, 2.85f - j * 0.2f, -20.94f, 1.2f, 0.05f, 0.01f, 0.9f, 0.85f, 0.6f, 4);
-        cb(0, 3.6f, -20.95f, 1.2f, 0.5f, 0.04f, 0.95f, 0.90f, 0.80f, 4);                            // ventanita del proyector
-        cb(0, 5.3f, -21.5f, 7.0f, 1.3f, 0.15f, 0.05f, 0.04f, 0.05f, 16);                            // cartel
-        cb(0, 5.82f, -21.4f, 6.4f, 0.07f, 0.04f, 0.95f, 0.25f, 0.55f, 4);
-        cb(0, 4.78f, -21.4f, 6.4f, 0.07f, 0.04f, 0.95f, 0.25f, 0.55f, 4);
-        for (int k = -5; k <= 5; k++) cb(k * 0.42f, 5.3f, -21.4f, 0.26f, 0.5f, 0.04f, 0.20f, 0.85f, 0.85f, (k & 1) ? 4 : 19);   // letras
-        for (int t = -1; t <= 1; t += 2) {   // mesas de picnic con sombrilla
-            const float tx = t * 7.5f, tz = -17.5f;
-            cb(tx, 0.75f, tz, 1.8f, 0.06f, 0.8f, 0.35f, 0.22f, 0.12f, 6);
-            cb(tx, 0.45f, tz - 0.65f, 1.8f, 0.05f, 0.3f, 0.35f, 0.22f, 0.12f, 6);
-            cb(tx, 0.45f, tz + 0.65f, 1.8f, 0.05f, 0.3f, 0.35f, 0.22f, 0.12f, 6);
-            for (int l = -1; l <= 1; l += 2) cb(tx + l * 0.75f, 0.37f, tz, 0.08f, 0.74f, 1.5f, 0.3f, 0.19f, 0.1f, 6);
-            cb(tx, 1.4f, tz, 0.05f, 1.4f, 0.05f, 0.5f, 0.5f, 0.5f, 18);
-            for (int q = 0; q < 4; q++) bx(tx, 2.05f, tz, 1.1f, 0.04f, 2.3f, q * 45.f, 18.f, 0, q & 1 ? 0.85f : 0.1f, q & 1 ? 0.8f : 0.35f, q & 1 ? 0.75f : 0.55f, 6);
-            cb(tx + 2.0f, 0.45f, tz + 0.5f, 0.5f, 0.9f, 0.5f, 0.12f, 0.2f, 0.12f, 16);              // tacho
-        }
-        // ---- Entrada: boletería con cartel de foquitos
-        cb(-19.0f, 1.3f, -16.0f, 2.2f, 2.6f, 2.2f, 0.75f, 0.70f, 0.6f, 5);
-        cb(-19.0f, 2.75f, -16.0f, 2.8f, 0.2f, 2.8f, 0.55f, 0.08f, 0.06f, 16);
-        cb(-17.88f, 1.6f, -16.0f, 0.03f, 0.9f, 1.2f, 0.95f, 0.75f, 0.4f, 4);
-        for (int s2 = -1; s2 <= 1; s2 += 2) cb(-19.0f + s2 * 3.0f, 2.5f, -19.5f, 0.2f, 5.0f, 0.2f, 0.3f, 0.3f, 0.3f, 16);
-        cb(-19.0f, 5.2f, -19.5f, 6.6f, 1.6f, 0.25f, 0.55f, 0.08f, 0.06f, 16);
-        cb(-19.0f, 5.2f, -19.36f, 5.0f, 0.7f, 0.02f, 0.95f, 0.85f, 0.6f, 4);
-        for (int k = 0; k < 15; k++) { cb(-22.2f + k * 0.46f, 5.95f, -19.35f, 0.1f, 0.1f, 0.05f, 0.95f, 0.75f, 0.35f, 19);
-                                       cb(-22.2f + k * 0.46f, 4.45f, -19.35f, 0.1f, 0.1f, 0.05f, 0.95f, 0.75f, 0.35f, 19); }
-        // ---- Guirnaldas de foquitos de punta a punta sobre las calles, y faroles
-        for (int ln = -1; ln <= 1; ln++) {
-            const float lz2 = ln * 7.0f - 3.5f;
-            cb(-20.0f, 2.6f, lz2, 0.12f, 5.2f, 0.12f, 0.15f, 0.12f, 0.1f, 6);
-            cb(20.0f, 2.6f, lz2, 0.12f, 5.2f, 0.12f, 0.15f, 0.12f, 0.1f, 6);
-            for (int k = 0; k <= 40; k++) {
-                const float tx = -20.0f + k * 1.0f, tt = tx / 20.0f;
-                cb(tx, 5.0f - 1.2f * (1.0f - tt * tt), lz2, 0.07f, 0.09f, 0.07f, 0.95f, 0.78f, 0.45f, (k % 3) ? 4 : 19);
+        // techo y portaequipajes con sus luces, y la luz azul de ambiente
+        cy(1.52f, 2.18f, ZC, 4.1f, 0.06f, LEN, 0.70f, 0.70f, 0.69f, 5);
+        for (int s2 = 0; s2 < 2; s2++) {
+            const float bc = s2 ? 2.75f : 0.3f, in = s2 ? -1.f : 1.f;
+            by(bc, 1.92f, ZC, 1.55f, 0.42f, LEN, 0, s2 ? -8.f : 8.f, 0.74f, 0.74f, 0.72f, 16);
+            cy(bc + in * 0.78f, 1.74f, ZC, 0.02f, 0.02f, LEN, 0.25f, 0.45f, 0.95f, 4);                     // tira de luz azul
+            for (int rw = -4; rw <= 5; rw++) {
+                const float wz = rw * ROW;
+                cy(bc, 1.70f, wz - ROW / 2, 1.4f, 0.01f, 0.02f, 0.5f, 0.5f, 0.5f, 16);                     // junta de las tapas
+                cy(bc + in * 0.4f, 1.69f, wz, 0.5f, 0.03f, 0.12f, 0.55f, 0.55f, 0.55f, 16);                 // panel de luces
+                const bool lit = s2 == 1 && rw == 3;   // una luz de lectura prendida, más adelante
+                cy(bc + in * 0.3f, 1.675f, wz, 0.05f, 0.01f, 0.05f, 0.9f, 0.85f, 0.7f, lit ? 4 : 16);
             }
         }
-        for (int s2 = -1; s2 <= 1; s2 += 2) for (int k = 0; k < 4; k++) {
-            const float x = s2 * 23.0f, z = -18.0f + k * 11.0f;
-            cb(x, 3.0f, z, 0.15f, 6.0f, 0.15f, 0.15f, 0.15f, 0.16f, 16);
-            cb(x - s2 * 0.4f, 6.0f, z, 0.9f, 0.12f, 0.3f, 0.15f, 0.15f, 0.16f, 16);
-            cb(x - s2 * 0.75f, 5.92f, z, 0.35f, 0.04f, 0.2f, 0.85f, 0.65f, 0.35f, 4);
-        }
-        // ---- Cerca de troncos y el bosque: pinos en capas, cada vez más lejos y más oscuros (atrás, el bosque pintado)
-        for (int s2 = -1; s2 <= 1; s2 += 2) {
-            for (int k = 0; k < 16; k++) cb(s2 * 26.0f, 0.6f, -28.0f + k * 3.6f, 0.14f, 1.2f, 0.14f, 0.13f, 0.09f, 0.06f, 6);
-            cb(s2 * 26.0f, 1.0f, -1.0f, 0.08f, 0.08f, 56.0f, 0.13f, 0.09f, 0.06f, 6);
-            cb(s2 * 26.0f, 0.5f, -1.0f, 0.08f, 0.08f, 56.0f, 0.13f, 0.09f, 0.06f, 6);
-        }
-        for (int k = 0; k < 110; k++) {
-            const unsigned th = (unsigned)k * 2654435761u;
-            const float a = (float)k * 2.39996f;   // (ángulo de oro: repartidos parejo alrededor)
-            const float rr = 31.0f + (float)(k % 5) * 6.0f + (float)((th >> 8) % 100) * 0.04f;
-            const float x = sinf(a) * rr, z = cosf(a) * rr - 2.0f;
-            if (z > 24.0f && fabsf(x) < 14.0f) continue;   // (detrás de la pantalla se ven igual: los tapa ella)
-            const float h = 7.0f + (float)((th >> 16) % 7) * 1.3f, dk = 1.0f - (float)(k % 5) * 0.15f;
-            const float g = 0.016f * dk, gr = 0.024f * dk;
-            cb(x, h * 0.15f, z, 0.45f, h * 0.3f, 0.45f, 0.03f * dk, 0.022f * dk, 0.015f * dk, 6);   // tronco
-            for (int t = 0; t < 4; t++) {   // copa: cuatro pisos que se achican, girados para que no se vean cuadrados
-                const float w = h * (0.42f - t * 0.09f);
-                bx(x, h * (0.32f + t * 0.17f), z, w, h * 0.17f, w, (float)(t * 22 + k * 13), 0, 0, g, gr, g, 6);
+        // adelante: tabique con los carteles de cinturón y la cortina; atrás, otro tabique
+        cy(1.52f, 1.1f, Z1, 4.1f, 2.2f, 0.08f, 0.62f, 0.62f, 0.60f, 5);
+        cy(1.52f, 1.0f, Z1 - 0.05f, 0.7f, 1.9f, 0.04f, 0.10f, 0.14f, 0.28f, 6);
+        cy(0.7f, 1.95f, Z1 - 0.05f, 0.35f, 0.12f, 0.02f, 0.85f, 0.85f, 0.75f, 4);
+        cy(2.35f, 1.95f, Z1 - 0.05f, 0.35f, 0.12f, 0.02f, 0.85f, 0.85f, 0.75f, 4);
+        cy(1.52f, 1.1f, Z0, 4.1f, 2.2f, 0.08f, 0.62f, 0.62f, 0.60f, 5);
+        // asientos (mirando adelante): almohadón, respaldo inclinado, funda de la cabecera, apoyabrazos, mesita y pantalla atrás
+        const float SEAT[6] = {0.0f, 0.5f, 1.0f, 2.05f, 2.55f, 3.05f};
+        for (int rw = -4; rw <= 5; rw++) {
+            const float zz = rw * ROW;
+            for (int si = 0; si < 6; si++) {
+                const float x = SEAT[si];
+                cy(x, 0.42f, zz + 0.02f, 0.46f, 0.12f, 0.48f, 0.10f, 0.14f, 0.30f, 6);                    // almohadón
+                cy(x, 0.28f, zz, 0.40f, 0.16f, 0.44f, 0.20f, 0.20f, 0.21f, 16);                           // base
+                by(x, 0.86f, zz - 0.27f, 0.46f, 0.78f, 0.10f, -10.f, 0, 0.10f, 0.14f, 0.30f, 6);          // respaldo
+                by(x, 0.86f, zz - 0.335f, 0.46f, 0.80f, 0.04f, -10.f, 0, 0.30f, 0.30f, 0.32f, 16);        // su espalda (plástico)
+                by(x, 1.32f, zz - 0.27f, 0.40f, 0.18f, 0.13f, -10.f, 0, 0.78f, 0.78f, 0.76f, 6);          // funda de la cabecera
+                // pantalla apagada atrás del respaldo (la del asiento de adelante tuyo es tu pantalla de verdad)
+                if (!(si == 0 && rw == 1)) by(x, 1.07f, zz - 0.36f, 0.26f, 0.17f, 0.01f, -10.f, 0, 0.012f, 0.014f, 0.02f, 17);
+                by(x, 0.70f, zz - 0.365f, 0.36f, 0.24f, 0.02f, -10.f, 0, 0.26f, 0.26f, 0.28f, 16);        // mesita plegada
+                for (int ar = -1; ar <= 1; ar += 2) cy(x + ar * 0.25f, 0.62f, zz - 0.02f, 0.05f, 0.06f, 0.42f, 0.26f, 0.26f, 0.28f, 16);   // apoyabrazos
             }
         }
         glBindVertexArray(0);
@@ -6989,12 +6844,12 @@ static void placePanel(App &app, UiPanel *p) {
     bool floating = g_env == 1 || g_env == 3 || g_env == 4;
     if (p->tv) {
         // Tamaño de la TV según el lugar: pantalla de cine enorme, o TV de living
-        float W = g_env == 2 ? 11.7f : g_env == 5 ? 20.0f : 2.2f;
+        float W = g_env == 2 ? 11.7f : g_env == 5 ? 0.40f : 2.2f;
         p->hm = p->hm / p->wm * W; p->wm = W;
     }
     float ang = 0, dist = floating ? 2.6f : 2.85f, y = floating ? app.eyeH : 0.59f + p->hm / 2;
     if (p->tv && g_env == 2) { dist = 8.6f; y = 3.3f; }
-    if (p->tv && g_env == 5) { dist = 26.0f; y = 8.2f; }
+    if (p->tv && g_env == 5) { dist = 0.42f; y = app.eyeH - 0.08f; }   // (en el respaldo del asiento de adelante)
     if (!floating) y += app.worldY;
     if (!p->tv) { ang = angles[app.placedWindows % 8] * (float)M_PI / 180.f; dist = 2.0f; y = app.eyeH - 0.05f; app.placedWindows++; }
     float c = cosf(ang), sn = sinf(ang);
@@ -7732,7 +7587,7 @@ static bool insideRoom(const App &app, float x, float z) {
     float q[3] = {x - app.anc[0], 0, z - app.anc[2]};
     float lx = q[0] * -app.fwd[2] + q[2] * app.fwd[0], lz = q[0] * app.fwd[0] + q[2] * app.fwd[2];
     return g_env == 1 ? false   // (espacio: no hay adónde ir)
-         : g_env == 5 ? (fabsf(lx) < 24.0f && lz > -26.0f && lz < 18.0f)
+         : g_env == 5 ? false   // (avión: estás en tu asiento)
          : g_env == 4 ? sqrtf(lx * lx + lz * lz) < 20.0f
          : g_env == 2 ? (fabsf(lx) < 10.5f && lz > -13.5f && lz < 6.5f)
          : (fabsf(lx) < 3.1f && lz > -2.5f && lz < 2.45f);
@@ -7746,6 +7601,7 @@ static bool teleportInput(App &app, XrTime time, const XrView &head) {
     if (g_handMove && !g_ctlInUse && g_rh.h[1].active && g_rh.h[1].v.joy) st = {g_rh.h[1].v.sx, g_rh.h[1].v.sy};
     if (g_env == 3) st = {0, 0};   // passthrough: no te movés (ni girás ni te teletransportás): es tu cuarto real
     if (g_env == 1) st.y = 0;      // espacio: flotás (girar sí; ir a otro lado no: no hay piso)
+    if (g_env == 5) st = {0, 0};   // avión: sentado en tu asiento (ni girás ni te movés)
     // Sin controles, con la mano derecha en «pistola» (índice estirado, los otros tres dedos cerrados):
     //  · apuntando hacia adelante sale el arco; bajá el pulgar («disparo») para ir ahí
     //  · apuntando a un costado (más de 40°), el pulgar gira la sala hacia ese lado
