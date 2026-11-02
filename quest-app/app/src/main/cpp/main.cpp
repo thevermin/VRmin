@@ -5853,12 +5853,11 @@ out vec4 o;
 float h1(float n) { return fract(sin(n * 127.1) * 43758.5453); }
 float h2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 uniform float time;
-// (hash con enteros: el de sin() daba valores distintos de un lado y otro de cada celda en el visor y se veían cortes rectos en las nebulosas)
+// (hash sin sin() ni enteros: el de sin() se cortaba en líneas rectas en el visor y el de enteros daba siempre lo mismo)
 float h3(vec3 p) {
-    uvec3 q = uvec3(ivec3(floor(p)) + 32768);
-    uint h = q.x * 1597334677u ^ q.y * 3812015801u ^ q.z * 2798796415u;
-    h = (h ^ (h >> 16u)) * 2246822519u; h ^= h >> 13u; h *= 3266489917u; h ^= h >> 16u;
-    return float(h >> 8u) / 16777215.0;
+    vec3 q = fract(p * 0.1031);
+    q += dot(q, q.zyx + 31.32);
+    return fract((q.x + q.y) * q.z);
 }
 float vnoise(vec3 p) {
     vec3 i = floor(p), f = fract(p);
