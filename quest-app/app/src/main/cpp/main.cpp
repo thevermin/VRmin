@@ -5910,19 +5910,24 @@ vec3 spaceSky(vec3 d, vec3 rx, vec3 fz) {
     float R = 0.75;
     float bq = dot(d, P), cq = dot(P, P) - R * R, disc = bq * bq - cq;
     float tp = disc > 0.0 ? bq - sqrt(disc) : 1e9;           // distancia hasta la superficie (o nada)
-    vec3 ringN = normalize(vec3(0.18, 1.0, 0.28));
+    vec3 ringN = normalize(vec3(-0.27, 1.0, 0.32));   // (casi de canto: el aro pasa por delante del planeta)
     float dn = dot(d, ringN), tr = abs(dn) > 1e-4 ? dot(P, ringN) / dn : -1.0;
     vec3 rp = d * tr - P;
     float rr = length(rp) / R;
     float ringA = 0.0; vec3 ringC = vec3(0.0);
     if (tr > 0.0 && rr > 1.35 && rr < 2.25) {
-        float band = 0.55 + 0.45 * sin(rr * 41.0) * sin(rr * 13.0);
-        float gap = smoothstep(0.015, 0.04, abs(rr - 1.78));   // la división del anillo
+        // un aro de verdad: muchos anillos finitos, con grumos que giran alrededor del planeta (los de adentro más rápido)
+        vec3 ru = normalize(cross(ringN, vec3(0.0, 0.0, 1.0))), rv = cross(ringN, ru);
+        float ra = atan(dot(rp, rv), dot(rp, ru)) - time * 0.15 / (rr * sqrt(rr));
+        float fine = vnoise(vec3(rr * 90.0, 0.5, 0.5)) * 0.6 + vnoise(vec3(rr * 23.0, 4.5, 0.5)) * 0.4;
+        float clump = fbm(vec3(cos(ra) * rr * 7.0, sin(ra) * rr * 7.0, rr * 3.0));
+        float band = (0.35 + 0.65 * fine) * (0.7 + 0.6 * clump);
+        float gap = smoothstep(0.015, 0.04, abs(rr - 1.78)) * smoothstep(0.004, 0.012, abs(rr - 2.06));   // las divisiones del anillo
         // la sombra del planeta sobre el anillo
         vec3 rw = d * tr;
         vec3 toP = P - rw; float bs = dot(toP, sun), cs = dot(toP, toP) - R * R;
         float shadow = (bs > 0.0 && bs * bs - cs > 0.0) ? 0.15 : 1.0;
-        ringA = 0.7 * gap * smoothstep(1.35, 1.45, rr) * smoothstep(2.25, 2.1, rr);
+        ringA = (0.4 + 0.55 * fine) * (0.75 + 0.4 * clump) * gap * smoothstep(1.35, 1.45, rr) * smoothstep(2.25, 2.1, rr);   // (se ve el fondo entre los anillos)
         ringC = vec3(0.78, 0.70, 0.56) * band * 0.6 * shadow;
     }
     // el anillo de atrás (más lejos que el planeta) queda tapado por él
