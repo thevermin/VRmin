@@ -1,5 +1,6 @@
 name: Publicar versión
-# Arma la versión en GitHub (como borrador) con la app del Quest que compiló «App del Quest» en main
+# Arma la versión en GitHub (como borrador) con la app del Quest que compiló «App del Quest» en main y VRmin para
+# Windows («VRmin para Windows»)
 # (las notas salen de docs/releases/<etiqueta>.md).
 # La app de Mac NO sale de acá: se arma en la Mac de VRmin con «bash crear_app.sh --paquete» (firmada con el
 # certificado fijo de VRmin; el actualizador de VRmin Host rechaza otra firma) y se sube a mano al borrador antes
@@ -26,6 +27,9 @@ jobs:
           echo "App de Mac: $mac · App del Quest: $apk"
           [ "${{ inputs.sin_mac }}" = "true" ] || gh run download "$mac" -R "$GITHUB_REPOSITORY" -n VRmin-Host-mac -D out
           gh run download "$apk" -R "$GITHUB_REPOSITORY" -n VRmin-quest-apk -D out
+          # VRmin para Windows (si ya hay uno compilado)
+          win=$(gh run list -R "$GITHUB_REPOSITORY" --workflow windows.yml --branch main --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          [ -n "$win" ] && gh run download "$win" -R "$GITHUB_REPOSITORY" -n VRmin-Windows -D out || echo "Sin VRmin para Windows"
           ls -la out
       - name: Publicar
         run: |

@@ -1,0 +1,41 @@
+name: VRmin para Windows
+# Compila VRmin Host para Windows y el runtime de OpenXR (el mismo código que usa la Mac dentro de Wine) y arma
+# «VRmin Windows <versión>.zip». Al armar una versión, «Publicar versión» lo agrega solo.
+# (el nombre no lleva «Host»: el actualizador de VRmin Host de la Mac toma el .zip que dice «Host»)
+on:
+  push:
+    branches: [main]
+    paths: ['windows/**', 'mac/openxr/questvrbridge_openxr.c', '.github/workflows/windows.yml']
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04   # (mingw GCC 13, el mismo que el runtime de la Mac)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Herramientas (mingw-w64) y cabeceras de OpenXR y Vulkan
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq g++-mingw-w64-x86-64 gcc-mingw-w64-i686 zip >/dev/null
+          git clone -q --depth 1 --branch release-1.1.43 https://github.com/KhronosGroup/OpenXR-SDK.git "$RUNNER_TEMP/openxr"
+          git clone -q --depth 1 --branch v1.3.296 https://github.com/KhronosGroup/Vulkan-Headers.git "$RUNNER_TEMP/vulkan"
+      - name: Runtime de OpenXR (64 y 32 bits)
+        run: |
+          set -e
+          x86_64-w64-mingw32-gcc -O2 -shared -o mac/openxr/questvrbridge_openxr.dll mac/openxr/questvrbridge_openxr.c \
+            mac/openxr/questvrbridge_openxr.def -I"$RUNNER_TEMP/openxr/include" -I"$RUNNER_TEMP/vulkan/include" \
+            -ld3d11 -ldxgi -ldxguid -luuid -lws2_32 -lwinmm -static-libgcc -Wl,--kill-at
+          i686-w64-mingw32-gcc -O2 -msse2 -mfpmath=sse -shared -o mac/openxr/questvrbridge_openxr32.dll mac/openxr/questvrbridge_openxr.c \
+            mac/openxr/questvrbridge_openxr.def -I"$RUNNER_TEMP/openxr/include" -I"$RUNNER_TEMP/vulkan/include" \
+            -ld3d11 -ldxgi -ldxguid -luuid -lws2_32 -lwinmm -static-libgcc -Wl,--kill-at -Wl,--enable-stdcall-fixup
+      - name: VRmin Host.exe
+        run: |
+          set -e
+          v=$(grep -o 'VRMIN_WIN_VERSION "[^"]*' windows/host/host.h | sed 's/.*"//')
+          bash windows/host/build.sh "$RUNNER_TEMP/VRmin Windows"
+          cd "$RUNNER_TEMP" && zip -qr "VRmin Windows $v.zip" "VRmin Windows"
+          ls -la "$RUNNER_TEMP/VRmin Windows" "$RUNNER_TEMP/VRmin Windows/runtime"
+          echo "ZIP=$RUNNER_TEMP/VRmin Windows $v.zip" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VRmin-Windows
+          path: ${{ env.ZIP }}
+          retention-days: 30

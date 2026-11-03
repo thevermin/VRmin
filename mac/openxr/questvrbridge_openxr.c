@@ -488,14 +488,26 @@ static int64_t g_shmAsked;
 static int g_shmGen = -1;           /* conexión de imágenes donde se ofreció */
 static volatile LONG g_shmSentStat;
 
+/* ¿Corre dentro de Wine (Mac) o en Windows de verdad? (en Windows, VRmin Host es un programa de Windows y la memoria
+   compartida es una con nombre, sin archivo en el disco) */
+static int running_in_wine(void) { return GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version") != NULL; }
+#define SHM_WIN_NAME "Local\\VRminCuadros"
+
 static int shm_create(void) {
     if (g_shm) return 1;
+    uint64_t total = SHM_HDR + SHM_SLOT_MAX * SHM_SLOTS;
+    if (!running_in_wine()) {
+        g_shmMap = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, (DWORD)(total >> 32), (DWORD)total, SHM_WIN_NAME);
+        if (!g_shmMap) { logmsg("Memoria compartida: CreateFileMapping falló (%lu)", GetLastError()); return 0; }
+        g_shm = (uint8_t *)MapViewOfFile(g_shmMap, FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, (SIZE_T)total);
+        if (!g_shm) { logmsg("Memoria compartida: MapViewOfFile falló (%lu)", GetLastError()); CloseHandle(g_shmMap); g_shmMap = NULL; return 0; }
+        return 1;
+    }
     const wchar_t *path = L"C:\\questvrbridge\\cuadros.bin";
     CreateDirectoryW(L"C:\\questvrbridge", NULL);
     g_shmFile = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (g_shmFile == INVALID_HANDLE_VALUE) { logmsg("Memoria compartida: no se pudo crear el archivo (%lu)", GetLastError()); return 0; }
-    uint64_t total = SHM_HDR + SHM_SLOT_MAX * SHM_SLOTS;
     g_shmMap = CreateFileMappingW(g_shmFile, NULL, PAGE_READWRITE, (DWORD)(total >> 32), (DWORD)total, NULL);
     if (!g_shmMap) { logmsg("Memoria compartida: CreateFileMapping falló (%lu)", GetLastError()); CloseHandle(g_shmFile); g_shmFile = INVALID_HANDLE_VALUE; return 0; }
     g_shm = (uint8_t *)MapViewOfFile(g_shmMap, FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, (SIZE_T)total);
@@ -519,7 +531,7 @@ static void shm_offer(void) {
     if (wgufn) {
         char *u = wgufn(L"C:\\questvrbridge\\cuadros.bin");
         if (u) { strncpy(unixPath, u, sizeof unixPath - 1); HeapFree(GetProcessHeap(), 0, u); }
-    }
+    } else if (!running_in_wine()) strcpy(unixPath, "mapa:" SHM_WIN_NAME);   /* (en Windows: el nombre de la memoria) */
     if (!unixPath[0]) { logmsg("Memoria compartida: no pude saber la ruta en la Mac; sigo por la red"); g_shmMode = -1; return; }
     uint8_t pkt[5 + 1 + 8 + 1024];
     uint32_t plen = (uint32_t)strlen(unixPath);

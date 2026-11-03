@@ -1,0 +1,54 @@
+VRmin para Windows (beta)
+=========================
+
+Juegá en el Quest los juegos VR de Steam que tenés en tu PC con Windows, y usá el escritorio de Windows desde el visor.
+
+Qué hace falta
+- Windows 10 u 11 de 64 bits.
+- Una placa de video NVIDIA, AMD o Intel (la PC comprime la imagen con ella).
+- El Quest y la PC en la misma red Wi-Fi (mejor si la PC está conectada por cable al router).
+- La app VRmin instalada en el Quest (la misma que se usa con la Mac).
+
+Cómo se usa
+1. Descomprimí esta carpeta donde quieras (por ejemplo en Documentos) y abrí «VRmin Host.exe».
+   Si Windows avisa que la app no es conocida: «Más información» › «Ejecutar de todas formas».
+2. Cuando el Firewall de Windows pregunte, permití el acceso en redes privadas.
+3. Abrí VRmin en el Quest. La primera vez, escribí en el visor el código que aparece en la ventana de la PC.
+4. Elegí un juego en el visor. La primera vez, Windows pide permiso de administrador: es para que los juegos VR
+   usen VRmin en lugar de SteamVR.
+
+Mientras la ventana de VRmin Host está abierta, los juegos de SteamVR usan VRmin. Al cerrarla, SteamVR vuelve a
+quedar como antes. El botón «Volver a SteamVR» deshace todo lo que VRmin cambió en Windows.
+
+Si algo anda mal: botón «Registros» y mandá el archivo servidor.log en un Issue de GitHub.
+https://github.com/thevermin/VRmin/issues
+
+Todavía no está en Windows: ventanas sueltas, monitor virtual, 3D del escritorio y Modo Centinela.
+
+
+VRmin for Windows (beta)
+========================
+
+Play the Steam VR games on your Windows PC on the Quest, and use the Windows desktop from the headset.
+
+What you need
+- 64-bit Windows 10 or 11.
+- An NVIDIA, AMD or Intel graphics card (the PC uses it to compress the picture).
+- The Quest and the PC on the same Wi-Fi network (better if the PC is wired to the router).
+- The VRmin app on the Quest (the same one used with the Mac).
+
+How to use it
+1. Unzip this folder anywhere (for example in Documents) and open "VRmin Host.exe".
+   If Windows says the app isn't recognized: "More info" › "Run anyway".
+2. When Windows Firewall asks, allow access on private networks.
+3. Open VRmin on the Quest. The first time, type the code shown in the PC window into the headset.
+4. Pick a game in the headset. The first time, Windows asks for administrator permission: it's so that VR games
+   use VRmin instead of SteamVR.
+
+While the VRmin Host window is open, SteamVR games use VRmin. When you close it, SteamVR is back as it was.
+The "Back to SteamVR" button undoes everything VRmin changed in Windows.
+
+If something goes wrong: "Logs" button, and send the servidor.log file in a GitHub Issue.
+https://github.com/thevermin/VRmin/issues
+
+Not on Windows yet: separate windows, virtual monitor, desktop 3D and Sentinel Mode.
