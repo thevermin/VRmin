@@ -35,10 +35,10 @@ jobs:
             [ -f "$f" ] || mal "Falta $(basename "$f") en la app"
             grep -aq 'QuestVRBridge Local' "$f" || mal "$(basename "$f") no está firmado con el certificado de VRmin (¿se armó con VRMIN_ADHOC=1 o en GitHub?): armalo con «bash crear_app.sh --paquete» en la Mac de VRmin y reemplazalo"
           done
-          wins=$(ls | grep -c '^VRmin Windows .*\.zip$' || true)
+          wins=$(ls | grep -c '^VRmin[ .]Windows.*\.zip$' || true)   # (GitHub cambia los espacios por puntos)
           if [ "$wins" -gt 0 ]; then
             [ "$wins" = 1 ] || mal "Hay $wins .zip de VRmin para Windows"
-            unzip -q "VRmin Windows "*.zip -d w
+            unzip -q VRmin*Windows*.zip -d w
             [ -f "w/VRmin Windows/VRmin Host.exe" ] && [ -f "w/VRmin Windows/runtime/questvrbridge_openxr.dll" ] || mal "Al .zip de Windows le falta VRmin Host.exe o el runtime"
           fi
           echo "::notice::$TAG: app de Mac $v firmada con el certificado de VRmin, una sola app del Quest ($(ls *.apk))"
