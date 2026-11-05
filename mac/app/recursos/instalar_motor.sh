@@ -52,12 +52,13 @@ if [ -d "$WINEPREFIX" ] && [ "$USADO" != "$MARCA_MOTOR" ] && [ "${USADO#gcenx-11
   rm -rf "$WINEPREFIX"
 fi
 
-# Un motor de otra versión (por ejemplo Wine 10): se reemplaza
-if [ -x "$WINE" ] && ! grep -q "$ENGINE" "$WINEDIR/version" 2>/dev/null; then
+# Un motor de otra versión (por ejemplo Wine 10): se reemplaza. (Se mira el wine de verdad, no wine.sh: wine.sh siempre
+# existe y, sin motor, se borraba «el anterior» y no se bajaba el nuevo)
+if [ -x "$WINE_REAL" ] && ! grep -q "$ENGINE" "$WINEDIR/version" 2>/dev/null; then
   say "Reemplazando el motor anterior por Wine 11" "Replacing the previous engine with Wine 11"
   rm -rf "$WINEDIR"
 fi
-if [ ! -x "$WINE" ]; then
+if [ ! -x "$WINE_REAL" ]; then
   paso "Descargando el motor Wine 11 (≈170 MB)" "Downloading the Wine 11 engine (≈170 MB)"
   mkdir -p "$MOTOR"
   bajar "$ENGINE_URL" motor.tar.xz "$ENGINE_SHA"
