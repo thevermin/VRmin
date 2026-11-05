@@ -6661,12 +6661,16 @@ static void renderRoom(App &app, const XrView &view, const TvInfo *tv) {
         glDrawArrays(GL_TRIANGLES, 0, 36);
     };
     // Habitación: 7 m de ancho, de z=-2.8 (atrás del sillón) a z=2.8 (pared de la TV), 2.9 m de alto
-    box(0, -0.05f, 0.3f, 7.0f, 0.1f, 6.2f, 0.30f, 0.19f, 0.11f, 1);         // piso de madera
-    box(0, 2.95f, 0.3f, 7.0f, 0.1f, 6.2f, 0.55f, 0.54f, 0.52f, 5);          // techo
-    box(0, 1.45f, 3.45f, 7.0f, 2.9f, 0.1f, 0.30f, 0.30f, 0.33f, 5);      // pared de la TV
-    box(0, 1.45f, -2.85f, 7.0f, 2.9f, 0.1f, 0.52f, 0.48f, 0.43f, 5);     // pared de atrás
-    box(-3.55f, 1.45f, 0.3f, 0.1f, 2.9f, 6.2f, 0.50f, 0.46f, 0.41f, 5);     // pared izquierda
-    box(3.55f, 1.45f, 0.3f, 0.1f, 2.9f, 6.2f, 0.50f, 0.46f, 0.41f, 5);      // pared derecha
+    // (piso, techo y paredes se dibujan al final: lo que está delante ya está y esos puntos no se calculan dos veces)
+    auto shell = [&] {
+        glUniformMatrix3fv(app.rN, 1, GL_FALSE, N);
+        box(0, -0.05f, 0.3f, 7.0f, 0.1f, 6.2f, 0.30f, 0.19f, 0.11f, 1);         // piso de madera
+        box(0, 2.95f, 0.3f, 7.0f, 0.1f, 6.2f, 0.55f, 0.54f, 0.52f, 5);          // techo
+        box(0, 1.45f, 3.45f, 7.0f, 2.9f, 0.1f, 0.30f, 0.30f, 0.33f, 5);      // pared de la TV
+        box(0, 1.45f, -2.85f, 7.0f, 2.9f, 0.1f, 0.52f, 0.48f, 0.43f, 5);     // pared de atrás
+        box(-3.55f, 1.45f, 0.3f, 0.1f, 2.9f, 6.2f, 0.50f, 0.46f, 0.41f, 5);     // pared izquierda
+        box(3.55f, 1.45f, 0.3f, 0.1f, 2.9f, 6.2f, 0.50f, 0.46f, 0.41f, 5);      // pared derecha
+    };
     // zócalos
     box(0, 0.05f, 3.39f, 7.0f, 0.1f, 0.02f, 0.85f, 0.83f, 0.8f);
     box(0, 0.05f, -2.79f, 7.0f, 0.1f, 0.02f, 0.85f, 0.83f, 0.8f);
@@ -6763,6 +6767,7 @@ static void renderRoom(App &app, const XrView &view, const TvInfo *tv) {
             glDrawArrays(GL_TRIANGLES, 0, 36);
         }
     }
+    shell();
     glBindVertexArray(0);
     glDisable(GL_DEPTH_TEST);
 }
