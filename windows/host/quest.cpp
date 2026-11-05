@@ -117,7 +117,7 @@ static Auth pairCheck(const Json &m, const std::string &ip, std::string &newToke
     std::string id = m["id"].str();
     if (id.size() < 8 || id.size() > 80) return Auth::NeedCode;
     std::string name = m["device"].str("Quest");
-    std::wstring file = dataDir() + L"\\emparejados.json";
+    std::wstring file = dataDir() + L"\\paired.json";
     Json all = Json::parse(readFile(file));
     if (all.t != Json::Obj) all = Json::object();
     std::string tok = m["token"].str();
@@ -138,11 +138,11 @@ static Auth pairCheck(const Json &m, const std::string &ip, std::string &newToke
             writeFile(file, all.dump());
             pairCodeStr.clear();
             g_pairCode = -1;
-            logmsg("[emparejar] LISTO %s (%s)", name.c_str(), ip.c_str());
+            logmsg("[pairing] DONE %s (%s)", name.c_str(), ip.c_str());
             uiRefresh();
             return Auth::Ok;
         }
-        if (++pairTries >= 5) { pairCodeStr.clear(); logmsg("[emparejar] VENCIDO"); }
+        if (++pairTries >= 5) { pairCodeStr.clear(); logmsg("[pairing] EXPIRED"); }
         else return Auth::WrongCode;
     }
     if (pairCodeStr.empty() || now >= pairUntil || pairFor != id) {
@@ -157,7 +157,7 @@ static Auth pairCheck(const Json &m, const std::string &ip, std::string &newToke
         pairTries = 0;
         g_pairCode = (int)n;
         g_questName = name;
-        logmsg("[emparejar] CODIGO %s %s", c, name.c_str());
+        logmsg("[pairing] CODE %s %s", c, name.c_str());
         uiRefresh();
     }
     return m.has("code") ? Auth::WrongCode : Auth::NeedCode;
@@ -222,7 +222,7 @@ static void beaconThread() {
             std::string msg = "{\"qvb\":1,\"port\":9100,\"name\": " + Json::esc(name) + ",\"ll\":" + ll.dump() + "}";
             std::vector<uint32_t> targets = {0xFFFFFFFFu};
             for (auto b : a.bcast) targets.push_back(b);
-            if (!announced) { announced = true; logmsg("[quest] Avisando en la red local para la app del Quest (%d redes)", (int)a.bcast.size()); }
+            if (!announced) { announced = true; logmsg("[quest] Announcing on the local network for the Quest app (%d networks)", (int)a.bcast.size()); }
             for (uint32_t t : targets) {
                 sockaddr_in to{};
                 to.sin_family = AF_INET;
@@ -230,7 +230,7 @@ static void beaconThread() {
                 to.sin_addr.s_addr = t;
                 if (sendto(s, msg.data(), (int)msg.size(), 0, (sockaddr *)&to, sizeof to) < 0 && !warned) {
                     warned = true;
-                    logmsg("[quest] No pude avisar en la red local (error %d): revisá el Firewall de Windows", WSAGetLastError());
+                    logmsg("[quest] Couldn't announce on the local network (error %d): check Windows Firewall", WSAGetLastError());
                 }
             }
         } else announced = false;
@@ -261,7 +261,7 @@ static void readerThread(SOCKET c) {
     }
     Sleep(50);
     closesocket(c);
-    if (gone) { questOnDisconnect(); logmsg("[quest] App del Quest desconectada"); uiRefresh(); }
+    if (gone) { questOnDisconnect(); logmsg("[quest] Quest app disconnected"); uiRefresh(); }
 }
 
 static void listenThread() {
@@ -285,7 +285,7 @@ static void listenThread() {
         r = bind(ls, (sockaddr *)&a, sizeof a);
     }
     if (r != 0 || listen(ls, 4) != 0) {
-        logmsg("[quest] No se pudo abrir el puerto %d para la app del Quest (error %d)", NATIVE_PORT, WSAGetLastError());
+        logmsg("[quest] Couldn't open port %d for the Quest app (error %d)", NATIVE_PORT, WSAGetLastError());
         return;
     }
     while (true) {
@@ -303,7 +303,7 @@ static void listenThread() {
         std::string ip = ipb;
         if (ip.rfind("::ffff:", 0) == 0) ip = ip.substr(7);
         bool cable = ip.rfind("fe80", 0) == 0;
-        if (cable) logmsg("[quest] Conexión por el cable USB-C");
+        if (cable) logmsg("[quest] Connection over the USB-C cable");
         // Emparejado: el primer mensaje del Quest trae su clave (o el código que le mostramos)
         DWORD tv = 5000;
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
@@ -327,7 +327,7 @@ static void listenThread() {
                 }
             }
         }
-        if (!ok) { logmsg("[quest] Conexión de %s sin emparejar: se pidió el código", ip.c_str()); Sleep(200); closesocket(c); continue; }
+        if (!ok) { logmsg("[quest] Unpaired connection from %s: asked for the code", ip.c_str()); Sleep(200); closesocket(c); continue; }
         tv = 0;
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
         {
@@ -336,7 +336,7 @@ static void listenThread() {
             qSock = c; qNeedKey = true; qPending = 0; qQueue.clear();
         }
         g_questWifi = !cable;
-        logmsg("[quest] App del Quest conectada desde %s", ip.c_str());
+        logmsg("[quest] Quest app connected from %s", ip.c_str());
         questSendText(newToken.empty() ? "{\"type\":\"auth\",\"ok\":true}" : "{\"type\":\"auth\",\"ok\":true,\"token\":\"" + newToken + "\"}");
         Stream st = currentStream();
         Json cfg = Json::object();
@@ -361,8 +361,8 @@ static void statsThread() {
             c = qSock != INVALID_SOCKET; a = statSent; d = statDropped; w = statWaitKey; pe = qPending;
             statSent = statDropped = statWaitKey = 0;
         }
-        if (c && (a || d)) logmsg("[quest] últimos 5 s: %d cuadros enviados, %d descartados por red, %d esperando cuadro completo, %d KB en cola", a, d, w, (int)(pe / 1024));
-        if (c && a > 0) logmsg("[rendimiento] %s", perfSnapshot().dump().c_str());
+        if (c && (a || d)) logmsg("[quest] last 5 s: %d frames sent, %d dropped by the network, %d waiting for a full frame, %d KB queued", a, d, w, (int)(pe / 1024));
+        if (c && a > 0) logmsg("[performance] %s", perfSnapshot().dump().c_str());
     }
 }
 

@@ -62,10 +62,10 @@ struct VideoEncoder::Impl {
                 if (configure(wantHevc)) {
                     ok = true;
                     hevc = wantHevc; hw = hardware;
-                    logmsg("[%s] Codificador: %s %s (%s) · %dx%d · %d Mbps", name.c_str(), wantHevc ? "HEVC" : "H.264",
-                           hardware ? "por hardware" : "en el procesador", friendly.c_str(), w, h, bitrate / 1000000);
+                    logmsg("[%s] Encoder: %s %s (%s) · %dx%d · %d Mbps", name.c_str(), wantHevc ? "HEVC" : "H.264",
+                           hardware ? "hardware" : "software (CPU)", friendly.c_str(), w, h, bitrate / 1000000);
                 } else {
-                    logmsg("[%s] %s no aceptó %dx%d en %s", name.c_str(), friendly.c_str(), w, h, wantHevc ? "HEVC" : "H.264");
+                    logmsg("[%s] %s didn't accept %dx%d in %s", name.c_str(), friendly.c_str(), w, h, wantHevc ? "HEVC" : "H.264");
                     rel(codec); rel(events);
                     acts[i]->ShutdownObject();
                     rel(mft);
@@ -293,7 +293,7 @@ void EncWorker::run(VideoEncoder *self) {
                     delete im;
                     im = nullptr;
                 }
-                if (!im) { noneW = job.w; noneH = job.h; logmsg("[%s] ERROR: no hay codificador de video para %dx%d", self->name_.c_str(), job.w, job.h); }
+                if (!im) { noneW = job.w; noneH = job.h; logmsg("[%s] ERROR: no video encoder for %dx%d", self->name_.c_str(), job.w, job.h); }
                 else {
                     self->hevcNow_ = im->hevc;
                     if (job.hevc && !im->hevc) { failHevc = true; failW = job.w; failH = job.h; }
@@ -365,12 +365,12 @@ bool encoderCanHevc(int w, int h, int fps, int bitrate) {
     bool ok;
     {
         VideoEncoder::Impl im;
-        im.name = "prueba"; im.w = w; im.h = h; im.fps = fps; im.bitrate = bitrate;
+        im.name = "test"; im.w = w; im.h = h; im.fps = fps; im.bitrate = bitrate;
         ok = im.open(true, true);
     }
     MFShutdown();
     if (SUCCEEDED(ci)) CoUninitialize();
     cache[key] = ok;
-    if (!ok) logmsg("[video] Esta PC no codifica HEVC a %dx%d por hardware: se usa H.264", w, h);
+    if (!ok) logmsg("[video] This PC can't encode HEVC at %dx%d in hardware: using H.264", w, h);
     return ok;
 }

@@ -14,5 +14,5 @@ x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -Wno-unknown-pragmas -municode -mwin
 cp ../../mac/openxr/questvrbridge_openxr.dll ../../mac/openxr/questvrbridge_openxr.json \
    ../../mac/openxr/questvrbridge_openxr32.dll ../../mac/openxr/questvrbridge_openxr32.json "$OUT/runtime/"
 rm -f "$OUT/host.res"
-cp LEEME.txt "$OUT/"
+cp README.txt "$OUT/"
 echo "Listo: $OUT"

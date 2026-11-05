@@ -91,7 +91,7 @@ static void handlePixels(const uint8_t *src, uint32_t pose, bool rgba, int ew, i
     if (ew <= 0 || eh <= 0) return;
     framesTotal++;
     Stream st = currentStream();
-    if (framesTotal == 1) logmsg("[juego] Primer cuadro recibido: %dx%d por ojo, %s · se manda %dx%d", ew, eh, rgba ? "RGBA" : "BGRA", st.W, st.H);
+    if (framesTotal == 1) logmsg("[game] First frame received: %dx%d per eye, %s · sending %dx%d", ew, eh, rgba ? "RGBA" : "BGRA", st.W, st.H);
     lastGameFrame = nowNs();
     if (g_enc->busy() || !questConnected()) { perfAddDrop(); return; }   // (el codificador está atrasado: descartar)
     uint64_t start = nowNs();
@@ -150,7 +150,7 @@ static void readLoop(SOCKET s) {
         if (!readExact(s, buf.data(), n)) break;
         const uint8_t *b = buf.data();
         switch (b[0]) {
-        case 3: logmsg("[juego] %.*s", (int)n - 1, (const char *)b + 1); break;
+        case 3: logmsg("[game] %.*s", (int)n - 1, (const char *)b + 1); break;
         case 7: perfSetRuntime(std::string((const char *)b + 1, n - 1)); break;
         case 9: {
             profilesBegin(std::string((const char *)b + 1, n - 1));
@@ -161,7 +161,7 @@ static void readLoop(SOCKET s) {
         case 4: {
             std::lock_guard<std::mutex> g(cLock);
             clients.erase(s);   // esta conexión es solo de imágenes: no le mandamos poses
-            logmsg("[juego] Conexión de imágenes identificada");
+            logmsg("[game] Image connection identified");
             break;
         }
         case 5: {
@@ -184,10 +184,10 @@ static void readLoop(SOCKET s) {
                 shmSlot = slot;
                 MemoryBarrier();
                 hd->ack = nonce;   // confirmación: el runtime pasa a usarla
-                logmsg("[juego] Memoria compartida activa (los cuadros ya no pasan por la red)");
+                logmsg("[game] Shared memory active (frames no longer go through the network)");
             } else {
                 unmap();
-                logmsg("[juego] Memoria compartida: no pude abrir %s (error %lu); sigue por la red", where.c_str(), GetLastError());
+                logmsg("[game] Shared memory: couldn't open %s (error %lu); staying on the network", where.c_str(), GetLastError());
             }
             break;
         }
@@ -231,7 +231,7 @@ static void readLoop(SOCKET s) {
 }
 
 void gameStart() {
-    g_enc = new VideoEncoder("juego", onEncoded);
+    g_enc = new VideoEncoder("game", onEncoded);
     // Juego cargando (conectado pero sin cuadros desde hace más de 0,3 s, hasta 2 min): repetir el último cuadro, más oscuro
     std::thread([] {
         std::vector<uint8_t> dark;
@@ -263,7 +263,7 @@ void gameStart() {
         BOOL excl = TRUE;
         setsockopt(ls, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&excl, sizeof excl);
         if (bind(ls, (sockaddr *)&a, sizeof a) != 0 || listen(ls, 8) != 0) {
-            logmsg("ERROR: no se pudo abrir el puerto 9002 para el juego (¿otro VRmin Host abierto?)");
+            logmsg("ERROR: couldn't open port 9002 for the game (is another VRmin Host open?)");
             return;
         }
         while (true) {
@@ -282,7 +282,7 @@ void gameStart() {
                 total = (int)clients.size();
             }
             openConns++;
-            logmsg("[juego] Un juego se conectó a VRmin (conexiones abiertas: %d)", total);
+            logmsg("[game] A game connected to VRmin (open connections: %d)", total);
             {
                 std::lock_guard<std::mutex> g(cLock);
                 sendTo(c, configLine(false));
@@ -300,7 +300,7 @@ void gameStart() {
                 }
                 closesocket(c);
                 if (--openConns == 0) { profilesEnd(); std::lock_guard<std::mutex> g(holdLock); holdNv.clear(); }
-                logmsg("[juego] Conexión con un juego cerrada (quedan: %d)", left);
+                logmsg("[game] Connection with a game closed (left: %d)", left);
                 uiRefresh();
             }).detach();
         }

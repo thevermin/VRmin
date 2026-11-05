@@ -72,10 +72,10 @@ static bool setRuntimes(const std::wstring &j64, const std::wstring &j32) {
 
 static bool download(const char *url, const std::wstring &to) {
     HRESULT hr = URLDownloadToFileW(nullptr, wide(url).c_str(), to.c_str(), 0, nullptr);
-    if (FAILED(hr)) { logmsg("[preparar] No pude bajar %s (0x%08lx)", url, (unsigned long)hr); return false; }
+    if (FAILED(hr)) { logmsg("[setup] Couldn't download %s (0x%08lx)", url, (unsigned long)hr); return false; }
     // (que sea una DLL de verdad y no una página de error)
     std::string head = readFile(to).substr(0, 2);
-    if (head != "MZ") { logmsg("[preparar] Lo que bajé de %s no es una DLL", url); DeleteFileW(to.c_str()); return false; }
+    if (head != "MZ") { logmsg("[setup] What I downloaded from %s isn't a DLL", url); DeleteFileW(to.c_str()); return false; }
     return true;
 }
 
@@ -106,30 +106,30 @@ bool setupActivate() {
     bool ok = true;
     // 1) OpenXR: el runtime de VRmin (la primera vez se guarda cuál había, para «Volver a SteamVR»)
     if (_wcsicmp(activeRuntime(false).c_str(), ourJson(false).c_str()) != 0) {
-        std::wstring prev = dataDir() + L"\\openxr_anterior.txt";
+        std::wstring prev = dataDir() + L"\\previous_openxr.txt";
         if (GetFileAttributesW(prev.c_str()) == INVALID_FILE_ATTRIBUTES)
             writeFile(prev, utf8(activeRuntime(false)) + "\n" + utf8(activeRuntime(true)) + "\n");
-        logmsg("[preparar] Pidiendo permiso para activar el runtime de OpenXR de VRmin");
-        if (!setRuntimes(ourJson(false), ourJson(true))) { logmsg("[preparar] No se activó el runtime de OpenXR (¿se canceló el permiso?)"); ok = false; }
+        logmsg("[setup] Asking for permission to activate VRmin's OpenXR runtime");
+        if (!setRuntimes(ourJson(false), ourJson(true))) { logmsg("[setup] The OpenXR runtime wasn't activated (was the permission prompt cancelled?)"); ok = false; }
     }
     // 2) OpenComposite (la primera vez se baja)
     if (!ocFilesOk()) {
         CreateDirectoryW(ocDir().c_str(), nullptr);
         CreateDirectoryW((ocDir() + L"\\bin").c_str(), nullptr);
-        logmsg("[preparar] Bajando OpenComposite…");
+        logmsg("[setup] Downloading OpenComposite…");
         if (!download(OC_URL_64, ocDir() + L"\\bin\\vrclient_x64.dll")) ok = false;
         download(OC_URL_32, ocDir() + L"\\bin\\vrclient.dll");   // (los juegos de 32 bits son pocos: si falla, sigue)
     }
-    if (ocFilesOk() && !setVrpath(true)) { logmsg("[preparar] No pude activar OpenComposite"); ok = false; }
+    if (ocFilesOk() && !setVrpath(true)) { logmsg("[setup] Couldn't activate OpenComposite"); ok = false; }
     SetupState s = setupCheck();
-    logmsg("[preparar] OpenXR: %s · OpenComposite: %s", s.runtimeOk ? "VRmin" : "otro", s.ocOk ? "activo" : "no");
+    logmsg("[setup] OpenXR: %s · OpenComposite: %s", s.runtimeOk ? "VRmin" : "other", s.ocOk ? "active" : "no");
     uiRefresh();
     return ok && s.runtimeOk && s.ocOk;
 }
 
 bool setupRestoreSteamVR() {
     setVrpath(false);
-    std::string prev = readFile(dataDir() + L"\\openxr_anterior.txt");
+    std::string prev = readFile(dataDir() + L"\\previous_openxr.txt");
     bool ok = true;
     if (_wcsicmp(activeRuntime(false).c_str(), ourJson(false).c_str()) == 0) {
         size_t nl = prev.find('\n');
@@ -142,9 +142,9 @@ bool setupRestoreSteamVR() {
             ok = runElevated(std::wstring(sys) + L"\\cmd.exe",
                              L"/c reg delete \"HKLM\\SOFTWARE\\Khronos\\OpenXR\\1\" /v ActiveRuntime /f /reg:64 & reg delete \"HKLM\\SOFTWARE\\Khronos\\OpenXR\\1\" /v ActiveRuntime /f /reg:32 & exit 0");
         } else ok = setRuntimes(p64, p32);
-        if (ok) DeleteFileW((dataDir() + L"\\openxr_anterior.txt").c_str());
+        if (ok) DeleteFileW((dataDir() + L"\\previous_openxr.txt").c_str());
     }
-    logmsg("[preparar] SteamVR %s", ok ? "quedó como antes" : "no se pudo restaurar del todo");
+    logmsg("[setup] SteamVR %s", ok ? "is back as it was" : "couldn't be fully restored");
     uiRefresh();
     return ok;
 }

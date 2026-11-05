@@ -15,7 +15,7 @@ static std::mutex boundsLock;
 static RECT g_deskBounds{0, 0, 1920, 1080};   // la pantalla que se manda (coordenadas del escritorio)
 
 void deskSetOn(bool on) {
-    if (on != g_deskOn) logmsg("[escritorio] %s", on ? "encendido" : "apagado");
+    if (on != g_deskOn) logmsg("[desktop] %s", on ? "on" : "off");
     g_deskOn = on;
 }
 bool deskOn() { return g_deskOn; }
@@ -23,7 +23,7 @@ void deskRequestKey() { if (g_deskEnc) g_deskEnc->requestKey(); }
 std::string deskError() { std::lock_guard<std::mutex> g(errLock); return g_deskErr; }
 static void setErr(const std::string &e) {
     std::lock_guard<std::mutex> g(errLock);
-    if (e != g_deskErr && !e.empty()) logmsg("[escritorio] %s", e.c_str());
+    if (e != g_deskErr && !e.empty()) logmsg("[desktop] %s", e.c_str());
     g_deskErr = e;
 }
 
@@ -190,7 +190,7 @@ static void captureThread() {
 }
 
 void deskStart() {
-    g_deskEnc = new VideoEncoder("escritorio", onDeskEncoded);
+    g_deskEnc = new VideoEncoder("desktop", onDeskEncoded);
     std::thread(captureThread).detach();
 }
 

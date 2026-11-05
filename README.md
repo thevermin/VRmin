@@ -150,7 +150,7 @@ from VRmin Host too, over the USB-C cable.
 ### Windows (beta)
 There's also an early version for Windows PCs: download **VRmin Windows** from the
 [Releases](https://github.com/thevermin/VRmin/releases), unzip it and open **VRmin Host.exe**. It plays your Steam VR
-games on the Quest and shows the Windows desktop in the headset. The steps are in the `LEEME.txt` file inside.
+games on the Quest and shows the Windows desktop in the headset. The steps are in the `README.txt` file inside.
 
 ## FAQ
 

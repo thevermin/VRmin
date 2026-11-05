@@ -88,7 +88,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     WSAStartup(MAKEWORD(2, 2), &wd);
     timeBeginPeriod(1);
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);   // (es video en vivo: que Windows lo atienda primero)
-    logmsg("VRmin Host para Windows %s", VRMIN_WIN_VERSION);
+    logmsg("VRmin Host for Windows %s", VRMIN_WIN_VERSION);
     loadSettings();
     applySettings();
 
@@ -129,6 +129,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     UpdateWindow(g_wnd);
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-    logmsg("VRmin Host cerrado");
+    logmsg("VRmin Host closed");
     return 0;
 }

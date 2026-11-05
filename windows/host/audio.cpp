@@ -42,7 +42,7 @@ static void audioThread() {
             FAILED(ac->GetMixFormat(&wf)) ||
             FAILED(ac->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 200000, 0, wf, nullptr)) ||
             FAILED(ac->GetService(IID_PPV_ARGS(&cc))) || FAILED(ac->Start())) {
-            if (!warned) logmsg("[audio] No pude capturar el sonido de la PC");
+            if (!warned) logmsg("[audio] Couldn't capture the PC sound");
             warned = true;
             done();
             Sleep(3000);
@@ -55,7 +55,7 @@ static void audioThread() {
             static const GUID FLOAT_FMT = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
             isFloat = IsEqualGUID(x->SubFormat, FLOAT_FMT);
         }
-        logmsg("[audio] Enviando el sonido de la PC al Quest (%d Hz, %d canales, %s)", rate, ch, isFloat ? "float" : "enteros");
+        logmsg("[audio] Sending the PC sound to the Quest (%d Hz, %d channels, %s)", rate, ch, isFloat ? "float" : "integer");
         acc.clear();
         const size_t chunk = (size_t)(rate / 50) * 2;   // 20 ms, 2 canales
         while (wantAudio()) {

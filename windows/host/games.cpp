@@ -84,7 +84,7 @@ void gamesScan() {
     {
         std::lock_guard<std::mutex> g(gLock);
         if (vrCache.empty()) {
-            Json c = Json::parse(readFile(dataDir() + L"\\juegos_vr.json"));
+            Json c = Json::parse(readFile(dataDir() + L"\\vr_games.json"));
             for (auto &kv : c.o) vrCache[kv.first] = kv.second.boolean(true);
         }
     }
@@ -121,7 +121,7 @@ void gamesScan() {
     if (cacheChanged) {
         Json c = Json::object();
         for (auto &kv : vrCache) c.set(kv.first, kv.second);
-        writeFile(dataDir() + L"\\juegos_vr.json", c.dump());
+        writeFile(dataDir() + L"\\vr_games.json", c.dump());
     }
 }
 
@@ -186,7 +186,7 @@ std::string gamesRunningName() {
 void gamesQuit() {
     forEachGameProcess([](DWORD pid, const std::string &f) {
         HANDLE p = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-        if (p) { TerminateProcess(p, 0); CloseHandle(p); logmsg("[sala] Cerré %s (proceso %lu)", f.c_str(), pid); }
+        if (p) { TerminateProcess(p, 0); CloseHandle(p); logmsg("[room] Closed %s (process %lu)", f.c_str(), pid); }
     });
 }
 
@@ -203,7 +203,7 @@ void gamesLaunch(const std::string &id) {
         launching = Json::object().set("id", ge.id).set("name", ge.name).set("t", (long long)time(nullptr));
         launchingAt = nowNs();
     }
-    logmsg("[sala] Abriendo %s desde el visor%s", ge.name.c_str(), ge.vr ? "" : " (juego plano)");
+    logmsg("[room] Opening %s from the headset%s", ge.name.c_str(), ge.vr ? "" : " (flat game)");
     std::thread([ge] {
         if (ge.vr) {
             SetupState s = setupCheck();

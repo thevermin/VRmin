@@ -80,7 +80,7 @@ void logmsg(const char *fmt, ...) {
     va_end(ap);
     std::lock_guard<std::mutex> g(g_logLock);
     if (!g_logFile) {
-        std::wstring p = dataDir() + L"\\servidor.log", old = dataDir() + L"\\servidor_anterior.log";
+        std::wstring p = dataDir() + L"\\VRmin.log", old = dataDir() + L"\\VRmin-previous.log";
         MoveFileExW(p.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);   // (el de la vez anterior queda aparte)
         g_logFile = _wfopen(p.c_str(), L"w");
     }
@@ -92,7 +92,7 @@ void logmsg(const char *fmt, ...) {
 
 // ---------------- Ajustes ----------------
 void loadSettings() {
-    Json j = Json::parse(readFile(dataDir() + L"\\ajustes.json"));
+    Json j = Json::parse(readFile(dataDir() + L"\\settings.json"));
     std::lock_guard<std::mutex> g(g_setLock);
     Settings &s = g_set;
     if (j.has("eye")) s.eye = std::min(2560, std::max(512, (int)j["eye"].num()));
@@ -114,7 +114,7 @@ void saveSettings() {
         j.set("eye", s.eye).set("fps", s.fps).set("mbps", s.mbps).set("codec", s.hevc ? "hevc" : "h264").set("fov", s.fov)
          .set("audio", s.audio).set("deskMaxW", s.deskMaxW).set("deskFps", s.deskFps).set("deskMbps", s.deskMbps).set("deskAudio", s.deskAudio);
     }
-    writeFile(dataDir() + L"\\ajustes.json", j.dump());
+    writeFile(dataDir() + L"\\settings.json", j.dump());
 }
 
 // ---------------- Foveated encoding ----------------
@@ -185,7 +185,7 @@ static void computeStream() {
     st.W = st.fov.on() ? round64(st.eye * st.fov.ratio(0.5)) * 2 : st.eye * 2;
     st.H = st.fov.on() ? round64(st.eye * st.fov.ratio(st.fov.cy)) : st.eye;
     if (st.hevc && !encoderCanHevc(st.W, st.H, st.fps, st.bitrate)) st.hevc = false;
-    if (!st.hevc && st.W > 4096) logmsg("[ajustes] AVISO: %d de ancho es mucho para H.264 (máximo 4096): elegí menos nitidez o foveated encoding", st.W);
+    if (!st.hevc && st.W > 4096) logmsg("[settings] WARNING: %d wide is too much for H.264 (4096 max): pick a lower resolution or foveated encoding", st.W);
     std::lock_guard<std::mutex> g(g_runLock);
     g_run = st;
 }
@@ -193,8 +193,8 @@ void applySettings() {
     Stream before = currentStream();
     computeStream();
     Stream st = currentStream();
-    logmsg("[ajustes] %d por ojo · %d Hz · %d Mbps · %s · foveated %s · se codifica %dx%d", st.eye, st.fps, st.bitrate / 1000000,
-           st.hevc ? "HEVC" : "H.264", st.fov.on() ? st.fov.text().c_str() : "no", st.W, st.H);
+    logmsg("[settings] %d per eye · %d Hz · %d Mbps · %s · foveated %s · encoding %dx%d", st.eye, st.fps, st.bitrate / 1000000,
+           st.hevc ? "HEVC" : "H.264", st.fov.on() ? st.fov.text().c_str() : "off", st.W, st.H);
     if (before.W != st.W || before.H != st.H || before.hevc != st.hevc || before.fps != st.fps || before.bitrate != st.bitrate || before.eye != st.eye ||
         before.fov.text() != st.fov.text()) {
         gameQualityChanged();
@@ -242,7 +242,7 @@ static std::mutex g_profLock;
 static Json g_prof = Json::object();
 static bool g_profLoaded = false;
 static std::string g_current;
-static std::wstring profFile() { return dataDir() + L"\\perfiles_juegos.json"; }
+static std::wstring profFile() { return dataDir() + L"\\game_profiles.json"; }
 static void profLoad() {
     if (g_profLoaded) return;
     g_profLoaded = true;
@@ -280,8 +280,8 @@ void profilesBegin(const std::string &app) {
     profLoad();
     g_current = key;
     Eff e = effective(key);
-    logmsg("[juego] Ajustes de «%s»: escala %d %%, campo de visión %d %%%s%s", key.c_str(), (int)(e.scale * 100), (int)(e.fovk * 100),
-           e.index ? ", controles de Index" : "", e.vive ? ", controles de Vive" : "");
+    logmsg("[game] Settings for "%s": scale %d %%, field of view %d %%%s%s", key.c_str(), (int)(e.scale * 100), (int)(e.fovk * 100),
+           e.index ? ", Index controllers" : "", e.vive ? ", Vive controllers" : "");
 }
 void profilesEnd() { std::lock_guard<std::mutex> g(g_profLock); g_current.clear(); }
 Json profilesState() {
@@ -324,5 +324,5 @@ void profilesApply(const Json &m) {
         g_prof.set(key, p);
     }
     writeFile(profFile(), g_prof.dump());
-    logmsg("[juego] Ajustes avanzados de %s guardados (se aplican la próxima vez que se abra el juego)", key.empty() ? "todos los juegos" : key.c_str());
+    logmsg("[game] Advanced settings for %s saved (they apply the next time the game opens)", key.empty() ? "all games" : key.c_str());
 }

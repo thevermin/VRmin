@@ -31,7 +31,7 @@ std::string readFile(const std::wstring &path);
 bool writeFile(const std::wstring &path, const std::string &data);
 uint64_t nowNs();
 
-// ---------- Ajustes (los elige el Quest, quedan en ajustes.json) ----------
+// ---------- Ajustes (los elige el Quest, quedan en settings.json) ----------
 struct Settings {
     int eye = 1536, fps = 72, mbps = 40;
     bool hevc = true;

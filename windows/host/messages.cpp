@@ -39,17 +39,17 @@ void handleQuestMessage(const std::string &line) {
     if (t == "pose") { gameSendLine(line); return; }
     if (t == "key") questRequestKey();
     else if (t == "deskkey") deskRequestKey();
-    else if (t == "log") logmsg("[visor] %s", m["msg"].str().c_str());
+    else if (t == "log") logmsg("[headset] %s", m["msg"].str().c_str());
     else if (t == "framegen") { g_halfRate = m["on"].boolean(false); gameConfigChanged(); }
     else if (t == "hello") {
         std::string mode = m["mode"].str();
         mode2D = mode == "2d"; uiInHeadset = mode == "vr2";
         if (mode2D || uiInHeadset) deskSetOn(false);   // (el escritorio arranca oculto)
-        logmsg("[quest] %s", mode2D ? "Ventana del Quest (2D): lista de juegos y escritorio" : uiInHeadset ? "Sala VR con menú y ventanas" : "Modo VR");
+        logmsg("[quest] %s", mode2D ? "Quest window (2D): game list and desktop" : uiInHeadset ? "VR room with menu and windows" : "VR mode");
     } else if (t == "rejoin") {
         gameSendLine("{\"resetimg\":1}");
         questRequestKey();
-        logmsg("[quest] Volver al juego: rearmando la imagen del juego");
+        logmsg("[quest] Back to the game: rebuilding the game picture");
     } else if (t == "gamecfg") {
         profilesApply(m);
     } else if (t == "settings") {
@@ -70,10 +70,10 @@ void handleQuestMessage(const std::string &line) {
     } else if (t == "launch") {
         gamesLaunch(m["game"].str());
     } else if (t == "quitgame") {
-        logmsg("[sala] Cerrando el juego desde el visor");
+        logmsg("[room] Closing the game from the headset");
         std::thread(gamesQuit).detach();
     } else if (t == "report") {
-        logmsg("[reporte] pedido desde el visor");
+        logmsg("[report] requested from the headset");
     } else if (t == "desk") {
         if (m.has("on")) deskSetOn(m["on"].boolean());
         if (m["on"].boolean()) deskRequestKey();
