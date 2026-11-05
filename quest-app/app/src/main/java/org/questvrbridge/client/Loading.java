@@ -173,15 +173,24 @@ final class Loading {
         bb.setColor(Ui.ACCENT);
         bb.setCornerRadius(Ui.dp(c, 3));
         bar.setBackground(bb);
-        track.addView(bar, new FrameLayout.LayoutParams(Ui.dp(c, 90), Ui.dp(c, 5)));
-        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(Ui.dp(c, 260), Ui.dp(c, 5));
+        final int trackW = Ui.dp(c, 260);
+        track.addView(bar, new FrameLayout.LayoutParams(trackW, Ui.dp(c, 5)));
+        track.setClipChildren(true);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(trackW, Ui.dp(c, 5));
         tlp.topMargin = dp16;
         card.addView(track, tlp);
-        android.animation.ObjectAnimator a = android.animation.ObjectAnimator.ofFloat(bar, "translationX", 0, Ui.dp(c, 170));
-        a.setDuration(1100);
-        a.setRepeatMode(android.animation.ValueAnimator.REVERSE);
+        // La barrita barre de izquierda a derecha: la punta sale primero y la cola la alcanza (con aceleración suave)
+        bar.setPivotX(0);
+        android.animation.ValueAnimator a = android.animation.ValueAnimator.ofFloat(0f, 1f);
+        a.setDuration(1400);
         a.setRepeatCount(android.animation.ValueAnimator.INFINITE);
-        a.setInterpolator(new android.view.animation.AccelerateDecelerateInterpolator());
+        a.setInterpolator(new android.view.animation.LinearInterpolator());
+        a.addUpdateListener(an -> {
+            float u = (float) an.getAnimatedValue();
+            float h = smooth(Math.min(1f, u * 1.25f)), t = smooth(Math.max(0f, Math.min(1f, u * 1.25f - 0.25f)));
+            bar.setTranslationX(t * trackW);
+            bar.setScaleX(Math.max(0.001f, h - t));
+        });
         a.start();
 
         status = Ui.label(c, "", 19, Ui.TEXT2, false);
@@ -207,6 +216,12 @@ final class Loading {
         slp.gravity = Gravity.CENTER_HORIZONTAL;
         slp.bottomMargin = dp16 / 2;
         card.addView(sep, slp);
+        android.animation.ObjectAnimator br = android.animation.ObjectAnimator.ofFloat(sep, "alpha", 0.45f, 1f);   // (respira)
+        br.setDuration(1600);
+        br.setRepeatMode(android.animation.ValueAnimator.REVERSE);
+        br.setRepeatCount(android.animation.ValueAnimator.INFINITE);
+        br.setInterpolator(new android.view.animation.AccelerateDecelerateInterpolator());
+        br.start();
         LinearLayout tipText = new LinearLayout(c);
         tipText.setOrientation(LinearLayout.VERTICAL);
         tipText.addView(Ui.label(c, I18n.t("Consejo"), 14, Ui.ACCENT_TEXT, true));
@@ -250,12 +265,24 @@ final class Loading {
         loadCover(gameId);
     }
 
+    private static float smooth(float x) { return x * x * x * (x * (6 * x - 15) + 10); }
+
     private final Runnable tipTick = () -> { nextTip(); scheduleTip(); };
     private void scheduleTip() { ui.removeCallbacks(tipTick); ui.postDelayed(tipTick, TIP_MS); }
+    /// El consejo actual se va hacia arriba y el nuevo entra desde abajo
     private void nextTip() {
         if (tip == null || tips.isEmpty()) return;
         tipAt = (tipAt + 1) % tips.size();
-        tip.setText(tips.get(tipAt));
+        final TextView t = tip;
+        final String txt = tips.get(tipAt);
+        final float d = Ui.dp(t.getContext(), 10);
+        t.animate().cancel();
+        t.animate().alpha(0f).translationY(-d).setDuration(200).setInterpolator(new android.view.animation.AccelerateInterpolator(1.4f))
+                .withEndAction(() -> {
+                    t.setText(txt);
+                    t.setTranslationY(d);
+                    t.animate().alpha(1f).translationY(0).setDuration(240).setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f)).start();
+                }).start();
     }
 
     private void loadCover(String appId) {

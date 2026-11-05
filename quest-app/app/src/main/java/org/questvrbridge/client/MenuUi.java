@@ -107,6 +107,18 @@ final class MenuUi implements Link.Listener {
     private FrameLayout rootView;
     private LinearLayout panel, content;
     private TextView[] tabs = new TextView[5];
+    // El resaltado de la sección elegida se desliza de una pestaña a otra (se dibuja detrás de las pestañas)
+    private final GradientDrawable tabInd = new GradientDrawable();
+    private float indTop = -1, indBot = -1;
+    private android.animation.ValueAnimator indAnim;
+    private LinearLayout sideView;
+    // Portadas que entran en cascada (solo al abrir la pestaña, no cada vez que se actualiza la lista)
+    private long staggerUntil = 0;
+    private int staggerN = 0;
+    // Emparejar: el código que se mandó (para mostrarlo en ámbar si sale bien) y si ya se sacudió el error
+    private String pairSent = "";
+    private boolean wasPairing = false, shookWrong = false;
+    private long pairOkUntil = 0;
     private TextView vrButton;
     // Ajustes rápidos: íconos arriba de todo en Ajustes (como el centro de control del iPhone)
     static final String[] QUICK_IDS = {"front", "hands", "portal", "keyboard", "move", "palm", "hud", "cable", "rec"};
@@ -352,7 +364,18 @@ final class MenuUi implements Link.Listener {
         plp.setMargins(dp(ctx, 16), dp(ctx, 16), dp(ctx, 16), dp(ctx, 16));
         rootView.addView(panel, plp);
 
-        LinearLayout side = new LinearLayout(ctx);
+        LinearLayout side = new LinearLayout(ctx) {
+            @Override protected void dispatchDraw(android.graphics.Canvas c) {
+                if (indTop >= 0) {
+                    tabInd.setBounds(dp(ctx, 16), Math.round(indTop), getWidth() - dp(ctx, 16), Math.round(indBot));
+                    tabInd.draw(c);
+                }
+                super.dispatchDraw(c);
+            }
+        };
+        sideView = side;
+        tabInd.setColor(Ui.ACCENT_SEL);
+        tabInd.setCornerRadius(Ui.rad(ctx, 999));
         side.setOrientation(LinearLayout.VERTICAL);
         side.setPadding(dp(ctx, 16), dp(ctx, 28), dp(ctx, 16), dp(ctx, 18));
         GradientDrawable sbg = new GradientDrawable();
@@ -539,17 +562,40 @@ final class MenuUi implements Link.Listener {
         for (int i = 0; i < tabs.length; i++) {
             if (tabs[i] == null) continue;
             // la sección elegida se tiñe de ámbar (fondo suave, texto e ícono ámbar claro)
-            tabs[i].setBackground(Ui.hoverable(ctx, i == t ? Ui.ACCENT_SEL : 0, 999, false));
+            tabs[i].setBackground(Ui.hoverable(ctx, 0, 999, false));   // (el fondo ámbar es el resaltado que se desliza)
             tabs[i].setTextColor(i == t ? Ui.ACCENT_TEXT : Ui.TEXT2);
             tabs[i].setText(I18n.t(TAB_NAMES[i]));   // (por si cambió el idioma)
             Ui.leadingIcon(tabs[i], tabIcons[i], 22, i == t ? Ui.ACCENT_TEXT : Ui.TEXT2);
         }
+        moveTabIndicator(t);
+        staggerUntil = android.os.SystemClock.uptimeMillis() + 700; staggerN = 0;
         setPage = null;
         openChoice = null;
         drawnKey = "";
         rootView.post(() -> slideIn(0));
         render();
         autoTutorial();
+    }
+
+    /// Lleva el resaltado ámbar a la pestaña elegida: el borde que va adelante sale primero (se estira un poco al viajar)
+    private void moveTabIndicator(int t) {
+        if (sideView == null || tabs[t] == null) return;
+        TextView tv = tabs[t];
+        if (tv.getHeight() == 0) { tv.post(() -> moveTabIndicator(t)); return; }
+        final float toT = tv.getTop(), toB = tv.getBottom();
+        if (indTop < 0) { indTop = toT; indBot = toB; sideView.invalidate(); return; }
+        final float fromT = indTop, fromB = indBot;
+        final boolean down = toT > fromT;
+        if (indAnim != null) indAnim.cancel();
+        indAnim = android.animation.ValueAnimator.ofFloat(0f, 1f).setDuration(280);
+        indAnim.addUpdateListener(a -> {
+            float x = (float) a.getAnimatedValue();
+            float lead = 1f - (1f - x) * (1f - x) * (1f - x), trail = x * x * (3f - 2f * x);
+            indTop = fromT + (toT - fromT) * (down ? trail : lead);
+            indBot = fromB + (toB - fromB) * (down ? lead : trail);
+            sideView.invalidate();
+        });
+        indAnim.start();
     }
 
     View view() { return rootView; }
@@ -762,10 +808,19 @@ final class MenuUi implements Link.Listener {
         TextView code = Ui.label(ctx, shown.toString(), 40, Ui.TEXT, true);
         code.setPadding(0, dp(ctx, 8), 0, dp(ctx, 4));
         content.addView(code);
+        wasPairing = true;
         if (Link.I.pairWrong()) {
             TextView w = Ui.label(ctx, I18n.t("Ese código no es. Fijate el que muestra la Mac y probá de nuevo."), 15, Ui.ACCENT, true);
             content.addView(w);
-        }
+            if (!shookWrong) {   // (una vez por error: el código tiembla de lado a lado)
+                shookWrong = true;
+                code.setTextColor(Color.rgb(240, 110, 100));
+                android.animation.ObjectAnimator sh = android.animation.ObjectAnimator.ofFloat(code, "translationX", 0, dp(ctx, 14), -dp(ctx, 12), dp(ctx, 9), -dp(ctx, 6), dp(ctx, 3), 0);
+                sh.setDuration(420);
+                sh.start();
+                code.postDelayed(() -> code.setTextColor(Ui.TEXT), 900);
+            }
+        } else shookWrong = false;
         android.widget.GridLayout g = new android.widget.GridLayout(ctx);
         g.setColumnCount(3);
         String[] keys = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "⌫", "0", "✓"};
@@ -775,7 +830,7 @@ final class MenuUi implements Link.Listener {
             b.setGravity(Gravity.CENTER);
             b.setOnClickListener(v -> {
                 if ("⌫".equals(k)) { if (pairDigits.length() > 0) pairDigits.setLength(pairDigits.length() - 1); }
-                else if ("✓".equals(k)) { if (pairDigits.length() == 6) { Link.I.submitCode(pairDigits.toString()); pairDigits.setLength(0); } }
+                else if ("✓".equals(k)) { if (pairDigits.length() == 6) { pairSent = pairDigits.toString(); shookWrong = false; Link.I.submitCode(pairSent); pairDigits.setLength(0); } }
                 else if (pairDigits.length() < 6) pairDigits.append(k);
                 drawnKey = "";
                 render();
@@ -791,10 +846,37 @@ final class MenuUi implements Link.Listener {
         content.addView(cancel, wrap());
     }
 
+    private void renderPairedOk() {
+        header(I18n.t("¡Emparejado!"), null);
+        LinearLayout digits = new LinearLayout(ctx);
+        digits.setOrientation(LinearLayout.HORIZONTAL);
+        digits.setGravity(Gravity.CENTER_VERTICAL);
+        for (int i = 0; i < 6; i++) {
+            TextView d = Ui.label(ctx, String.valueOf(pairSent.charAt(i)), 40, Ui.TEXT, true);
+            d.setPadding(0, 0, dp(ctx, i == 2 ? 26 : 12), 0);
+            digits.addView(d);
+            final int k = i;
+            android.animation.ValueAnimator va = android.animation.ValueAnimator.ofArgb(Ui.TEXT, Ui.ACCENT).setDuration(160);
+            va.setStartDelay(80L * k);
+            va.addUpdateListener(a -> d.setTextColor((int) a.getAnimatedValue()));
+            va.start();
+        }
+        TextView tick = Ui.label(ctx, "✓", 40, Ui.ACCENT, true);
+        tick.setScaleX(0f); tick.setScaleY(0f);
+        tick.animate().scaleX(1f).scaleY(1f).setStartDelay(560).setDuration(260).setInterpolator(new android.view.animation.OvershootInterpolator(3f)).start();
+        digits.addView(tick);
+        content.addView(digits);
+        rootView.postDelayed(() -> { drawnKey = ""; render(); }, Math.max(50, pairOkUntil - android.os.SystemClock.uptimeMillis()));
+    }
+
     private void renderMacs() {
         String pm = Link.I.pairingMac();
         Link.Mac tg = Link.I.target();
         if (pm != null && tg != null && pm.equals(tg.name)) { renderPairing(pm); return; }
+        // Recién emparejado: el código se pone ámbar número por número y aparece un tilde
+        long nowP = android.os.SystemClock.uptimeMillis();
+        if (wasPairing) { wasPairing = false; if (Link.I.isConnected() && pairSent.length() == 6) pairOkUntil = nowP + 1600; }
+        if (nowP < pairOkUntil) { renderPairedOk(); return; }
         header(I18n.t("Computadoras"), I18n.t("Macs con VRmin Host abierto en tu red Wi-Fi."));
         // Conexión: a mano, solo por cable (el mismo ajuste que en Ajustes › Conexión)
         toggle(content, null, I18n.t("Solo por cable USB-C"), I18n.t("Los juegos y las pantallas van siempre por el cable (sin Wi-Fi). Sin cable no se conecta."),
@@ -1827,6 +1909,13 @@ final class MenuUi implements Link.Listener {
         t.setBackground(Ui.hoverable(ctx, Color.argb(22, 255, 255, 255), 22, false));
         t.setClickable(true);
         t.setAlpha(busy ? 0.5f : 1f);
+        Ui.card(t);
+        if (android.os.SystemClock.uptimeMillis() < staggerUntil && staggerN < 15) {
+            final float a = t.getAlpha();
+            t.setAlpha(0f); t.setTranslationY(dp(ctx, 16)); t.setScaleX(0.94f); t.setScaleY(0.94f);
+            t.animate().alpha(a).translationY(0).scaleX(1f).scaleY(1f).setStartDelay(60 + 35L * staggerN++).setDuration(260)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f)).start();
+        }
         ImageView img = new ImageView(ctx);
         img.setScaleType(ImageView.ScaleType.CENTER_CROP);
         img.setClipToOutline(true);

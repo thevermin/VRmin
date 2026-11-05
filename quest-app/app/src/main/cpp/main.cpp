@@ -1164,6 +1164,8 @@ struct UiPanel {
     bool follow = false, folInit = false;   // fijada a la vista: te sigue suavemente cuando girás
     double openAt = 0, closeAt = 0;         // animaciones: cuándo apareció (y cuándo se empezó a cerrar)
     float barK = 0, grabK = 0;              // barrita: 0 quieta · 0,5 apuntada · 1 agarrada; ventana «levantada» al moverla
+    float hoverK = 0;                       // apuntada con el láser (se acerca un poco hacia vos)
+    float liftX = 0, liftV = 0;             // agarrada: se acerca; al soltarla vuelve con un resorte (posición y velocidad)
     float folOff[3] = {0, 0, 0};            // dónde está respecto de tu cabeza (derecha, arriba, adelante)
     float str3d = 0.009f;
     float vrect[4] = {0, 0, 1, 1};   // dónde está la imagen de la Mac dentro de la ventana
@@ -1173,6 +1175,7 @@ struct UiPanel {
     float lastStr = -1;
 };
 static std::mutex g_uiLock;
+static std::atomic<bool> g_pointClickable{false};   // el láser está sobre algo que se puede tocar (botón, lista…)
 
 // 3D automático del escritorio: profundidad calculada por una IA en la Mac
 static std::atomic<int> g_3dMode{0};
@@ -1186,6 +1189,7 @@ static std::atomic<float> g_watchProg{0};        // cuánto falta para que se ab
 static float g_watchWorld[3] = {0, 1.2f, -0.4f};   // dónde estaba el reloj cuando lo miraste (para poner el menú encima)
 static const int KEYBOARD_ID = 0x2FFFFFC0;          // el teclado para escribir en la Mac
 static const int LOCK_NOTE_ID = 0x2FFFFFB1;         // el aviso de «controles y manos en pausa» (va donde el teclado)
+static const int PORTAL_HINT_ID = 0x2FFFFFB0;       // el aviso de cómo dibujar un portal
 static const int WRIST_MENU_ID = 0x2FFFFFE0;        // el menú que aparece sobre el reloj
 static std::atomic<bool> g_wristFollow{true};       // el menú del reloj lo sigue (o quedó suelto, como una ventana)
 static float g_watchNow[3] = {0, 1.2f, -0.4f};      // dónde está el reloj ahora
@@ -1253,6 +1257,10 @@ Java_org_questvrbridge_client_VrActivity_nativeSetRealHands(JNIEnv *, jclass, jb
 /// El menú del reloj sigue al reloj (true) o queda suelto donde está, como una ventana más (false)
 extern "C" JNIEXPORT void JNICALL
 Java_org_questvrbridge_client_VrActivity_nativeSetWristFollow(JNIEnv *, jclass, jboolean on) { g_wristFollow = on; }
+
+/// El láser está sobre algo que se puede tocar (el punto crece un poco)
+extern "C" JNIEXPORT void JNICALL
+Java_org_questvrbridge_client_VrActivity_nativeSetPointClickable(JNIEnv *, jclass, jboolean on) { g_pointClickable = on; }
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_questvrbridge_client_VrActivity_nativeSetLaser(JNIEnv *, jclass, jint color, jfloat gain) {
@@ -1726,6 +1734,8 @@ struct App {
     PFN_xrUpdateSwapchainFB xrUpdateSwapchainFB = nullptr;
     XrFoveationProfileFB fovRoom = XR_NULL_HANDLE, fovNone = XR_NULL_HANDLE;
     int fovState = -1;            // 1: la sala con foveated rendering · 0: sin (el video del juego)
+    double pressAt[2] = {0, 0};   // cuándo apretó cada mano sobre un panel (el punto del láser «late»)
+    double gameTransAt = 0;       // cuándo se entró o se salió de un juego (la imagen se abre desde el centro)
     Swapchain listSc, deskSc, overlay[2];
     bool listReady = false, deskReady = false;
     GLuint deskTex = 0;
@@ -1775,7 +1785,8 @@ struct App {
     GLuint blitProg = 0; GLint bTex = -1;
     double anchorAt = 0;   // cuándo se tomó el punto de referencia (la transición espera a que todo esté listo)
     float revealFwd[3] = {0, 0, -1};
-    GLuint maskProg = 0;
+    GLuint maskProg = 0, glowProg = 0;
+    GLint gTan = -1, gRot = -1, gFwd = -1, gAng = -1, gStr = -1;
     GLint mTan = -1, mRot = -1, mFwd = -1, mAng = -1;
     bool tpAim = false, tpOk = false;
     float tpTgt[3] = {0, 0, 0};
@@ -5788,18 +5799,29 @@ static void renderOverlay(App &app, int e, const XrView &view, const Ray *rays, 
         glUniform4f(app.uCol, col[0], col[1], col[2], std::min(1.f, alpha));
         drawQuad(app, v);
         if (r.hit) {
-            // Puntero: un punto redondo donde toca el rayo, un poquito hacia adelante del panel
+            // Puntero: un punto redondo donde toca el rayo, un poquito hacia adelante del panel. Crece sobre lo que se
+            // puede tocar (lo dice la parte Java) y «late» al apretar.
+            static float grow = 0;
+            static double lastG = 0;
+            double gn = nowMs();
+            float gdt = lastG > 0 ? std::min(0.1f, (float)(gn - lastG) / 1000.f) : 0.f;
+            lastG = gn;
+            grow += ((g_pointClickable.load() ? 1.f : 0.f) - grow) * std::min(1.f, gdt * 14.f);
             float c[3] = {tip[0] - r.d[0] * 0.004f, tip[1] - r.d[1] * 0.004f, tip[2] - r.d[2] * 0.004f};
-            const float k = 0.011f;
-            float q[20];
             const float cr[4][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
-            for (int j = 0; j < 4; j++) {
-                for (int a = 0; a < 3; a++) q[j * 5 + a] = c[a] + (right[a] * cr[j][0] + up[a] * cr[j][1]) * k;
-                q[j * 5 + 3] = (cr[j][0] + 1) * 0.5f; q[j * 5 + 4] = (cr[j][1] + 1) * 0.5f;
-            }
-            glUniform1f(app.uRound, 1);
-            glUniform4f(app.uCol, 1, 1, 1, 1);
-            drawQuad(app, q);
+            auto disc = [&](float k, float a) {
+                float q[20];
+                for (int j = 0; j < 4; j++) {
+                    for (int b = 0; b < 3; b++) q[j * 5 + b] = c[b] + (right[b] * cr[j][0] + up[b] * cr[j][1]) * k;
+                    q[j * 5 + 3] = (cr[j][0] + 1) * 0.5f; q[j * 5 + 4] = (cr[j][1] + 1) * 0.5f;
+                }
+                glUniform1f(app.uRound, 1);
+                glUniform4f(app.uCol, 1, 1, 1, a);
+                drawQuad(app, q);
+            };
+            float px = r.hand >= 0 ? (float)((gn - app.pressAt[r.hand]) / 380.0) : 1.f;
+            if (px >= 0.f && px < 1.f) disc(0.011f * (1.3f + 2.2f * px), 0.45f * (1.f - px) * (1.f - px));
+            disc(0.011f * (1.f + 0.45f * grow), 1.f);
         }
     }
     // Viñeta al moverte: bordes oscuros (centrados en el centro óptico de cada ojo)
@@ -7343,6 +7365,7 @@ static int uiInput(App &app, XrTime time, const XrView &head, Ray rays[2], std::
             else { javaPointer(hp.down, 2, u, v, 0); markHot(hp.down); }   // mientras se arrastra, su barra no se esconde
         } else if (pressed && hitKind[h] == 1) {
             hp.down = hitPanel[h];
+            app.pressAt[h] = nowMs();
             javaPointer(hp.down, 1, hu[h], hv[h], 0);
         }
         hp.hover = hitKind[h] == 1 ? hitPanel[h] : -1;
@@ -7382,6 +7405,15 @@ static int uiInput(App &app, XrTime time, const XrView &head, Ray rays[2], std::
         if (p->closeAt > 0) b.a *= std::max(0.f, 1.f - (float)(nowMs() - p->closeAt) / 150.f);
         if (p->openAt > 0 && nowMs() - p->openAt < 320) b.a *= (float)(nowMs() - p->openAt) / 320.f;
         bars.push_back(b);
+    }
+    // Lo que apuntás se acerca un poco; lo que agarrás, más (y al soltarlo se asienta con un resorte)
+    for (UiPanel *p : g_ui) {
+        bool hv = (hitPanel[0] == p->id && hitKind[0] == 1) || (hitPanel[1] == p->id && hitKind[1] == 1);
+        bool gr = app.hp[0].grab == p->id || app.hp[1].grab == p->id || app.hp[0].down == p->id || app.hp[1].down == p->id;
+        p->hoverK += ((hv ? 1.f : 0.f) - p->hoverK) * std::min(1.f, barDt * 12.f);
+        float acc = 260.f * ((gr ? 1.f : 0.f) - p->liftX) - 20.f * p->liftV;
+        p->liftV += acc * barDt; p->liftX += p->liftV * barDt;
+        if (!gr && fabsf(p->liftX) < 1e-4f && fabsf(p->liftV) < 1e-3f) { p->liftX = 0; p->liftV = 0; }
     }
     if (!g_inGameNow) palmMenuUpdate(app, time, head);
     if (false) {   // (manos dibujadas y reloj: reemplazados por las manos reales)
@@ -7822,6 +7854,71 @@ void main() {
     app.mRot = glGetUniformLocation(app.maskProg, "rot");
     app.mFwd = glGetUniformLocation(app.maskProg, "fwd");
     app.mAng = glGetUniformLocation(app.maskProg, "ang");
+    // El borde de la transición entre salas brilla en ámbar, con chispitas (se suma a la imagen)
+    const char *gfs = R"(#version 300 es
+precision highp float;
+uniform vec4 tanLRDU;
+uniform mat3 rot;
+uniform vec3 fwd;
+uniform float ang, str;
+in vec2 uv;
+out vec4 o;
+void main() {
+    vec3 dv = normalize(vec3(mix(tanLRDU.x, tanLRDU.y, uv.x), mix(tanLRDU.z, tanLRDU.w, uv.y), -1.0));
+    vec3 dw = rot * dv;
+    float a = acos(clamp(dot(dw, fwd), -1.0, 1.0));
+    float x = (a - (ang - 0.37)) / 0.11;
+    float ring = exp(-x * x);
+    vec3 cell = floor(dw * 90.0);
+    float h = fract(sin(dot(cell, vec3(127.1, 311.7, 74.7))) * 43758.5453);
+    float spark = h > 0.93 ? smoothstep(0.32, 0.0, length(fract(dw * 90.0) - 0.5)) * exp(-x * x * 0.25) : 0.0;
+    o = vec4(vec3(1.0, 0.68, 0.30) * (ring * 0.55 + spark * 0.9) * str, 0.0);
+})";
+    app.glowProg = glCreateProgram();
+    glAttachShader(app.glowProg, compileShader(GL_VERTEX_SHADER, vs));
+    glAttachShader(app.glowProg, compileShader(GL_FRAGMENT_SHADER, gfs));
+    glLinkProgram(app.glowProg);
+    app.gTan = glGetUniformLocation(app.glowProg, "tanLRDU");
+    app.gRot = glGetUniformLocation(app.glowProg, "rot");
+    app.gFwd = glGetUniformLocation(app.glowProg, "fwd");
+    app.gAng = glGetUniformLocation(app.glowProg, "ang");
+    app.gStr = glGetUniformLocation(app.glowProg, "str");
+}
+
+/// El borde brillante de la transición (se dibuja encima, sumando luz)
+static void applyGlow(App &app, const XrView &view, float r) {
+    if (!app.glowProg) return;
+    float str = 4.f * r * (1.f - r);
+    if (str < 0.02f) return;
+    glUseProgram(app.glowProg);
+    glUniform4f(app.gTan, tanf(view.fov.angleLeft), tanf(view.fov.angleRight), tanf(view.fov.angleDown), tanf(view.fov.angleUp));
+    float m[9]; quatToMat(view.pose.orientation, m);
+    glUniformMatrix3fv(app.gRot, 1, GL_FALSE, m);
+    glUniform3fv(app.gFwd, 1, app.revealFwd);
+    glUniform1f(app.gAng, r * ((float)M_PI + 0.8f));
+    glUniform1f(app.gStr, str);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
+    glBindVertexArray(app.vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDisable(GL_BLEND);
+}
+
+/// Entrar o salir de un juego: la imagen nueva se abre desde el centro de la vista (afuera, negro)
+static void applyOpenFromCenter(App &app, const XrView &view, float k) {
+    glUseProgram(app.maskProg);
+    glUniform4f(app.mTan, tanf(view.fov.angleLeft), tanf(view.fov.angleRight), tanf(view.fov.angleDown), tanf(view.fov.angleUp));
+    float m[9]; quatToMat(view.pose.orientation, m);
+    glUniformMatrix3fv(app.mRot, 1, GL_FALSE, m);
+    const float f0[3] = {0, 0, -1};
+    float fw[3]; rotate(view.pose.orientation, f0, fw);
+    glUniform3fv(app.mFwd, 1, fw);
+    glUniform1f(app.mAng, 0.15f + k * 1.9f);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_ZERO, GL_SRC_COLOR, GL_ZERO, GL_ONE);   // (oscurece el color; el alfa queda: negro, no tu cuarto)
+    glBindVertexArray(app.vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDisable(GL_BLEND);
 }
 
 /// Cuánto del ambiente se ve (0 = solo tu cuarto real, 1 = todo el ambiente), con aceleración suave
@@ -7913,6 +8010,7 @@ void main() { o = vec4(texture(tex, uv).rgb, 1.0); })";
     glBindVertexArray(app.vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glDisable(GL_BLEND);
+    applyGlow(app, view, k);
 }
 
 /// Cuánto se ve un panel durante la transición: el mismo borde suave que abre la sala lo va descubriendo
@@ -8321,6 +8419,7 @@ static void renderFrame(App &app) {
     // Entrar o salir de un juego: la parte Java pausa lo que no se ve (ventanas de la sala, menú) y lo reanuda al volver
     if (showVideo != g_inGameNow) {
         g_inGameNow = showVideo;
+        app.gameTransAt = nowMs();
         if (!showVideo && g_gameMenu) { g_gameMenu = false; javaBool(g_jGameMenu, false); }
         javaBool(g_jGameState, showVideo);
         sendLog(showVideo ? "Juego VR: la sala se apaga (menú del juego: mantener el botón de menú izquierdo)" : "Juego VR cerrado: vuelve la sala");
@@ -8497,6 +8596,11 @@ static void renderFrame(App &app) {
             if (reveal < 1.f && app.hasPassthrough) glClearColor(0, 0, 0, 0); else glClearColor(k, k, k * 1.6f, 1);
             glClear(GL_COLOR_BUFFER_BIT);
         }
+        // Al entrar o salir de un juego, la imagen nueva se abre desde el centro (0,6 s)
+        if (app.gameTransAt > 0 && nowMs() - app.gameTransAt < 600) {
+            float x = (float)((nowMs() - app.gameTransAt) / 600.0);
+            applyOpenFromCenter(app, views[e], x * x * (3.f - 2.f * x));
+        }
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         xrReleaseSwapchainImage(s.handle, &ri);
@@ -8655,20 +8759,38 @@ static void renderFrame(App &app) {
         bool fading = false;
         // Animación al abrir (crece un poco y aparece), al cerrar (se achica y se va) y al moverla (se «levanta»)
         float animA = 1.f, animS = 1.f;
+        float animOff[3] = {0, 0, 0};   // corrimiento de la animación (en metros, en el mundo)
         {
             const UiPanel *ap = p;
             if (p->parent) for (UiPanel *q : g_ui) if (q->id == p->parent) { ap = q; break; }   // la barra sigue a su ventana
             double tn = nowMs();
-            if (ap->openAt > 0 && tn - ap->openAt < 320) {
-                float x = (float)(tn - ap->openAt) / 320.f, e = 1.f - (1.f - x) * (1.f - x) * (1.f - x);
-                animA *= e; animS *= 0.9f + 0.1f * e;
+            const bool fromWrist = ap->id == WRIST_MENU_ID, drop = ap->id == LOCK_NOTE_ID || ap->id == PORTAL_HINT_ID;
+            float up = 0;   // hacia arriba (+) o abajo (-)
+            if (ap->openAt > 0 && tn - ap->openAt < 450) {
+                float x = (float)(tn - ap->openAt) / 450.f;
+                float spr = 1.f - expf(-6.5f * x) * cosf(9.f * x);           // resorte suave: se pasa apenas y se asienta
+                float eo = 1.f - (1.f - x) * (1.f - x) * (1.f - x);
+                animA *= std::min(1.f, x * 3.f);
+                animS *= fromWrist ? 0.2f + 0.8f * spr : 0.88f + 0.12f * spr;
+                up += drop ? 0.05f * (1.f - spr) : fromWrist ? 0.f : -0.035f * (1.f - eo);
             }
             if (ap->closeAt > 0) {
                 float x = std::min(1.f, (float)(tn - ap->closeAt) / 180.f), e = x * x;
-                animA *= 1.f - e; animS *= 1.f - 0.12f * e;
+                animA *= 1.f - e; animS *= fromWrist ? 1.f - 0.8f * e : 1.f - 0.12f * e;
+                up += drop ? 0.04f * e : -0.02f * e;
             }
             animS *= 1.f - 0.03f * ap->grabK; animA *= 1.f - 0.12f * ap->grabK;
             if (!app.hasColorScale) animA = 1.f;
+            // Hacia tu cabeza: un poco al apuntarle, más al agarrarla (las pantallas grandes, menos; la TV fija, nada)
+            float toward = 0;
+            if (!ap->hud && !(ap->tv && fixedScreenEnv())) {
+                const bool big = ap->wm > 1.3f || ap->tv;
+                toward = ap->hoverK * (big ? 0.006f : 0.012f) + ap->liftX * (big ? 0.02f : 0.03f);
+            }
+            float th[3] = {headPose.position.x - ap->pose.position.x, headPose.position.y - ap->pose.position.y, headPose.position.z - ap->pose.position.z};
+            float tl = sqrtf(dot3(th, th));
+            if (tl > 0.05f) for (int k = 0; k < 3; k++) animOff[k] = th[k] / tl * toward;
+            animOff[1] += up;
         }
         if ((smoothPanels && reveal < 1.f) || animA < 0.999f) {
             float a = (smoothPanels && reveal < 1.f) ? (p->hud ? reveal : panelReveal(app, p->pose, reveal)) : 1.f;
@@ -8694,7 +8816,7 @@ static void renderFrame(App &app) {
             const float ez[3] = {0, 0, 1};
             float n[3]; rotate(p->pose.orientation, ez, n);
             c.pose.orientation = p->pose.orientation;
-            c.pose.position = {p->pose.position.x + n[0] * p->radius, p->pose.position.y + n[1] * p->radius, p->pose.position.z + n[2] * p->radius};
+            c.pose.position = {p->pose.position.x + n[0] * p->radius + animOff[0], p->pose.position.y + n[1] * p->radius + animOff[1], p->pose.position.z + n[2] * p->radius + animOff[2]};
             c.radius = p->radius;
             c.centralAngle = p->wm * animS / p->radius;
             c.aspectRatio = p->wm / p->hm;
@@ -8709,13 +8831,14 @@ static void renderFrame(App &app) {
             q.subImage.swapchain = sc;
             q.subImage.imageRect = {{0, 0}, {p->w, p->h}};
             q.pose = p->pose;
+            q.pose.position = {p->pose.position.x + animOff[0], p->pose.position.y + animOff[1], p->pose.position.z + animOff[2]};
             q.size = {p->wm * animS, p->hm * animS};
             if (fillEye) {   // solo el video, sin barras, ampliado alrededor de su centro
                 const float ex[3] = {1, 0, 0}, ey[3] = {0, 1, 0};
                 float ax[3], ay[3]; rotate(p->pose.orientation, ex, ax); rotate(p->pose.orientation, ey, ay);
-                q.pose.position = {p->pose.position.x + ax[0] * p->fillOff[0] + ay[0] * p->fillOff[1],
-                                   p->pose.position.y + ax[1] * p->fillOff[0] + ay[1] * p->fillOff[1],
-                                   p->pose.position.z + ax[2] * p->fillOff[0] + ay[2] * p->fillOff[1]};
+                q.pose.position = {p->pose.position.x + ax[0] * p->fillOff[0] + ay[0] * p->fillOff[1] + animOff[0],
+                                   p->pose.position.y + ax[1] * p->fillOff[0] + ay[1] * p->fillOff[1] + animOff[1],
+                                   p->pose.position.z + ax[2] * p->fillOff[0] + ay[2] * p->fillOff[1] + animOff[2]};
                 q.size = {p->fillSize[0] * animS, p->fillSize[1] * animS};
             }
             if (p->hud) {

@@ -88,7 +88,61 @@ final class Ui {
         s.addState(new int[]{android.R.attr.state_pressed}, fill(c, Color.argb(110, 255, 255, 255), radiusDp, oval));
         s.addState(new int[]{android.R.attr.state_hovered}, fill(c, Color.argb(60, 255, 255, 255), radiusDp, oval));
         s.addState(new int[]{}, fill(c, base, radiusDp, oval));
+        s.setEnterFadeDuration(110);   // (el brillo aparece y se va de a poco, no de golpe)
+        s.setExitFadeDuration(170);
         return s;
+    }
+
+    // ---------------------------------------------------------------- Profundidad al apuntar y al apretar
+    // Lo que apuntás con el láser se acerca un poco (más grande y con sombra, como si saliera del panel); al apretarlo
+    // se hunde y suelta una onda. Lo hace VrActivity para todos los paneles; acá están las animaciones.
+    private static final java.util.WeakHashMap<android.view.View, Boolean> CARDS = new java.util.WeakHashMap<>();
+    /** Portadas y tarjetas: además de acercarse, se inclinan un poco hacia vos. */
+    static void card(android.view.View v) { CARDS.put(v, true); }
+    /** La tarjeta que contiene a v (o v mismo), si hay. */
+    static android.view.View cardOf(android.view.View v) {
+        for (android.view.View x = v; x != null; x = x.getParent() instanceof android.view.View ? (android.view.View) x.getParent() : null)
+            if (CARDS.containsKey(x)) return x;
+        return null;
+    }
+
+    static void liftHover(android.view.View v, boolean on) {
+        float big = Math.max(v.getWidth(), v.getHeight());
+        float s = on ? 1f + Math.min(0.06f, dp(v.getContext(), 7) / Math.max(1f, big)) : 1f;
+        v.animate().setStartDelay(0).scaleX(s).scaleY(s).translationZ(on ? dp(v.getContext(), 7) : 0)
+                .rotationX(on && CARDS.containsKey(v) ? -5f : 0f)
+                .setDuration(on ? 140 : 180).setInterpolator(new android.view.animation.DecelerateInterpolator(1.5f)).start();
+    }
+
+    static void liftPress(android.view.View v, boolean down) {
+        if (down) {
+            ripple(v);
+            v.animate().setStartDelay(0).scaleX(0.97f).scaleY(0.97f).translationZ(dp(v.getContext(), 1)).setDuration(80)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
+        } else {
+            float big = Math.max(v.getWidth(), v.getHeight());
+            float s = 1f + Math.min(0.06f, dp(v.getContext(), 7) / Math.max(1f, big));
+            v.animate().setStartDelay(0).scaleX(s).scaleY(s).translationZ(dp(v.getContext(), 7)).setDuration(220)
+                    .setInterpolator(new android.view.animation.OvershootInterpolator(2.2f)).start();
+        }
+    }
+
+    /** Onda al apretar (una vez por botón: se queda como su «frente»). */
+    private static void ripple(android.view.View v) {
+        if (v.getForeground() != null) return;
+        float r = dp(v.getContext(), 12);
+        Drawable bg = v.getBackground();
+        if (bg != null) {
+            android.graphics.Outline o = new android.graphics.Outline();
+            bg.setBounds(0, 0, v.getWidth(), v.getHeight());
+            bg.getOutline(o);
+            if (o.getRadius() > 0) r = o.getRadius();
+        }
+        GradientDrawable mask = new GradientDrawable();
+        mask.setColor(Color.WHITE);
+        mask.setCornerRadius(r);
+        v.setForeground(new android.graphics.drawable.RippleDrawable(
+                android.content.res.ColorStateList.valueOf(Color.argb(60, 255, 255, 255)), null, mask));
     }
 
     static TextView label(Context c, String text, float sp, int color, boolean medium) {
@@ -138,6 +192,8 @@ final class Ui {
         s.addState(new int[]{android.R.attr.state_pressed}, fill(c, Color.rgb(200, 144, 60), 999, false));
         s.addState(new int[]{android.R.attr.state_hovered}, fill(c, Color.rgb(242, 186, 98), 999, false));
         s.addState(new int[]{}, fill(c, ACCENT, 999, false));
+        s.setEnterFadeDuration(110);
+        s.setExitFadeDuration(170);
         b.setBackground(s);
         return b;
     }

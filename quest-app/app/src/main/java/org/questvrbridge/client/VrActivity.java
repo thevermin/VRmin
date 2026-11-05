@@ -40,6 +40,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
     static native void nativeSetWatch(boolean on);
     static native void nativeSetTimeZone(int minutes);
     static native void nativeSetWristFollow(boolean follow);
+    static native void nativeSetPointClickable(boolean on);
     static native void nativeSetRealHands(boolean on);
     static native void nativeSetCameraAllowed(boolean on);
     static native void nativeSetHandSat(float sat);
@@ -127,6 +128,8 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
         boolean inGame;               // se ve durante el juego (abierta desde el menú del juego)
         boolean paused;               // ventana de la sala pausada mientras hay un juego
         long downTime;
+        View lifted;                  // lo que el láser tiene encima (acercado); null: nada que se pueda tocar
+        View liftedCard;              // su tarjeta (una portada): sigue acercada mientras apuntás a sus botones
         int w, h;
     }
 
@@ -498,6 +501,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
             if (action == 1 && (p.win != null || id == TV_ID)) { lastMacClick = SystemClock.uptimeMillis(); lastMacPanel = id; }
             float x = u * p.root.getWidth(), y = v * p.root.getHeight();
             long now = SystemClock.uptimeMillis();
+            lift(p, id, action, x, y);
             MotionEvent e;
             switch (action) {
                 case 0:
@@ -532,6 +536,49 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
             }
             e.recycle();
         });
+    }
+
+    // ------------------------------------------------------------------ Profundidad al apuntar y al apretar
+    private boolean pointClickable;
+    /** Lo que apunta el láser se acerca (Ui.liftHover) y al apretarlo se hunde (Ui.liftPress). No en las pantallas de la Mac. */
+    private void lift(Panel p, int id, int action, float x, float y) {
+        boolean macScreen = p.win != null || id == TV_ID;
+        View target = null;
+        if (!macScreen && action != 5 && p.root instanceof ViewGroup) target = clickableAt((ViewGroup) p.root, x, y, p.root.getWidth(), p.root.getHeight());
+        if (action == 2) target = p.lifted;   // (mientras se arrastra, sigue el mismo)
+        if (target != p.lifted) {
+            View card = target != null ? Ui.cardOf(target) : null;
+            if (p.lifted != null && p.lifted != card) Ui.liftHover(p.lifted, false);
+            if (p.liftedCard != null && p.liftedCard != card) Ui.liftHover(p.liftedCard, false);
+            if (card != null && card != p.liftedCard) Ui.liftHover(card, true);
+            if (target != null && target != card) Ui.liftHover(target, true);
+            p.lifted = target; p.liftedCard = card;
+        }
+        if (target != null && action == 1) Ui.liftPress(target, true);
+        if (target != null && action == 3) Ui.liftPress(target, false);
+        boolean c = target != null;
+        if (c != pointClickable) { pointClickable = c; nativeSetPointClickable(c); }
+    }
+
+    /** Lo más profundo que se puede tocar bajo (x, y); no los contenedores grandes (el panel entero, una lista). */
+    private static View clickableAt(ViewGroup g, float x, float y, int rootW, int rootH) {
+        View found = null;
+        ViewGroup cur = g;
+        float cx = x, cy = y;
+        while (cur != null) {
+            View hit = null;
+            for (int i = cur.getChildCount() - 1; i >= 0; i--) {
+                View ch = cur.getChildAt(i);
+                if (ch.getVisibility() != View.VISIBLE || ch.getAlpha() < 0.05f) continue;
+                float lx = cx - ch.getLeft() + cur.getScrollX(), ly = cy - ch.getTop() + cur.getScrollY();
+                if (lx >= 0 && ly >= 0 && lx < ch.getWidth() && ly < ch.getHeight()) { hit = ch; cx = lx; cy = ly; break; }
+            }
+            if (hit == null) break;
+            boolean small = hit.getWidth() < rootW * 0.6f || hit.getHeight() < rootH * 0.4f;
+            if (hit.isClickable() && hit.isEnabled() && small && !(hit instanceof android.widget.AbsSeekBar) && !(hit instanceof android.widget.EditText)) found = hit;
+            cur = hit instanceof ViewGroup ? (ViewGroup) hit : null;
+        }
+        return found;
     }
 
     // ------------------------------------------------------------------ MenuUi.Host

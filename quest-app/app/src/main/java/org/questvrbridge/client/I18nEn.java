@@ -529,6 +529,7 @@ final class I18nEn {
         m.put("Tus manos con la cámara del visor, encima del juego. Usa un poco más de batería y de rendimiento.", "Your hands from the headset camera, on top of the game. Uses a bit more battery and performance.");
         m.put("Indicador de rendimiento", "Performance indicator");
         m.put("Cuadros por segundo, Wi-Fi y demora, arriba a la izquierda", "Frames per second, Wi-Fi and latency, top left");
+        m.put("¡Emparejado!", "Paired!");
         m.put("Emparejar con ", "Pair with ");
         m.put("Escribí el código de 6 números que aparece en la Mac. Solo hace falta la primera vez.", "Enter the 6-digit code shown on the Mac. You only need to do this once.");
         m.put("Ese código no es. Fijate el que muestra la Mac y probá de nuevo.", "That's not the code. Check the one shown on the Mac and try again.");
