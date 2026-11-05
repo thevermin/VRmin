@@ -280,7 +280,7 @@ void profilesBegin(const std::string &app) {
     profLoad();
     g_current = key;
     Eff e = effective(key);
-    logmsg("[game] Settings for "%s": scale %d %%, field of view %d %%%s%s", key.c_str(), (int)(e.scale * 100), (int)(e.fovk * 100),
+    logmsg("[game] Settings for \"%s\": scale %d %%, field of view %d %%%s%s", key.c_str(), (int)(e.scale * 100), (int)(e.fovk * 100),
            e.index ? ", Index controllers" : "", e.vive ? ", Vive controllers" : "");
 }
 void profilesEnd() { std::lock_guard<std::mutex> g(g_profLock); g_current.clear(); }
