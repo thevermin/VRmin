@@ -39,3 +39,8 @@ jobs:
           name: VRmin-quest-apk
           path: quest-app/app/build/outputs/apk/release/*.apk
           retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VRmin-quest-symbols
+          path: quest-app/app/build/intermediates/merged_native_libs/release/**/libqvbclient.so
+          retention-days: 30

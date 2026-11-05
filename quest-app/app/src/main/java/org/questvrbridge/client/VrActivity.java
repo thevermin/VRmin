@@ -41,6 +41,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
     static native void nativeSetTimeZone(int minutes);
     static native void nativeSetWristFollow(boolean follow);
     static native void nativeSetPointClickable(boolean on);
+    static native void nativeSetLift(int panel, float u0, float v0, float u1, float v1, int state);
     static native void nativeSetRealHands(boolean on);
     static native void nativeSetCameraAllowed(boolean on);
     static native void nativeSetHandSat(float sat);
@@ -51,6 +52,8 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
     static native void nativeCloseGameMenu();
     static native void nativeSetGameHidden(boolean on);
     static native void nativeSetVersion(String v);
+    static native void nativeSetCrashFile(String path);
+    static native void nativeSetCrashNote(String note);
     static native void nativeSetHandGestures(boolean on);
     static native void nativeSetHeight(float m);
     static native void nativeSetHandMove(boolean on);
@@ -128,8 +131,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
         boolean inGame;               // se ve durante el juego (abierta desde el menú del juego)
         boolean paused;               // ventana de la sala pausada mientras hay un juego
         long downTime;
-        View lifted;                  // lo que el láser tiene encima (acercado); null: nada que se pueda tocar
-        View liftedCard;              // su tarjeta (una portada): sigue acercada mientras apuntás a sus botones
+        View lifted;                  // lo que el láser tiene encima (sale del panel); null: nada que se pueda tocar
         int w, h;
     }
 
@@ -201,6 +203,52 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
             @Override public void onConnection(boolean connected, String name) { lastPanelOpen = SystemClock.uptimeMillis(); }
         });
         try { nativeSetVersion(getPackageManager().getPackageInfo(getPackageName(), 0).versionName); } catch (Exception ignored) { }
+        crashReport();
+    }
+
+    // ------------------------------------------------------------------ cierres inesperados
+    /// Lo que pasó si la app se cerró sola la última vez (se manda al registro de la Mac al conectar), y desde ahora
+    /// se guarda la pila si vuelve a pasar (parte nativa y parte Java).
+    private void crashReport() {
+        java.io.File nf = new java.io.File(getFilesDir(), "crash_native.txt"), jf = new java.io.File(getFilesDir(), "crash_java.txt");
+        StringBuilder sb = new StringBuilder();
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+                java.util.List<android.app.ApplicationExitInfo> l = am.getHistoricalProcessExitReasons(getPackageName(), 0, 1);
+                long seen = prefs().getLong("lastExitTs", 0);
+                if (!l.isEmpty() && l.get(0).getTimestamp() > seen) {
+                    android.app.ApplicationExitInfo x = l.get(0);
+                    prefs().edit().putLong("lastExitTs", x.getTimestamp()).apply();
+                    int r = x.getReason();
+                    if (r == android.app.ApplicationExitInfo.REASON_CRASH || r == android.app.ApplicationExitInfo.REASON_CRASH_NATIVE
+                            || r == android.app.ApplicationExitInfo.REASON_ANR || r == android.app.ApplicationExitInfo.REASON_LOW_MEMORY
+                            || r == android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE)
+                        sb.append("motivo ").append(r).append(" · ").append(x.getDescription())
+                          .append(" · memoria ").append(x.getPss() / 1024).append(" MB · hace ")
+                          .append((System.currentTimeMillis() - x.getTimestamp()) / 60000).append(" min\n");
+                }
+            }
+        } catch (Throwable ignored) { }
+        for (java.io.File f : new java.io.File[]{nf, jf}) {
+            if (f.length() > 0) {
+                try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
+                    String s; int n = 0;
+                    while ((s = br.readLine()) != null && n++ < 45) sb.append(s).append('\n');
+                } catch (Exception ignored) { }
+            }
+            f.delete();
+        }
+        if (sb.length() > 0) nativeSetCrashNote(sb.toString());
+        nativeSetCrashFile(nf.getAbsolutePath());
+        final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+            try (java.io.PrintWriter w = new java.io.PrintWriter(new java.io.FileWriter(jf))) {
+                w.println("Java, hilo " + t.getName() + ":");
+                e.printStackTrace(w);
+            } catch (Throwable ignored) { }
+            if (prev != null) prev.uncaughtException(t, e);
+        });
     }
 
     // ------------------------------------------------------------------ teclado
@@ -540,24 +588,39 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
 
     // ------------------------------------------------------------------ Profundidad al apuntar y al apretar
     private boolean pointClickable;
-    /** Lo que apunta el láser se acerca (Ui.liftHover) y al apretarlo se hunde (Ui.liftPress). No en las pantallas de la Mac. */
+    private final int[] liftLoc = new int[2], liftRoot = new int[2];
+    private final float[] liftSent = new float[5];
+    private int liftSentPanel = -1;
+    /** Lo que apunta el láser sale del panel (nativeSetLift: la parte nativa lo dibuja más adelante, con su sombra) y al
+     *  apretarlo se hunde y suelta una onda. No en las pantallas de la Mac. */
     private void lift(Panel p, int id, int action, float x, float y) {
         boolean macScreen = p.win != null || id == TV_ID;
         View target = null;
         if (!macScreen && action != 5 && p.root instanceof ViewGroup) target = clickableAt((ViewGroup) p.root, x, y, p.root.getWidth(), p.root.getHeight());
         if (action == 2) target = p.lifted;   // (mientras se arrastra, sigue el mismo)
-        if (target != p.lifted) {
-            View card = target != null ? Ui.cardOf(target) : null;
-            if (p.lifted != null && p.lifted != card) Ui.liftHover(p.lifted, false);
-            if (p.liftedCard != null && p.liftedCard != card) Ui.liftHover(p.liftedCard, false);
-            if (card != null && card != p.liftedCard) Ui.liftHover(card, true);
-            if (target != null && target != card) Ui.liftHover(target, true);
-            p.lifted = target; p.liftedCard = card;
-        }
-        if (target != null && action == 1) Ui.liftPress(target, true);
-        if (target != null && action == 3) Ui.liftPress(target, false);
+        p.lifted = target;
+        View card = target != null ? Ui.cardOf(target) : null;
+        View shown = card != null ? card : target;   // (en una portada sale la portada entera)
+        if (target != null && action == 1) Ui.liftPress(target);
         boolean c = target != null;
         if (c != pointClickable) { pointClickable = c; nativeSetPointClickable(c); }
+        int state = 0;
+        float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
+        int rw = p.root.getWidth(), rh = p.root.getHeight();
+        if (shown != null && rw > 0 && rh > 0 && shown.isAttachedToWindow()) {
+            shown.getLocationInWindow(liftLoc);
+            p.root.getLocationInWindow(liftRoot);
+            float l = liftLoc[0] - liftRoot[0], t = liftLoc[1] - liftRoot[1];
+            u0 = Math.max(0f, l / rw); v0 = Math.max(0f, t / rh);
+            u1 = Math.min(1f, (l + shown.getWidth() * shown.getScaleX()) / rw); v1 = Math.min(1f, (t + shown.getHeight() * shown.getScaleY()) / rh);
+            state = action == 1 || action == 2 ? 2 : 1;
+            if (u1 - u0 < 0.002f || v1 - v0 < 0.002f) state = 0;
+        }
+        if (state == 0 && liftSentPanel != id) return;   // (otro panel tiene lo apuntado)
+        if (liftSentPanel == id && liftSent[0] == state && liftSent[1] == u0 && liftSent[2] == v0 && liftSent[3] == u1 && liftSent[4] == v1) return;
+        liftSentPanel = state == 0 ? -1 : id;
+        liftSent[0] = state; liftSent[1] = u0; liftSent[2] = v0; liftSent[3] = u1; liftSent[4] = v1;
+        nativeSetLift(id, u0, v0, u1, v1, state);
     }
 
     /** Lo más profundo que se puede tocar bajo (x, y); no los contenedores grandes (el panel entero, una lista). */

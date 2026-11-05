@@ -40,6 +40,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
+#include <dlfcn.h>
+#include <unwind.h>
 
 #include <atomic>
 #include <map>
@@ -1046,6 +1049,60 @@ Java_org_questvrbridge_client_VrActivity_nativeSetVersion(JNIEnv *env, jclass, j
     if (c) { snprintf(g_appVersion, sizeof g_appVersion, "%s", c); env->ReleaseStringUTFChars(v, c); }
 }
 
+// ---------------------------------------------------------------- Cierres inesperados
+// Si la parte nativa se cae, se guarda en un archivo qué señal fue y la pila (biblioteca + desplazamiento); la próxima vez
+// que abre la app, la parte Java lo lee y se manda al registro de la Mac al conectar (nativeSetCrashNote).
+static int g_crashFd = -1;
+static struct sigaction g_oldSig[32];
+struct CrashBt { uintptr_t pc[40]; int n; };
+static _Unwind_Reason_Code crashStep(struct _Unwind_Context *c, void *arg) {
+    CrashBt *b = (CrashBt *)arg;
+    uintptr_t pc = _Unwind_GetIP(c);
+    if (pc && b->n < 40) b->pc[b->n++] = pc;
+    return b->n < 40 ? _URC_NO_REASON : _URC_END_OF_STACK;
+}
+static void crashWrite(const char *s) { if (g_crashFd >= 0) { ssize_t r = write(g_crashFd, s, strlen(s)); (void)r; } }
+static void crashHandler(int sig, siginfo_t *si, void *uc) {
+    char line[320];
+    snprintf(line, sizeof line, "Señal %d (código %d) en %p · hilo %d\n", sig, si ? si->si_code : 0, si ? si->si_addr : nullptr, gettid());
+    crashWrite(line);
+    CrashBt b{}; _Unwind_Backtrace(crashStep, &b);
+    for (int i = 0; i < b.n; i++) {
+        Dl_info d{};
+        if (dladdr((void *)b.pc[i], &d) && d.dli_fname) {
+            const char *f = strrchr(d.dli_fname, '/');
+            snprintf(line, sizeof line, "#%02d %s+0x%lx %s\n", i, f ? f + 1 : d.dli_fname, (unsigned long)(b.pc[i] - (uintptr_t)d.dli_fbase),
+                     d.dli_sname ? d.dli_sname : "");
+        } else snprintf(line, sizeof line, "#%02d 0x%lx\n", i, (unsigned long)b.pc[i]);
+        crashWrite(line);
+    }
+    if (g_crashFd >= 0) { close(g_crashFd); g_crashFd = -1; }
+    sigaction(sig, &g_oldSig[sig], nullptr);   // el sistema sigue con lo suyo (su propio informe)
+    raise(sig);
+}
+extern "C" JNIEXPORT void JNICALL
+Java_org_questvrbridge_client_VrActivity_nativeSetCrashFile(JNIEnv *env, jclass, jstring path) {
+    const char *c = env->GetStringUTFChars(path, nullptr);
+    if (!c) return;
+    g_crashFd = open(c, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    env->ReleaseStringUTFChars(path, c);
+    struct sigaction sa{};
+    sa.sa_sigaction = crashHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    for (int s : {SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL}) sigaction(s, &sa, &g_oldSig[s]);
+}
+static std::mutex g_crashNoteLock;
+static std::string g_crashNote;   // lo que pasó la última vez (se manda al conectar)
+extern "C" JNIEXPORT void JNICALL
+Java_org_questvrbridge_client_VrActivity_nativeSetCrashNote(JNIEnv *env, jclass, jstring note) {
+    const char *c = env->GetStringUTFChars(note, nullptr);
+    if (!c) return;
+    std::lock_guard<std::mutex> lk(g_crashNoteLock);
+    g_crashNote = c;
+    env->ReleaseStringUTFChars(note, c);
+}
+
 static void javaBool(jmethodID m, bool v) {
     JNIEnv *e = jenv();
     if (!e || !g_act || !m) return;
@@ -1164,7 +1221,6 @@ struct UiPanel {
     bool follow = false, folInit = false;   // fijada a la vista: te sigue suavemente cuando girás
     double openAt = 0, closeAt = 0;         // animaciones: cuándo apareció (y cuándo se empezó a cerrar)
     float barK = 0, grabK = 0;              // barrita: 0 quieta · 0,5 apuntada · 1 agarrada; ventana «levantada» al moverla
-    float hoverK = 0;                       // apuntada con el láser (se acerca un poco hacia vos)
     float liftX = 0, liftV = 0;             // agarrada: se acerca; al soltarla vuelve con un resorte (posición y velocidad)
     float folOff[3] = {0, 0, 0};            // dónde está respecto de tu cabeza (derecha, arriba, adelante)
     float str3d = 0.009f;
@@ -1542,6 +1598,17 @@ static void networkLoop() {
                             javaConnection(true, g_serverName.empty() ? ip : g_serverName);
                             requestKey();
                             sendLog("App nativa conectada (Quest) · versión %s", g_appVersion);
+                            {
+                                std::string note;
+                                { std::lock_guard<std::mutex> lk(g_crashNoteLock); note.swap(g_crashNote); }
+                                size_t a = 0;
+                                for (int k = 0; a < note.size() && k < 60; k++) {   // una línea del registro por línea
+                                    size_t b = note.find('\n', a);
+                                    if (b == std::string::npos) b = note.size();
+                                    if (b > a) sendLog("Cierre inesperado anterior: %s", note.substr(a, std::min<size_t>(b - a, 400)).c_str());
+                                    a = b + 1;
+                                }
+                            }
                             if (g_vigia) sendPacket("{\"type\":\"vigia\",\"on\":true}");   // (Modo Centinela pedido antes de conectar)
                         }
                     }
@@ -7406,11 +7473,9 @@ static int uiInput(App &app, XrTime time, const XrView &head, Ray rays[2], std::
         if (p->openAt > 0 && nowMs() - p->openAt < 320) b.a *= (float)(nowMs() - p->openAt) / 320.f;
         bars.push_back(b);
     }
-    // Lo que apuntás se acerca un poco; lo que agarrás, más (y al soltarlo se asienta con un resorte)
+    // La ventana que movés se acerca un poco (y al soltarla se asienta con un resorte)
     for (UiPanel *p : g_ui) {
-        bool hv = (hitPanel[0] == p->id && hitKind[0] == 1) || (hitPanel[1] == p->id && hitKind[1] == 1);
-        bool gr = app.hp[0].grab == p->id || app.hp[1].grab == p->id || app.hp[0].down == p->id || app.hp[1].down == p->id;
-        p->hoverK += ((hv ? 1.f : 0.f) - p->hoverK) * std::min(1.f, barDt * 12.f);
+        bool gr = app.hp[0].grab == p->id || app.hp[1].grab == p->id;
         float acc = 260.f * ((gr ? 1.f : 0.f) - p->liftX) - 20.f * p->liftV;
         p->liftV += acc * barDt; p->liftX += p->liftV * barDt;
         if (!gr && fabsf(p->liftX) < 1e-4f && fabsf(p->liftV) < 1e-3f) { p->liftX = 0; p->liftV = 0; }
@@ -7872,7 +7937,7 @@ void main() {
     vec3 cell = floor(dw * 90.0);
     float h = fract(sin(dot(cell, vec3(127.1, 311.7, 74.7))) * 43758.5453);
     float spark = h > 0.93 ? smoothstep(0.32, 0.0, length(fract(dw * 90.0) - 0.5)) * exp(-x * x * 0.25) : 0.0;
-    o = vec4(vec3(1.0, 0.68, 0.30) * (ring * 0.55 + spark * 0.9) * str, 0.0);
+    o = vec4(vec3(1.0, 0.68, 0.30) * (ring * 1.0 + spark * 1.5) * str, 0.0);
 })";
     app.glowProg = glCreateProgram();
     glAttachShader(app.glowProg, compileShader(GL_VERTEX_SHADER, vs));
@@ -7888,7 +7953,7 @@ void main() {
 /// El borde brillante de la transición (se dibuja encima, sumando luz)
 static void applyGlow(App &app, const XrView &view, float r) {
     if (!app.glowProg) return;
-    float str = 4.f * r * (1.f - r);
+    float str = std::min(1.f, 6.f * r * (1.f - r));
     if (str < 0.02f) return;
     glUseProgram(app.glowProg);
     glUniform4f(app.gTan, tanf(view.fov.angleLeft), tanf(view.fov.angleRight), tanf(view.fov.angleDown), tanf(view.fov.angleUp));
@@ -7902,6 +7967,94 @@ static void applyGlow(App &app, const XrView &view, float r) {
     glBindVertexArray(app.vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glDisable(GL_BLEND);
+}
+
+// ---------------------------------------------------------------- Profundidad de lo que apuntás
+// El botón (o la portada) que apunta el láser sale del panel: una capa del Quest con ese pedazo de la imagen del panel,
+// un poco más adelante, con una sombra suave debajo. Como es profundidad real, se nota más al mirarlo de costado.
+// Al apretarlo se hunde, y al soltarlo vuelve con un pequeño zoom.
+static std::mutex g_liftLock;
+static int g_liftPanel = -1, g_liftState = 0;   // estado: 0 nada, 1 apuntado, 2 apretado
+static float g_liftRect[4] = {0, 0, 0, 0};      // u0, v0, u1, v1 (0..1, desde arriba a la izquierda del panel)
+extern "C" JNIEXPORT void JNICALL
+Java_org_questvrbridge_client_VrActivity_nativeSetLift(JNIEnv *, jclass, jint panel, jfloat u0, jfloat v0, jfloat u1, jfloat v1, jint state) {
+    std::lock_guard<std::mutex> lk(g_liftLock);
+    g_liftPanel = panel; g_liftState = state;
+    g_liftRect[0] = u0; g_liftRect[1] = v0; g_liftRect[2] = u1; g_liftRect[3] = v1;
+}
+struct LiftAnim { int panel = -1; float r[4] = {0, 0, 0, 0}; float x = 0, v = 0; int state = 0; double relAt = 0; };
+static LiftAnim g_lift;
+static Swapchain g_liftShadow;
+static bool g_liftShadowTried = false;
+
+/// La sombra: una sola imagen chica (un rectángulo redondeado difuminado), dibujada una vez
+static void liftShadowInit(App &app) {
+    if (g_liftShadowTried) return;
+    g_liftShadowTried = true;
+    if (!createSwapchain(app, g_liftShadow, 128, 128, 1)) return;
+    static const char *vs = R"(#version 300 es
+out vec2 uv;
+void main() {
+    vec2 q = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    uv = q;
+    gl_Position = vec4(q * 2.0 - 1.0, 0.0, 1.0);
+})";
+    static const char *fs = R"(#version 300 es
+precision mediump float;
+in vec2 uv;
+out vec4 o;
+void main() {
+    vec2 d = abs(uv - 0.5) - vec2(0.27);
+    float dist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - 0.06;
+    float a = 1.0 - smoothstep(-0.10, 0.17, dist);
+    o = vec4(0.0, 0.0, 0.0, a * a);
+})";
+    GLuint pr = glCreateProgram();
+    glAttachShader(pr, compileShader(GL_VERTEX_SHADER, vs));
+    glAttachShader(pr, compileShader(GL_FRAGMENT_SHADER, fs));
+    glLinkProgram(pr);
+    uint32_t idx = 0;
+    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (XR_FAILED(xrAcquireSwapchainImage(g_liftShadow.handle, &ai, &idx))) { glDeleteProgram(pr); return; }
+    XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(g_liftShadow.handle, &wi);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_liftShadow.fbos[idx]);
+    glViewport(0, 0, 128, 128);
+    glDisable(GL_BLEND);
+    glUseProgram(pr);
+    glBindVertexArray(app.vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_liftShadow.handle, &ri);
+    glDeleteProgram(pr);
+}
+
+/// Avanza el resorte de lo apuntado (una vez por cuadro)
+static void liftUpdate(App &app, float dt) {
+    int panel, state; float r[4];
+    {
+        std::lock_guard<std::mutex> lk(g_liftLock);
+        panel = g_liftPanel; state = g_liftState;
+        for (int k = 0; k < 4; k++) r[k] = g_liftRect[k];
+    }
+    LiftAnim &L = g_lift;
+    if (app.lastHover != panel && app.hp[0].down != panel && app.hp[1].down != panel) state = 0;   // (el láser ya no está ahí)
+    if (panel >= 0 && state > 0) {
+        const bool same = panel == L.panel && fabsf((r[0] + r[2]) - (L.r[0] + L.r[2])) < 0.01f && fabsf((r[1] + r[3]) - (L.r[1] + L.r[3])) < 0.3f &&
+                          fabsf((r[2] - r[0]) - (L.r[2] - L.r[0])) < 0.01f && fabsf((r[3] - r[1]) - (L.r[3] - L.r[1])) < 0.01f;
+        if (!same) { L.x = 0; L.v = 0; L.relAt = 0; }   // otro botón: sale desde el panel
+        L.panel = panel;
+        for (int k = 0; k < 4; k++) L.r[k] = r[k];       // (el mismo botón que se corre en una lista: lo sigue)
+        if (L.state == 2 && state == 1) L.relAt = nowMs();
+        L.state = state;
+    } else L.state = 0;
+    const float tgt = L.state == 1 ? 1.f : L.state == 2 ? 0.2f : 0.f;
+    const float acc = 380.f * (tgt - L.x) - 22.f * L.v;   // se pasa un poco y se asienta
+    L.v += acc * dt; L.x += L.v * dt;
+    if (L.state == 0 && L.x < 0.01f && fabsf(L.v) < 0.05f) { L.x = 0; L.v = 0; L.panel = -1; }
+    if (L.panel >= 0 && !g_liftShadowTried) liftShadowInit(app);
 }
 
 /// Entrar o salir de un juego: la imagen nueva se abre desde el centro de la vista (afuera, negro)
@@ -8766,27 +8919,26 @@ static void renderFrame(App &app) {
             double tn = nowMs();
             const bool fromWrist = ap->id == WRIST_MENU_ID, drop = ap->id == LOCK_NOTE_ID || ap->id == PORTAL_HINT_ID;
             float up = 0;   // hacia arriba (+) o abajo (-)
-            if (ap->openAt > 0 && tn - ap->openAt < 450) {
-                float x = (float)(tn - ap->openAt) / 450.f;
-                float spr = 1.f - expf(-6.5f * x) * cosf(9.f * x);           // resorte suave: se pasa apenas y se asienta
+            const float wristDrop = 0.06f + ap->hm * 0.5f;   // (del centro del menú al reloj)
+            if (ap->openAt > 0 && tn - ap->openAt < 600) {
+                float x = (float)(tn - ap->openAt) / 600.f;
+                float spr = 1.f - expf(-5.5f * x) * cosf(10.f * x);          // resorte: se pasa un poco y se asienta
                 float eo = 1.f - (1.f - x) * (1.f - x) * (1.f - x);
-                animA *= std::min(1.f, x * 3.f);
-                animS *= fromWrist ? 0.2f + 0.8f * spr : 0.88f + 0.12f * spr;
-                up += drop ? 0.05f * (1.f - spr) : fromWrist ? 0.f : -0.035f * (1.f - eo);
+                animA *= std::min(1.f, x * 3.5f);
+                animS *= fromWrist ? 0.15f + 0.85f * spr : 0.8f + 0.2f * spr;
+                // el menú del reloj sale del reloj y sube a su lugar; los avisos caen desde arriba; lo demás sube un poco
+                up += drop ? 0.08f * (1.f - spr) : fromWrist ? -wristDrop * (1.f - eo) : -0.05f * (1.f - eo);
             }
             if (ap->closeAt > 0) {
                 float x = std::min(1.f, (float)(tn - ap->closeAt) / 180.f), e = x * x;
-                animA *= 1.f - e; animS *= fromWrist ? 1.f - 0.8f * e : 1.f - 0.12f * e;
-                up += drop ? 0.04f * e : -0.02f * e;
+                animA *= 1.f - e * e; animS *= fromWrist ? 1.f - 0.85f * e : 1.f - 0.15f * e;
+                up += drop ? 0.05f * e : fromWrist ? -wristDrop * e : -0.03f * e;
             }
             animS *= 1.f - 0.03f * ap->grabK; animA *= 1.f - 0.12f * ap->grabK;
             if (!app.hasColorScale) animA = 1.f;
-            // Hacia tu cabeza: un poco al apuntarle, más al agarrarla (las pantallas grandes, menos; la TV fija, nada)
+            // La ventana que movés se acerca hacia tu cabeza (las pantallas grandes, menos; la TV fija, nada)
             float toward = 0;
-            if (!ap->hud && !(ap->tv && fixedScreenEnv())) {
-                const bool big = ap->wm > 1.3f || ap->tv;
-                toward = ap->hoverK * (big ? 0.006f : 0.012f) + ap->liftX * (big ? 0.02f : 0.03f);
-            }
+            if (!ap->hud && !(ap->tv && fixedScreenEnv())) toward = ap->liftX * (ap->wm > 1.3f || ap->tv ? 0.025f : 0.04f);
             float th[3] = {headPose.position.x - ap->pose.position.x, headPose.position.y - ap->pose.position.y, headPose.position.z - ap->pose.position.z};
             float tl = sqrtf(dot3(th, th));
             if (tl > 0.05f) for (int k = 0; k < 3; k++) animOff[k] = th[k] / tl * toward;
@@ -8852,8 +9004,60 @@ static void renderFrame(App &app) {
                 q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
             }
             layers[nLayers++] = (XrCompositionLayerBaseHeader *)&q;
+            // Lo que apunta el láser en este panel: su sombra sobre el panel y el pedazo de imagen, más adelante
+            const LiftAnim &L = g_lift;
+            if (L.panel == p->id && eye == XR_EYE_VISIBILITY_BOTH && !fillEye && !p->hud && p->closeAt == 0 && L.x > 0.005f &&
+                g_liftShadow.handle != XR_NULL_HANDLE && nLayers + 2 <= MAXL - 2) {
+                const float ex[3] = {1, 0, 0}, ey[3] = {0, 1, 0}, ez[3] = {0, 0, 1};
+                float ax[3], ay[3], an[3];
+                rotate(q.pose.orientation, ex, ax); rotate(q.pose.orientation, ey, ay); rotate(q.pose.orientation, ez, an);
+                const float lx = std::max(0.f, L.x);
+                float bump = 0;   // al soltar: un pequeño zoom
+                if (L.relAt > 0) { float k = (float)((nowMs() - L.relAt) / 380.0); if (k < 1.f) bump = 0.07f * sinf(k * (float)M_PI) * (1.f - 0.4f * k); }
+                const float zoom = 1.f + 0.035f * lx + bump;
+                const float depth = 0.016f * lx;
+                const float cu = (L.r[0] + L.r[2]) * 0.5f - 0.5f, cv = 0.5f - (L.r[1] + L.r[3]) * 0.5f;
+                const float bw = (L.r[2] - L.r[0]) * q.size.width, bh = (L.r[3] - L.r[1]) * q.size.height;
+                const float cx = cu * q.size.width, cy = cv * q.size.height;
+                // sombra: sobre el panel, un poco más abajo cuanto más sale el botón
+                XrCompositionLayerColorScaleBiasKHR &sf = fades[nf++];
+                sf = {XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR};
+                sf.next = app.hasLayerSettings ? (const void *)&settings : nullptr;
+                const float sa = std::min(1.f, lx) * 0.75f * animA;
+                sf.colorScale = {sa, sa, sa, sa};
+                XrCompositionLayerQuad &sq = quads[nq++];
+                sq = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+                sq.next = app.hasColorScale ? (const void *)&sf : sf.next;
+                sq.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                sq.space = app.space;
+                sq.eyeVisibility = eye;
+                sq.subImage.swapchain = g_liftShadow.handle;
+                sq.subImage.imageRect = {{0, 0}, {g_liftShadow.w, g_liftShadow.h}};
+                sq.pose.orientation = q.pose.orientation;
+                const float sdy = -depth * 0.45f;
+                for (int k = 0; k < 3; k++) (&sq.pose.position.x)[k] = (&q.pose.position.x)[k] + ax[k] * cx + ay[k] * (cy + sdy) + an[k] * 0.0005f;
+                const float m = std::min(bw, bh) * 0.35f + 0.012f;
+                sq.size = {bw * 1.08f + m * 2.f, bh * 1.08f + m * 2.f};
+                layers[nLayers++] = (XrCompositionLayerBaseHeader *)&sq;
+                // el botón mismo
+                XrCompositionLayerQuad &lq = quads[nq++];
+                lq = q;
+                lq.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                const int px0 = (int)lroundf(L.r[0] * p->w), px1 = (int)lroundf(L.r[2] * p->w);
+                const int py0 = (int)lroundf((1.f - L.r[3]) * p->h), py1 = (int)lroundf((1.f - L.r[1]) * p->h);   // (la imagen va de abajo hacia arriba)
+                lq.subImage.imageRect = {{std::max(0, px0), std::max(0, py0)}, {std::max(1, std::min(p->w, px1) - std::max(0, px0)), std::max(1, std::min(p->h, py1) - std::max(0, py0))}};
+                for (int k = 0; k < 3; k++) (&lq.pose.position.x)[k] = (&q.pose.position.x)[k] + ax[k] * cx + ay[k] * cy + an[k] * depth;
+                lq.size = {bw * zoom, bh * zoom};
+                layers[nLayers++] = (XrCompositionLayerBaseHeader *)&lq;
+            }
         }
     };
+    {
+        static double lastLiftT = 0;
+        const double lt = nowMs();
+        liftUpdate(app, lastLiftT > 0 ? std::min(0.05f, (float)(lt - lastLiftT) / 1000.f) : 0.f);
+        lastLiftT = lt;
+    }
     {
         // El indicador de rendimiento se ve también durante un juego
         std::lock_guard<std::mutex> lk(g_uiLock);

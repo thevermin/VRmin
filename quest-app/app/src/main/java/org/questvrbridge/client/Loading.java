@@ -275,13 +275,13 @@ final class Loading {
         tipAt = (tipAt + 1) % tips.size();
         final TextView t = tip;
         final String txt = tips.get(tipAt);
-        final float d = Ui.dp(t.getContext(), 10);
+        final float d = Ui.dp(t.getContext(), 18);
         t.animate().cancel();
-        t.animate().alpha(0f).translationY(-d).setDuration(200).setInterpolator(new android.view.animation.AccelerateInterpolator(1.4f))
+        t.animate().alpha(0f).translationY(-d).setDuration(260).setInterpolator(new android.view.animation.AccelerateInterpolator(1.4f))
                 .withEndAction(() -> {
                     t.setText(txt);
                     t.setTranslationY(d);
-                    t.animate().alpha(1f).translationY(0).setDuration(240).setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f)).start();
+                    t.animate().alpha(1f).translationY(0).setDuration(320).setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f)).start();
                 }).start();
     }
 

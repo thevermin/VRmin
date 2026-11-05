@@ -94,10 +94,10 @@ final class Ui {
     }
 
     // ---------------------------------------------------------------- Profundidad al apuntar y al apretar
-    // Lo que apuntás con el láser se acerca un poco (más grande y con sombra, como si saliera del panel); al apretarlo
-    // se hunde y suelta una onda. Lo hace VrActivity para todos los paneles; acá están las animaciones.
+    // Lo que apuntás con el láser sale del panel (lo dibuja la parte nativa, con profundidad real); al apretarlo se hunde
+    // y suelta una onda (acá). VrActivity lo hace para todos los paneles.
     private static final java.util.WeakHashMap<android.view.View, Boolean> CARDS = new java.util.WeakHashMap<>();
-    /** Portadas y tarjetas: además de acercarse, se inclinan un poco hacia vos. */
+    /** Portadas y tarjetas: sale la tarjeta entera aunque apuntes a uno de sus botones. */
     static void card(android.view.View v) { CARDS.put(v, true); }
     /** La tarjeta que contiene a v (o v mismo), si hay. */
     static android.view.View cardOf(android.view.View v) {
@@ -106,26 +106,7 @@ final class Ui {
         return null;
     }
 
-    static void liftHover(android.view.View v, boolean on) {
-        float big = Math.max(v.getWidth(), v.getHeight());
-        float s = on ? 1f + Math.min(0.06f, dp(v.getContext(), 7) / Math.max(1f, big)) : 1f;
-        v.animate().setStartDelay(0).scaleX(s).scaleY(s).translationZ(on ? dp(v.getContext(), 7) : 0)
-                .rotationX(on && CARDS.containsKey(v) ? -5f : 0f)
-                .setDuration(on ? 140 : 180).setInterpolator(new android.view.animation.DecelerateInterpolator(1.5f)).start();
-    }
-
-    static void liftPress(android.view.View v, boolean down) {
-        if (down) {
-            ripple(v);
-            v.animate().setStartDelay(0).scaleX(0.97f).scaleY(0.97f).translationZ(dp(v.getContext(), 1)).setDuration(80)
-                    .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
-        } else {
-            float big = Math.max(v.getWidth(), v.getHeight());
-            float s = 1f + Math.min(0.06f, dp(v.getContext(), 7) / Math.max(1f, big));
-            v.animate().setStartDelay(0).scaleX(s).scaleY(s).translationZ(dp(v.getContext(), 7)).setDuration(220)
-                    .setInterpolator(new android.view.animation.OvershootInterpolator(2.2f)).start();
-        }
-    }
+    static void liftPress(android.view.View v) { ripple(v); }
 
     /** Onda al apretar (una vez por botón: se queda como su «frente»). */
     private static void ripple(android.view.View v) {
@@ -142,7 +123,7 @@ final class Ui {
         mask.setColor(Color.WHITE);
         mask.setCornerRadius(r);
         v.setForeground(new android.graphics.drawable.RippleDrawable(
-                android.content.res.ColorStateList.valueOf(Color.argb(60, 255, 255, 255)), null, mask));
+                android.content.res.ColorStateList.valueOf(Color.argb(95, 255, 255, 255)), null, mask));
     }
 
     static TextView label(Context c, String text, float sp, int color, boolean medium) {

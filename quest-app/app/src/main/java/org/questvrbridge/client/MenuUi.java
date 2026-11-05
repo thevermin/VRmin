@@ -568,7 +568,7 @@ final class MenuUi implements Link.Listener {
             Ui.leadingIcon(tabs[i], tabIcons[i], 22, i == t ? Ui.ACCENT_TEXT : Ui.TEXT2);
         }
         moveTabIndicator(t);
-        staggerUntil = android.os.SystemClock.uptimeMillis() + 700; staggerN = 0;
+        staggerUntil = android.os.SystemClock.uptimeMillis() + 900; staggerN = 0;
         setPage = null;
         openChoice = null;
         drawnKey = "";
@@ -587,7 +587,7 @@ final class MenuUi implements Link.Listener {
         final float fromT = indTop, fromB = indBot;
         final boolean down = toT > fromT;
         if (indAnim != null) indAnim.cancel();
-        indAnim = android.animation.ValueAnimator.ofFloat(0f, 1f).setDuration(280);
+        indAnim = android.animation.ValueAnimator.ofFloat(0f, 1f).setDuration(380);
         indAnim.addUpdateListener(a -> {
             float x = (float) a.getAnimatedValue();
             float lead = 1f - (1f - x) * (1f - x) * (1f - x), trail = x * x * (3f - 2f * x);
@@ -1912,8 +1912,8 @@ final class MenuUi implements Link.Listener {
         Ui.card(t);
         if (android.os.SystemClock.uptimeMillis() < staggerUntil && staggerN < 15) {
             final float a = t.getAlpha();
-            t.setAlpha(0f); t.setTranslationY(dp(ctx, 16)); t.setScaleX(0.94f); t.setScaleY(0.94f);
-            t.animate().alpha(a).translationY(0).scaleX(1f).scaleY(1f).setStartDelay(60 + 35L * staggerN++).setDuration(260)
+            t.setAlpha(0f); t.setTranslationY(dp(ctx, 30)); t.setScaleX(0.88f); t.setScaleY(0.88f);
+            t.animate().alpha(a).translationY(0).scaleX(1f).scaleY(1f).setStartDelay(60 + 55L * staggerN++).setDuration(380)
                     .setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f)).start();
         }
         ImageView img = new ImageView(ctx);
