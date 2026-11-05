@@ -39,4 +39,12 @@ jobs:
           title=$(head -1 "$notes" | sed 's/^## *//')
           flag=""; [ "${{ inputs.beta }}" = "true" ] && flag="--prerelease"
           [ "${{ inputs.draft }}" = "true" ] && flag="$flag --draft"
-          gh release create "${{ inputs.tag }}" out/* -R "$GITHUB_REPOSITORY" --target main --title "$title" --notes-file "$notes" $flag
+          # Si ya hay un borrador con esa etiqueta, se actualiza (notas y archivos nuevos; lo que se subió a mano queda)
+          draft=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=30" -q '.[] | select(.draft and .tag_name == "${{ inputs.tag }}") | .id' | head -1)
+          if [ -n "$draft" ]; then
+            gh release upload "${{ inputs.tag }}" out/* -R "$GITHUB_REPOSITORY" --clobber
+            gh release edit "${{ inputs.tag }}" -R "$GITHUB_REPOSITORY" --title "$title" --notes-file "$notes"
+            echo "Borrador ${{ inputs.tag }} actualizado"
+          else
+            gh release create "${{ inputs.tag }}" out/* -R "$GITHUB_REPOSITORY" --target main --title "$title" --notes-file "$notes" $flag
+          fi
