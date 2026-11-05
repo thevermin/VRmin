@@ -1719,6 +1719,13 @@ struct App {
     bool hasLayerSettings = false;
     bool hasCylinder = false;
     bool hasColorScale = false;   // para que la TV y las ventanas aparezcan y desaparezcan de a poco
+    // Foveated rendering de la sala (Meta): el borde de la imagen se dibuja con menos detalle (la lente igual lo ve borroso)
+    bool hasFoveation = false;
+    PFN_xrCreateFoveationProfileFB xrCreateFoveationProfileFB = nullptr;
+    PFN_xrDestroyFoveationProfileFB xrDestroyFoveationProfileFB = nullptr;
+    PFN_xrUpdateSwapchainFB xrUpdateSwapchainFB = nullptr;
+    XrFoveationProfileFB fovRoom = XR_NULL_HANDLE, fovNone = XR_NULL_HANDLE;
+    int fovState = -1;            // 1: la sala con foveated rendering · 0: sin (el video del juego)
     Swapchain listSc, deskSc, overlay[2];
     bool listReady = false, deskReady = false;
     GLuint deskTex = 0;
@@ -1780,6 +1787,13 @@ struct App {
 
     // Living con la TV (lo dibuja el Quest; la Mac no manda video mientras no haya juego)
     GLuint roomProg = 0, cubeVao = 0, cubeVbo = 0, depth[2] = {0, 0}, readFbo = 0;
+    GLuint instVbo = 0;           // cajas del cine en una sola llamada (una «instancia» por caja)
+    GLint rL = -1, rInst = -1;
+    std::vector<float> inst;      // por caja: centro (3), tamaño (3), color (3), material (1)
+    GLuint skyCube = 0, skyBakeProg = 0;   // la parte quieta del cielo del espacio, dibujada una vez
+    GLint rSkyCube = -1, rSkyBaked = -1;
+    bool skyBaked = false;
+    double roomMsSum = 0; int roomMsN = 0, roomEnvLog = -1;   // cuánto tarda la sala por cuadro (para el registro)
     // Manos: un objeto en cada mano (control remoto, celular, banana o lápiz) y el láser solo en una
     GLuint handProg = 0, ovDepth[2] = {0, 0};
     GLint hVP = -1, hM = -1, hCol = -1, hEye = -1, hEmit = -1, hSkin = -1, hScl = -1;
@@ -2058,6 +2072,11 @@ static bool initXR(App &app) {
     if (app.hasHandTracking && hasExt(exts, "XR_META_simultaneous_hands_and_controllers")) { enable.push_back("XR_META_simultaneous_hands_and_controllers"); app.hasSimul = true; }
     // Ventanas curvas
     if (hasExt(exts, XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME)) { enable.push_back(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME); app.hasCylinder = true; }
+    // Foveated rendering de la sala
+    if (hasExt(exts, XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME) && hasExt(exts, XR_FB_FOVEATION_EXTENSION_NAME) && hasExt(exts, XR_FB_FOVEATION_CONFIGURATION_EXTENSION_NAME)) {
+        enable.push_back(XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME); enable.push_back(XR_FB_FOVEATION_EXTENSION_NAME);
+        enable.push_back(XR_FB_FOVEATION_CONFIGURATION_EXTENSION_NAME); app.hasFoveation = true;
+    }
     // Transparencia por capa (aparecer y desaparecer suave)
     if (hasExt(exts, XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME)) { enable.push_back(XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME); app.hasColorScale = true; }
 
@@ -2152,6 +2171,23 @@ static bool initXR(App &app) {
         createSwapchain(app, app.overlay[e], w, h, 1);   // rayos de los controles en la sala
     }
     LOGI("Swapchains %dx%d por ojo (%s)", app.sc[0].w, app.sc[0].h, app.srgb ? "sRGB" : "RGBA8");
+    if (app.hasFoveation) {
+        xrGetInstanceProcAddr(app.instance, "xrCreateFoveationProfileFB", (PFN_xrVoidFunction *)&app.xrCreateFoveationProfileFB);
+        xrGetInstanceProcAddr(app.instance, "xrDestroyFoveationProfileFB", (PFN_xrVoidFunction *)&app.xrDestroyFoveationProfileFB);
+        xrGetInstanceProcAddr(app.instance, "xrUpdateSwapchainFB", (PFN_xrVoidFunction *)&app.xrUpdateSwapchainFB);
+        if (app.xrCreateFoveationProfileFB && app.xrUpdateSwapchainFB) {
+            for (int k = 0; k < 2; k++) {
+                XrFoveationLevelProfileCreateInfoFB lv{XR_TYPE_FOVEATION_LEVEL_PROFILE_CREATE_INFO_FB};
+                lv.level = k == 0 ? XR_FOVEATION_LEVEL_HIGH_FB : XR_FOVEATION_LEVEL_NONE_FB;
+                lv.verticalOffset = 0;
+                lv.dynamic = XR_FOVEATION_DYNAMIC_DISABLED_FB;
+                XrFoveationProfileCreateInfoFB pc{XR_TYPE_FOVEATION_PROFILE_CREATE_INFO_FB};
+                pc.next = &lv;
+                if (XR_FAILED(app.xrCreateFoveationProfileFB(app.session, &pc, k == 0 ? &app.fovRoom : &app.fovNone))) app.hasFoveation = false;
+            }
+        } else app.hasFoveation = false;
+        LOGI("Foveated rendering de la sala: %s", app.hasFoveation ? "sí" : "no disponible");
+    }
 
     // Controles
     XrActionSetCreateInfo as{XR_TYPE_ACTION_SET_CREATE_INFO};
@@ -5819,13 +5855,26 @@ static void initRoom(App &app) {
     const char *vs = R"(#version 300 es
 layout(location = 0) in vec3 pos;
 layout(location = 1) in vec3 nrm;
+// (cajas en una sola llamada: centro, tamaño, color y material de cada una, en coordenadas de la sala)
+layout(location = 2) in vec3 iC;
+layout(location = 3) in vec3 iS;
+layout(location = 4) in vec3 iCol;
+layout(location = 5) in float iMat;
 uniform mat4 VP;
 uniform mat4 M;
+uniform mat4 L;          // de la sala al mundo (ejes y ancla)
 uniform mat3 N;
+uniform int inst;
+uniform vec3 col;
+uniform int mat;
 out vec3 wp;
 out vec3 wn;
+out vec3 vCol;
+flat out int vMat;
 void main() {
-    vec4 w = M * vec4(pos, 1.0);
+    vec4 w = inst == 1 ? L * vec4(iC + pos * iS, 1.0) : M * vec4(pos, 1.0);
+    vCol = inst == 1 ? iCol : col;
+    vMat = inst == 1 ? int(iMat + 0.5) : mat;
     wp = w.xyz;
     wn = N * nrm;
     gl_Position = VP * w;
@@ -5835,8 +5884,10 @@ void main() {
 precision highp float;
 in vec3 wp;
 in vec3 wn;
-uniform vec3 col;
-uniform int mat;
+in vec3 vCol;
+flat in int vMat;
+vec3 col;
+int mat;
 uniform vec3 eye, lightP, lampP;
 uniform vec3 anc, rx, fz;            // ejes de la habitación
 uniform vec3 ledP[4], ledD[4];     // un foco por lado de la TV (izq, der, arriba, abajo)
@@ -5850,6 +5901,7 @@ uniform vec3 scrG[9];                // colores de la imagen en 3x3 zonas
 uniform float gain;                  // brillo elegido para la pantalla y las luces
 uniform float scrK;                  // qué tan rápido se apaga la luz de la pantalla con la distancia
 out vec4 o;
+// <<cielo-base (esta parte también arma la imagen quieta del cielo del espacio)
 float h1(float n) { return fract(sin(n * 127.1) * 43758.5453); }
 float h2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 uniform float time;
@@ -5869,15 +5921,38 @@ float vnoise(vec3 p) {
 const mat3 FBM_ROT = mat3(0.00, 0.80, 0.60, -0.80, 0.36, -0.48, -0.60, -0.48, 0.64);
 float fbm(vec3 p) { float a = 0.5, s = 0.0; for (int i = 0; i < 4; i++) { s += a * vnoise(p); p = FBM_ROT * p * 2.03; a *= 0.5; } return s; }
 
-// Espacio: nebulosas de colores, estrellas de varios tamaños, un planeta con atmósfera y anillo, y un sol lejano
-vec3 spaceSky(vec3 d, vec3 rx, vec3 fz) {
-    // (el cielo va con la sala: al girar, gira la sala y el cielo con ella, no con tu cabeza)
-    d = vec3(dot(d, rx), d.y, dot(d, fz)); rx = vec3(1.0, 0.0, 0.0); fz = vec3(0.0, 0.0, 1.0);
+// La parte quieta del cielo del espacio (fondo, nebulosas, galaxia y el resplandor del sol), en coordenadas de la sala:
+// se dibuja una sola vez en un cubemap y después solo se lee
+vec3 spaceBase(vec3 d) {
     vec3 c = vec3(0.003, 0.004, 0.010);
     float n1 = fbm(d * 2.2 + vec3(3.1, 0.0, 1.7)), n2 = fbm(d * 3.7 + vec3(-2.0, 5.0, 0.3));
     c += vec3(0.32, 0.08, 0.40) * pow(smoothstep(0.45, 0.85, n1), 2.0) * 0.55;
     c += vec3(0.05, 0.22, 0.42) * pow(smoothstep(0.5, 0.9, n2), 2.0) * 0.5;
     c += vec3(0.6, 0.25, 0.12) * pow(smoothstep(0.62, 0.95, n1 * n2 * 1.6), 3.0) * 0.4;
+    vec3 sun = normalize(vec3(-0.8, 0.35, 0.3));
+    c += vec3(1.0, 0.7, 0.4) * pow(max(dot(d, sun), 0.0), 18.0) * 0.12;
+    // Galaxia espiral lejana (una mancha suave con brazos)
+    vec3 gc = normalize(vec3(-0.7, 0.45, -0.5));
+    vec3 gu = normalize(cross(gc, vec3(0.3, 1.0, 0.1))), gv = cross(gc, gu);
+    vec2 q = vec2(dot(d, gu), dot(d, gv) * 2.2) / 0.09;
+    float rq = length(q), aq = atan(q.y, q.x);
+    if (rq < 3.0 && dot(d, gc) > 0.0) {
+        float arms = 0.5 + 0.5 * cos(aq * 2.0 - log(rq + 0.05) * 4.0);
+        c += vec3(0.75, 0.70, 0.95) * (exp(-rq * 5.0) * 1.2 + arms * exp(-rq * 2.2) * 0.25) * 0.35 * smoothstep(3.0, 1.8, rq);
+    }
+    return c;
+}
+// cielo-base>>
+uniform samplerCube skyBase;
+uniform int skyBaked;
+
+// Espacio: nebulosas de colores, estrellas de varios tamaños, un planeta con atmósfera y anillo, y un sol lejano
+vec3 spaceSky(vec3 d, vec3 rx, vec3 fz) {
+    // (el cielo va con la sala: al girar, gira la sala y el cielo con ella, no con tu cabeza)
+    d = vec3(dot(d, rx), d.y, dot(d, fz)); rx = vec3(1.0, 0.0, 0.0); fz = vec3(0.0, 0.0, 1.0);
+    vec3 c;
+    if (skyBaked == 1) { c = texture(skyBase, d).rgb; c *= c; }   // (guardado como raíz cuadrada: menos escalones en lo oscuro)
+    else c = spaceBase(d);
     for (int l = 0; l < 3; l++) {
         float sc = 140.0 + float(l) * 160.0;
         vec3 g = floor(d * sc);
@@ -5890,21 +5965,10 @@ vec3 spaceSky(vec3 d, vec3 rx, vec3 fz) {
             c += tint * smoothstep(0.3, 0.0, dist) * (1.5 - float(l) * 0.4) * (0.6 + 0.4 * sin(time * (1.0 + st * 3.0) + st * 50.0));
         }
     }
-    // sol lejano
+    // sol lejano (el disco; su resplandor está en la parte quieta)
     vec3 sun = normalize(-rx * 0.8 + fz * 0.3 + vec3(0.0, 0.35, 0.0));
     float sd = max(dot(d, sun), 0.0);
-    c += vec3(1.0, 0.9, 0.75) * pow(sd, 900.0) * 6.0 + vec3(1.0, 0.7, 0.4) * pow(sd, 18.0) * 0.12;
-    // Galaxia espiral lejana (una mancha suave con brazos)
-    {
-        vec3 gc = normalize(-rx * 0.7 - fz * 0.5 + vec3(0.0, 0.45, 0.0));
-        vec3 gu = normalize(cross(gc, vec3(0.3, 1.0, 0.1))), gv = cross(gc, gu);
-        vec2 q = vec2(dot(d, gu), dot(d, gv) * 2.2) / 0.09;
-        float rq = length(q), aq = atan(q.y, q.x);
-        if (rq < 3.0 && dot(d, gc) > 0.0) {
-            float arms = 0.5 + 0.5 * cos(aq * 2.0 - log(rq + 0.05) * 4.0);
-            c += vec3(0.75, 0.70, 0.95) * (exp(-rq * 5.0) * 1.2 + arms * exp(-rq * 2.2) * 0.25) * 0.35 * smoothstep(3.0, 1.8, rq);
-        }
-    }
+    c += vec3(1.0, 0.9, 0.75) * pow(sd, 900.0) * 6.0;
     // Planeta (una esfera de verdad: se ve redonda desde cualquier ángulo) con nubes que se mueven y un anillo
     vec3 P = normalize(rx * 0.6 + fz * 0.75 + vec3(0.0, 0.18, 0.0)) * 3.0;
     float R = 0.75;
@@ -6010,6 +6074,7 @@ vec3 sunsetSky(vec3 d, vec3 rx, vec3 fz) {
     return c;
 }
 void main() {
+    col = vCol; mat = vMat;
     vec3 n = normalize(wn);
     if (dot(n, eye - wp) < 0.0) n = -n;   // las paredes se ven desde adentro
     vec3 q = wp - anc;
@@ -6167,6 +6232,34 @@ void main() {
     GLuint P = app.roomProg;
     app.rVP = glGetUniformLocation(P, "VP"); app.rM = glGetUniformLocation(P, "M"); app.rN = glGetUniformLocation(P, "N");
     app.rCol = glGetUniformLocation(P, "col"); app.rMat = glGetUniformLocation(P, "mat");
+    app.rL = glGetUniformLocation(P, "L"); app.rInst = glGetUniformLocation(P, "inst");
+    app.rSkyCube = glGetUniformLocation(P, "skyBase"); app.rSkyBaked = glGetUniformLocation(P, "skyBaked");
+    // Programa para dibujar una vez la parte quieta del cielo del espacio (usa las mismas funciones que la sala)
+    {
+        std::string all = fs;
+        size_t a = all.find("// <<cielo-base"), b = all.find("// cielo-base>>");
+        if (a != std::string::npos && b != std::string::npos) {
+            std::string bfs = "#version 300 es\nprecision highp float;\nuniform int face;\nuniform float size;\nout vec4 o;\n" + all.substr(a, b - a) +
+                "void main() {\n"
+                "    vec2 st = gl_FragCoord.xy / size * 2.0 - 1.0;\n"
+                "    vec3 d;\n"
+                "    if (face == 0) d = vec3(1.0, -st.y, -st.x);\n"
+                "    else if (face == 1) d = vec3(-1.0, -st.y, st.x);\n"
+                "    else if (face == 2) d = vec3(st.x, 1.0, st.y);\n"
+                "    else if (face == 3) d = vec3(st.x, -1.0, -st.y);\n"
+                "    else if (face == 4) d = vec3(st.x, -st.y, 1.0);\n"
+                "    else d = vec3(-st.x, -st.y, -1.0);\n"
+                "    o = vec4(sqrt(max(spaceBase(normalize(d)), 0.0)), 1.0);\n"
+                "}\n";
+            const char *bvs = "#version 300 es\nvoid main() { vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+            GLuint bp = glCreateProgram();
+            glAttachShader(bp, compileShader(GL_VERTEX_SHADER, bvs));
+            glAttachShader(bp, compileShader(GL_FRAGMENT_SHADER, bfs.c_str()));
+            glLinkProgram(bp);
+            GLint lok = 0; glGetProgramiv(bp, GL_LINK_STATUS, &lok);
+            if (lok) app.skyBakeProg = bp; else { char log[1024]; glGetProgramInfoLog(bp, sizeof log, nullptr, log); LOGE("Cielo (cubemap): %s", log); glDeleteProgram(bp); }
+        }
+    }
     app.rEye = glGetUniformLocation(P, "eye"); app.rLight = glGetUniformLocation(P, "lightP"); app.rLamp = glGetUniformLocation(P, "lampP");
     app.rAnc = glGetUniformLocation(P, "anc"); app.rRx = glGetUniformLocation(P, "rx"); app.rFz = glGetUniformLocation(P, "fz");
     app.rLedP = glGetUniformLocation(P, "ledP"); app.rLedD = glGetUniformLocation(P, "ledD"); app.rLedC = glGetUniformLocation(P, "ledC");
@@ -6198,6 +6291,13 @@ void main() {
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void *)0);
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void *)(3 * sizeof(float)));
+    // (las cajas del cine: un buffer con los datos de cada caja; esos atributos se encienden solo al dibujarlas)
+    glGenBuffers(1, &app.instVbo);
+    glBindBuffer(GL_ARRAY_BUFFER, app.instVbo);
+    for (int a = 0; a < 4; a++) {
+        glVertexAttribPointer(2 + a, a == 3 ? 1 : 3, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void *)(a * 3 * sizeof(float)));
+        glVertexAttribDivisor(2 + a, 1);
+    }
     glBindVertexArray(0);
 
     // Profundidad para cada ojo (la habitación tiene cosas delante de otras)
@@ -6390,13 +6490,12 @@ static void renderRoom(App &app, const XrView &view, const TvInfo *tv) {
     if (g_env == 2) {
         glUniform1f(app.rLedOn, 0.f);
         float a0[3] = {0, 0, 0}; glUniform3fv(app.rAmb, 1, a0);
+        // (las ~1500 cajas del cine se juntan y se dibujan en una sola llamada)
+        std::vector<float> &I = app.inst;
+        I.clear();
         auto cb = [&](float x, float y, float z, float sx, float sy, float sz, float cr, float cg, float cbl, int mat) {
-            float c[3]; local(x, y, z, c);
-            float M[16] = {r[0] * sx, r[1] * sx, r[2] * sx, 0, up[0] * sy, up[1] * sy, up[2] * sy, 0, f[0] * sz, f[1] * sz, f[2] * sz, 0, c[0], c[1], c[2], 1};
-            glUniformMatrix4fv(app.rM, 1, GL_FALSE, M);
-            glUniform3f(app.rCol, cr, cg, cbl);
-            glUniform1i(app.rMat, mat);
-            glDrawArrays(GL_TRIANGLES, 0, 36);
+            const float v[10] = {x, y, z, sx, sy, sz, cr, cg, cbl, (float)mat};
+            I.insert(I.end(), v, v + 10);
         };
         // sala grande: 22 m de ancho, de z=-15,5 a z=10,5 (la pantalla, en z=8,6, del mismo tamaño), 11 m de alto;
         // el piso baja hacia la pantalla en gradas (tu fila, la 0, está a la altura del piso real)
@@ -6455,6 +6554,17 @@ static void renderRoom(App &app, const XrView &view, const TvInfo *tv) {
         cb(10.9f, 3.3f, 7.4f, 0.04f, 0.25f, 0.6f, 0.1f, 0.9f, 0.3f, 4);
         cb(-7.5f, 5.6f, -15.25f, 0.6f, 0.25f, 0.04f, 0.1f, 0.9f, 0.3f, 4);
         cb(7.5f, 5.6f, -15.25f, 0.6f, 0.25f, 0.04f, 0.1f, 0.9f, 0.3f, 4);
+        // las paredes (la primera caja) van al final: lo que las tapa ya está dibujado y esos puntos no se pintan
+        std::rotate(I.begin(), I.begin() + 10, I.end());
+        const float Lm[16] = {r[0], r[1], r[2], 0, up[0], up[1], up[2], 0, f[0], f[1], f[2], 0, anc[0], anc[1], anc[2], 1};
+        glUniformMatrix4fv(app.rL, 1, GL_FALSE, Lm);
+        glUniform1i(app.rInst, 1);
+        glBindBuffer(GL_ARRAY_BUFFER, app.instVbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(I.size() * sizeof(float)), I.data(), GL_STREAM_DRAW);
+        for (int a = 2; a <= 5; a++) glEnableVertexAttribArray(a);
+        glDrawArraysInstanced(GL_TRIANGLES, 0, 36, (GLsizei)(I.size() / 10));
+        for (int a = 2; a <= 5; a++) glDisableVertexAttribArray(a);
+        glUniform1i(app.rInst, 0);
         glBindVertexArray(0);
         glDisable(GL_DEPTH_TEST);
         return;
@@ -6479,6 +6589,51 @@ static void renderRoom(App &app, const XrView &view, const TvInfo *tv) {
         return;
     }
     // Espacio: cielo alrededor y una plataforma; sin habitación (la TV flota como una ventana más)
+    if (g_env == 1 && !app.skyBaked && app.skyBakeProg) {
+        // La parte quieta del cielo se dibuja una sola vez (6 caras de 512) y después cada punto solo la lee
+        app.skyBaked = true;
+        const int SZ = 512;
+        GLint prevFbo = 0, vp[4];
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo); glGetIntegerv(GL_VIEWPORT, vp);
+        glGenTextures(1, &app.skyCube);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, app.skyCube);
+        for (int k = 0; k < 6; k++) glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + k, 0, GL_RGBA8, SZ, SZ, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+        GLuint fb = 0;
+        glGenFramebuffers(1, &fb);
+        glBindFramebuffer(GL_FRAMEBUFFER, fb);
+        glDisable(GL_DEPTH_TEST);
+        glUseProgram(app.skyBakeProg);
+        glUniform1f(glGetUniformLocation(app.skyBakeProg, "size"), (float)SZ);
+        glViewport(0, 0, SZ, SZ);
+        glBindVertexArray(app.vao);
+        bool ok = true;
+        for (int k = 0; k < 6; k++) {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X + k, app.skyCube, 0);
+            if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { ok = false; break; }
+            glUniform1i(glGetUniformLocation(app.skyBakeProg, "face"), k);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
+        glDeleteFramebuffers(1, &fb);
+        glViewport(vp[0], vp[1], vp[2], vp[3]);
+        if (!ok) { glDeleteTextures(1, &app.skyCube); app.skyCube = 0; LOGE("Cielo (cubemap): no se pudo dibujar"); }
+        else LOGI("Cielo del espacio: parte quieta lista (cubemap %d)", SZ);
+        glUseProgram(app.roomProg);
+        glBindVertexArray(app.cubeVao);
+        glEnable(GL_DEPTH_TEST);
+    }
+    glUniform1i(app.rSkyBaked, app.skyCube ? 1 : 0);
+    glUniform1i(app.rSkyCube, 5);   // (siempre en su propia unidad, aunque todavía no exista)
+    if (app.skyCube) {
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, app.skyCube);
+        glActiveTexture(GL_TEXTURE0);
+    }
     if (g_env == 1) {
         auto boxW = [&](const float c[3], float sx, float sy, float sz, int mat) {
             float M[16] = {r[0] * sx, r[1] * sx, r[2] * sx, 0, up[0] * sy, up[1] * sy, up[2] * sy, 0, f[0] * sz, f[1] * sz, f[2] * sz, 0, c[0], c[1], c[2], 1};
@@ -8249,6 +8404,15 @@ static void renderFrame(App &app) {
     }
     XrCompositionLayerProjectionView pv[2];
     XrCompositionLayerSpaceWarpInfoFB swInfo[2];
+    if (app.hasFoveation && app.fovState != (showVideo ? 0 : 1)) {
+        app.fovState = showVideo ? 0 : 1;
+        for (int e = 0; e < 2; e++) {
+            XrSwapchainStateFoveationFB st{XR_TYPE_SWAPCHAIN_STATE_FOVEATION_FB};
+            st.profile = showVideo ? app.fovNone : app.fovRoom;
+            app.xrUpdateSwapchainFB(app.sc[e].handle, (XrSwapchainStateBaseHeaderFB *)&st);
+        }
+    }
+    double roomT0 = 0;
     for (int e = 0; e < 2; e++) {
         Swapchain &s = app.sc[e];
         uint32_t idx = 0;
@@ -8318,6 +8482,7 @@ static void renderFrame(App &app) {
         } else if (app.anchor && app.roomProg) {
             rw = (int)(s.w * 0.85f) & ~1; rh = (int)(s.h * 0.85f) & ~1;
             glViewport(0, 0, rw, rh);
+            if (e == 0) roomT0 = nowMs();
             renderRoom(app, views[e], haveTv ? &tvInfo : nullptr);
             if (reveal < 1.f) applyReveal(app, views[e], reveal);
             else if (cross < 1.f && app.envFrom != 3) crossFrom(app, e, views[e], haveTv ? &tvInfo : nullptr, s.fbos[idx], rw, rh, cross);
@@ -8349,6 +8514,18 @@ static void renderFrame(App &app) {
         pv[e].fov = showVideo ? app.shown.eye[e].fov : views[e].fov;
         pv[e].subImage.swapchain = s.handle;
         pv[e].subImage.imageRect = {{0, 0}, {rw, rh}};
+    }
+    // Registro: cuánto tarda en armarse la sala por cuadro (los dos ojos), cada 10 s
+    if (roomT0 > 0) {
+        app.roomMsSum += nowMs() - roomT0; app.roomMsN++;
+        static double lastLog = 0;
+        if (nowMs() - lastLog > 10000 && app.roomMsN > 0) {
+            static const char *names[] = {"living", "espacio", "cine", "passthrough", "carga"};
+            int en = g_env.load();
+            sendLog("Sala %s: %.2f ms por cuadro para armarla (procesador) · foveated rendering %s", en >= 0 && en <= 4 ? names[en] : "?",
+                    app.roomMsSum / app.roomMsN, app.fovState == 1 ? "sí" : "no");
+            app.roomMsSum = 0; app.roomMsN = 0; lastLog = nowMs();
+        }
     }
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     layer.space = app.space;
