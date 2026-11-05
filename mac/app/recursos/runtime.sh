@@ -72,6 +72,27 @@ asegurar_32bits() {
   return 0
 }
 
+# Juegos de 64 bits: la misma versión de GameNative (v10), con las interfaces de OpenVR nuevas que piden los juegos
+# de 2026 (IVRSystem_026, IVRCompositor_029, IVROverlay_028, IVRInput_011). La compilación que se bajaba antes
+# (znix.xyz, rama openxr) sólo llega a IVRSystem_022, y un juego nuevo se cierra al arrancar con
+# «OpenComposite DLLMain ERROR: unknown/unsupported interface IVRSystem_026» (No Man's Sky).
+# (GPLv3)
+OC_URL_64="https://github.com/GameNative/opencomposite/releases/download/v10/opencomposite_x64.dll"
+OC_SHA_64="0d395d267734bba3efa514edb836e728ac8c94ae2228c5ea31fca51a2d2819d8"
+asegurar_64bits() {
+  local oc="$P/descargas/opencomposite_x64_v10.dll"
+  [ "$(cat "$Q/opencomposite/.version64" 2>/dev/null)" = "$OC_SHA_64" ] && return 0
+  mkdir -p "$P/descargas" "$Q/opencomposite/bin"
+  [ "$(shasum -a 256 "$oc" 2>/dev/null | cut -d' ' -f1)" = "$OC_SHA_64" ] || curl -fsL -o "$oc" "$OC_URL_64" || true
+  if [ "$(shasum -a 256 "$oc" 2>/dev/null | cut -d' ' -f1)" = "$OC_SHA_64" ]; then
+    cp "$oc" "$Q/opencomposite/bin/vrclient_x64.dll" && echo "$OC_SHA_64" > "$Q/opencomposite/.version64" \
+      && echo "OpenComposite de 64 bits instalado"
+  else
+    echo "No se pudo descargar OpenComposite de 64 bits (sigo con el que ya estaba)"
+  fi
+  return 0
+}
+
 # Copia directa (texturas compartidas de DXMT): DXMT reconoce la GPU por su número de Metal (registryID, dado vuelta),
 # y Wine le había puesto otro número propio (LUID). Si no coinciden, DXMT no puede compartir texturas. Se le pone a
 # Wine el mismo número (en el registro de Windows; solo si es distinto).
@@ -112,6 +133,7 @@ preparar_runtime() {
     openxr|openvr)
       escribir_vrpath 'C:\questvrbridge\opencomposite'
       [ "$antes" = "openxr" ] || { openxr_activo 'C:\questvrbridge\questvrbridge_openxr.json' 'C:\questvrbridge\questvrbridge_openxr32.json'; rm -f "$Q/.runtime32"; }
+      asegurar_64bits
       asegurar_32bits
       echo "openxr" > "$Q/.runtime"
       echo "Runtime: OpenXR → VRmin · OpenVR → OpenComposite → VRmin"
