@@ -1,5 +1,5 @@
 name: Something doesn't work
-description: Report a bug or a problem with VRmin Host or the Quest app.
+description: Report a bug or a problem with VRmin Host (Mac or Windows beta) or the Quest app.
 labels: [bug]
 body:
   - type: markdown
@@ -20,10 +20,17 @@ body:
     attributes:
       label: Game (if it's about a game)
       placeholder: "SUPERHOT VR"
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Computer
+      options: [Mac, Windows PC (beta)]
+    validations:
+      required: true
   - type: input
     id: mac
     attributes:
-      label: Mac model
+      label: Mac model (or PC graphics card)
       description: Apple menu → About This Mac.
       placeholder: "MacBook Air M2, 16 GB"
     validations:
@@ -31,7 +38,7 @@ body:
   - type: input
     id: macos
     attributes:
-      label: macOS version
+      label: macOS version (or Windows version)
       placeholder: "macOS 15.7"
     validations:
       required: true

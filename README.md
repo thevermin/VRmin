@@ -6,7 +6,7 @@
 
 **Play your SteamVR games on a Mac. Streamed to your Meta Quest.**
 
-Free and open source · Apple Silicon Mac + Meta Quest + Steam
+Free and open source · Apple Silicon Mac + Meta Quest + Steam · Windows PC (beta)
 
 [**Download**](../../releases/latest) · [How it works](#how-it-works) · [Install](#install) · [FAQ](#faq) · [☕ Support on Ko-fi](https://ko-fi.com/thevermin)
 
@@ -25,6 +25,9 @@ Free and open source · Apple Silicon Mac + Meta Quest + Steam
 Macs can't run SteamVR games. VRmin makes it happen: it runs the **Windows version** of your Steam VR games on your
 Mac (using Wine and a Metal translation layer), and streams the picture to your **Meta Quest** over Wi‑Fi, with your
 head and hand movements going back the other way.
+
+There's also an early **Windows** version (beta) that streams the Steam VR games on your Windows PC to the Quest in the
+same way: see [Windows (beta)](#windows-beta).
 
 It is two apps that work together:
 
@@ -99,6 +102,7 @@ Put the Quest on your monitor: it tracks you with its cameras while the game sho
 - The Mac and the Quest on the **same Wi‑Fi** network (5/6 GHz, or the Mac on Ethernet, works best)
 - A Steam account with your VR games, and space for them (VRmin installs its own Steam for Windows: games are
   downloaded again there)
+- **Windows PC (beta):** 64-bit Windows 10 or 11, an NVIDIA, AMD or Intel graphics card, and Steam with your VR games
 
 ### Older headsets
 VRmin runs on Quest 1, Quest 2 and Quest Pro. Quest 2 has been confirmed working by testers; Quest 1 and Pro haven't been
@@ -170,6 +174,10 @@ installer on your Mac, and it doesn't collect any data.
 **Something doesn't work.**
 Click **"Something's wrong"** in VRmin Host (it collects the logs into a .zip on your Desktop) and open an
 [Issue](../../issues/new/choose) with it.
+
+**Does it work on Windows?**
+Yes, in beta: download **VRmin Windows** from the [Releases](../../releases/latest) (see [Windows (beta)](#windows-beta)).
+It hasn't been tested much yet, so please tell us how it goes. The Mac version is still the main one.
 
 **Where can I ask questions, share ideas or tell you which games work?**
 In [Discussions](../../discussions). Compatibility reports (even "it works great!") are very welcome as
