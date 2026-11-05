@@ -1,7 +1,7 @@
 name: Revisar la versión publicada
 # Al publicar una versión: que tenga una sola app de Mac y una del Quest (y, si está, una de Windows completa), que la de Mac sea de esa versión y que esté
 # firmada con el certificado fijo de VRmin («QuestVRBridge Local»). Si no, el botón «Actualizar» de VRmin Host la
-# rechaza (así pasó con la 0.47). Si algo falla, este trabajo queda en rojo y GitHub avisa por mail.
+# rechaza. Si algo falla, este trabajo queda en rojo y GitHub avisa por mail.
 on:
   release:
     types: [published]

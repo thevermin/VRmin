@@ -2992,7 +2992,7 @@ static void handGestures(RealHands::Hand &H, int side, const XrHandJointLocation
             // Con la mano abierta, «meñique → índice» apunta más arriba que el tubo de un puño cerrado sobre un control:
             // inclinar 45° hacia adelante/abajo (giro sobre el X propio) para que el láser y las manos del juego coincidan
             q = adjustPose(q, -45.f, 90.f, side);   // de fábrica: 45° hacia adelante y la palma como la de un control
-            // Lo «0» de las manos sin calibrar (probado jugando): 85° hacia adelante y el giro de cada mano
+            // Lo «0» de las manos sin calibrar: 85° hacia adelante y el giro de cada mano
             q = adjustPose(q, -85.f, side == 0 ? -130.f : 80.f, side);
             H.gGripPose.orientation = q;
             H.gGripPose.position = {palm[0] - R[3] * 0.035f, palm[1] - R[4] * 0.035f, palm[2] - R[5] * 0.035f};   // delante de la palma
@@ -3382,7 +3382,7 @@ void main() {
     vec3 v = normalize(eye - wp);
     float e0 = 0.02, e1 = 0.10 + 0.14 * soft;   // (igual en todas las salas)
     float a = flatSurf > 0.5 ? alphaV * inImg
-                             : smoothstep(e0, e1, abs(dot(n, v))) * inImg;   // borde finito (antes era muy ancho y se veía como una sombra doble)
+                             : smoothstep(e0, e1, abs(dot(n, v))) * inImg;   // borde finito
     a *= smoothstep(fadeP.w, fadeP.w - 0.03, dot(wp - fadeP.xyz, fadeD));   // final del antebrazo, difuminado
     if (depthOnly > 1.5) { color = vec4(0.0, 0.0, 0.0, a); return; }
     // color: mezcla de las dos cámaras según cuánto ve cada una ese punto
@@ -3803,7 +3803,7 @@ static void sendPose(App &app, const XrView views[2], XrTime t) {
                 add(1);
                 for (int k = 0; k < 2; k++) {   // agarre (desde la palma) y rayo (el de la mano), con el ajuste del usuario
                     XrPosef p = (k == 0 && H.gGripOk) ? H.gGripPose : H.aim;
-                    // Calibrada con los controles: como si tuvieras el control agarrado. Si no, lo «0» (probado jugando:
+                    // Calibrada con los controles: como si tuvieras el control agarrado. Si no, lo «0» (
                     // 85° hacia adelante y el giro de cada mano; el agarre ya lo trae). Encima va el ajuste del usuario.
                     if (!handCalApply(h, k, H, p) && !(k == 0 && H.gGripOk)) p.orientation = adjustPose(p.orientation, -85.f, h == 0 ? -130.f : 80.f, h);
                     p.orientation = adjustPose(p.orientation, g_gripPitch[h].load(), g_gripRoll[h].load(), h);
@@ -5853,7 +5853,7 @@ out vec4 o;
 float h1(float n) { return fract(sin(n * 127.1) * 43758.5453); }
 float h2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 uniform float time;
-// (hash sin sin() ni enteros: el de sin() se cortaba en líneas rectas en el visor y el de enteros daba siempre lo mismo)
+// (hash solo con fract y sumas: da lo mismo en cualquier GPU, sin cortes entre celdas)
 float h3(vec3 p) {
     vec3 q = fract(p * 0.1031);
     q += dot(q, q.zyx + 31.32);
@@ -5861,7 +5861,7 @@ float h3(vec3 p) {
 }
 float vnoise(vec3 p) {
     vec3 i = floor(p), f = fract(p);
-    f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);   // (suave también en la curvatura: si no, se veían las aristas de la grilla del ruido)
+    f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);   // (suave también en la curvatura: sin aristas de la grilla del ruido)
     return mix(mix(mix(h3(i), h3(i + vec3(1, 0, 0)), f.x), mix(h3(i + vec3(0, 1, 0)), h3(i + vec3(1, 1, 0)), f.x), f.y),
                mix(mix(h3(i + vec3(0, 0, 1)), h3(i + vec3(1, 0, 1)), f.x), mix(h3(i + vec3(0, 1, 1)), h3(i + vec3(1, 1, 1)), f.x), f.y), f.z);
 }
@@ -5885,7 +5885,7 @@ vec3 spaceSky(vec3 d, vec3 rx, vec3 fz) {
         vec3 cen = (g + 0.5 + (vec3(h3(g + 7.0), h3(g + 13.0), h3(g + 19.0)) - 0.5) * 0.3) / sc;
         float dist = length(d - normalize(cen)) * sc;
         float thr = 0.985 - float(l) * 0.01;
-        if (st > thr) {   // (cada estrella entra entera en su celda: antes se cortaban en líneas rectas)
+        if (st > thr) {   // (cada estrella entra entera en su celda)
             vec3 tint = mix(vec3(0.75, 0.82, 1.0), vec3(1.0, 0.85, 0.65), h3(g + 3.0));
             c += tint * smoothstep(0.3, 0.0, dist) * (1.5 - float(l) * 0.4) * (0.6 + 0.4 * sin(time * (1.0 + st * 3.0) + st * 50.0));
         }

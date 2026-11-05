@@ -25,7 +25,7 @@ if [ ! -x renderer/QuestRenderer ] || [ renderer/main.swift -nt renderer/QuestRe
   fi
 fi
 
-# Valores por defecto (probados en MacBook Air M2): 1024 por ojo, 90 Hz, 70 Mbps
+# Valores por defecto: 1024 por ojo, 90 Hz, 70 Mbps
 export VR_EYE=${VR_EYE:-1024} VR_FPS=${VR_FPS:-90} VR_MBPS=${VR_MBPS:-70}
 /usr/bin/python3 "$(pwd)/server.py" &
 SERVER=$!

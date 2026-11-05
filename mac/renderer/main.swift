@@ -1133,8 +1133,8 @@ final class GameLink {
                                                     NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 1, alpha: 1)]
         let line = CTLineCreateWithAttributedString(NSAttributedString(string: tr("Cargando…", "Loading…"), attributes: attrs))
         let bounds = CTLineGetBoundsWithOptions(line, [])
-        // En cada ojo, donde se ve un punto a 3 m delante de tu cabeza (no en el centro de la imagen: los ojos del Quest
-        // no miran al centro de su imagen, y el cartel se veía doble)
+        // En cada ojo, donde se ve un punto a 3 m delante de la cabeza (no en el centro de la imagen: los ojos del Quest
+        // no miran al centro de su imagen)
         let eyes = shared.pose?.eyes ?? []
         for e in 0..<2 {
             var u: CGFloat = 0.5, v: CGFloat = 0.5
@@ -1800,7 +1800,7 @@ final class Vigia: NSObject, NSWindowDelegate {
         image = CALayer()
         image.frame = v.bounds
         // El juego dibuja cada ojo cuadrado pero con un campo de visión de pantalla (≈ 1,54:1): se estira a toda la
-        // pantalla para que quede con sus proporciones reales (antes se veía estirado hacia arriba)
+        // pantalla para que quede con sus proporciones reales
         image.contentsGravity = .resize
         image.minificationFilter = .trilinear; image.magnificationFilter = .linear
         image.contentsRect = CGRect(x: 0, y: 0, width: 0.5, height: 1)   // ojo izquierdo

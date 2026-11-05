@@ -535,7 +535,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
     }
 
     // ------------------------------------------------------------------ MenuUi.Host
-    /// Intensidad del 3D: 100% = correr la imagen 1,5% del ancho (antes era 3%, demasiado)
+    /// Intensidad del 3D: 100% = correr la imagen 1,5% del ancho
     private static final float MAX_3D = 0.015f;
     private static final int HUD_ID = 0x2FFFFFF0;
 
