@@ -295,7 +295,7 @@ final class MenuUi implements Link.Listener {
     }
 
     private boolean autoVr = false;   // ya entramos en VR solos por este juego
-    private static final String[] TAB_NAMES = {"Computadoras", "Escritorio", "Juegos", "Ajustes", "Salas"};
+    private static final String[] TAB_NAMES = {"Conexión", "Escritorio", "Juegos", "Ajustes", "Salas"};
     private String[] tabIcons;
     private TextView footer;
     private DwellButton menuButton;
@@ -423,7 +423,7 @@ final class MenuUi implements Link.Listener {
         bug.setBackground(Ui.hoverable(ctx, 0, 999, false));
         bug.setClickable(true);
         bug.setOnClickListener(v -> {
-            if (Link.I.state() == null) { Tutorials.confirm(rootView, I18n.t("Algo anda mal"), I18n.t("Conectate a tu Mac primero: el reporte lo arma VRmin Host con los registros de la Mac."), I18n.t("Ir a Computadoras"), () -> setTab(TAB_MACS)); return; }
+            if (Link.I.state() == null) { Tutorials.confirm(rootView, I18n.t("Algo anda mal"), I18n.t("Conectate a tu Mac primero: el reporte lo arma VRmin Host con los registros de la Mac."), I18n.t("Ir a Conexión"), () -> setTab(TAB_MACS)); return; }
             Tutorials.confirm(rootView, I18n.t("Algo anda mal"),
                     I18n.t("VRmin Host junta los registros de la Mac, del visor y de los juegos en un .zip en el Escritorio de la Mac. Mandalo cuando pidas ayuda y contá qué pasó. No incluye claves ni datos personales."),
                     I18n.t("Armar el reporte"), () -> {
@@ -569,7 +569,7 @@ final class MenuUi implements Link.Listener {
         }
         moveTabIndicator(t);
         staggerUntil = android.os.SystemClock.uptimeMillis() + 900; staggerN = 0;
-        setPage = null;
+        setPage = null; qCustom = false;
         openChoice = null;
         drawnKey = "";
         rootView.post(() -> slideIn(0));
@@ -759,8 +759,8 @@ final class MenuUi implements Link.Listener {
         else if (tab == TAB_ROOM) renderRoom();
         else if (tab == TAB_SET) renderSettings(conn ? st : null);   // los ajustes del Quest se usan sin conectarse a la Mac
         else if (!conn || st == null) {
-            header(I18n.t("Sin conexión"), I18n.t("Primero elegí tu Mac en «Computadoras»."));
-            TextView go = Ui.pill(ctx, I18n.t("Ir a Computadoras"));
+            header(I18n.t("Sin conexión"), I18n.t("Primero elegí tu Mac en «Conexión»."));
+            TextView go = Ui.pill(ctx, I18n.t("Ir a Conexión"));
             go.setOnClickListener(v -> setTab(TAB_MACS));
             content.addView(go, wrap());
         } else if (tab == TAB_DESK) renderDesk(st);
@@ -877,7 +877,7 @@ final class MenuUi implements Link.Listener {
         long nowP = android.os.SystemClock.uptimeMillis();
         if (wasPairing) { wasPairing = false; if (Link.I.isConnected() && pairSent.length() == 6) pairOkUntil = nowP + 1600; }
         if (nowP < pairOkUntil) { renderPairedOk(); return; }
-        header(I18n.t("Computadoras"), I18n.t("Macs con VRmin Host abierto en tu red Wi-Fi."));
+        header(I18n.t("Conexión"), I18n.t("Macs con VRmin Host abierto en tu red Wi-Fi."));
         // Conexión: a mano, solo por cable (el mismo ajuste que en Ajustes › Conexión)
         toggle(content, null, I18n.t("Solo por cable USB-C"), I18n.t("Los juegos y las pantallas van siempre por el cable (sin Wi-Fi). Sin cable no se conecta."),
                 prefs().getBoolean("cableOnly", false), on -> { prefs().edit().putBoolean("cableOnly", on).apply(); host.setCableOnly(on); });
@@ -1060,6 +1060,21 @@ final class MenuUi implements Link.Listener {
         lp.topMargin = dp(ctx, 10);
         into.addView(c, lp);
         return c;
+    }
+
+    /// Una frase corta y un botón «?» que muestra la explicación completa
+    private void noteMore(LinearLayout into, String text, String title, String more) {
+        LinearLayout r = new LinearLayout(ctx);
+        r.setOrientation(LinearLayout.HORIZONTAL);
+        r.setGravity(Gravity.CENTER_VERTICAL);
+        r.setPadding(dp(ctx, 8), dp(ctx, 8), 0, 0);
+        r.addView(Ui.label(ctx, text, 14, Ui.TEXT2, false), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        TextView q = Ui.pill(ctx, "?");
+        q.setOnClickListener(v -> Tutorials.info(rootView, title, more));
+        LinearLayout.LayoutParams qlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        qlp.leftMargin = dp(ctx, 10);
+        r.addView(q, qlp);
+        into.addView(r);
     }
 
     /// Texto chico de ayuda debajo de un grupo
@@ -1253,7 +1268,7 @@ final class MenuUi implements Link.Listener {
         content.addView(r);
     }
 
-    private void openPage(String page) { setPage = page; openChoice = null; redraw(); slideIn(page == null ? -1 : 1); }
+    private void openPage(String page) { setPage = page; openChoice = null; qCustom = false; redraw(); slideIn(page == null ? -1 : 1); }
 
     /// Animación al cambiar de página o de sección: el contenido entra deslizándose y aparece
     private void slideIn(int dir) {
@@ -1296,7 +1311,7 @@ final class MenuUi implements Link.Listener {
     }
 
     // Opciones (lo que se guarda y cómo se muestra)
-    private static final int[] EYES = {1024, 1280, 1536, 1832, 2048, 2304, 2560}, FPSS = {72, 90, 120}, MBPSS = {40, 70, 100, 150, 200};
+    static final int[] EYES = {1024, 1280, 1536, 1832, 2048, 2304, 2560}, FPSS = {72, 90, 120}, MBPSS = {40, 70, 100, 150, 200};
     private static final String[] EYE_NAMES = {"1024\nNormal", "1280\nAlta", "1536\nMuy alta", "1832\nMáxima · la Mac trabaja mucho más", "2048\nPara Macs Pro o Max · con foveated encoding",
             "2304\nPara Macs Max o Ultra · con HEVC", "2560\nPara Macs Ultra · con HEVC y foveated encoding"};
     private static final String[] MBPS_NAMES = {"40 Mbps\nBaja", "70 Mbps\nMedia", "100 Mbps\nAlta", "150 Mbps\nMuy alta", "200 Mbps\nMáxima · mejor por cable"};
@@ -1359,8 +1374,30 @@ final class MenuUi implements Link.Listener {
     static final String[] FOVC_NAMES = {"Chico", "Medio", "Grande"};
     private int selFov = -1, selFovC = -1, selCodec = -1;
     private static final String[] MODE_NAMES = {"Apagado", "IA", "Lado a lado (SBS)", "Arriba/abajo"};
-    /// Perfiles rápidos de los juegos: posiciones en EYES, FPSS y MBPSS
-    private static final int[][] PROFILES = {{0, 0, 0}, {0, 1, 1}, {1, 1, 2}};
+    /// Ajustes de calidad predeterminados (los mismos que en VRmin Host): posiciones en EYES, FPSS y MBPSS
+    static final int[][] PRESETS = {{0, 0, 0}, {0, 1, 1}, {2, 1, 2}, {4, 1, 3}};
+    static final String[] PRESET_NAMES = {"Bajo", "Medio", "Alto", "Ultra"};
+    static final String[] PRESET_FOR = {"MacBook Air con M1, o si el Wi-Fi es lento", "MacBook Air, Mac mini e iMac (M1 a M4)",
+            "MacBook Pro y Mac mini con chip Pro", "Chip Max o Ultra (MacBook Pro, Mac Studio)"};
+    /// El ajuste pensado para el chip de la Mac conectada
+    static int recommendedPreset() {
+        JSONObject st = Link.I.state();
+        String c = st == null ? "" : st.optString("macChip", "");
+        return c.contains("Max") || c.contains("Ultra") ? 3 : c.contains("Pro") ? 2 : 1;
+    }
+    /// «Medio ●●○○ · Recomendado para tu Mac\nMacBook Air… · 1024 px · 90 Hz · 70 Mbps»
+    static String presetLabel(int i) {
+        StringBuilder b = new StringBuilder(I18n.t(PRESET_NAMES[i])).append("  ");
+        for (int k = 0; k < 4; k++) b.append(k <= i ? '●' : '○');
+        if (i == recommendedPreset()) b.append(" · ").append(I18n.t("Recomendado para tu Mac"));
+        return b.append('\n').append(I18n.t(PRESET_FOR[i])).append(" · ").append(EYES[PRESETS[i][0]]).append(" px · ")
+                .append(FPSS[PRESETS[i][1]]).append(" Hz · ").append(MBPSS[PRESETS[i][2]]).append(" Mbps").toString();
+    }
+    static int presetOf(int eye, int fps, int mbps) {
+        for (int i = 0; i < PRESETS.length; i++) if (PRESETS[i][0] == eye && PRESETS[i][1] == fps && PRESETS[i][2] == mbps) return i;
+        return -1;
+    }
+    private boolean qCustom = false;   // «Personalizado» elegido (aunque coincida con uno)
 
     private static final float[] SEATED_HEIGHTS = {1.60f, 1.70f, 1.75f, 1.80f, 1.90f};
     /// Altura que se aplica: sentado = la elegida; de pie = la real (0) o la elegida
@@ -1401,7 +1438,7 @@ final class MenuUi implements Link.Listener {
             if (selAudio < 0) { String a = cfg.optString("audio", "quest"); selAudio = a.equals("mac") ? 1 : a.equals("both") ? 2 : 0; }
             if (selFov < 0) { selFov = fovLevel(cfg); selFovC = fovSize(cfg); }
         }
-        if (setPage != null && !host.inVR() && (setPage.equals("image") || setPage.equals("hands") || setPage.equals("3d") || setPage.equals("height") || setPage.equals("move"))) setPage = null;
+        if (setPage != null && !host.inVR() && (setPage.equals("image") || setPage.equals("hands") || setPage.equals("laser") || setPage.equals("3d") || setPage.equals("height") || setPage.equals("move"))) setPage = null;
 
         if (setPage == null) {
             header(I18n.t("Ajustes"), I18n.t("Todo se guarda solo."));
@@ -1409,25 +1446,24 @@ final class MenuUi implements Link.Listener {
             content.addView(Ui.section(ctx, I18n.t("General")));
             navRow("lang", "globe", I18n.english() ? "Language" : "Idioma", I18n.english() ? "English" : "Español");
             if (host.inVR()) {
-                boolean stand = prefs().getInt("posture", prefs().getFloat("heightM", 1.75f) <= 0.5f ? 1 : 0) == 1;
-                navRow("height", "visor", I18n.t("Tu altura"), (stand ? I18n.t("De pie · ") : I18n.t("Sentado · ")) + heightName(effectiveHeight()));
+                toggle(content, null, I18n.t("Solo por cable USB-C"), I18n.t("Los juegos y las pantallas van siempre por el cable (sin Wi-Fi). Sin cable no se conecta."),
+                        prefs().getBoolean("cableOnly", false), on -> { prefs().edit().putBoolean("cableOnly", on).apply(); host.setCableOnly(on); });
+                toggle(content, null, I18n.t("Abrir el teclado solo"), I18n.t("Cuando tocás un lugar para escribir en la Mac. También está el botón del teclado en la barra de cada pantalla."),
+                        prefs().getBoolean("kbAuto", true), on -> prefs().edit().putBoolean("kbAuto", on).apply());
             }
             content.addView(Ui.section(ctx, I18n.t("Calidad")));
             navRow("games", "gamepad", I18n.t("Juegos VR"), online ? I18n.t("Calidad y rendimiento, para todos o para cada juego") : I18n.t("Con la Mac conectada"));
             navRow("desk", "display", I18n.t("Escritorio y ventanas"), prefs().getInt("deskMaxW", 2560) + " px · " + prefs().getInt("deskFps", 60) + " fps");
             if (host.inVR()) {
-                content.addView(Ui.section(ctx, I18n.t("Movimiento")));
+                content.addView(Ui.section(ctx, I18n.t("Comodidad")));
+                boolean stand = prefs().getInt("posture", prefs().getFloat("heightM", 1.75f) <= 0.5f ? 1 : 0) == 1;
+                navRow("height", "visor", I18n.t("Tu altura"), (stand ? I18n.t("De pie · ") : I18n.t("Sentado · ")) + heightName(effectiveHeight()));
                 navRow("move", "room", I18n.t("Moverte por la sala"), moveSummary());
-                content.addView(Ui.section(ctx, I18n.t("Teclado")));
-                toggle(content, null, I18n.t("Abrir el teclado solo"), I18n.t("Cuando tocás un lugar para escribir en la Mac. También está el botón del teclado en la barra de cada pantalla."),
-                        prefs().getBoolean("kbAuto", true), on -> prefs().edit().putBoolean("kbAuto", on).apply());
-                content.addView(Ui.section(ctx, I18n.t("Conexión")));
-                toggle(content, null, I18n.t("Solo por cable USB-C"), I18n.t("Los juegos y las pantallas van siempre por el cable (sin Wi-Fi). Sin cable no se conecta."),
-                        prefs().getBoolean("cableOnly", false), on -> { prefs().edit().putBoolean("cableOnly", on).apply(); host.setCableOnly(on); });
                 content.addView(Ui.section(ctx, I18n.t("Studio")));
                 navRow("image", "filter", I18n.t("Imagen"), I18n.t(IMG_NAMES[Math.min(IMG_NAMES.length - 1, prefs().getInt("imgPreset", 0))]));
-                navRow("hands", "hand", I18n.t("Manos y controles"), I18n.t(prefs().getBoolean("realHands", true) ? "Manos reales" : "Solo el láser"));
-                navRow("gestures", "hand", I18n.t("Gestos de las manos"), I18n.t("Joystick virtual y botones"));
+                navRow("hands", "hand", I18n.t("Manos"), I18n.t(prefs().getBoolean("realHands", true) ? "Manos reales" : "Solo el láser"));
+                navRow("gestures", "hand", I18n.t("Gestos"), I18n.t("Sin controles: clic, moverte y jugar con las manos"));
+                navRow("laser", "sliders", I18n.t("Láser"), I18n.t(laserTouch() ? "Toca las pantallas" : "Solo el menú"));
                 toggle(content, "stats", I18n.t("Indicador de rendimiento"), I18n.t("Cuadros por segundo, Mbps y demora"), prefs().getBoolean("hud", false),
                         on -> { prefs().edit().putBoolean("hud", on).apply(); host.setHud(on); });
             }
@@ -1454,7 +1490,18 @@ final class MenuUi implements Link.Listener {
                 break;
             }
             case "gestures": {
-                pageHeader(I18n.t("Gestos de las manos"), I18n.t("Sin controles: qué hace cada gesto, en Studio y en los juegos."));
+                pageHeader(I18n.t("Gestos"), I18n.t("Sin controles: qué hace cada gesto, en Studio y en los juegos."));
+                note(content, I18n.t("Sin controles, apuntá con la mano y juntá el índice con el pulgar para hacer clic."));
+                if (host.inVR()) {
+                    toggle(content, null, I18n.t("Moverte con las manos"), I18n.t("Con la mano derecha en forma de pistola"),
+                            prefs().getBoolean("handMove", true), on -> { prefs().edit().putBoolean("handMove", on).apply(); host.setHandMove(on); });
+                    noteMore(content, I18n.t("Apuntá al piso y bajá el pulgar para ir ahí."), I18n.t("Moverte con las manos"),
+                            I18n.t("Sin controles, con la mano derecha en forma de pistola (índice estirado, los otros tres dedos cerrados): apuntá al piso adelante y bajá el pulgar para ir ahí; apuntá a un costado y bajá el pulgar para girar."));
+                    toggle(content, null, I18n.t("Jugar con las manos (experimental)"), I18n.t("No se recomienda en juegos rápidos."),
+                            prefs().getBoolean("handGestures", true), on -> { prefs().edit().putBoolean("handGestures", on).apply(); host.setHandGestures(on); });
+                    noteMore(content, I18n.t("Tus manos hacen de control en los juegos."), I18n.t("Jugar con las manos (experimental)"),
+                            I18n.t("Sin controles, tus manos hacen de control: pellizco con el índice = gatillo · cerrar mayor, anular y meñique = agarre · pellizco con el mayor = B/Y · pellizco con el anular = A/X · pellizco con el meñique izquierdo = menú (mantenelo para este menú) · pulgar sobre la palma = apretar el joystick · puño con el pulgar encima y mover la mano = joystick"));
+                }
                 GestureUi gu = new GestureUi(ctx, prefs(), host::applyGestures, this::redraw);
                 gu.profilePicker(content, gestureProfile, i -> { gestureProfile = i; redraw(); });
                 GestureUi.note(ctx, content);
@@ -1535,8 +1582,8 @@ final class MenuUi implements Link.Listener {
             case "games": {
                 pageHeader(I18n.t("Juegos VR"), I18n.t("Primero elegí si es para todos los juegos o para uno. Un juego con ajustes propios siempre usa los suyos."));
                 if (!online) {   // estos ajustes los guarda la Mac
-                    note(content, I18n.t("Estos ajustes se guardan en la Mac: conectate a tu Mac en «Computadoras» para cambiarlos."));
-                    TextView go = Ui.pill(ctx, I18n.t("Ir a Computadoras"));
+                    note(content, I18n.t("Estos ajustes se guardan en la Mac: conectate a tu Mac en «Conexión» para cambiarlos."));
+                    TextView go = Ui.pill(ctx, I18n.t("Ir a Conexión"));
                     go.setOnClickListener(v -> setTab(TAB_MACS));
                     content.addView(go, wrap());
                     break;
@@ -1580,35 +1627,29 @@ final class MenuUi implements Link.Listener {
             }
 
             case "hands":
-                pageHeader(I18n.t("Manos y controles"), I18n.t("Cómo se ven tus manos y el láser en la sala."));
+                pageHeader(I18n.t("Manos"), I18n.t("Cómo se ven tus manos y tus controles en la sala."));
                 toggle(content, null, I18n.t("Seguimiento de manos"), I18n.t("Apagado, VRmin usa solo los controles: no sigue tus manos, ni sus gestos, ni el menú en la mano."),
                         prefs().getBoolean("handTracking", true), on -> { prefs().edit().putBoolean("handTracking", on).apply(); host.setHandTracking(on); });
                 toggle(content, null, I18n.t("Ver tus manos reales"), I18n.t("Con los controles se ven los controles; sin controles, tus manos (nunca las dos cosas a la vez)"),
                         prefs().getBoolean("realHands", true), on -> { prefs().edit().putBoolean("realHands", on).apply(); host.setRealHands(on); });
-                note(content, I18n.t("Ver tus manos reales puede bajar un poco el rendimiento. Si notás tirones, apagalo."));
+                noteMore(content, I18n.t("Puede bajar un poco el rendimiento."), I18n.t("Ver tus manos reales"),
+                        I18n.t("Ver tus manos reales puede bajar un poco el rendimiento. Si notás tirones, apagalo.") + "\n\n"
+                                + I18n.t("Para que el borde de tus manos se vea suave, VRmin usa las cámaras del visor (te pide permiso una vez). Sin ese permiso se ven con el borde marcado."));
                 block(content).addView(slider(I18n.t("Color de las manos"), "handSat", 50, p -> host.setHandColor(p / 50f * 0.8f)));
                 block(content).addView(slider(I18n.t("Suavidad del borde"), "edgeSoft", 60, p -> host.setEdgeSoft(p / 100f)));
-                content.addView(Ui.section(ctx, I18n.t("Portal")));
-                toggle(content, null, I18n.t("Portal al cuarto real"), I18n.t("Dibujá un círculo alrededor de algo (por ejemplo, tu teclado) y esa zona se ve hasta que lo apagues"),
-                        portalOn, on -> { portalOn = on; host.setPortal(on); if (on) showPortalHint(); else hidePortalHint(); });
-                note(content, I18n.t("Para dibujarlo: fuera de las ventanas, pellizcá con la mano del láser (o apretá el gatillo) y recorré el contorno con la punta del índice o del control. Al soltar, el portal queda listo. Para hacer otro, apagalo y volvé a encenderlo."));
-                note(content, I18n.t("Para que el borde de tus manos se vea suave, VRmin usa las cámaras del visor (te pide permiso una vez). Sin ese permiso se ven con el borde marcado."));
                 toggle(content, null, I18n.t("Abrir el menú mirando la mano"), I18n.t("Mirá el borde de la mano, del lado del meñique, durante un momento"),
                         prefs().getBoolean("palmMenu", true), on -> { prefs().edit().putBoolean("palmMenu", on).apply(); host.setWatch(on); });
-                note(content, I18n.t("Sin controles, apuntá con la mano y juntá el índice con el pulgar para hacer clic."));
-                note(content, I18n.t("El láser sale de una sola mano. Para pasarlo a la otra, apretá su gatillo (o pellizcá con esa mano)."));
-                content.addView(Ui.section(ctx, I18n.t("Moverte")));
-                toggle(content, null, I18n.t("Moverte con las manos"), I18n.t("Sin controles, con la mano derecha en forma de pistola (índice estirado, los otros tres dedos cerrados): apuntá al piso adelante y bajá el pulgar para ir ahí; apuntá a un costado y bajá el pulgar para girar."),
-                        prefs().getBoolean("handMove", true), on -> { prefs().edit().putBoolean("handMove", on).apply(); host.setHandMove(on); });
-                content.addView(Ui.section(ctx, I18n.t("Juegos")));
-                toggle(content, null, I18n.t("Jugar con las manos (experimental)"), I18n.t("No se recomienda en juegos rápidos.") + " " + I18n.t("Sin controles, tus manos hacen de control: pellizco con el índice = gatillo · cerrar mayor, anular y meñique = agarre · pellizco con el mayor = B/Y · pellizco con el anular = A/X · pellizco con el meñique izquierdo = menú (mantenelo para este menú) · pulgar sobre la palma = apretar el joystick · puño con el pulgar encima y mover la mano = joystick"),
-                        prefs().getBoolean("handGestures", true), on -> { prefs().edit().putBoolean("handGestures", on).apply(); host.setHandGestures(on); });
-                content.addView(Ui.section(ctx, I18n.t("Láser")));
-                note(content, I18n.t("Para que el láser no haga clic en una pantalla, usá el botón del láser en la barra de esa pantalla."));
-                note(content, I18n.t("Para poner en pausa los controles y las manos (por ejemplo, para comer mirando una película): mantené A y B (o X e Y) un segundo, juntá el pulgar con el meñique derecho o tocá el botón de pausa en la barra de una pantalla. Para volver, el mismo atajo o el mismo gesto."));
+                break;
+
+            case "laser":
+                pageHeader(I18n.t("Láser"), I18n.t("Su color y qué puede tocar."));
+                laserToggle();
                 swatches(content, I18n.t("Color"), LASER_COLORS, Math.min(LASER_COLORS.length - 1, prefs().getInt("laserCol", 0)),
                         i -> { prefs().edit().putInt("laserCol", i).apply(); applyLaser(); });
                 block(content).addView(slider(I18n.t("Intensidad"), "laserK", 60, p -> host.setLaser(prefs().getInt("laserCol", 0), Math.max(0.15f, p / 60f))));
+                note(content, I18n.t("El láser sale de una sola mano. Para pasarlo a la otra, apretá su gatillo (o pellizcá con esa mano)."));
+                noteMore(content, I18n.t("Para que el láser no haga clic en una pantalla, usá el botón del láser en su barra."), I18n.t("Pausa"),
+                        I18n.t("Para poner en pausa los controles y las manos (por ejemplo, para comer mirando una película): mantené A y B (o X e Y) un segundo, juntá el pulgar con el meñique derecho o tocá el botón de pausa en la barra de una pantalla. Para volver, el mismo atajo o el mismo gesto."));
                 break;
 
             case "3d":
@@ -1698,6 +1739,11 @@ final class MenuUi implements Link.Listener {
         header(I18n.t("Salas"), I18n.t("El lugar donde estás en el Modo Studio."));
         choice(content, I18n.t("Lugar"), null, new String[]{I18n.t("Living\nCon TV y luces"), I18n.t("Espacio\nFlotás entre planetas, sin moverte"), I18n.t("Cine\nPantalla gigante"), I18n.t("Passthrough\nTu cuarto real: todo flota, sin moverte"), I18n.t("Carga\nEl vacío de la pantalla de carga")},
                 prefs().getInt("env", 0), i -> { prefs().edit().putInt("env", i).apply(); host.setEnvironment(i); }, true);
+        content.addView(Ui.section(ctx, I18n.t("Portal")));
+        toggle(content, null, I18n.t("Portal al cuarto real"), I18n.t("Dibujá un círculo alrededor de algo (por ejemplo, tu teclado) y esa zona se ve hasta que lo apagues"),
+                portalOn, on -> { portalOn = on; host.setPortal(on); if (on) showPortalHint(); else hidePortalHint(); });
+        noteMore(content, I18n.t("Se dibuja con la mano o el control."), I18n.t("Portal al cuarto real"),
+                I18n.t("Para dibujarlo: fuera de las ventanas, pellizcá con la mano del láser (o apretá el gatillo) y recorré el contorno con la punta del índice o del control. Al soltar, el portal queda listo. Para hacer otro, apagalo y volvé a encenderlo."));
         content.addView(Ui.section(ctx, I18n.t("Luces")));
         toggle(content, null, I18n.t("Luces detrás de la TV"), I18n.t("Siguen los colores de la pantalla (solo en el living)"), prefs().getBoolean("leds", true),
                 on -> { prefs().edit().putBoolean("leds", on).apply(); host.setLeds(on); });
@@ -1706,17 +1752,20 @@ final class MenuUi implements Link.Listener {
 
     /// Calidad de los juegos (para todos): perfil, nitidez, fluidez, Mbps, sonido y foveated encoding, con «Aplicar»
     private void qualityBlock(JSONObject cfg) {
-        int prof = PROFILES.length;   // «A tu gusto» si no coincide con ninguno
-        for (int i = 0; i < PROFILES.length; i++)
-            if (PROFILES[i][0] == selEye && PROFILES[i][1] == selFps && PROFILES[i][2] == selMbps) prof = i;
-        option(content, I18n.t("Perfil"), I18n.t("Lo más fácil: elegí uno y listo"),
-                new String[]{I18n.t("Más fluido\nPara Wi-Fi lento o si se entrecorta"), I18n.t("Equilibrado\nRecomendado"),
-                        I18n.t("Más nítido\nPide más a la Mac y al Wi-Fi"), I18n.t("A tu gusto\nLo que elijas abajo")}, prof,
-                i -> { if (i < PROFILES.length) { selEye = PROFILES[i][0]; selFps = PROFILES[i][1]; selMbps = PROFILES[i][2]; } });
-        qualityDetail(selEye, selFps, selMbps, selFov, selFovC, i -> selEye = i, i -> selFps = i, i -> selMbps = i, i -> selFov = i, i -> selFovC = i);
+        int prof = presetOf(selEye, selFps, selMbps);
+        int sel = qCustom || prof < 0 ? PRESETS.length : prof;
+        String[] labels = new String[PRESETS.length + 1];
+        for (int i = 0; i < PRESETS.length; i++) labels[i] = presetLabel(i);
+        labels[PRESETS.length] = I18n.t("Personalizado\nElegí cada ajuste a tu gusto");
+        choice(content, I18n.t("Calidad"), I18n.t("Elegí uno según tu Mac"), labels, sel, i -> {
+            qCustom = i == PRESETS.length;
+            if (!qCustom) { selEye = PRESETS[i][0]; selFps = PRESETS[i][1]; selMbps = PRESETS[i][2]; }
+            redraw();
+        }, true);
+        if (sel == PRESETS.length) qualityDetail(selEye, selFps, selMbps, selFov, selFovC, i -> selEye = i, i -> selFps = i, i -> selMbps = i, i -> selFov = i, i -> selFovC = i);
         content.addView(Ui.section(ctx, I18n.t("Sonido y video")));
         option(content, I18n.t("Sonido"), null, new String[]{audioName(0), audioName(1), audioName(2)}, selAudio, i -> selAudio = i);
-        option(content, I18n.t("Códec de video"), I18n.t("HEVC da mejor imagen con los mismos Mbps. H.264 queda por ahora, por si HEVC anda mal."),
+        if (sel == PRESETS.length) option(content, I18n.t("Códec de video"), I18n.t("HEVC da mejor imagen con los mismos Mbps. H.264 queda por ahora, por si HEVC anda mal."),
                 new String[]{I18n.t("HEVC\nRecomendado"), I18n.t("H.264\nEl de antes")}, selCodec, i -> selCodec = i);
         boolean changed = EYES[selEye] != cfg.optInt("eye") || FPSS[selFps] != cfg.optInt("fps") || MBPSS[selMbps] != cfg.optInt("mbps")
                 || !AUDIOS[selAudio].equals(cfg.optString("audio", "quest")) || !CODECS[selCodec].equals(cfg.optString("codec", "hevc"))
@@ -1805,15 +1854,32 @@ final class MenuUi implements Link.Listener {
             initQuality(cfg);
             qualityBlock(cfg);
         } else {
-            // La calidad de este juego: la suya o la general. Se guarda al elegir y se usa la próxima vez que se abra
+            // La calidad de este juego: la general, uno de los predeterminados o personalizada. Se guarda al elegir
             final String sc = "key:" + key;
             JSONObject q = v == null ? new JSONObject() : v;
+            JSONObject o = own == null ? null : own.optJSONObject(key);
+            boolean hasQ = o != null && (o.has("eye") || o.has("fps") || o.has("mbps"));
+            int ge = indexOf(EYES, q.optInt("eye", cfg.optInt("eye", 1024))), gf = indexOf(FPSS, q.optInt("fps", cfg.optInt("fps", 90))),
+                    gm = indexOf(MBPSS, q.optInt("mbps", cfg.optInt("mbps", 70)));
             int fl = q.has("fov") ? fovLevel(q) : fovLevel(cfg), fs = q.has("fov") ? fovSize(q) : fovSize(cfg);
-            qualityDetail(indexOf(EYES, q.optInt("eye", cfg.optInt("eye", 1024))), indexOf(FPSS, q.optInt("fps", cfg.optInt("fps", 90))),
-                    indexOf(MBPSS, q.optInt("mbps", cfg.optInt("mbps", 70))), fl, fs,
-                    i -> sendAdv(sc, "eye", String.valueOf(EYES[i])), i -> sendAdv(sc, "fps", String.valueOf(FPSS[i])),
-                    i -> sendAdv(sc, "mbps", String.valueOf(MBPSS[i])),
-                    i -> sendAdv(sc, "fov", "\"" + fovString(ctx, i, fs) + "\""), i -> sendAdv(sc, "fov", "\"" + fovString(ctx, fl, i) + "\""));
+            int gp = presetOf(ge, gf, gm);
+            int gsel = !hasQ && !qCustom ? 0 : qCustom || gp < 0 ? PRESETS.length + 1 : gp + 1;
+            String[] gl = new String[PRESETS.length + 2];
+            gl[0] = I18n.t("Como todos los juegos\nUsa la calidad general");
+            for (int i = 0; i < PRESETS.length; i++) gl[i + 1] = presetLabel(i);
+            gl[PRESETS.length + 1] = I18n.t("Personalizado\nElegí cada ajuste a tu gusto");
+            choice(content, I18n.t("Calidad"), null, gl, gsel, i -> {
+                qCustom = i == PRESETS.length + 1;
+                if (i == 0) Link.I.send("{\"type\":\"gamecfg\",\"scope\":\"" + sc + "\",\"eye\":0}");
+                else if (!qCustom) Link.I.send("{\"type\":\"gamecfg\",\"scope\":\"" + sc + "\",\"eye\":" + EYES[PRESETS[i - 1][0]]
+                        + ",\"fps\":" + FPSS[PRESETS[i - 1][1]] + ",\"mbps\":" + MBPSS[PRESETS[i - 1][2]] + "}");
+                redraw();
+            }, true);
+            if (gsel == PRESETS.length + 1)
+                qualityDetail(ge, gf, gm, fl, fs,
+                        i -> sendAdv(sc, "eye", String.valueOf(EYES[i])), i -> sendAdv(sc, "fps", String.valueOf(FPSS[i])),
+                        i -> sendAdv(sc, "mbps", String.valueOf(MBPSS[i])),
+                        i -> sendAdv(sc, "fov", "\"" + fovString(ctx, i, fs) + "\""), i -> sendAdv(sc, "fov", "\"" + fovString(ctx, fl, i) + "\""));
             note(content, I18n.t("Se guarda al elegir y se usa la próxima vez que abras este juego (la conexión se corta unos segundos al abrirlo)."));
         }
         advanced(content, v, key.isEmpty() ? "all" : "key:" + key);
@@ -1838,7 +1904,9 @@ final class MenuUi implements Link.Listener {
         JSONObject cfg = st.optJSONObject("cfg");
         if (cfg != null) {
             initQuality(cfg);
-            LinearLayout q = Ui.row(ctx, "sliders", I18n.t("Calidad de los juegos"), EYES[selEye] + " · " + FPSS[selFps] + " Hz · " + MBPSS[selMbps] + " Mbps");
+            int qp = presetOf(selEye, selFps, selMbps);
+            LinearLayout q = Ui.row(ctx, "sliders", I18n.t("Calidad de los juegos"), (qp < 0 ? I18n.t("Personalizado") + " · " : I18n.t(PRESET_NAMES[qp]) + " · ")
+                    + EYES[selEye] + " · " + FPSS[selFps] + " Hz · " + MBPSS[selMbps] + " Mbps");
             q.addView(Ui.label(ctx, gamesQuality ? "⌃" : "›", 22, Ui.TEXT2, false));
             q.setOnClickListener(v -> { gamesQuality = !gamesQuality; redraw(); });
             content.addView(q);
@@ -1954,7 +2022,7 @@ final class MenuUi implements Link.Listener {
             over.addView(pb);
             if (!dir.isEmpty()) {   // (los juegos planos no tienen estos ajustes)
                 TextView ab = Ui.pill(ctx, I18n.t("Ajustes"));
-                ab.setOnClickListener(v -> { gameCfgName = name; advKey = dir; redraw(); });
+                ab.setOnClickListener(v -> { gameCfgName = name; advKey = dir; qCustom = false; redraw(); });
                 LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
                 alp.leftMargin = dp(ctx, 10);
                 over.addView(ab, alp);

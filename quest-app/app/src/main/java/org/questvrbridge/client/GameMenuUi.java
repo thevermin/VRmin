@@ -53,7 +53,6 @@ final class GameMenuUi implements Link.Listener {
     private boolean showGestures = false;
     // Imagen del juego (se guarda en la Mac): lo elegido acá hasta tocar «Aplicar»
     private static final int[] EYES = {1024, 1280, 1536, 1832, 2048, 2304, 2560}, FPSS = {72, 90, 120}, MBPSS = {40, 70, 100, 150, 200};
-    private static final int[][] PROFILES = {{0, 0, 0}, {0, 1, 1}, {1, 1, 2}};
     private int selEye = -1, selFps = -1, selMbps = -1, selFov = 0, selFovC = 1;
     private boolean showDetail = false, applied = false;
     private int qAll = -1;                 // la imagen se cambia para: 1 = todos los juegos · 0 = este juego (-1 = según tenga la suya)
@@ -526,13 +525,12 @@ final class GameMenuUi implements Link.Listener {
         int curEye = indexOf(EYES, q.optInt("eye", 1024)), curFps = indexOf(FPSS, q.optInt("fps", 90)), curMbps = indexOf(MBPSS, q.optInt("mbps", 70));
         int curFov = MenuUi.fovLevel(q), curFovC = MenuUi.fovSize(q);
         if (selEye < 0) { selEye = curEye; selFps = curFps; selMbps = curMbps; selFov = curFov; selFovC = curFovC; }
-        int prof = -1;
-        for (int i = 0; i < PROFILES.length; i++)
-            if (PROFILES[i][0] == selEye && PROFILES[i][1] == selFps && PROFILES[i][2] == selMbps) prof = i;
-        pills(I18n.t("Perfil"), prof < 0 ? I18n.t("A tu gusto (abajo)") : I18n.t("Lo más fácil: elegí uno y tocá «Aplicar»"),
-                new String[]{I18n.t("Más fluido"), I18n.t("Equilibrado"), I18n.t("Más nítido")}, prof,
-                i -> { selEye = PROFILES[i][0]; selFps = PROFILES[i][1]; selMbps = PROFILES[i][2]; applied = false; });
-        TextView more = Ui.label(ctx, showDetail ? I18n.t("Ocultar el detalle") : I18n.t("Ajustar a mano"), 14, Ui.ACCENT_TEXT, true);
+        int prof = MenuUi.presetOf(selEye, selFps, selMbps);
+        String[] pn = new String[MenuUi.PRESETS.length];
+        for (int i = 0; i < pn.length; i++) pn[i] = I18n.t(MenuUi.PRESET_NAMES[i]) + (i == MenuUi.recommendedPreset() ? " ★" : "");
+        pills(I18n.t("Calidad"), prof < 0 ? I18n.t("Personalizado (abajo)") : I18n.t(MenuUi.PRESET_FOR[prof]),
+                pn, prof, i -> { selEye = MenuUi.PRESETS[i][0]; selFps = MenuUi.PRESETS[i][1]; selMbps = MenuUi.PRESETS[i][2]; applied = false; });
+        TextView more = Ui.label(ctx, showDetail ? I18n.t("Ocultar el detalle") : I18n.t("Personalizado"), 14, Ui.ACCENT_TEXT, true);
         more.setPadding(dp(ctx, 18), dp(ctx, 8), 0, dp(ctx, 4));
         more.setOnClickListener(v -> { showDetail = !showDetail; drawnKey = ""; render(); });
         right.addView(more);

@@ -56,7 +56,7 @@ final class Tutorials {
             new Tut("conectar", "laptop", "start", "Conectar tu Mac", "Connecting your Mac", new String[][]{
                     s("laptop", "Abrí VRmin Host en la Mac.", "Open VRmin Host on the Mac."),
                     s("cable", "El Quest y la Mac en la misma red Wi-Fi, o unidos con un cable USB-C (más estable y con menos demora).", "The Quest and the Mac on the same Wi-Fi, or joined by a USB-C cable (steadier, with less delay)."),
-                    s("check", "Elegí tu Mac en «Computadoras». La primera vez, escribí el código de 6 números que aparece en la Mac.", "Pick your Mac in “Computers”. The first time, type the 6-digit code shown on the Mac."),
+                    s("check", "Elegí tu Mac en «Conexión». La primera vez, escribí el código de 6 números que aparece en la Mac.", "Pick your Mac in “Connection”. The first time, type the 6-digit code shown on the Mac."),
             }),
             // ---------------------------------------------------------------- pantallas
             new Tut("escritorio", "display", "screens", "Ver tu Mac", "Seeing your Mac", new String[][]{
@@ -104,7 +104,7 @@ final class Tutorials {
             new Tut("manos", "hand", "studio", "Usar las manos sin controles", "Using your hands, no controllers", new String[][]{
                     s("pinch", "Apuntá con la mano y juntá índice y pulgar para hacer clic.", "Point with your hand and touch index finger to thumb to click."),
                     s("hand", "Para teletransportarte: mano derecha en forma de pistola, apuntá al piso y bajá el pulgar.", "To teleport: right hand like a pistol, aim at the floor and drop your thumb."),
-                    s("sliders", "En Ajustes › Gestos de las manos elegís qué hace cada gesto, en Studio y en los juegos (y armás macros).", "In Settings › Hand gestures you choose what each gesture does, in Studio and in games (and build macros)."),
+                    s("sliders", "En Ajustes › Gestos elegís qué hace cada gesto, en Studio y en los juegos (y armás macros).", "In Settings › Gestures you choose what each gesture does, in Studio and in games (and build macros)."),
             }),
             new Tut("salas", "room", "studio", "Las salas", "The rooms", new String[][]{
                     s("room", "Living: un living con una tele grande fija.", "Living room: a living room with a big fixed TV."),
@@ -340,6 +340,24 @@ final class Tutorials {
             ok.setOnClickListener(v -> close(root, TAG, after));
             bar.addView(ok);
         }
+    }
+
+    /** Una explicación (desde un botón «?»): el texto y «Entendido». */
+    static void info(FrameLayout root, String title, String text) {
+        Context c = root.getContext();
+        LinearLayout card = sheet(root, TAG);
+        titleRow(card, "help", title, null);
+        TextView t = Ui.label(c, text, 16, Ui.TEXT2, false);
+        t.setPadding(0, dp(c, 12), 0, 0);
+        card.addView(t);
+        LinearLayout bar = new LinearLayout(c);
+        bar.setGravity(Gravity.END);
+        TextView ok = Ui.primary(c, I18n.english() ? "Got it" : "Entendido");
+        ok.setOnClickListener(v -> close(root, TAG, null));
+        bar.addView(ok);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        blp.topMargin = dp(c, 18);
+        card.addView(bar, blp);
     }
 
     /** Una pregunta antes de algo que borra lo tuyo (como el aviso del portal): «Cancelar» o la acción. */

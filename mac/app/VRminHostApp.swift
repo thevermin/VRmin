@@ -44,6 +44,19 @@ let RUNTIME_OPCIONES: [(id: String, nombre: String)] = [
     ("plano", "Sin VR (pantalla plana)"),
 ]
 let ESTADOS_JUEGO = ["sin probar", "funciona", "con problemas", "no funciona"]
+
+/// Ajustes de calidad predeterminados de los juegos VR (píxeles por ojo, cuadros por segundo, Mbps). Los mismos en el Quest.
+struct QualityPreset { let id: String; let name: String; let forMac: String; let eye: Int; let fps: Int; let mbps: Int; let level: Int }
+let QUALITY_PRESETS: [QualityPreset] = [
+    QualityPreset(id: "bajo", name: "Bajo", forMac: "MacBook Air con M1, o si el Wi-Fi es lento", eye: 1024, fps: 72, mbps: 40, level: 1),
+    QualityPreset(id: "medio", name: "Medio", forMac: "MacBook Air, Mac mini e iMac (M1 a M4)", eye: 1024, fps: 90, mbps: 70, level: 2),
+    QualityPreset(id: "alto", name: "Alto", forMac: "MacBook Pro y Mac mini con chip Pro", eye: 1536, fps: 90, mbps: 100, level: 3),
+    QualityPreset(id: "ultra", name: "Ultra", forMac: "Chip Max o Ultra (MacBook Pro, Mac Studio)", eye: 2048, fps: 90, mbps: 150, level: 4),
+]
+/// El ajuste pensado para este chip
+func qualityRecommended(_ chip: String) -> String {
+    chip.contains("Max") || chip.contains("Ultra") ? "ultra" : chip.contains("Pro") ? "alto" : "medio"
+}
 /// Cosas de Steam que no son juegos
 let NOT_GAMES: Set<String> = ["228980", "250820", "1070560", "1391110", "1628350"]
 
@@ -133,7 +146,13 @@ final class AppModel: ObservableObject {
     @Published var audioOK = false
     @Published var busyTask: String?
     @Published var steamRunning = false
-    @Published var openGames = Set<String>()   // carpetas (en minúsculas) de los juegos abiertos ahora
+    @Published var openGames = Set<String>() {   // carpetas (en minúsculas) de los juegos abiertos ahora
+        didSet {
+            for dir in oldValue.subtracting(openGames) {
+                if let g = games.first(where: { $0.installdir.lowercased() == dir }), vr[g.id]?.perfil.estado == "sin probar" { askWorked = g }
+            }
+        }
+    }
     /// Modo Centinela: herramientas de Android (adb) para que el visor apoyado no apague la pantalla
     @Published var adbInstalled = false
     @Published var vigiaActive = false   // el Modo Centinela está andando (lo dice el renderizador)
@@ -337,7 +356,26 @@ final class AppModel: ObservableObject {
             if serverRunning && cableOnly != oldValue { restartServer() } else { settingsChanged() }
         } }
     private func settingsChanged() { gameQ = nil; pendingRestart = serverRunning && settingsKey != runningWith }
-    func resetQuality() { fps = 90; eye = 1024; mbps = 70; audioMac = false; audioOnlyMac = false }
+    func resetQuality() { applyPreset(recommendedPreset); audioMac = false; audioOnlyMac = false }
+
+    /// El chip de la Mac («Apple M2», «Apple M4 Max»…), para recomendar un ajuste de calidad
+    lazy var chip: String = {
+        var n = 0
+        sysctlbyname("machdep.cpu.brand_string", nil, &n, nil, 0)
+        var b = [CChar](repeating: 0, count: max(1, n))
+        sysctlbyname("machdep.cpu.brand_string", &b, &n, nil, 0)
+        let s = String(cString: b)
+        return s.isEmpty ? "Apple" : s
+    }()
+    /// Ajustes de calidad predeterminados (los mismos que en el Quest)
+    var recommendedPreset: String { qualityRecommended(chip) }
+    var currentPreset: String { QUALITY_PRESETS.first { $0.eye == eye && $0.fps == fps && $0.mbps == mbps }?.id ?? "custom" }
+    func applyPreset(_ id: String) {
+        guard let p = QUALITY_PRESETS.first(where: { $0.id == id }) else { return }
+        eye = p.eye; fps = p.fps; mbps = p.mbps
+    }
+    /// Si se terminó de probar un juego nuevo: «¿Funcionó?» (una vez, al cerrarlo)
+    @Published var askWorked: SteamGame? = nil
 
     private var server: Process?
     private var checkedGames: Set<String> = []
@@ -889,7 +927,11 @@ final class AppModel: ObservableObject {
     }
 
     func play(_ g: SteamGame) {
-        if !serverRunning { append(L("Primero encendé el servidor (o conectate desde el Quest).")); return }
+        if !serverRunning {   // se enciende solo y el juego se abre cuando está listo
+            startServer()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in if self?.serverRunning == true { self?.play(g) } }
+            return
+        }
         if !steamRunning { append(L("Primero abrí Steam y esperá a ver tu biblioteca.")); return }
         // ¿Este juego quiere otra calidad que la que corre ahora?
         loadAdv()
@@ -1056,6 +1098,7 @@ struct ContentView: View {
     @State private var showLog = false
     @State private var showVigiaHelp = false
     @State private var tut: TutPresent? = nil   // tutorial o Ayuda en pantalla
+    @State private var gameAdv: SteamGame? = nil   // ajustes de un juego (desde su menú)
 
     var body: some View {
         // (toda la ventana se desplaza: así los juegos se ven enteros, sin una lista chica con su propia barra)
@@ -1066,6 +1109,7 @@ struct ContentView: View {
                 connectionCard
                 prepCard
             }
+            cableCard
             gamesCard
             recordCard
             logSection
@@ -1078,6 +1122,7 @@ struct ContentView: View {
         .tint(Theme.amber)
         .sheet(isPresented: $showSettings) { SettingsView().environmentObject(m) }
         .sheet(item: $tut) { p in TutorialSheet(p: p) }
+        .sheet(item: $gameAdv) { g in GameSettingsSheet(game: g).environmentObject(m) }
         .onAppear {   // la bienvenida, la primera vez
             if Tutoriales.enabled("bienvenida"), let t = Tutoriales.find("bienvenida") {
                 UserDefaults.standard.set(true, forKey: "tutNo_bienvenida")   // (una sola vez; sigue en la Ayuda)
@@ -1118,16 +1163,26 @@ struct ContentView: View {
                 ProgressView().controlSize(.small)
                 Text(t).font(.callout).foregroundStyle(Theme.text2).lineLimit(1)
             }
-            HStack(spacing: 8) {
-                // «Lista» solo si de verdad está todo: motor, Steam instalado y abierto
-                let falta = !m.engineReady ? L("Falta instalar el motor") : !m.steamInstalled ? L("Falta instalar Steam")
-                    : !m.steamRunning ? L("Falta abrir Steam") : m.steamStuck ? L("Steam se trabó") : nil
-                Dot(on: m.questConnected && falta == nil, warn: falta != nil || (m.serverRunning && !m.questConnected))
-                Text(falta ?? (m.questConnected ? L("Quest conectado") : m.serverRunning ? L("Esperando al Quest") : L("Lista")))
-                    .font(.system(size: 13, weight: .semibold))
+            // «Lista» solo si de verdad está todo: motor, Steam instalado y abierto. Si falta algo, tocarlo lo hace.
+            let falta = !m.engineReady ? L("Falta instalar el motor") : !m.steamInstalled ? L("Falta instalar Steam")
+                : !m.steamRunning ? L("Falta abrir Steam") : m.steamStuck ? L("Steam se trabó") : nil
+            let fix: (() -> Void)? = !m.engineReady || !m.openComposite ? { m.run(L("Instalando el motor"), "instalar_motor.sh") }
+                : !m.steamInstalled ? { m.run(L("Instalando Steam"), "instalar_steam.sh") }
+                : !m.steamRunning ? { m.run(L("Abriendo Steam"), "abrir_steam.sh") }
+                : m.steamStuck ? { m.restartSteam() } : nil
+            Button { fix?() } label: {
+                HStack(spacing: 8) {
+                    Dot(on: m.questConnected && falta == nil, warn: falta != nil || (m.serverRunning && !m.questConnected))
+                    Text(falta ?? (m.questConnected ? L("Quest conectado") : m.serverRunning ? L("Esperando al Quest") : L("Lista")))
+                        .font(.system(size: 13, weight: .semibold))
+                    if falta != nil { Image(systemName: "arrow.right.circle.fill").foregroundStyle(Theme.amber) }
+                }
+                .padding(.horizontal, 12).padding(.vertical, 7)
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.white.opacity(0.07)))
             }
-            .padding(.horizontal, 12).padding(.vertical, 7)
-            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.white.opacity(0.07)))
+            .buttonStyle(.plain)
+            .disabled(fix == nil || m.busyTask != nil)
+            .help(falta == nil ? "" : L("Tocá para hacerlo ahora"))
             if let n = m.newHost {
                 Button { m.updateHost() } label: {
                     Label(m.hostBack ? L("Volver a la %@ (estable)", n.version) : L("Actualizar a la %@", n.version),
@@ -1156,28 +1211,33 @@ struct ContentView: View {
 
     private var connectionCard: some View {
         Card(title: L("Conexión"), icon: "visionpro") {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(m.questConnected ? L("El Quest está usando esta Mac")
-                     : m.serverRunning ? L("Encendida: abrí VRmin en el Quest")
-                     : L("Abrí VRmin en el Quest y tocá Conectar"))
-                    .font(.system(size: 17, weight: .semibold))
-                Text(m.serverRunning ? L("Se apaga sola cuando cerrás esta app.")
-                     : L("No hace falta encender nada acá: el Quest la enciende al conectarse."))
-                    .font(.callout).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
-                Toggle(L("Solo por cable USB-C"), isOn: $m.cableOnly).toggleStyle(.switch)
-                    .font(.callout)
-                    .help(L("Los juegos van siempre por el cable: se rechaza la conexión por Wi-Fi de la sala VR. Se aplica al reiniciar el servidor."))
-                if !m.statsLine.isEmpty {
-                    Text(m.statsLine).font(.system(size: 11, design: .monospaced)).foregroundStyle(Theme.text2).lineLimit(2)
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: m.questConnected ? "checkmark.circle.fill" : "wifi")
+                    .font(.system(size: 26)).foregroundStyle(m.questConnected ? Theme.amber : Theme.text2)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(m.questConnected ? L("El Quest está usando esta Mac") : L("Abrí VRmin en el Quest y tocá Conectar"))
+                        .font(.system(size: 17, weight: .semibold))
+                    Text(m.questConnected ? L("Se desconecta sola cuando cerrás esta app.")
+                         : L("No hace falta tocar nada acá: la Mac se prepara sola cuando el Quest se conecta."))
+                        .font(.callout).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
                 }
             }
-            HStack {
-                Button(m.serverRunning ? L("Apagar") : L("Encender ahora")) {
-                    if m.serverRunning { m.stopServer() } else { m.startServer() }
+            if m.cableOnly {   // (antes se elegía acá; ahora se elige en el Quest)
+                HStack {
+                    Label(L("Solo por cable USB-C (activado en esta Mac)"), systemImage: "cable.connector").font(.callout)
+                    Spacer()
+                    Button(L("Desactivar")) { m.cableOnly = false }.buttonStyle(Pill())
                 }
-                .buttonStyle(Pill())
+            } else {
+                Text(L("¿Solo por cable USB-C? Se elige en el Quest: Ajustes › General."))
+                    .font(.caption).foregroundStyle(Theme.text2)
+            }
+            HStack(spacing: 10) {
                 if m.audioOK {
                     Label(L("Sonido OK"), systemImage: "speaker.wave.2.fill").font(.caption).foregroundStyle(Theme.amberText)
+                }
+                if !m.statsLine.isEmpty {
+                    Text(m.statsLine).font(.system(size: 11, design: .monospaced)).foregroundStyle(Theme.text2).lineLimit(2)
                 }
             }
         }
@@ -1196,68 +1256,114 @@ struct ContentView: View {
         }
     }
 
+    /// Lo que hay que instalar una vez (en pasos numerados); cuando está todo, queda solo Steam
+    private var setupDone: Bool { m.engineReady && m.openComposite && m.steamInstalled }
+    private func step(_ n: Int, _ done: Bool) -> some View {
+        ZStack {
+            Circle().fill(done ? Theme.amber : Color.white.opacity(0.1)).frame(width: 22, height: 22)
+            if done { Image(systemName: "checkmark").font(.system(size: 11, weight: .bold)).foregroundStyle(Theme.bg) }
+            else { Text("\(n)").font(.system(size: 12, weight: .bold)) }
+        }
+    }
     private var prepCard: some View {
-        Card(title: L("Para los juegos VR"), icon: "gamecontroller") {
-            row(L("Motor de juegos de Windows"), m.engineReady && m.openComposite,
-                !m.engineReady ? L("Sin instalar (≈270 MB)") : (m.openComposite ? L("Instalado") : L("Falta una parte (OpenComposite)")),
-                warn: m.engineReady && !m.openComposite) {
-                if !(m.engineReady && m.openComposite) {
-                    Button(m.engineReady ? L("Completar") : L("Instalar")) { m.run(L("Instalando el motor"), "instalar_motor.sh") }
-                        .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
-                }
-            }
-            row(L("Steam para Windows"), m.steamRunning,
-                !m.steamInstalled ? L("Sin instalar") : (m.steamRunning ? (m.steamStuck ? L("Se trabó · reinicialo") : L("Abierto")) : L("Cerrado · tarda ~1 minuto en abrir")),
-                warn: m.steamInstalled && (!m.steamRunning || m.steamStuck)) {
-                if !m.steamInstalled {
-                    Button(L("Instalar")) { m.run(L("Instalando Steam"), "instalar_steam.sh") }
-                        .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil || !m.engineReady)
-                } else if !m.steamRunning {
-                    Button(L("Abrir")) { m.run(L("Abriendo Steam"), "abrir_steam.sh") }
-                        .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil || !m.engineReady)
-                } else {
-                    if m.steamStuck {
-                        Button(L("Reiniciar Steam")) { m.restartSteam() }.buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
+        Card(title: setupDone ? L("Steam") : L("Primera vez"), icon: setupDone ? "gamecontroller" : "list.number") {
+            if !setupDone {
+                let n = [m.engineReady && m.openComposite, m.steamInstalled, m.steamRunning].filter { $0 }.count
+                ProgressView(value: Double(n), total: 3).tint(Theme.amber)
+                Text(L("Paso %ld de 3 · se hace una sola vez", min(3, n + 1))).font(.caption).foregroundStyle(Theme.text2)
+                HStack(spacing: 10) {
+                    step(1, m.engineReady && m.openComposite)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(L("Motor de juegos de Windows")).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                        Text(!m.engineReady ? L("Sin instalar (≈270 MB)") : (m.openComposite ? L("Instalado") : L("Falta una parte (OpenComposite)")))
+                            .font(.caption).foregroundStyle(Theme.text2)
                     }
-                    else { Button(L("Mostrar")) { m.run(L("Mostrando Steam"), "abrir_steam.sh", exclusive: false) }.buttonStyle(Pill()) }
-                    Button(L("Cerrar")) { m.closeAll() }.buttonStyle(Pill())
-                }
-            }
-            row(L("Modo Centinela"), m.adbInstalled && m.adbState == "device",
-                L("Visor apoyado") + " · " + (!m.adbInstalled ? L("Sin instalar")
-                : m.adbState == "device" ? L("Listo")
-                : m.adbState == "unauthorized" ? L("Tocá «Permitir» en el visor")
-                : L("Conectá el Quest por cable USB-C")),
-                warn: m.adbState != "device") {
-                Button { showVigiaHelp.toggle() } label: { Image(systemName: "questionmark") }
-                    .buttonStyle(Pill())
-                    .help(L("Cómo activar el modo desarrollador"))
-                    .popover(isPresented: $showVigiaHelp, arrowEdge: .bottom) { vigiaHelp }
-                if !m.adbInstalled {
-                    Button(L("Instalar")) { m.run(L("Instalando las herramientas del Modo Centinela"), "instalar_adb.sh") }
-                        .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
-                } else if m.vigiaActive {
-                    Label(L("Funcionando"), systemImage: "checkmark.circle.fill")
-                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.amberText)
-                        .help(L("El Modo Centinela está andando: el juego se ve en la ventana «VRmin · Modo Centinela». Para salir, cerrá esa ventana o apretá Esc."))
-                } else if m.adbState == "device" {
-                    Button(L("Empezar")) {
-                        // primero su tutorial (con «Empezar»); si lo apagaste, empieza directo
-                        if Tutoriales.enabled("centinela"), let t = Tutoriales.find("centinela") {
-                            tut = TutPresent(tut: t, auto: true, start: (L("Empezar el Modo Centinela"), { m.startVigiaOnly() }))
-                        } else { m.startVigiaOnly() }
+                    Spacer()
+                    if !(m.engineReady && m.openComposite) {
+                        Button(m.engineReady ? L("Completar") : L("Instalar")) { m.run(L("Instalando el motor"), "instalar_motor.sh") }
+                            .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
                     }
-                        .buttonStyle(Pill(primary: true))
-                        .help(L("Abre VRmin en el visor directo en el Modo Centinela, sin tocarlo. Después abrí un juego con «Jugar»."))
                 }
+                HStack(spacing: 10) {
+                    step(2, m.steamInstalled)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(L("Steam para Windows")).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                        Text(m.steamInstalled ? L("Instalado") : L("Sin instalar")).font(.caption).foregroundStyle(Theme.text2)
+                    }
+                    Spacer()
+                    if !m.steamInstalled {
+                        Button(L("Instalar")) { m.run(L("Instalando Steam"), "instalar_steam.sh") }
+                            .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil || !m.engineReady)
+                    }
+                }
+                HStack(spacing: 10) {
+                    step(3, m.steamRunning)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(L("Abrí Steam, iniciá sesión y bajá tus juegos")).font(.system(size: 14, weight: .semibold)).lineLimit(2)
+                        Text(L("Tarda ~1 minuto en abrir")).font(.caption).foregroundStyle(Theme.text2)
+                    }
+                    Spacer()
+                }
+            } else {
+                row(L("Steam para Windows"), m.steamRunning,
+                    m.steamRunning ? (m.steamStuck ? L("Se trabó · reinicialo") : L("Abierto")) : L("Cerrado · tarda ~1 minuto en abrir"),
+                    warn: !m.steamRunning || m.steamStuck) {
+                    if !m.steamRunning {
+                        Button(L("Abrir")) { m.run(L("Abriendo Steam"), "abrir_steam.sh") }
+                            .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
+                    } else {
+                        if m.steamStuck {
+                            Button(L("Reiniciar Steam")) { m.restartSteam() }.buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
+                        }
+                        else { Button(L("Mostrar")) { m.run(L("Mostrando Steam"), "abrir_steam.sh", exclusive: false) }.buttonStyle(Pill()) }
+                        Button(L("Cerrar")) { m.closeAll() }.buttonStyle(Pill())
+                    }
+                }
+                Label(L("Motor y Steam instalados"), systemImage: "checkmark.seal.fill").font(.caption).foregroundStyle(Theme.amberText)
             }
-            row(L("App del Quest"), m.adbState == "device" && !(m.questAppVersion ?? "").isEmpty && !m.questAppAction,
-                questAppStatus, warn: m.questAppAction) {
-                if m.questAppAction {
-                    Button(m.questAppVersion == "" ? L("Instalar") : m.questAppBack ? L("Volver a la estable") : L("Actualizar")) { m.installQuestApp() }
-                        .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
-                        .help(m.questAppBack ? L("Se desinstala la beta del visor y se instala la estable, por el cable USB-C. Los ajustes del visor vuelven a los de fábrica.")
-                              : L("Se instala por el cable USB-C, sin SideQuest. Tus ajustes del visor se conservan."))
+        }
+    }
+
+    /// Lo que usa el cable USB-C: el Modo Centinela y la app del Quest
+    private var cableCard: some View {
+        Card(title: L("Visor por cable USB-C"), icon: "cable.connector") {
+            HStack(alignment: .top, spacing: 20) {
+                row(L("Modo Centinela"), m.adbInstalled && m.adbState == "device",
+                    L("Jugar con el visor apoyado") + " · " + (!m.adbInstalled ? L("Sin instalar")
+                    : m.adbState == "device" ? L("Listo")
+                    : m.adbState == "unauthorized" ? L("Tocá «Permitir» en el visor")
+                    : L("Conectá el Quest por cable USB-C")),
+                    warn: m.adbState != "device") {
+                    Button { showVigiaHelp.toggle() } label: { Image(systemName: "questionmark") }
+                        .buttonStyle(Pill())
+                        .help(L("Cómo activar el modo desarrollador"))
+                        .popover(isPresented: $showVigiaHelp, arrowEdge: .bottom) { vigiaHelp }
+                    if !m.adbInstalled {
+                        Button(L("Instalar")) { m.run(L("Instalando las herramientas del Modo Centinela"), "instalar_adb.sh") }
+                            .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
+                    } else if m.vigiaActive {
+                        Label(L("Funcionando"), systemImage: "checkmark.circle.fill")
+                            .font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.amberText)
+                            .help(L("El Modo Centinela está andando: el juego se ve en la ventana «VRmin · Modo Centinela». Para salir, cerrá esa ventana o apretá Esc."))
+                    } else if m.adbState == "device" {
+                        Button(L("Empezar")) {
+                            // primero su tutorial (con «Empezar»); si lo apagaste, empieza directo
+                            if Tutoriales.enabled("centinela"), let t = Tutoriales.find("centinela") {
+                                tut = TutPresent(tut: t, auto: true, start: (L("Empezar el Modo Centinela"), { m.startVigiaOnly() }))
+                            } else { m.startVigiaOnly() }
+                        }
+                            .buttonStyle(Pill(primary: true))
+                            .help(L("Abre VRmin en el visor directo en el Modo Centinela, sin tocarlo. Después abrí un juego con «Jugar»."))
+                    }
+                }
+                row(L("App del Quest"), m.adbState == "device" && !(m.questAppVersion ?? "").isEmpty && !m.questAppAction,
+                    questAppStatus, warn: m.questAppAction) {
+                    if m.questAppAction {
+                        Button(m.questAppVersion == "" ? L("Instalar") : m.questAppBack ? L("Volver a la estable") : L("Actualizar")) { m.installQuestApp() }
+                            .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
+                            .help(m.questAppBack ? L("Se desinstala la beta del visor y se instala la estable, por el cable USB-C. Los ajustes del visor vuelven a los de fábrica.")
+                                  : L("Se instala por el cable USB-C, sin SideQuest. Tus ajustes del visor se conservan."))
+                    }
                 }
             }
         }
@@ -1336,9 +1442,33 @@ struct ContentView: View {
 
     private var gamesCard: some View {
         Card(title: L("Juegos"), icon: "square.grid.2x2") {
+            if let g = m.askWorked {   // al cerrar un juego que no se había probado
+                HStack(spacing: 10) {
+                    Image(systemName: "hand.raised.fill").foregroundStyle(Theme.amber)
+                    Text(L("¿Funcionó bien %@?", g.name)).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                    Spacer()
+                    Button { m.setVR(g.id, "estado", "funciona"); m.askWorked = nil } label: { Label(L("Sí"), systemImage: "hand.thumbsup.fill") }
+                        .buttonStyle(Pill(primary: true))
+                    Button { m.setVR(g.id, "estado", "con problemas"); m.askWorked = nil } label: { Label(L("Tuvo problemas"), systemImage: "hand.thumbsdown.fill") }
+                        .buttonStyle(Pill())
+                    Button { m.askWorked = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless).help(L("Ahora no"))
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.amber.opacity(0.12)))
+            }
             if m.games.isEmpty {
-                Text(L("Todavía no hay juegos. Instalalos desde Steam y aparecen acá (y en el Quest)."))
-                    .font(.callout).foregroundStyle(Theme.text2)
+                HStack {
+                    Image(systemName: "tray").font(.system(size: 22)).foregroundStyle(Theme.text2)
+                    Text(L("Todavía no hay juegos. Instalalos desde Steam y aparecen acá (y en el Quest)."))
+                        .font(.callout).foregroundStyle(Theme.text2)
+                    Spacer()
+                    if m.steamInstalled && !m.steamRunning {
+                        Button(L("Abrir Steam")) { m.run(L("Abriendo Steam"), "abrir_steam.sh") }
+                            .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
+                    } else if m.steamRunning {
+                        Button(L("Mostrar Steam")) { m.run(L("Mostrando Steam"), "abrir_steam.sh", exclusive: false) }.buttonStyle(Pill())
+                    }
+                }
             } else {
                 let flat = sortedGames.filter { m.vr[$0.id]?.vr == false }
                 let vrGames = sortedGames.filter { m.vr[$0.id]?.vr != false }
@@ -1398,13 +1528,14 @@ struct ContentView: View {
                 if open { Text(L("Abierto")).font(.caption.weight(.semibold)).foregroundStyle(Theme.amberText) }
                 Spacer(minLength: 0)
             }
-            Text(gameStatus(g)).font(.caption2).foregroundStyle(Theme.text2).lineLimit(1).help(gameStatus(g))
+            Text(gameStatus(g)).font(.caption2).foregroundStyle(Theme.text2).lineLimit(1).help(gameStatus(g) + "\n" + gameTech(g))
             HStack(spacing: 6) {
                 if g.inLibrary {
                     if !open {
                         Button(L("Jugar")) { m.play(g) }
                             .buttonStyle(Pill(primary: true))
-                            .disabled(!m.serverRunning || !m.steamRunning)
+                            .disabled(!m.steamRunning)
+                            .help(m.steamRunning ? "" : L("Primero abrí Steam"))
                     }
                     if let v = m.vr[g.id] { vrMenu(g, v) }
                 } else {
@@ -1417,20 +1548,33 @@ struct ContentView: View {
         }
     }
 
-    /// Lo que se ve debajo del nombre de un juego: con qué runtime abre, qué se detectó, y si ya se probó
+    /// Lo que se ve debajo del nombre de un juego: si funciona, en palabras simples (lo técnico, al pasar el mouse)
     private func gameStatus(_ g: SteamGame) -> String {
         guard g.inLibrary else { return L("En GameHub · se puede traer sin volver a bajarlo") }
-        guard let v = m.vr[g.id] else { return L("En tu biblioteca · revisando qué VR usa…") }
-        let apis = v.deteccion.apis.isEmpty ? L("API no detectada") : v.deteccion.apis.map { $0 == "openxr" ? "OpenXR" : $0 == "openvr" ? "OpenVR" : L("Oculus") }.joined(separator: " + ")
-        var s = "\(L(v.runtimeNombre))\(v.perfil.pedido == "auto" ? " (auto)" : "") · \(apis) · \(L(v.deteccion.motor)) · \(L(v.perfil.estado))"
+        guard let v = m.vr[g.id] else { return L("Revisando el juego…") }
+        var s: String
+        switch v.perfil.estado {
+        case "funciona": s = L("Funciona")
+        case "con problemas": s = L("Anda con problemas")
+        case "no funciona": s = L("No funciona por ahora")
+        default: s = L("Sin probar todavía")
+        }
+        if m.adv[g.installdir] != nil { s += " · " + L("ajustes propios") }
         if let a = v.perfil.avisos.first { s += L("\nAviso: ") + a }
         return s
+    }
+    private func gameTech(_ g: SteamGame) -> String {
+        guard let v = m.vr[g.id] else { return "" }
+        let apis = v.deteccion.apis.isEmpty ? L("API no detectada") : v.deteccion.apis.map { $0 == "openxr" ? "OpenXR" : $0 == "openvr" ? "OpenVR" : L("Oculus") }.joined(separator: " + ")
+        return "\(L(v.runtimeNombre))\(v.perfil.pedido == "auto" ? " (auto)" : "") · \(apis) · \(L(v.deteccion.motor))"
     }
 
     /// Menú de VR de un juego: runtime, cómo abrirlo, diagnóstico, estado y registros
     private func vrMenu(_ g: SteamGame, _ v: VRJuego) -> some View {
         Menu {
-            Picker(L("Runtime de VR"), selection: Binding(get: { v.perfil.pedido }, set: { m.setVR(g.id, "runtime", $0) })) {
+            Button(L("Calidad y rendimiento de este juego…")) { m.loadAdv(); gameAdv = g }
+            Divider()
+            Picker(L("Sistema de VR"), selection: Binding(get: { v.perfil.pedido }, set: { m.setVR(g.id, "runtime", $0) })) {
                 ForEach(RUNTIME_OPCIONES, id: \.id) { o in
                     Text(o.id == "auto" ? L("Automático (%@)", L(RUNTIME_OPCIONES.first { $0.id == v.deteccion.recomendado }?.nombre ?? v.deteccion.recomendado)) : L(o.nombre)).tag(o.id)
                 }
@@ -1460,7 +1604,7 @@ struct ContentView: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
-        .help(L("VR de este juego: runtime, cómo abrirlo y registros"))
+        .help(L("Ajustes de este juego: calidad, sistema de VR, cómo abrirlo y registros"))
         .accessibilityLabel(L("Opciones de VR de %@", g.name))
     }
 
@@ -1514,6 +1658,147 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Calidad: ajustes predeterminados (Bajo, Medio, Alto, Ultra) o personalizado
+/// Cuatro rayitas que se llenan según el nivel (más = más nítido y más trabajo para la Mac)
+struct LevelBars: View {
+    let level: Int
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 3) {
+            ForEach(1...4, id: \.self) { i in
+                RoundedRectangle(cornerRadius: 1.5).fill(i <= level ? Theme.amber : Color.white.opacity(0.15))
+                    .frame(width: 5, height: CGFloat(5 + i * 3))
+            }
+        }
+    }
+}
+/// Una tarjeta por ajuste; la elegida con borde ámbar. extra: otra opción antes (por ejemplo «Como todos los juegos»)
+struct PresetPicker: View {
+    let selected: String
+    let recommended: String
+    var extra: (id: String, name: String, hint: String)? = nil
+    let pick: (String) -> Void
+    private func card(_ id: String, _ name: String, _ hint: String, level: Int?, rec: Bool) -> some View {
+        Button { pick(id) } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(name).font(.system(size: 14, weight: .bold))
+                    Spacer()
+                    if let level { LevelBars(level: level) }
+                    else { Image(systemName: id == "custom" ? "slider.horizontal.3" : "square.on.square").foregroundStyle(Theme.text2) }
+                }
+                Text(hint).font(.caption).foregroundStyle(Theme.text2).multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                if rec { Text(L("Recomendado para tu Mac")).font(.caption2.weight(.semibold)).foregroundStyle(Theme.amberText) }
+                Spacer(minLength: 0)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, minHeight: 84, alignment: .topLeading)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(selected == id ? Theme.amber.opacity(0.14) : Color.white.opacity(0.05)))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(selected == id ? Theme.amber : Color.clear, lineWidth: 1.5))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+    var body: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 8, alignment: .top)], spacing: 8) {
+            if let e = extra { card(e.id, e.name, e.hint, level: nil, rec: false) }
+            ForEach(QUALITY_PRESETS, id: \.id) { p in
+                card(p.id, L(p.name), L(p.forMac) + "\n" + "\(p.eye) px · \(p.fps) Hz · \(p.mbps) Mbps", level: p.level, rec: p.id == recommended)
+            }
+            card("custom", L("Personalizado"), L("Elegí cada ajuste a tu gusto"), level: nil, rec: false)
+        }
+    }
+}
+
+/// Escala de render, campo de visión, escala automática y controles emulados: para todos los juegos ("") o uno (su carpeta)
+struct AdvancedBlock: View {
+    @EnvironmentObject var m: AppModel
+    let key: String
+    private func group<C: View>(_ title: String, _ hint: String? = nil, @ViewBuilder _ c: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.system(size: 13, weight: .semibold))
+            c()
+            if let hint { Text(hint).font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true) }
+        }
+    }
+    var body: some View {
+        let all = m.adv[""] ?? AppModel.AdvP(), own = key.isEmpty ? nil : m.adv[key]
+        let scale = own?.scale ?? all.scale ?? 1, fovk = own?.fovk ?? all.fovk ?? 1
+        let auto = own?.auto ?? all.auto ?? false, index = own?.index ?? all.index ?? false, vive = own?.vive ?? all.vive ?? false
+        VStack(alignment: .leading, spacing: 12) {
+            group(L("Escala de render"), L("El juego dibuja menos píxeles y la Mac los agranda con MetalFX: más cuadros por segundo")) {
+                Picker(L("Escala de render"), selection: Binding(get: { Int((scale * 100).rounded()) }, set: { v in m.setAdv(key) { $0.scale = Double(v) / 100 } })) {
+                    ForEach([50, 60, 70, 80, 90, 100], id: \.self) { Text("\($0) %").tag($0) }
+                }.pickerStyle(.segmented).labelsHidden()
+            }
+            group(L("Campo de visión"), L("Las esquinas casi no se ven por las lentes: si el juego no las dibuja, rinde más")) {
+                Picker(L("Campo de visión"), selection: Binding(get: { Int((fovk * 100).rounded()) }, set: { v in m.setAdv(key) { $0.fovk = Double(v) / 100 } })) {
+                    ForEach([80, 85, 90, 95, 100], id: \.self) { Text("\($0) %").tag($0) }
+                }.pickerStyle(.segmented).labelsHidden()
+            }
+            Toggle(L("Escala automática"), isOn: Binding(get: { auto }, set: { v in m.setAdv(key) { $0.auto = v } })).toggleStyle(.switch)
+            Toggle(L("Emular controles de Valve Index"), isOn: Binding(get: { index }, set: { v in m.setAdv(key) { $0.index = v; if v { $0.vive = false } } })).toggleStyle(.switch)
+            // (para juegos hechos para los controles de Vive, como DOOM VFR: el stick hace de trackpad)
+            Toggle(L("Emular controles de HTC Vive"), isOn: Binding(get: { vive }, set: { v in m.setAdv(key) { $0.vive = v; if v { $0.index = false } } })).toggleStyle(.switch)
+                .help(L("Para juegos hechos para los controles de Vive: el stick hace de trackpad (moverlo es deslizar el dedo, hundirlo es hacer clic)"))
+            Text(L("Hay que volver a abrir el juego para que se aplique.")).font(.caption).foregroundStyle(Theme.text2)
+        }
+    }
+}
+
+/// Ajustes de un solo juego (desde su menú en Juegos): calidad propia o la de todos, y rendimiento
+struct GameSettingsSheet: View {
+    @EnvironmentObject var m: AppModel
+    @Environment(\.dismiss) private var dismiss
+    let game: SteamGame
+    @State private var custom = false
+    var body: some View {
+        let key = game.installdir
+        let own = m.adv[key]
+        let e = own?.eye ?? m.eye, f = own?.fps ?? m.fps, mb = own?.mbps ?? m.mbps
+        let sel = own?.eye == nil && own?.fps == nil && own?.mbps == nil && !custom ? "all"
+            : (custom ? "custom" : QUALITY_PRESETS.first { $0.eye == e && $0.fps == f && $0.mbps == mb }?.id ?? "custom")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    Text(L("Ajustes de %@", game.name)).font(.system(size: 20, weight: .bold)).lineLimit(1)
+                    Spacer()
+                    Button(L("Listo")) { dismiss() }.buttonStyle(Pill(primary: true)).keyboardShortcut(.defaultAction)
+                }
+                Text(L("Solo para este juego. Se usan la próxima vez que lo abras.")).font(.callout).foregroundStyle(Theme.text2)
+                Card(title: L("Calidad"), icon: "dial.medium") {
+                    PresetPicker(selected: sel, recommended: m.recommendedPreset,
+                                 extra: ("all", L("Como todos los juegos"), L("Usa la calidad general de Ajustes"))) { id in
+                        custom = id == "custom"
+                        if id == "all" { m.setAdv(key) { $0.eye = nil; $0.fps = nil; $0.mbps = nil } }
+                        else if let p = QUALITY_PRESETS.first(where: { $0.id == id }) { m.setAdv(key) { $0.eye = p.eye; $0.fps = p.fps; $0.mbps = p.mbps } }
+                        else { m.setAdv(key) { $0.eye = e; $0.fps = f; $0.mbps = mb } }
+                    }
+                    if sel == "custom" {
+                        Picker(L("Nitidez (píxeles por ojo)"), selection: Binding(get: { e }, set: { v in m.setAdv(key) { $0.eye = v; $0.fps = f; $0.mbps = mb } })) {
+                            ForEach([1024, 1280, 1536, 1832, 2048, 2304, 2560], id: \.self) { Text("\($0)").tag($0) }
+                        }
+                        Picker(L("Fluidez (cuadros por segundo)"), selection: Binding(get: { f }, set: { v in m.setAdv(key) { $0.eye = e; $0.fps = v; $0.mbps = mb } })) {
+                            ForEach([72, 90, 120], id: \.self) { Text("\($0)").tag($0) }
+                        }
+                        Picker(L("Calidad de imagen (Mbps)"), selection: Binding(get: { mb }, set: { v in m.setAdv(key) { $0.eye = e; $0.fps = f; $0.mbps = v } })) {
+                            ForEach([40, 70, 100, 150, 200], id: \.self) { Text("\($0)").tag($0) }
+                        }
+                    }
+                }
+                Card(title: L("Rendimiento"), icon: "speedometer") { AdvancedBlock(key: key) }
+                if own != nil {
+                    Button(L("Usar los de todos los juegos")) { m.resetAdv(key); custom = false }.buttonStyle(Pill())
+                }
+            }
+            .padding(22)
+        }
+        .frame(width: 560).frame(maxHeight: 720)
+        .background(Theme.bg).foregroundStyle(Theme.text).tint(Theme.amber).preferredColorScheme(.dark)
+        .onAppear { m.loadAdv() }
+    }
+}
+
 // MARK: - Ajustes (lo justo: calidad de los juegos VR, sonido y la Mac)
 struct SettingsView: View {
     @EnvironmentObject var m: AppModel
@@ -1527,42 +1812,12 @@ struct SettingsView: View {
         }
     }
 
-    @State private var advKey = ""
-    /// Avanzado: escala de render, campo de visión, escala automática y controles de Index, para todos los juegos o uno
+    @State private var showCustom = false
+    /// Avanzado: para todos los juegos (los de un juego, en su menú de Juegos)
     private var advancedCard: some View {
-        let vrGames = m.games.filter { $0.inLibrary && m.vr[$0.id]?.vr != false }
-        let all = m.adv[""] ?? AppModel.AdvP(), own = advKey.isEmpty ? nil : m.adv[advKey]
-        let scale = own?.scale ?? all.scale ?? 1, fovk = own?.fovk ?? all.fovk ?? 1
-        let auto = own?.auto ?? all.auto ?? false, index = own?.index ?? all.index ?? false, vive = own?.vive ?? all.vive ?? false
-        let again = L("Hay que volver a abrir el juego para que se aplique.")
-        return Card(title: L("Avanzado"), icon: "slider.horizontal.3") {
-            group(L("Configurando"), L("Si un juego tiene ajustes propios, siempre se usan esos. Si no, usa los de «Todos los juegos». Para que vuelva a usar los generales: «Usar los de todos los juegos».")) {
-                HStack {
-                    Picker(L("Configurando"), selection: $advKey) {
-                        Text(L("Todos los juegos")).tag("")
-                        ForEach(vrGames) { g in Text(g.name + (m.adv[g.installdir] != nil ? " ★" : "")).tag(g.installdir) }
-                    }.labelsHidden()
-                    if !advKey.isEmpty && own != nil {
-                        Button(L("Usar los de todos los juegos")) { m.resetAdv(advKey) }.buttonStyle(Pill())
-                    }
-                }
-            }
-            group(L("Escala de render"), L("El juego dibuja menos píxeles y la Mac los agranda con MetalFX: más cuadros por segundo") + "\n" + again) {
-                Picker(L("Escala de render"), selection: Binding(get: { Int((scale * 100).rounded()) }, set: { v in m.setAdv(advKey) { $0.scale = Double(v) / 100 } })) {
-                    ForEach([50, 60, 70, 80, 90, 100], id: \.self) { Text("\($0) %").tag($0) }
-                }.pickerStyle(.segmented).labelsHidden()
-            }
-            group(L("Campo de visión"), L("Las esquinas casi no se ven por las lentes: si el juego no las dibuja, rinde más") + "\n" + again) {
-                Picker(L("Campo de visión"), selection: Binding(get: { Int((fovk * 100).rounded()) }, set: { v in m.setAdv(advKey) { $0.fovk = Double(v) / 100 } })) {
-                    ForEach([80, 85, 90, 95, 100], id: \.self) { Text("\($0) %").tag($0) }
-                }.pickerStyle(.segmented).labelsHidden()
-            }
-            Toggle(L("Escala automática"), isOn: Binding(get: { auto }, set: { v in m.setAdv(advKey) { $0.auto = v } })).toggleStyle(.switch)
-            Toggle(L("Emular controles de Valve Index"), isOn: Binding(get: { index }, set: { v in m.setAdv(advKey) { $0.index = v; if v { $0.vive = false } } })).toggleStyle(.switch)
-            // (para juegos hechos para los controles de Vive, como DOOM VFR: el stick hace de trackpad)
-            Toggle(L("Emular controles de HTC Vive"), isOn: Binding(get: { vive }, set: { v in m.setAdv(advKey) { $0.vive = v; if v { $0.index = false } } })).toggleStyle(.switch)
-                .help(L("Para juegos hechos para los controles de Vive: el stick hace de trackpad (moverlo es deslizar el dedo, hundirlo es hacer clic)"))
-            Text(again).font(.caption).foregroundStyle(Theme.text2)
+        Card(title: L("Rendimiento (todos los juegos)"), icon: "speedometer") {
+            AdvancedBlock(key: "")
+            Text(L("Para un solo juego: el botón de ajustes de su portada, en Juegos.")).font(.caption).foregroundStyle(Theme.text2)
         }
         .onAppear { m.loadAdv() }
     }
@@ -1576,38 +1831,45 @@ struct SettingsView: View {
                 Button(L("Listo")) { dismiss() }.buttonStyle(Pill(primary: true)).keyboardShortcut(.defaultAction)
             }
 
-            Card(title: L("Juegos VR"), icon: "visionpro") {
-                Text(L("También se cambian desde el Quest, en Ajustes.")).font(.caption).foregroundStyle(Theme.text2)
-                group(L("Nitidez (píxeles por ojo)")) {
-                    Picker(L("Nitidez"), selection: $m.eye) {
-                        Text("1024").tag(1024); Text("1280").tag(1280); Text("1536").tag(1536); Text("1832").tag(1832); Text("2048").tag(2048)
-                        Text("2304").tag(2304); Text("2560").tag(2560)
-                    }.pickerStyle(.segmented).labelsHidden()
-                    Text(L("2304 y 2560 son para Macs con chip Pro, Max o Ultra.")).font(.caption).foregroundStyle(Theme.text2)
+            Card(title: L("Calidad de los juegos VR"), icon: "dial.medium") {
+                Text(L("Elegí uno según tu Mac. También se cambia desde el Quest, en Ajustes.")).font(.caption).foregroundStyle(Theme.text2)
+                PresetPicker(selected: showCustom ? "custom" : m.currentPreset, recommended: m.recommendedPreset) { id in
+                    showCustom = id == "custom"
+                    if id != "custom" { m.applyPreset(id) }
                 }
-                group(L("Códec de video"), L("HEVC da mejor imagen con los mismos Mbps. H.264 queda como opción temporal, por si HEVC anda mal.")) {
-                    Picker(L("Códec"), selection: $m.codec) {
-                        Text("HEVC").tag("hevc"); Text("H.264").tag("h264")
-                    }.pickerStyle(.segmented).labelsHidden()
-                }
-                group(L("Foveated encoding"), L("El borde de cada ojo va más liviano: menos demora y un centro más nítido. Con 2048 conviene dejarlo encendido.")) {
-                    Picker(L("Foveated encoding"), selection: Binding(get: { Int(m.fov.split(separator: ",").first ?? "0") ?? 0 },
-                                                                     set: { lv in
-                        var parts = m.fov.split(separator: ",").map(String.init)
-                        if lv == 0 { m.fov = "0" } else if parts.count >= 2 { parts[0] = "\(lv)"; m.fov = parts.joined(separator: ",") } else { m.fov = "\(lv),1" }
-                    })) {
-                        Text(L("Apagado")).tag(0); Text(L("Suave")).tag(1); Text(L("Medio")).tag(2); Text(L("Fuerte")).tag(3)
-                    }.pickerStyle(.segmented).labelsHidden()
-                }
-                group(L("Fluidez (cuadros por segundo)")) {
-                    Picker(L("Fluidez"), selection: $m.fps) {
-                        Text("72").tag(72); Text("90").tag(90); Text("120").tag(120)
-                    }.pickerStyle(.segmented).labelsHidden()
-                }
-                group(L("Calidad de imagen (Mbps)")) {
-                    Picker(L("Calidad"), selection: $m.mbps) {
-                        Text("40").tag(40); Text("70").tag(70); Text("100").tag(100); Text("150").tag(150); Text("200").tag(200)
-                    }.pickerStyle(.segmented).labelsHidden()
+                Text(L("Tu Mac: %@", m.chip)).font(.caption).foregroundStyle(Theme.text2)
+                if showCustom || m.currentPreset == "custom" {
+                    group(L("Nitidez (píxeles por ojo)")) {
+                        Picker(L("Nitidez"), selection: $m.eye) {
+                            Text("1024").tag(1024); Text("1280").tag(1280); Text("1536").tag(1536); Text("1832").tag(1832); Text("2048").tag(2048)
+                            Text("2304").tag(2304); Text("2560").tag(2560)
+                        }.pickerStyle(.segmented).labelsHidden()
+                        Text(L("2304 y 2560 son para Macs con chip Pro, Max o Ultra.")).font(.caption).foregroundStyle(Theme.text2)
+                    }
+                    group(L("Fluidez (cuadros por segundo)")) {
+                        Picker(L("Fluidez"), selection: $m.fps) {
+                            Text("72").tag(72); Text("90").tag(90); Text("120").tag(120)
+                        }.pickerStyle(.segmented).labelsHidden()
+                    }
+                    group(L("Calidad de imagen (Mbps)")) {
+                        Picker(L("Calidad"), selection: $m.mbps) {
+                            Text("40").tag(40); Text("70").tag(70); Text("100").tag(100); Text("150").tag(150); Text("200").tag(200)
+                        }.pickerStyle(.segmented).labelsHidden()
+                    }
+                    group(L("Foveated encoding"), L("El borde de cada ojo va más liviano: menos demora y un centro más nítido. Con 2048 conviene dejarlo encendido.")) {
+                        Picker(L("Foveated encoding"), selection: Binding(get: { Int(m.fov.split(separator: ",").first ?? "0") ?? 0 },
+                                                                         set: { lv in
+                            var parts = m.fov.split(separator: ",").map(String.init)
+                            if lv == 0 { m.fov = "0" } else if parts.count >= 2 { parts[0] = "\(lv)"; m.fov = parts.joined(separator: ",") } else { m.fov = "\(lv),1" }
+                        })) {
+                            Text(L("Apagado")).tag(0); Text(L("Suave")).tag(1); Text(L("Medio")).tag(2); Text(L("Fuerte")).tag(3)
+                        }.pickerStyle(.segmented).labelsHidden()
+                    }
+                    group(L("Códec de video"), L("HEVC da mejor imagen con los mismos Mbps. H.264 queda como opción temporal, por si HEVC anda mal.")) {
+                        Picker(L("Códec"), selection: $m.codec) {
+                            Text("HEVC").tag("hevc"); Text("H.264").tag("h264")
+                        }.pickerStyle(.segmented).labelsHidden()
+                    }
                 }
                 group(L("Sonido de los juegos")) {
                     Picker(L("Sonido"), selection: Binding(get: { m.audioMode }, set: { m.audioMode = $0 })) {
@@ -1615,16 +1877,17 @@ struct SettingsView: View {
                     }.pickerStyle(.segmented).labelsHidden()
                 }
                 HStack {
-                    Button(L("Recomendado")) { m.resetQuality() }.buttonStyle(Pill())
+                    Button(L("Recomendado")) { showCustom = false; m.resetQuality() }.buttonStyle(Pill())
                     Spacer()
-                    if m.pendingRestart {
+                    if m.pendingRestart && !m.openGames.isEmpty {
                         Button(L("Aplicar")) { m.restartServer() }.buttonStyle(Pill(primary: true))
                     }
                 }
-                Text(m.pendingRestart ? L("Aplicar corta la conexión unos segundos. Si cambiaste la nitidez, volvé a abrir el juego.")
-                     : L("Recomendado para una MacBook Air: 1024 · 90 · 70."))
-                    .font(.caption).foregroundStyle(m.pendingRestart ? Theme.amberText : Theme.text2)
-                    .fixedSize(horizontal: false, vertical: true)
+                if m.pendingRestart {
+                    Text(m.openGames.isEmpty ? L("Se aplica al cerrar los ajustes (la conexión se corta unos segundos).")
+                         : L("Hay un juego abierto: tocá «Aplicar» o se aplica la próxima vez. Si cambiaste la nitidez, volvé a abrir el juego."))
+                        .font(.caption).foregroundStyle(Theme.amberText).fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             advancedCard
@@ -1669,8 +1932,9 @@ struct SettingsView: View {
         }
         .padding(22)
         }   // (ScrollView: con «Avanzado», los ajustes no entran en una pantalla chica)
-        .frame(width: 520)
+        .frame(width: 560)
         .frame(maxHeight: 760)
+        .onDisappear { if m.pendingRestart && m.openGames.isEmpty { m.restartServer() } }
         .background(Theme.bg)
         .foregroundStyle(Theme.text)
         .tint(Theme.amber)

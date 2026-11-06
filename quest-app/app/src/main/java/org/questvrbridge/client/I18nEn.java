@@ -256,7 +256,6 @@ final class I18nEn {
         m.put("Celular", "Phone");
         m.put("Cine\nCálido", "Cinema\nWarm");
         m.put("Cine\nPantalla gigante", "Cinema\nGiant screen");
-        m.put("Computadoras", "Computers");
         m.put("Conectado", "Connected");
         m.put("Conectado a ", "Connected to ");
         m.put("Conectado · ", "Connected · ");
@@ -298,7 +297,7 @@ final class I18nEn {
         m.put("Indicador de rendimiento", "Performance overlay");
         m.put("Intensidad  ", "Strength  ");
         m.put("Intensidad del 3D", "3D strength");
-        m.put("Ir a Computadoras", "Go to Computers");
+        m.put("Ir a Conexión", "Go to Connection");
         m.put("Juegos", "Games");
         m.put("Juegos VR", "VR games");
         m.put("La pantalla de tu Mac y sus ventanas, cada una donde quieras.", "Your Mac's screen and windows, each wherever you want.");
@@ -334,7 +333,7 @@ final class I18nEn {
         m.put("Para videos 3D arriba/abajo: cada ojo ve su mitad", "For over/under 3D videos: each eye sees its half");
         m.put("Para videos 3D lado a lado (SBS): cada ojo ve su mitad", "For side-by-side (SBS) 3D videos: each eye sees its half");
         m.put("Personal\nA tu gusto", "Custom\nYour way");
-        m.put("Primero elegí tu Mac en «Computadoras».", "First pick your Mac in “Computers”.");
+        m.put("Primero elegí tu Mac en «Conexión».", "First pick your Mac in “Connection”.");
         m.put("Píxeles por ojo. Más = más nítido, la Mac trabaja más", "Pixels per eye. Higher = sharper, more work for your Mac");
         m.put("Rendimiento", "Performance");
         m.put("Rendimiento: oculto", "Performance: hidden");
@@ -546,7 +545,7 @@ final class I18nEn {
         m.put("Manos reales", "Passthrough hands");
         m.put("Solo el láser", "Laser only");
         m.put("Con la Mac conectada", "When connected to the Mac");
-        m.put("Estos ajustes se guardan en la Mac: conectate a tu Mac en «Computadoras» para cambiarlos.", "These settings are stored on the Mac: connect to your Mac in “Computers” to change them.");
+        m.put("Estos ajustes se guardan en la Mac: conectate a tu Mac en «Conexión» para cambiarlos.", "These settings are stored on the Mac: connect to your Mac in “Connection” to change them.");
         m.put("Se guarda ahora y se aplica al conectarte a la Mac.", "Saved now and applied when you connect to the Mac.");
         m.put("Modo Centinela", "Sentinel Mode");
         m.put("Jugar sin el visor puesto", "Play without wearing the headset");
@@ -757,6 +756,33 @@ final class I18nEn {
         m.put("Este juego", "This game");
         m.put("Se aplican la próxima vez que abras el juego. En Ajustes › Juegos VR › Avanzado están los de todos los juegos.", "They apply the next time you open the game. Settings › VR games › Advanced has the ones for all games.");
         m.put("Usar los de todos los juegos", "Use the settings for all games");
+        m.put("Personalizado", "Custom");
+        m.put("Personalizado (abajo)", "Custom (below)");
+        m.put("Apuntá al piso y bajá el pulgar para ir ahí.", "Point at the floor and lower your thumb to go there.");
+        m.put("Como todos los juegos\nUsa la calidad general", "Same as all games\nUses the general quality");
+        m.put("Con la mano derecha en forma de pistola", "With your right hand shaped like a gun");
+        m.put("Cómo se ven tus manos y tus controles en la sala.", "How your hands and controllers look in the room.");
+        m.put("Elegí uno según tu Mac", "Pick one for your Mac");
+        m.put("Gestos", "Gestures");
+        m.put("Manos", "Hands");
+        m.put("Para que el láser no haga clic en una pantalla, usá el botón del láser en su barra.", "To stop the laser from clicking on a screen, use the laser button on its bar.");
+        m.put("Pausa", "Pause");
+        m.put("Personalizado\nElegí cada ajuste a tu gusto", "Custom\nChoose each setting yourself");
+        m.put("Puede bajar un poco el rendimiento.", "It can lower performance a little.");
+        m.put("Recomendado para tu Mac", "Recommended for your Mac");
+        m.put("Se dibuja con la mano o el control.", "You draw it with your hand or controller.");
+        m.put("Sin controles: clic, moverte y jugar con las manos", "Without controllers: click, move and play with your hands");
+        m.put("Su color y qué puede tocar.", "Its color and what it can touch.");
+        m.put("Tus manos hacen de control en los juegos.", "Your hands work as controllers in games.");
+        m.put("Bajo", "Low");
+        m.put("Alto", "High");
+        m.put("Ultra", "Ultra");
+        m.put("Solo el menú", "Menu only");
+        m.put("Toca las pantallas", "Touches the screens");
+        m.put("MacBook Air con M1, o si el Wi-Fi es lento", "MacBook Air with M1, or slow Wi-Fi");
+        m.put("MacBook Air, Mac mini e iMac (M1 a M4)", "MacBook Air, Mac mini and iMac (M1 to M4)");
+        m.put("MacBook Pro y Mac mini con chip Pro", "MacBook Pro and Mac mini with a Pro chip");
+        m.put("Chip Max o Ultra (MacBook Pro, Mac Studio)", "Max or Ultra chip (MacBook Pro, Mac Studio)");
         m.put("Más", "More");
     }
 }

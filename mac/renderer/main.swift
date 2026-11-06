@@ -1005,6 +1005,7 @@ final class GameProfiles {
             if let v = index { p.index = v }
             if let v = vive { p.vive = v }
             if !key.isEmpty {   // (la calidad de «todos» es la general de VRmin Host, no va acá)
+                if eye == 0 { p.eye = nil; p.fps = nil; p.mbps = nil; p.fov = nil }   // («Como todos los juegos»: su calidad vuelve a la general)
                 if let v = eye, (512...2560).contains(v) { p.eye = v }
                 if let v = fps, [72, 80, 90, 120].contains(v) { p.fps = v }
                 if let v = mbps, (10...300).contains(v) { p.mbps = v }
@@ -2807,6 +2808,14 @@ final class Lobby {
         for l in out.split(separator: "\n") where l.contains("Model Name:") { return l.components(separatedBy: ":").last?.trimmingCharacters(in: .whitespaces) ?? "Mac" }
         return "Mac"
     }()
+    /// El chip («Apple M2 Pro»…): el Quest recomienda la calidad según esto
+    private lazy var macChip: String = {
+        var n = 0
+        sysctlbyname("machdep.cpu.brand_string", nil, &n, nil, 0)
+        var b = [CChar](repeating: 0, count: max(1, n))
+        sysctlbyname("machdep.cpu.brand_string", &b, &n, nil, 0)
+        return String(cString: b)
+    }()
     private func findGameName() -> String {
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/ps"); p.arguments = ["-axo", "command="]
         let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
@@ -2848,7 +2857,7 @@ final class Lobby {
             }
         }
         if !gameActive { gameName = "" } else { lastGameActive = Date() }
-        let obj: [String: Any] = ["type": "lobby2d", "launching": launchingInfo(gameActive) ?? NSNull(), "game": gameActive, "gameName": gameName, "macModel": macModel, "busy": b, "status": st, "desk": desktopOn, "deskErr": err,
+        let obj: [String: Any] = ["type": "lobby2d", "launching": launchingInfo(gameActive) ?? NSNull(), "game": gameActive, "gameName": gameName, "macModel": macModel, "macChip": macChip, "busy": b, "status": st, "desk": desktopOn, "deskErr": err,
                                   "depth3d": depth3D.enabled, "depthStatus": depth3D.statusText,
                                   "cfg": ["eye": GEN_EYE, "fps": GEN_FPS, "mbps": GEN_MBPS, "audioMac": env["VR_AUDIO_MAC"] == "1", "fov": GEN_FOV,   // (los generales)
                                           "codec": env["VR_CODEC"] ?? "hevc", "run": "\(EYE) · \(FPS) Hz · \(BITRATE / 1_000_000) Mbps",
