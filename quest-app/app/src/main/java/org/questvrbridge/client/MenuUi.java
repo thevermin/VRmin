@@ -1909,7 +1909,6 @@ final class MenuUi implements Link.Listener {
         t.setBackground(Ui.hoverable(ctx, Color.argb(22, 255, 255, 255), 22, false));
         t.setClickable(true);
         t.setAlpha(busy ? 0.5f : 1f);
-        Ui.card(t);
         if (android.os.SystemClock.uptimeMillis() < staggerUntil && staggerN < 15) {
             final float a = t.getAlpha();
             t.setAlpha(0f); t.setTranslationY(dp(ctx, 30)); t.setScaleX(0.88f); t.setScaleY(0.88f);

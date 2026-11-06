@@ -41,7 +41,6 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
     static native void nativeSetTimeZone(int minutes);
     static native void nativeSetWristFollow(boolean follow);
     static native void nativeSetPointClickable(boolean on);
-    static native void nativeSetLift(int panel, float u0, float v0, float u1, float v1, int state);
     static native void nativeSetRealHands(boolean on);
     static native void nativeSetCameraAllowed(boolean on);
     static native void nativeSetHandSat(float sat);
@@ -131,7 +130,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
         boolean inGame;               // se ve durante el juego (abierta desde el menú del juego)
         boolean paused;               // ventana de la sala pausada mientras hay un juego
         long downTime;
-        View lifted;                  // lo que el láser tiene encima (sale del panel); null: nada que se pueda tocar
+        View lifted;                  // lo que el láser tiene encima; null: nada que se pueda tocar
         int w, h;
     }
 
@@ -588,39 +587,16 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
 
     // ------------------------------------------------------------------ Profundidad al apuntar y al apretar
     private boolean pointClickable;
-    private final int[] liftLoc = new int[2], liftRoot = new int[2];
-    private final float[] liftSent = new float[5];
-    private int liftSentPanel = -1;
-    /** Lo que apunta el láser sale del panel (nativeSetLift: la parte nativa lo dibuja más adelante, con su sombra) y al
-     *  apretarlo se hunde y suelta una onda. No en las pantallas de la Mac. */
+    /** Al apretar algo, una onda (Ui.liftPress); el puntero crece sobre lo que se puede tocar. No en las pantallas de la Mac. */
     private void lift(Panel p, int id, int action, float x, float y) {
         boolean macScreen = p.win != null || id == TV_ID;
         View target = null;
         if (!macScreen && action != 5 && p.root instanceof ViewGroup) target = clickableAt((ViewGroup) p.root, x, y, p.root.getWidth(), p.root.getHeight());
         if (action == 2) target = p.lifted;   // (mientras se arrastra, sigue el mismo)
         p.lifted = target;
-        View card = target != null ? Ui.cardOf(target) : null;
-        View shown = card != null ? card : target;   // (en una portada sale la portada entera)
         if (target != null && action == 1) Ui.liftPress(target);
         boolean c = target != null;
         if (c != pointClickable) { pointClickable = c; nativeSetPointClickable(c); }
-        int state = 0;
-        float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
-        int rw = p.root.getWidth(), rh = p.root.getHeight();
-        if (shown != null && rw > 0 && rh > 0 && shown.isAttachedToWindow()) {
-            shown.getLocationInWindow(liftLoc);
-            p.root.getLocationInWindow(liftRoot);
-            float l = liftLoc[0] - liftRoot[0], t = liftLoc[1] - liftRoot[1];
-            u0 = Math.max(0f, l / rw); v0 = Math.max(0f, t / rh);
-            u1 = Math.min(1f, (l + shown.getWidth() * shown.getScaleX()) / rw); v1 = Math.min(1f, (t + shown.getHeight() * shown.getScaleY()) / rh);
-            state = action == 1 || action == 2 ? 2 : 1;
-            if (u1 - u0 < 0.002f || v1 - v0 < 0.002f) state = 0;
-        }
-        if (state == 0 && liftSentPanel != id) return;   // (otro panel tiene lo apuntado)
-        if (liftSentPanel == id && liftSent[0] == state && liftSent[1] == u0 && liftSent[2] == v0 && liftSent[3] == u1 && liftSent[4] == v1) return;
-        liftSentPanel = state == 0 ? -1 : id;
-        liftSent[0] = state; liftSent[1] = u0; liftSent[2] = v0; liftSent[3] = u1; liftSent[4] = v1;
-        nativeSetLift(id, u0, v0, u1, v1, state);
     }
 
     /** Lo más profundo que se puede tocar bajo (x, y); no los contenedores grandes (el panel entero, una lista). */

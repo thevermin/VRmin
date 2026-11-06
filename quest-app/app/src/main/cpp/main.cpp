@@ -7969,94 +7969,6 @@ static void applyGlow(App &app, const XrView &view, float r) {
     glDisable(GL_BLEND);
 }
 
-// ---------------------------------------------------------------- Profundidad de lo que apuntás
-// El botón (o la portada) que apunta el láser sale del panel: una capa del Quest con ese pedazo de la imagen del panel,
-// un poco más adelante, con una sombra suave debajo. Como es profundidad real, se nota más al mirarlo de costado.
-// Al apretarlo se hunde, y al soltarlo vuelve con un pequeño zoom.
-static std::mutex g_liftLock;
-static int g_liftPanel = -1, g_liftState = 0;   // estado: 0 nada, 1 apuntado, 2 apretado
-static float g_liftRect[4] = {0, 0, 0, 0};      // u0, v0, u1, v1 (0..1, desde arriba a la izquierda del panel)
-extern "C" JNIEXPORT void JNICALL
-Java_org_questvrbridge_client_VrActivity_nativeSetLift(JNIEnv *, jclass, jint panel, jfloat u0, jfloat v0, jfloat u1, jfloat v1, jint state) {
-    std::lock_guard<std::mutex> lk(g_liftLock);
-    g_liftPanel = panel; g_liftState = state;
-    g_liftRect[0] = u0; g_liftRect[1] = v0; g_liftRect[2] = u1; g_liftRect[3] = v1;
-}
-struct LiftAnim { int panel = -1; float r[4] = {0, 0, 0, 0}; float x = 0, v = 0; int state = 0; double relAt = 0; };
-static LiftAnim g_lift;
-static Swapchain g_liftShadow;
-static bool g_liftShadowTried = false;
-
-/// La sombra: una sola imagen chica (un rectángulo redondeado difuminado), dibujada una vez
-static void liftShadowInit(App &app) {
-    if (g_liftShadowTried) return;
-    g_liftShadowTried = true;
-    if (!createSwapchain(app, g_liftShadow, 128, 128, 1)) return;
-    static const char *vs = R"(#version 300 es
-out vec2 uv;
-void main() {
-    vec2 q = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
-    uv = q;
-    gl_Position = vec4(q * 2.0 - 1.0, 0.0, 1.0);
-})";
-    static const char *fs = R"(#version 300 es
-precision mediump float;
-in vec2 uv;
-out vec4 o;
-void main() {
-    vec2 d = abs(uv - 0.5) - vec2(0.27);
-    float dist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - 0.06;
-    float a = 1.0 - smoothstep(-0.10, 0.17, dist);
-    o = vec4(0.0, 0.0, 0.0, a * a);
-})";
-    GLuint pr = glCreateProgram();
-    glAttachShader(pr, compileShader(GL_VERTEX_SHADER, vs));
-    glAttachShader(pr, compileShader(GL_FRAGMENT_SHADER, fs));
-    glLinkProgram(pr);
-    uint32_t idx = 0;
-    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    if (XR_FAILED(xrAcquireSwapchainImage(g_liftShadow.handle, &ai, &idx))) { glDeleteProgram(pr); return; }
-    XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wi.timeout = XR_INFINITE_DURATION;
-    xrWaitSwapchainImage(g_liftShadow.handle, &wi);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_liftShadow.fbos[idx]);
-    glViewport(0, 0, 128, 128);
-    glDisable(GL_BLEND);
-    glUseProgram(pr);
-    glBindVertexArray(app.vao);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    xrReleaseSwapchainImage(g_liftShadow.handle, &ri);
-    glDeleteProgram(pr);
-}
-
-/// Avanza el resorte de lo apuntado (una vez por cuadro)
-static void liftUpdate(App &app, float dt) {
-    int panel, state; float r[4];
-    {
-        std::lock_guard<std::mutex> lk(g_liftLock);
-        panel = g_liftPanel; state = g_liftState;
-        for (int k = 0; k < 4; k++) r[k] = g_liftRect[k];
-    }
-    LiftAnim &L = g_lift;
-    if (app.lastHover != panel && app.hp[0].down != panel && app.hp[1].down != panel) state = 0;   // (el láser ya no está ahí)
-    if (panel >= 0 && state > 0) {
-        const bool same = panel == L.panel && fabsf((r[0] + r[2]) - (L.r[0] + L.r[2])) < 0.01f && fabsf((r[1] + r[3]) - (L.r[1] + L.r[3])) < 0.3f &&
-                          fabsf((r[2] - r[0]) - (L.r[2] - L.r[0])) < 0.01f && fabsf((r[3] - r[1]) - (L.r[3] - L.r[1])) < 0.01f;
-        if (!same) { L.x = 0; L.v = 0; L.relAt = 0; }   // otro botón: sale desde el panel
-        L.panel = panel;
-        for (int k = 0; k < 4; k++) L.r[k] = r[k];       // (el mismo botón que se corre en una lista: lo sigue)
-        if (L.state == 2 && state == 1) L.relAt = nowMs();
-        L.state = state;
-    } else L.state = 0;
-    const float tgt = L.state == 1 ? 1.f : L.state == 2 ? 0.2f : 0.f;
-    const float acc = 380.f * (tgt - L.x) - 22.f * L.v;   // se pasa un poco y se asienta
-    L.v += acc * dt; L.x += L.v * dt;
-    if (L.state == 0 && L.x < 0.01f && fabsf(L.v) < 0.05f) { L.x = 0; L.v = 0; L.panel = -1; }
-    if (L.panel >= 0 && !g_liftShadowTried) liftShadowInit(app);
-}
-
 /// Entrar o salir de un juego: la imagen nueva se abre desde el centro de la vista (afuera, negro)
 static void applyOpenFromCenter(App &app, const XrView &view, float k) {
     glUseProgram(app.maskProg);
@@ -9004,60 +8916,8 @@ static void renderFrame(App &app) {
                 q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
             }
             layers[nLayers++] = (XrCompositionLayerBaseHeader *)&q;
-            // Lo que apunta el láser en este panel: su sombra sobre el panel y el pedazo de imagen, más adelante
-            const LiftAnim &L = g_lift;
-            if (L.panel == p->id && eye == XR_EYE_VISIBILITY_BOTH && !fillEye && !p->hud && p->closeAt == 0 && L.x > 0.005f &&
-                g_liftShadow.handle != XR_NULL_HANDLE && nLayers + 2 <= MAXL - 2) {
-                const float ex[3] = {1, 0, 0}, ey[3] = {0, 1, 0}, ez[3] = {0, 0, 1};
-                float ax[3], ay[3], an[3];
-                rotate(q.pose.orientation, ex, ax); rotate(q.pose.orientation, ey, ay); rotate(q.pose.orientation, ez, an);
-                const float lx = std::max(0.f, L.x);
-                float bump = 0;   // al soltar: un pequeño zoom
-                if (L.relAt > 0) { float k = (float)((nowMs() - L.relAt) / 380.0); if (k < 1.f) bump = 0.07f * sinf(k * (float)M_PI) * (1.f - 0.4f * k); }
-                const float zoom = 1.f + 0.035f * lx + bump;
-                const float depth = 0.016f * lx;
-                const float cu = (L.r[0] + L.r[2]) * 0.5f - 0.5f, cv = 0.5f - (L.r[1] + L.r[3]) * 0.5f;
-                const float bw = (L.r[2] - L.r[0]) * q.size.width, bh = (L.r[3] - L.r[1]) * q.size.height;
-                const float cx = cu * q.size.width, cy = cv * q.size.height;
-                // sombra: sobre el panel, un poco más abajo cuanto más sale el botón
-                XrCompositionLayerColorScaleBiasKHR &sf = fades[nf++];
-                sf = {XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR};
-                sf.next = app.hasLayerSettings ? (const void *)&settings : nullptr;
-                const float sa = std::min(1.f, lx) * 0.75f * animA;
-                sf.colorScale = {sa, sa, sa, sa};
-                XrCompositionLayerQuad &sq = quads[nq++];
-                sq = {XR_TYPE_COMPOSITION_LAYER_QUAD};
-                sq.next = app.hasColorScale ? (const void *)&sf : sf.next;
-                sq.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-                sq.space = app.space;
-                sq.eyeVisibility = eye;
-                sq.subImage.swapchain = g_liftShadow.handle;
-                sq.subImage.imageRect = {{0, 0}, {g_liftShadow.w, g_liftShadow.h}};
-                sq.pose.orientation = q.pose.orientation;
-                const float sdy = -depth * 0.45f;
-                for (int k = 0; k < 3; k++) (&sq.pose.position.x)[k] = (&q.pose.position.x)[k] + ax[k] * cx + ay[k] * (cy + sdy) + an[k] * 0.0005f;
-                const float m = std::min(bw, bh) * 0.35f + 0.012f;
-                sq.size = {bw * 1.08f + m * 2.f, bh * 1.08f + m * 2.f};
-                layers[nLayers++] = (XrCompositionLayerBaseHeader *)&sq;
-                // el botón mismo
-                XrCompositionLayerQuad &lq = quads[nq++];
-                lq = q;
-                lq.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-                const int px0 = (int)lroundf(L.r[0] * p->w), px1 = (int)lroundf(L.r[2] * p->w);
-                const int py0 = (int)lroundf((1.f - L.r[3]) * p->h), py1 = (int)lroundf((1.f - L.r[1]) * p->h);   // (la imagen va de abajo hacia arriba)
-                lq.subImage.imageRect = {{std::max(0, px0), std::max(0, py0)}, {std::max(1, std::min(p->w, px1) - std::max(0, px0)), std::max(1, std::min(p->h, py1) - std::max(0, py0))}};
-                for (int k = 0; k < 3; k++) (&lq.pose.position.x)[k] = (&q.pose.position.x)[k] + ax[k] * cx + ay[k] * cy + an[k] * depth;
-                lq.size = {bw * zoom, bh * zoom};
-                layers[nLayers++] = (XrCompositionLayerBaseHeader *)&lq;
-            }
         }
     };
-    {
-        static double lastLiftT = 0;
-        const double lt = nowMs();
-        liftUpdate(app, lastLiftT > 0 ? std::min(0.05f, (float)(lt - lastLiftT) / 1000.f) : 0.f);
-        lastLiftT = lt;
-    }
     {
         // El indicador de rendimiento se ve también durante un juego
         std::lock_guard<std::mutex> lk(g_uiLock);

@@ -93,19 +93,8 @@ final class Ui {
         return s;
     }
 
-    // ---------------------------------------------------------------- Profundidad al apuntar y al apretar
-    // Lo que apuntás con el láser sale del panel (lo dibuja la parte nativa, con profundidad real); al apretarlo se hunde
-    // y suelta una onda (acá). VrActivity lo hace para todos los paneles.
-    private static final java.util.WeakHashMap<android.view.View, Boolean> CARDS = new java.util.WeakHashMap<>();
-    /** Portadas y tarjetas: sale la tarjeta entera aunque apuntes a uno de sus botones. */
-    static void card(android.view.View v) { CARDS.put(v, true); }
-    /** La tarjeta que contiene a v (o v mismo), si hay. */
-    static android.view.View cardOf(android.view.View v) {
-        for (android.view.View x = v; x != null; x = x.getParent() instanceof android.view.View ? (android.view.View) x.getParent() : null)
-            if (CARDS.containsKey(x)) return x;
-        return null;
-    }
-
+    // ---------------------------------------------------------------- Al apretar
+    // Una onda sobre lo que apretás (VrActivity lo hace para todos los paneles).
     static void liftPress(android.view.View v) { ripple(v); }
 
     /** Onda al apretar (una vez por botón: se queda como su «frente»). */
