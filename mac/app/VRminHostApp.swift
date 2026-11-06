@@ -1181,7 +1181,7 @@ struct ContentView: View {
                 .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.white.opacity(0.07)))
             }
             .buttonStyle(.plain)
-            .disabled(fix == nil || m.busyTask != nil)
+            .disabled(falta == nil || fix == nil || m.busyTask != nil)
             .help(falta == nil ? "" : L("Tocá para hacerlo ahora"))
             if let n = m.newHost {
                 Button { m.updateHost() } label: {
