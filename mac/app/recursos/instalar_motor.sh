@@ -27,7 +27,10 @@ TPL_SHA="bbe996e4e4375318485953d0c7818b7b4b0a4dc1f13303bcc584f99f7602f78d"
 DXMT_URL="https://github.com/ramiabih/play-windows-steam-on-mac/releases/download/dxmt-fork-v1/dxmt-fork-macos-arm64.tar.gz"
 DXMT_SHA="51043dd4cf585d52b1415c452052a0953dc01f9f9663ae0c3d6984907c25fab5"
 DXMT_DIR="$P/dxmt/fork-v1"
-OC_URL="https://znix.xyz/OpenComposite/download.php?arch=x64&branch=openxr"
+# OpenComposite 64 bits: la versión de GameNative (v10). La de znix.xyz que se usaba antes sólo llega a
+# IVRSystem_022, y los juegos de 2026 piden IVRSystem_026 (No Man's Sky se cierra al arrancar)
+OC_URL="https://github.com/GameNative/opencomposite/releases/download/v10/opencomposite_x64.dll"
+OC_SHA="0d395d267734bba3efa514edb836e728ac8c94ae2228c5ea31fca51a2d2819d8"
 export WINEDEBUG=-all
 
 paso() { echo; say "==> $1" "==> ${2:-$1}"; }
@@ -122,14 +125,13 @@ fi
 "$WINESERVER" -w
 
 paso "OpenComposite (para juegos de SteamVR/OpenVR)" "OpenComposite (for SteamVR/OpenVR games)"
-OC="$P/descargas/opencomposite_x64.dll"
+OC="$P/descargas/opencomposite_x64_v10.dll"
 mkdir -p "$P/descargas"
-if ! file -b "$OC" 2>/dev/null | grep -qE 'PE32\+.*DLL'; then
-  curl -fL --progress-bar -o "$OC" "$OC_URL" || true
-fi
-if file -b "$OC" 2>/dev/null | grep -qE 'PE32\+.*DLL'; then
+[ "$(shasum -a 256 "$OC" 2>/dev/null | cut -d' ' -f1)" = "$OC_SHA" ] || curl -fL --progress-bar -o "$OC" "$OC_URL" || true
+if [ "$(shasum -a 256 "$OC" 2>/dev/null | cut -d' ' -f1)" = "$OC_SHA" ] && file -b "$OC" 2>/dev/null | grep -qE 'PE32\+.*DLL'; then
   mkdir -p "$Q/opencomposite/bin"
   cp "$OC" "$Q/opencomposite/bin/vrclient_x64.dll"
+  echo "$OC_SHA" > "$Q/opencomposite/.version64"
   U="$WINEPREFIX/drive_c/users/$USER/AppData/Local/openvr"
   mkdir -p "$U"
   cat > "$U/openvrpaths.vrpath" <<'JSON'
