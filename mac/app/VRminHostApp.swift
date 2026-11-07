@@ -50,7 +50,7 @@ let ESTADOS_JUEGO = ["sin probar", "funciona", "con problemas", "no funciona"]
 struct QualityPreset { let id: String; let name: String; let forMac: String; let eye: Int; let fps: Int; let mbps: Int; let level: Int }
 let QUALITY_PRESETS: [QualityPreset] = [
     QualityPreset(id: "bajo", name: "Bajo", forMac: "MacBook Air con M1, o si el Wi-Fi es lento", eye: 1024, fps: 72, mbps: 40, level: 1),
-    QualityPreset(id: "medio", name: "Medio", forMac: "MacBook Air, Mac mini e iMac (M1 a M4)", eye: 1024, fps: 90, mbps: 70, level: 2),
+    QualityPreset(id: "medio", name: "Medio", forMac: "MacBook Air, Mac mini e iMac (M1 a M4)", eye: 1280, fps: 90, mbps: 70, level: 2),
     QualityPreset(id: "alto", name: "Alto", forMac: "MacBook Pro y Mac mini con chip Pro", eye: 1536, fps: 90, mbps: 100, level: 3),
     QualityPreset(id: "ultra", name: "Ultra", forMac: "Chip Max o Ultra (MacBook Pro, Mac Studio)", eye: 2048, fps: 90, mbps: 150, level: 4),
 ]

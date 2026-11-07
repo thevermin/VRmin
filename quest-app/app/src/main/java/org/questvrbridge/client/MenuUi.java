@@ -1380,7 +1380,7 @@ final class MenuUi implements Link.Listener {
     private int selFov = -1, selFovC = -1, selCodec = -1;
     private static final String[] MODE_NAMES = {"Apagado", "IA", "Lado a lado (SBS)", "Arriba/abajo"};
     /// Ajustes de calidad predeterminados (los mismos que en VRmin Host): posiciones en EYES, FPSS y MBPSS
-    static final int[][] PRESETS = {{0, 0, 0}, {0, 1, 1}, {2, 1, 2}, {4, 1, 3}};
+    static final int[][] PRESETS = {{0, 0, 0}, {1, 1, 1}, {2, 1, 2}, {4, 1, 3}};
     static final String[] PRESET_NAMES = {"Bajo", "Medio", "Alto", "Ultra"};
     static final String[] PRESET_FOR = {"MacBook Air con M1, o si el Wi-Fi es lento", "MacBook Air, Mac mini e iMac (M1 a M4)",
             "MacBook Pro y Mac mini con chip Pro", "Chip Max o Ultra (MacBook Pro, Mac Studio)"};
@@ -1390,7 +1390,7 @@ final class MenuUi implements Link.Listener {
         String c = st == null ? "" : st.optString("macChip", "");
         return c.contains("Max") || c.contains("Ultra") ? 3 : c.contains("Pro") ? 2 : 1;
     }
-    /// «Medio ●●○○ · Recomendado para tu Mac\nMacBook Air… · 1024 px · 90 Hz · 70 Mbps»
+    /// «Medio ●●○○ · Recomendado para tu Mac\nMacBook Air… · 1280 px · 90 Hz · 70 Mbps»
     static String presetLabel(int i) {
         StringBuilder b = new StringBuilder(I18n.t(PRESET_NAMES[i])).append("  ");
         for (int k = 0; k < 4; k++) b.append(k <= i ? '●' : '○');

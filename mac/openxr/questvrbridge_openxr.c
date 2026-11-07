@@ -3810,11 +3810,50 @@ static void gl_readback(Session *s, const XrCompositionLayerProjection *pl, XrTi
     gl_end(&p);
 }
 
+/* Anota en el registro las capas que manda el juego cada vez que cambian (cuántas, de qué tipo, su imagen y dónde
+ * están), para ver en un reporte qué paneles llegan y cuáles no se pueden mostrar */
+static void log_layers(const XrFrameEndInfo *info) {
+    static uint32_t last; static int logged;
+    uint32_t sig = info->layerCount * 2654435761u;
+    for (uint32_t i = 0; i < info->layerCount; i++) {
+        const XrCompositionLayerBaseHeader *l = info->layers[i];
+        if (!l) continue;
+        sig = sig * 31u + (uint32_t)l->type + (uint32_t)l->layerFlags * 7u;
+        if (l->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+            const XrCompositionLayerQuad *q = (const XrCompositionLayerQuad *)l;
+            sig = sig * 31u + (uint32_t)(uintptr_t)q->subImage.swapchain + (uint32_t)q->subImage.imageRect.extent.width * 131u
+                  + (uint32_t)q->subImage.imageRect.extent.height;
+        }
+    }
+    if (sig == last || logged >= 60) return;
+    last = sig; logged++;
+    int nq = 0;
+    logmsg("Capas del juego: %u", info->layerCount);
+    for (uint32_t i = 0; i < info->layerCount; i++) {
+        const XrCompositionLayerBaseHeader *l = info->layers[i];
+        if (!l) { logmsg("  %u: vacía", i); continue; }
+        if (l->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) { logmsg("  %u: imagen 3D", i); continue; }
+        if (l->type != XR_TYPE_COMPOSITION_LAYER_QUAD) { logmsg("  %u: tipo %d (no se muestra)", i, (int)l->type); continue; }
+        const XrCompositionLayerQuad *q = (const XrCompositionLayerQuad *)l;
+        const Swapchain *qs = (const Swapchain *)q->subImage.swapchain;
+        const Space *sp = (const Space *)q->space;
+        const char *where = !sp ? "?" : sp->isAction ? "control" : sp->ref == XR_REFERENCE_SPACE_TYPE_VIEW ? "cabeza"
+                          : sp->ref == XR_REFERENCE_SPACE_TYPE_LOCAL ? "local" : "piso";
+        logmsg("  %u: panel %d · imagen %ux%u formato %d · recorte %d,%d %dx%d · %.2fx%.2f m en (%.2f, %.2f, %.2f) respecto de %s · banderas 0x%x%s",
+               i, nq, qs ? qs->w : 0, qs ? qs->h : 0, qs ? (int)qs->dxgi : -1,
+               q->subImage.imageRect.offset.x, q->subImage.imageRect.offset.y, q->subImage.imageRect.extent.width, q->subImage.imageRect.extent.height,
+               q->size.width, q->size.height, q->pose.position.x, q->pose.position.y, q->pose.position.z, where, (unsigned)q->layerFlags,
+               nq >= NQ ? " · NO SE MUESTRA (demasiados paneles)" : "");
+        nq++;
+    }
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEndInfo *info) {
     Session *s = (Session *)session;
     g_inside = "xrEndFrame";
     int hadProj = 0;
     InterlockedExchangeAdd(&g_layers, (LONG)info->layerCount);
+    log_layers(info);
     for (uint32_t i = 0; i < info->layerCount; i++) {
         if (info->layers[i] && info->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) hadProj = 1;
     }
