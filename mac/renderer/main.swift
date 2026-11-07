@@ -283,10 +283,18 @@ final class Foveator {
     }
     private var quadTex: [MTLTexture?] = Array(repeating: nil, count: 8)
     /// Lo mismo, con el cuadro ya en la GPU (copia directa: una textura compartida con el juego, los dos ojos lado a lado)
-    func warpTexture(_ src: MTLTexture, ew: Int, eh: Int, rects: [SIMD4<Float>], into pb: CVPixelBuffer) -> Bool {
+    func warpTexture(_ src: MTLTexture, ew: Int, eh: Int, rects: [SIMD4<Float>], into pb: CVPixelBuffer, quads: [GameQuad] = []) -> Bool {
         // (se lee como colores sin convertir, igual que los píxeles por memoria)
         let view: MTLPixelFormat = src.pixelFormat == .rgba8Unorm_srgb ? .rgba8Unorm : src.pixelFormat == .bgra8Unorm_srgb ? .bgra8Unorm : src.pixelFormat
-        return warpCore(ew: ew, eh: eh, store: src.pixelFormat, view: view, inMode: .private, rects: rects, into: pb) { cb, e, inT in
+        var qt: [(MTLTexture, GameQuad)] = []   // (paneles flotantes: los sube el procesador, son chicos)
+        for (i, q) in quads.enumerated() where i < 8 {
+            let qf: MTLPixelFormat = q.flags & 8 != 0 ? .rgba8Unorm : .bgra8Unorm
+            guard let tx = tex(q.w, q.h, qf, [.shaderRead], .shared, reuse: quadTex[i]) else { continue }
+            quadTex[i] = tx
+            tx.replace(region: MTLRegionMake2D(0, 0, q.w, q.h), mipmapLevel: 0, withBytes: q.pixels, bytesPerRow: q.w * 4)
+            qt.append((tx, q))
+        }
+        return warpCore(ew: ew, eh: eh, store: src.pixelFormat, view: view, inMode: .private, rects: rects, into: pb, quads: qt) { cb, e, inT in
             guard let b = cb.makeBlitCommandEncoder() else { return }
             b.copy(from: src, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: e * ew, y: 0, z: 0), sourceSize: MTLSize(width: ew, height: eh, depth: 1),
                    to: inT, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
@@ -1338,7 +1346,7 @@ final class GameLink {
                     shmBuf = Foveator.shared?.dev.makeBuffer(bytesNoCopy: mm, length: rounded, options: .storageModeShared, deallocator: nil)
                     print("[juego] Memoria compartida \(shmBuf != nil ? "también vista por la GPU (sin copias en la Mac)" : "solo por el procesador")")
                     OSMemoryBarrier()
-                    h[7] = 0x32564F50   // reserved[2] «POV2»: sé dibujar los paneles flotantes del juego (tipo 12)
+                    h[7] = 0x33564F50   // reserved[2] «POV3»: sé dibujar los paneles flotantes del juego (tipos 12 y 13)
                     OSMemoryBarrier()
                     h[2] = nonce   // confirmación: el runtime pasa a usarla
                     print("[juego] Memoria compartida activa (los cuadros ya no pasan por la red)")
@@ -1361,18 +1369,7 @@ final class GameLink {
                     frameLock.lock()
                     setStage("procesando imagen")
                     let base = UnsafeRawPointer(m + 64 + slot * shmSlot)
-                    // cada panel: w, h, banderas, (relleno), 2 ojos × 4 esquinas × (x, y, z, w), y después sus píxeles
-                    var quads: [Foveator.GameQuad] = [], off = ew * 2 * eh * 4
-                    for _ in 0..<nq {
-                        guard off + 144 <= shmSlot else { break }
-                        let hp = (base + off).assumingMemoryBound(to: UInt32.self)
-                        let qw = Int(hp[0]), qh = Int(hp[1]), fl = hp[2]
-                        guard qw > 0, qh > 0, off + 144 + qw * qh * 4 <= shmSlot else { break }
-                        let fp = (base + off + 16).assumingMemoryBound(to: Float.self)
-                        let clip = (0..<2).map { e in (0..<4).map { k in SIMD4<Float>(fp[e * 16 + k * 4], fp[e * 16 + k * 4 + 1], fp[e * 16 + k * 4 + 2], fp[e * 16 + k * 4 + 3]) } }
-                        quads.append(Foveator.GameQuad(w: qw, h: qh, flags: fl, clip: clip, pixels: base + off + 144, offset: 64 + slot * shmSlot + off + 144))
-                        off += 144 + qw * qh * 4
-                    }
+                    let quads = readQuads(base, slot: slot, slotSize: shmSlot, from: ew * 2 * eh * 4, count: nq)
                     handlePixels(base, poseId: poseId, isRGBA: buf[6] == 1, ew: ew, eh: eh, quads: quads,
                                  gpu: shmBuf.map { ($0, 64 + slot * shmSlot) })
                     frameLock.unlock()
@@ -1398,9 +1395,9 @@ final class GameLink {
                 h[5] = gpuTex.isEmpty ? 0x4c494146 : 0x31555047   // reserved[0]: «FAIL» o «GPU1»
                 print(gpuTex.isEmpty ? "[juego] Copia directa: no pude abrir las texturas del juego; sigue la memoria compartida"
                                      : "[juego] Copia directa activa: el cuadro del juego no sale de la GPU (\(ew)x\(eh) por ojo, \(list[0].pixelFormat.rawValue))")
-            case 11:
-                // Cuadro listo en una textura compartida
-                guard n >= 10, let m = shm else { break }
+            case 11, 13:
+                // Cuadro listo en una textura compartida (13: con paneles flotantes al principio de su lugar en la memoria)
+                guard n >= (buf[0] == 13 ? 12 : 10), let m = shm else { break }
                 let slot = Int(buf[1])
                 guard slot < 3 else { break }
                 let state = (m + 32 + slot * 4).assumingMemoryBound(to: Int32.self)
@@ -1411,7 +1408,8 @@ final class GameLink {
                     setStage("esperando turno")
                     frameLock.lock()
                     setStage("procesando imagen")
-                    handleTexture(gpuTex[slot], poseId: poseId, ew: ew, eh: eh)
+                    let quads = buf[0] == 13 ? readQuads(UnsafeRawPointer(m + 64 + slot * shmSlot), slot: slot, slotSize: shmSlot, from: 0, count: Int(buf[11])) : []
+                    handleTexture(gpuTex[slot], poseId: poseId, ew: ew, eh: eh, quads: quads)
                     frameLock.unlock()
                 }
                 OSMemoryBarrier()
@@ -1520,7 +1518,23 @@ final class GameLink {
         hold(pb, poseId); encodeQueue.async { enc.encode(pb, frameNo: fn, poseId: poseId, forceKey: key, start: start) }
     }
     /// Cuadro del juego que ya está en la GPU (copia directa)
-    private func handleTexture(_ tex: MTLTexture, poseId: UInt32, ew: Int, eh: Int) {
+    /// Los paneles flotantes de un lugar de la memoria compartida, desde «from»: cada uno w, h, banderas, (relleno),
+    /// 2 ojos × 4 esquinas × (x, y, z, w), y después sus píxeles
+    private func readQuads(_ base: UnsafeRawPointer, slot: Int, slotSize shmSlot: Int, from: Int, count: Int) -> [Foveator.GameQuad] {
+        var quads: [Foveator.GameQuad] = [], off = from
+        for _ in 0..<count {
+            guard off + 144 <= shmSlot else { break }
+            let hp = (base + off).assumingMemoryBound(to: UInt32.self)
+            let qw = Int(hp[0]), qh = Int(hp[1]), fl = hp[2]
+            guard qw > 0, qh > 0, off + 144 + qw * qh * 4 <= shmSlot else { break }
+            let fp = (base + off + 16).assumingMemoryBound(to: Float.self)
+            let clip = (0..<2).map { e in (0..<4).map { k in SIMD4<Float>(fp[e * 16 + k * 4], fp[e * 16 + k * 4 + 1], fp[e * 16 + k * 4 + 2], fp[e * 16 + k * 4 + 3]) } }
+            quads.append(Foveator.GameQuad(w: qw, h: qh, flags: fl, clip: clip, pixels: base + off + 144, offset: 64 + slot * shmSlot + off + 144))
+            off += 144 + qw * qh * 4
+        }
+        return quads
+    }
+    private func handleTexture(_ tex: MTLTexture, poseId: UInt32, ew: Int, eh: Int, quads: [Foveator.GameQuad] = []) {
         guard ew > 0, eh > 0, let fv = Foveator.shared else { return }
         frames += 1
         if frames == 1 { print("[juego] Primer cuadro recibido: \(ew)x\(eh) por ojo, copia directa en la GPU · se manda \(W)x\(H)") }
@@ -1529,7 +1543,7 @@ final class GameLink {
         let start = DispatchTime.now().uptimeNanoseconds
         var po: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(nil, pool, &po)
-        guard let pb = po, fv.warpTexture(tex, ew: ew, eh: eh, rects: eyeRects(), into: pb) else { shared.endFrame(); return }
+        guard let pb = po, fv.warpTexture(tex, ew: ew, eh: eh, rects: eyeRects(), into: pb, quads: quads) else { shared.endFrame(); return }
         Perf.shared.addMac(Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
         let fn = shared.nextFrameNo(), key = shared.takeKey(), enc = encoder
         hold(pb, poseId); encodeQueue.async { enc.encode(pb, frameNo: fn, poseId: poseId, forceKey: key, start: start) }

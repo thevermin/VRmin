@@ -483,7 +483,8 @@ static HANDLE g_shmFile = INVALID_HANDLE_VALUE, g_shmMap;
 static uint8_t *g_shm;
 static int g_shmMode;               /* 0 esperando confirmación · 1 activa · -1 no disponible (TCP) */
 #define OV_MAGIC 0x32564F50u   /* "POV2" en reserved[2]: la Mac sabe dibujar los paneles flotantes ella misma (tipo 12) */
-static volatile int g_ovMac;
+#define OV_MAGIC3 0x33564F50u  /* "POV3": también junto con la copia directa (tipo 13) */
+static volatile int g_ovMac, g_ovGpu;
 static int64_t g_shmAsked;
 static int g_shmGen = -1;           /* conexión de imágenes donde se ofreció */
 static volatile LONG g_shmSentStat;
@@ -561,7 +562,7 @@ static int shm_active(void) {
     if (g_shmMode == 0 && g_shm) {
         ShmHdr *h = (ShmHdr *)g_shm;
         if (h->ack == h->nonce) {
-            g_shmMode = 1; g_ovMac = h->reserved[2] == OV_MAGIC;
+            g_shmMode = 1; g_ovMac = h->reserved[2] == OV_MAGIC || h->reserved[2] == OV_MAGIC3; g_ovGpu = h->reserved[2] == OV_MAGIC3;
             logmsg("Memoria compartida activa: los cuadros ya no pasan por la red%s", g_ovMac ? " (la Mac dibuja los paneles flotantes)" : "");
             return 1;
         }
@@ -596,11 +597,12 @@ static void shm_notify_t(uint8_t type, int slot, uint32_t pid, uint8_t fmt, uint
     InterlockedIncrement(&g_statSent);
 }
 static void shm_notify(int slot, uint32_t pid, uint8_t fmt, uint32_t ew, uint32_t eh) { shm_notify_t(6, slot, pid, fmt, ew, eh); }
-/* Igual, con nq paneles flotantes después de la imagen del juego en el lugar (cada uno: QuadHdr + sus píxeles) */
-static void shm_notify_quads(int slot, uint32_t pid, uint8_t fmt, uint32_t ew, uint32_t eh, uint32_t nq) {
+/* Igual, con nq paneles flotantes en el lugar (cada uno: QuadHdr + sus píxeles): tipo 12, después de la imagen del
+ * juego; tipo 13, con la imagen en una textura compartida (copia directa) y los paneles al principio del lugar */
+static void shm_notify_quads_t(uint8_t type, int slot, uint32_t pid, uint8_t fmt, uint32_t ew, uint32_t eh, uint32_t nq) {
     uint8_t p[4 + 12];
     uint32_t len = 12;
-    p[0] = 0; p[1] = 0; p[2] = 0; p[3] = (uint8_t)len; p[4] = 12;
+    p[0] = 0; p[1] = 0; p[2] = 0; p[3] = (uint8_t)len; p[4] = type;
     p[5] = (uint8_t)slot;
     p[6] = (uint8_t)(pid >> 24); p[7] = (uint8_t)(pid >> 16); p[8] = (uint8_t)(pid >> 8); p[9] = (uint8_t)pid;
     p[10] = fmt;
@@ -614,6 +616,7 @@ static void shm_notify_quads(int slot, uint32_t pid, uint8_t fmt, uint32_t ew, u
     }
     InterlockedIncrement(&g_statSent);
 }
+static void shm_notify_quads(int slot, uint32_t pid, uint8_t fmt, uint32_t ew, uint32_t eh, uint32_t nq) { shm_notify_quads_t(12, slot, pid, fmt, ew, eh, nq); }
 
 /* ------------------------------------------------------------------ */
 /* Copia directa: el cuadro no sale de la GPU. Se copia (en la GPU) a     */
@@ -647,7 +650,7 @@ static int g_gpuState;              /* 0 sin probar · 1 esperando a la Mac · 2
 static ID3D11Texture2D *g_gpuTex[SHM_SLOTS];
 static ID3D11Query *g_gpuQ[SHM_SLOTS];
 static int g_gpuPending[SHM_SLOTS];
-static uint32_t g_gpuPose[SHM_SLOTS];
+static uint32_t g_gpuPose[SHM_SLOTS], g_gpuNq[SHM_SLOTS];   /* (paneles flotantes en el lugar, tipo 13) */
 static uint32_t g_gpuW, g_gpuH, g_gpuGen; static DXGI_FORMAT g_gpuFmt;
 static int g_gpuShmGen = -1;        /* conexión de imágenes donde se ofrecieron */
 /* La Mac se entera apenas la GPU termina la copia: se revisa mientras el juego espera su próximo cuadro
@@ -775,7 +778,8 @@ static int gpu_done(ID3D11DeviceContext *ctx, int i) {   /* (con g_gpuLock tomad
     g_gpuPending[i] = 0;
     MemoryBarrier();
     ((ShmHdr *)g_shm)->state[i] = 1;
-    shm_notify_t(11, i, g_gpuPose[i], fmt_code(g_gpuFmt), g_gpuW, g_gpuH);
+    if (g_gpuNq[i]) shm_notify_quads_t(13, i, g_gpuPose[i], fmt_code(g_gpuFmt), g_gpuW, g_gpuH, g_gpuNq[i]);
+    else shm_notify_t(11, i, g_gpuPose[i], fmt_code(g_gpuFmt), g_gpuW, g_gpuH);
     return 1;
 }
 
@@ -872,6 +876,8 @@ typedef struct Session {
     /* panel flotante (capa «quad»: el menú de Half-Life 2, por ejemplo): se lee y se pega sobre la imagen de cada ojo */
     VkBuffer vkQBuf[STAGES][NQ]; VkDeviceMemory vkQMem[STAGES][NQ]; void *vkQMap[STAGES][NQ]; size_t vkQCap[NQ];
     struct { int on, rgba, blend, premul, flip; uint32_t w, h; XrPosef pose; XrExtent2Df size; XrPosef eye[2]; XrFovf fov[2]; } vkQ[STAGES][NQ];
+    /* (D3D11: la imagen de cada panel se copia a una textura de lectura; vkQ guarda dónde cae) */
+    ID3D11Texture2D *dQ[STAGES][NQ]; uint32_t dQw[STAGES][NQ], dQh[STAGES][NQ]; DXGI_FORMAT dQf[STAGES][NQ];
     /* OpenGL: el contexto del juego, y para leer la imagen un framebuffer y dos PBO */
     int gl; HDC gldc; HGLRC glrc;
     GLuint glFbo, glPbo[STAGES]; GLsync glSync[STAGES];
@@ -2288,6 +2294,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroySession(XrSession session) {
         }
     }
     for (int k = 0; k < 3; k++) if (s->staging[k]) ID3D11Texture2D_Release(s->staging[k]);
+    for (int k = 0; k < STAGES; k++) for (int j = 0; j < NQ; j++) if (s->dQ[k][j]) ID3D11Texture2D_Release(s->dQ[k][j]);
     EnterCriticalSection(&g_gpuLock); gpu_release(); g_gpuShmGen = -1; g_gpuCtx = NULL; LeaveCriticalSection(&g_gpuLock);
     if (s->ctx) ID3D11DeviceContext_Release(s->ctx);
     if (s->dev) ID3D11Device_Release(s->dev);
@@ -2760,6 +2767,10 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrBeginFrame(XrSession s, const XrFrameBeginIn
     g_inside = "xrBeginFrame"; (void)s; (void)i; return XR_SUCCESS; }
 
 
+static int d3d_quads_copy(Session *s, int k, const XrCompositionLayerProjection *pl, const XrCompositionLayerQuad *const *qls, int nq);
+static uint32_t d3d_quads_write(Session *s, int k, uint8_t *dst, size_t room, size_t *used);
+static void quad_eyes(Session *s, int k, int qn, const XrCompositionLayerProjection *pl, uint32_t id);
+
 /* Copia los dos ojos (en la GPU) lado a lado en dst. 0 = algo no coincide (se descarta el cuadro) */
 static int copy_eyes(Session *s, const XrCompositionLayerProjection *pl, ID3D11Texture2D *dst, uint32_t ew, uint32_t eh, DXGI_FORMAT fmt) {
     for (int e = 0; e < 2; e++) {
@@ -2788,7 +2799,7 @@ static int copy_eyes(Session *s, const XrCompositionLayerProjection *pl, ID3D11T
     return 1;
 }
 
-static void readback(Session *s, const XrCompositionLayerProjection *pl, XrTime displayTime) {
+static void readback(Session *s, const XrCompositionLayerProjection *pl, const XrCompositionLayerQuad *const *qls, int nq, XrTime displayTime) {
     Swapchain *sc0 = (Swapchain *)pl->views[0].subImage.swapchain;
     if (!sc0 || sc0->dxgi == DXGI_FORMAT_UNKNOWN) return;
     if (sc0->dxgi != DXGI_FORMAT_R8G8B8A8_TYPELESS && sc0->dxgi != DXGI_FORMAT_B8G8R8A8_TYPELESS) return;
@@ -2834,7 +2845,7 @@ static void readback(Session *s, const XrCompositionLayerProjection *pl, XrTime 
 
     /* Copia directa (la imagen no sale de la GPU): con la memoria compartida funcionando, sin Modo Centinela
        (que necesita los píxeles) y sin imagen dada vuelta */
-    if (g_gpuState >= 0 && !g_vigia && !flip && shm_active() && ew <= 2560 && eh <= 2560) {
+    if (g_gpuState >= 0 && !g_vigia && !flip && shm_active() && ew <= 2560 && eh <= 2560 && (!nq || g_ovGpu || !g_ovMac)) {
         if (g_gpuW != ew || g_gpuH != eh || g_gpuFmt != sc0->dxgi || g_gpuShmGen != g_shmGen) {
             if (!gpu_setup(s->dev, ew, eh, sc0->dxgi)) { g_gpuState = -1; logmsg("Copia directa no disponible: sigo con la memoria compartida"); }
         } else if (g_gpuState == 1) {
@@ -2870,6 +2881,16 @@ static void readback(Session *s, const XrCompositionLayerProjection *pl, XrTime 
             pid = g_track.id;
             for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].time == displayTime) { pid = g_poseHist[hh].id; break; }
             LeaveCriticalSection(&g_lock);
+            /* paneles flotantes (menú): su imagen va al principio del lugar en la memoria, y la Mac los dibuja encima */
+            g_gpuNq[ss] = 0;
+            if (nq && g_ovGpu) {
+                int qn = d3d_quads_copy(s, s->stNext, pl, qls, nq);
+                if (qn) {
+                    quad_eyes(s, s->stNext, qn, pl, pid);
+                    size_t used = 0;
+                    g_gpuNq[ss] = d3d_quads_write(s, s->stNext, g_shm + SHM_HDR + (size_t)ss * SHM_SLOT_MAX, SHM_SLOT_MAX, &used);
+                }
+            }
             g_gpuPose[ss] = pid; g_gpuPending[ss] = 1;
             ID3D11DeviceContext_End(s->ctx, (ID3D11Asynchronous *)g_gpuQ[ss]);
             ID3D11DeviceContext_Flush(s->ctx);
@@ -2889,6 +2910,8 @@ static void readback(Session *s, const XrCompositionLayerProjection *pl, XrTime 
     id = g_track.id;
     for (int h = 0; h < POSE_HIST; h++) if (g_poseHist[h].time == displayTime) { id = g_poseHist[h].id; break; }
     LeaveCriticalSection(&g_lock);
+    { int qn = g_ovMac ? d3d_quads_copy(s, k, pl, qls, nq) : d3d_quads_copy(s, k, pl, qls, 0);   /* (paneles: solo si la Mac los dibuja) */
+      if (qn) quad_eyes(s, k, qn, pl, id); }
     s->stPose[k] = id; s->stValid[k] = 1; s->stFlip[k] = flip;
     s->stNext = (k + 1) % STAGES;
 
@@ -2927,11 +2950,14 @@ static void readback(Session *s, const XrCompositionLayerProjection *pl, XrTime 
             memcpy(dst + (size_t)y * rb, (uint8_t *)sm.pData + (size_t)sy * sm.RowPitch, rb);
         }
         ID3D11DeviceContext_Unmap(s->ctx, (ID3D11Resource *)s->staging[r], 0);
+        size_t used = (size_t)rb * s->stH;
+        uint32_t nqs = g_ovMac ? d3d_quads_write(s, r, dst + used, SHM_SLOT_MAX - used, &used) : 0;
         g_sumCopy += (now_ns() - c0) / 1e6; g_nCopy++;
         s->stValid[r] = 0;
         MemoryBarrier();
         sh->state[ss] = 1;
-        shm_notify(ss, s->stPose[r], fmt_code(s->stFmt), s->stW, s->stH);
+        if (nqs) shm_notify_quads(ss, s->stPose[r], fmt_code(s->stFmt), s->stW, s->stH, nqs);
+        else shm_notify(ss, s->stPose[r], fmt_code(s->stFmt), s->stW, s->stH);
         return;
     }
     /* Esperando que la Mac confirme la memoria compartida: no mezclar con envíos por TCP en la misma conexión */
@@ -3016,6 +3042,7 @@ static const OvXf *ovxf_find(XrVector3f p) {
             return &g_ovXf[i];
     return NULL;
 }
+
 /* Cuaternión de una rotación dada por sus ejes (columnas x, y, z, ya normalizados) */
 static XrQuaternionf quat_from_axes(XrVector3f x, XrVector3f y, XrVector3f z) {
     float m00 = x.x, m11 = y.y, m22 = z.z, tr = m00 + m11 + m22;
@@ -3026,6 +3053,61 @@ static XrQuaternionf quat_from_axes(XrVector3f x, XrVector3f y, XrVector3f z) {
     else { float sq = sqrtf(1.0f + m22 - m00 - m11) * 2; q.w = (x.y - y.x) / sq; q.x = (z.x + x.z) / sq; q.y = (z.y + y.z) / sq; q.z = 0.25f * sq; }
     return q;
 }
+
+/* Dónde cae el panel flotante j (del lugar k): su pose respecto de la capa de la imagen 3D, su tamaño, los ojos y el
+ * campo de visión de la capa, y cómo se mezcla. (Lo usan Vulkan y D3D11.) */
+static void quad_meta(Session *s, int k, int j, const XrCompositionLayerProjection *pl, const XrCompositionLayerQuad *ql,
+                      const Swapchain *qs, int qw, int qh, int qflip, const Track *tk) {
+    /* dónde está el panel respecto de la capa de la imagen 3D (y cada ojo, con la pose y el campo de visión de la capa) */
+    int v1, v2;
+    XrPosef pw = space_world((const Space *)pl->space, tk, &v1), qw0 = space_world((const Space *)ql->space, tk, &v2);
+    /* el giro: el que fijó el juego (si se lo vio fijarlo), o si no, mirando a la cabeza con el «arriba» del mundo */
+    XrPosef qpose = ql->pose; XrExtent2Df qsize = ql->size; int real = 0;
+    const OvXf *xf = ovxf_find(ql->pose.position);
+    if (xf) {
+        const float *m = xf->m;
+        XrVector3f cx = { m[0], m[4], m[8] }, cy = { m[1], m[5], m[9] }, cz = { m[2], m[6], m[10] };
+        float lx = sqrtf(cx.x * cx.x + cx.y * cx.y + cx.z * cx.z), ly = sqrtf(cy.x * cy.x + cy.y * cy.y + cy.z * cy.z);
+        float lz = sqrtf(cz.x * cz.x + cz.y * cz.y + cz.z * cz.z);
+        if (lx > 1e-4f && ly > 1e-4f && lz > 1e-4f && fabsf(m[0]) > 0.05f && fabsf(m[5]) > 0.05f) {
+            cx.x /= lx; cx.y /= lx; cx.z /= lx; cy.x /= ly; cy.y /= ly; cy.z /= ly; cz.x /= lz; cz.y /= lz; cz.z /= lz;
+            qpose.orientation = quat_from_axes(cx, cy, cz);
+            /* (OpenComposite multiplicó el tamaño por m[0] y m[5]; con giro, lo correcto es el largo de cada eje) */
+            qsize.width = ql->size.width / m[0] * lx; qsize.height = ql->size.height / m[5] * ly;
+            if (qsize.width < 0) qsize.width = -qsize.width;
+            if (qsize.height < 0) qsize.height = -qsize.height;
+            real = 1;
+        }
+    }
+    s->vkQ[k][j].pose = pmul(pinv(pw), pmul(qw0, qpose));
+    if (!real) {
+        XrVector3f P = s->vkQ[k][j].pose.position;
+        XrVector3f H = { (pl->views[0].pose.position.x + pl->views[1].pose.position.x) * 0.5f,
+                         (pl->views[0].pose.position.y + pl->views[1].pose.position.y) * 0.5f,
+                         (pl->views[0].pose.position.z + pl->views[1].pose.position.z) * 0.5f };
+        XrVector3f z = { H.x - P.x, H.y - P.y, H.z - P.z };
+        float zl = sqrtf(z.x * z.x + z.y * z.y + z.z * z.z);
+        if (zl > 1e-4f) {
+            z.x /= zl; z.y /= zl; z.z /= zl;
+            XrVector3f x = { z.z, 0, -z.x };   /* arriba (0,1,0) × z */
+            float xl = sqrtf(x.x * x.x + x.z * x.z);
+            if (xl > 1e-4f) {
+                x.x /= xl; x.z /= xl;
+                XrVector3f y = { z.y * x.z - z.z * x.y, z.z * x.x - z.x * x.z, z.x * x.y - z.y * x.x };
+                s->vkQ[k][j].pose.orientation = quat_from_axes(x, y, z);
+            }
+        }
+    }
+    s->vkQ[k][j].size = qsize;
+    for (int e = 0; e < 2; e++) { s->vkQ[k][j].eye[e] = pl->views[e].pose; s->vkQ[k][j].fov[e] = pl->views[e].fov; }
+    s->vkQ[k][j].w = (uint32_t)qw; s->vkQ[k][j].h = (uint32_t)qh;
+    s->vkQ[k][j].rgba = fmt_code(qs->dxgi) != 0;
+    s->vkQ[k][j].blend = (ql->layerFlags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT) != 0;
+    s->vkQ[k][j].premul = (ql->layerFlags & XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT) == 0;
+    s->vkQ[k][j].flip = qflip;
+    s->vkQ[k][j].on = 1;
+}
+
 
 /* Un panel flotante para la Mac: tamaño, banderas (1 mezcla con alfa, 2 alfa premultiplicado, 4 dado vuelta, 8 RGBA)
  * y sus 4 esquinas en cada ojo como posiciones de recorte (x, y, z, w) dentro del rectángulo de ese ojo (w <= 0: no se
@@ -3052,6 +3134,80 @@ static void vk_quad_header(Session *s, int r, int j, QuadHdr *q) {
             q->c[e][k][3] = w;
         }
     }
+}
+
+/* Los paneles se proyectan con los ojos de la pose que se le informa al visor (la de la imagen): si no, temblaban
+ * igual que antes la imagen */
+static void quad_eyes(Session *s, int k, int qn, const XrCompositionLayerProjection *pl, uint32_t id) {
+    Track tr; int found = 0;
+    EnterCriticalSection(&g_lock);
+    for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].id == id && g_poseTrack[hh].valid) { tr = g_poseTrack[hh]; found = 1; break; }
+    LeaveCriticalSection(&g_lock);
+    if (!found) return;
+    int vb; XrPosef pinvw = pinv(space_world((const Space *)pl->space, &tr, &vb));
+    if (vb) for (int j = 0; j < qn; j++) for (int e = 0; e < 2; e++) s->vkQ[k][j].eye[e] = pmul(pinvw, tr.eye[e]);
+}
+
+/* D3D11: copia (en la GPU) la imagen de cada panel flotante a su textura de lectura del lugar k, y anota dónde cae.
+ * Devuelve cuántos quedaron (en orden: menú, HUD…). */
+static int d3d_quads_copy(Session *s, int k, const XrCompositionLayerProjection *pl, const XrCompositionLayerQuad *const *qls, int nq) {
+    for (int j = 0; j < NQ; j++) s->vkQ[k][j].on = 0;
+    if (!nq) return 0;
+    Track tk; EnterCriticalSection(&g_lock); tk = g_track; LeaveCriticalSection(&g_lock);
+    int qn = 0;
+    for (int i = 0; i < nq && qn < NQ; i++) {
+        const XrCompositionLayerQuad *ql = qls[i];
+        Swapchain *qs = (Swapchain *)ql->subImage.swapchain;
+        int qx = ql->subImage.imageRect.offset.x, qy = ql->subImage.imageRect.offset.y;
+        int qw = ql->subImage.imageRect.extent.width, qh = ql->subImage.imageRect.extent.height;
+        int qflip = qh < 0;   /* (alto negativo: la imagen viene dada vuelta) */
+        if (qw < 0) { qx += qw; qw = -qw; }
+        if (qh < 0) { qy += qh; qh = -qh; }
+        if (!qs || !qs->img[0] || (qs->dxgi != DXGI_FORMAT_R8G8B8A8_TYPELESS && qs->dxgi != DXGI_FORMAT_B8G8R8A8_TYPELESS)
+            || qx < 0 || qy < 0 || qw <= 0 || qh <= 0 || qx + qw > (int)qs->w || qy + qh > (int)qs->h || qw > 4096 || qh > 4096) continue;
+        int j = qn;
+        /* (la textura de lectura solo crece: los paneles cambian de tamaño seguido) */
+        if (!s->dQ[k][j] || s->dQw[k][j] < (uint32_t)qw || s->dQh[k][j] < (uint32_t)qh || s->dQf[k][j] != qs->dxgi) {
+            if (s->dQ[k][j]) ID3D11Texture2D_Release(s->dQ[k][j]);
+            s->dQ[k][j] = NULL;
+            D3D11_TEXTURE2D_DESC d; memset(&d, 0, sizeof d);
+            d.Width = (UINT)qw > s->dQw[k][j] ? (UINT)qw : s->dQw[k][j]; d.Height = (UINT)qh > s->dQh[k][j] ? (UINT)qh : s->dQh[k][j];
+            d.MipLevels = 1; d.ArraySize = 1; d.Format = qs->dxgi; d.SampleDesc.Count = 1;
+            d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(ID3D11Device_CreateTexture2D(s->dev, &d, NULL, &s->dQ[k][j]))) { s->dQ[k][j] = NULL; s->dQw[k][j] = s->dQh[k][j] = 0; continue; }
+            s->dQw[k][j] = d.Width; s->dQh[k][j] = d.Height; s->dQf[k][j] = qs->dxgi;
+        }
+        D3D11_BOX box = { (UINT)qx, (UINT)qy, 0, (UINT)(qx + qw), (UINT)(qy + qh), 1 };
+        ID3D11DeviceContext_CopySubresourceRegion(s->ctx, (ID3D11Resource *)s->dQ[k][j], 0, 0, 0, 0,
+                                                  (ID3D11Resource *)qs->img[qs->released], ql->subImage.imageArrayIndex * qs->mips, &box);
+        quad_meta(s, k, j, pl, ql, qs, qw, qh, qflip, &tk);
+        qn++;
+    }
+    return qn;
+}
+
+/* D3D11: escribe en dst los paneles del lugar k (cada uno: QuadHdr + sus píxeles) para que los dibuje la Mac. Espera a
+ * que la GPU termine sus copias. Devuelve cuántos entraron; *used suma lo que ocupan. */
+static uint32_t d3d_quads_write(Session *s, int k, uint8_t *dst, size_t room, size_t *used) {
+    uint32_t n = 0; size_t at = 0;
+    int64_t q0 = now_ns(); int any = 0;
+    for (int j = 0; j < NQ; j++) if (s->vkQ[k][j].on && s->dQ[k][j]) {
+        any = 1;
+        uint32_t w = s->vkQ[k][j].w, h = s->vkQ[k][j].h;
+        size_t px = (size_t)w * h * 4;
+        if (at + sizeof(QuadHdr) + px > room) break;
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (FAILED(ID3D11DeviceContext_Map(s->ctx, (ID3D11Resource *)s->dQ[k][j], 0, D3D11_MAP_READ, 0, &m))) continue;
+        QuadHdr *qh = (QuadHdr *)(dst + at);
+        vk_quad_header(s, k, j, qh);
+        uint8_t *o = dst + at + sizeof(QuadHdr);
+        for (uint32_t y = 0; y < h; y++) memcpy(o + (size_t)y * w * 4, (const uint8_t *)m.pData + (size_t)y * m.RowPitch, (size_t)w * 4);
+        ID3D11DeviceContext_Unmap(s->ctx, (ID3D11Resource *)s->dQ[k][j], 0);
+        at += sizeof(QuadHdr) + px; n++;
+    }
+    if (any) { g_dgQuadMs += (now_ns() - q0) / 1e6; g_dgQuadN++; }
+    *used += at;
+    return n;
 }
 
 static void vk_composite_quad(Session *s, int r, int j, uint8_t *dst, uint32_t ew, uint32_t eh, int dstRgba) {
@@ -3474,54 +3630,7 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
         toSrc[nbq] = toSrc[0]; toSrc[nbq].image = qimg[j]; toSrc[nbq].subresourceRange.baseArrayLayer = qlay; toSrc[nbq].oldLayout = qL;
         back[nbq] = back[0]; back[nbq].image = qimg[j]; back[nbq].subresourceRange.baseArrayLayer = qlay; back[nbq].newLayout = qL;
         nbq++;
-        /* dónde está el panel respecto de la capa de la imagen 3D (y cada ojo, con la pose y el campo de visión de la capa) */
-        int v1, v2;
-        XrPosef pw = space_world((const Space *)pl->space, &tk, &v1), qw0 = space_world((const Space *)ql->space, &tk, &v2);
-        /* el giro: el que fijó el juego (si se lo vio fijarlo), o si no, mirando a la cabeza con el «arriba» del mundo */
-        XrPosef qpose = ql->pose; XrExtent2Df qsize = ql->size; int real = 0;
-        const OvXf *xf = ovxf_find(ql->pose.position);
-        if (xf) {
-            const float *m = xf->m;
-            XrVector3f cx = { m[0], m[4], m[8] }, cy = { m[1], m[5], m[9] }, cz = { m[2], m[6], m[10] };
-            float lx = sqrtf(cx.x * cx.x + cx.y * cx.y + cx.z * cx.z), ly = sqrtf(cy.x * cy.x + cy.y * cy.y + cy.z * cy.z);
-            float lz = sqrtf(cz.x * cz.x + cz.y * cz.y + cz.z * cz.z);
-            if (lx > 1e-4f && ly > 1e-4f && lz > 1e-4f && fabsf(m[0]) > 0.05f && fabsf(m[5]) > 0.05f) {
-                cx.x /= lx; cx.y /= lx; cx.z /= lx; cy.x /= ly; cy.y /= ly; cy.z /= ly; cz.x /= lz; cz.y /= lz; cz.z /= lz;
-                qpose.orientation = quat_from_axes(cx, cy, cz);
-                /* (OpenComposite multiplicó el tamaño por m[0] y m[5]; con giro, lo correcto es el largo de cada eje) */
-                qsize.width = ql->size.width / m[0] * lx; qsize.height = ql->size.height / m[5] * ly;
-                if (qsize.width < 0) qsize.width = -qsize.width;
-                if (qsize.height < 0) qsize.height = -qsize.height;
-                real = 1;
-            }
-        }
-        s->vkQ[k][j].pose = pmul(pinv(pw), pmul(qw0, qpose));
-        if (!real) {
-            XrVector3f P = s->vkQ[k][j].pose.position;
-            XrVector3f H = { (pl->views[0].pose.position.x + pl->views[1].pose.position.x) * 0.5f,
-                             (pl->views[0].pose.position.y + pl->views[1].pose.position.y) * 0.5f,
-                             (pl->views[0].pose.position.z + pl->views[1].pose.position.z) * 0.5f };
-            XrVector3f z = { H.x - P.x, H.y - P.y, H.z - P.z };
-            float zl = sqrtf(z.x * z.x + z.y * z.y + z.z * z.z);
-            if (zl > 1e-4f) {
-                z.x /= zl; z.y /= zl; z.z /= zl;
-                XrVector3f x = { z.z, 0, -z.x };   /* arriba (0,1,0) × z */
-                float xl = sqrtf(x.x * x.x + x.z * x.z);
-                if (xl > 1e-4f) {
-                    x.x /= xl; x.z /= xl;
-                    XrVector3f y = { z.y * x.z - z.z * x.y, z.z * x.x - z.x * x.z, z.x * x.y - z.y * x.x };
-                    s->vkQ[k][j].pose.orientation = quat_from_axes(x, y, z);
-                }
-            }
-        }
-        s->vkQ[k][j].size = qsize;
-        for (int e = 0; e < 2; e++) { s->vkQ[k][j].eye[e] = pl->views[e].pose; s->vkQ[k][j].fov[e] = pl->views[e].fov; }
-        s->vkQ[k][j].w = (uint32_t)qw; s->vkQ[k][j].h = (uint32_t)qh;
-        s->vkQ[k][j].rgba = fmt_code(qs->dxgi) != 0;
-        s->vkQ[k][j].blend = (ql->layerFlags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT) != 0;
-        s->vkQ[k][j].premul = (ql->layerFlags & XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT) == 0;
-        s->vkQ[k][j].flip = qflip;
-        s->vkQ[k][j].on = 1;
+        quad_meta(s, k, j, pl, ql, qs, qw, qh, qflip, &tk);
     }
     VkCommandBuffer cb = s->vkCb[k];
     vk.ResetCommandBuffer(cb, 0);
@@ -3555,16 +3664,8 @@ static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, cons
     s->stPose[k] = id;
     /* los paneles se proyectan con los ojos de la pose que se le informa al visor (la de la imagen): si no, temblaban
      * igual que antes la imagen */
-    if (qn) {
-        Track tr; int found = 0;
-        EnterCriticalSection(&g_lock);
-        for (int hh = 0; hh < POSE_HIST; hh++) if (g_poseHist[hh].id == id && g_poseTrack[hh].valid) { tr = g_poseTrack[hh]; found = 1; break; }
-        LeaveCriticalSection(&g_lock);
-        if (found) {
-            int vb; XrPosef pinvw = pinv(space_world((const Space *)pl->space, &tr, &vb));
-            if (vb) for (int j = 0; j < qn; j++) for (int e = 0; e < 2; e++) s->vkQ[k][j].eye[e] = pmul(pinvw, tr.eye[e]);
-        }
-    } s->stValid[k] = 1; s->stFlip[k] = flip;
+    if (qn) quad_eyes(s, k, qn, pl, id);
+    s->stValid[k] = 1; s->stFlip[k] = flip;
     s->stNext = (k + 1) % STAGES;
 
     /* 2) Leer la copia y pasarla a la memoria compartida: apenas la GPU termina este mismo cuadro (no el anterior:
@@ -3732,17 +3833,17 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
                     }
                     logmsg("Ajuste multi-pass consultado por el juego %ld veces", (long)g_hookHits);
                 }
+                const XrCompositionLayerQuad *qls[NQ]; int nq = 0;   /* (los paneles flotantes, en orden) */
+                for (uint32_t j = 0; j < info->layerCount && nq < NQ; j++)
+                    if (info->layers[j] && info->layers[j]->type == XR_TYPE_COMPOSITION_LAYER_QUAD) qls[nq++] = (const XrCompositionLayerQuad *)info->layers[j];
                 if (s->vk) {
-                    const XrCompositionLayerQuad *qls[NQ]; int nq = 0;   /* (los paneles flotantes, en orden) */
-                    for (uint32_t j = 0; j < info->layerCount && nq < NQ; j++)
-                        if (info->layers[j] && info->layers[j]->type == XR_TYPE_COMPOSITION_LAYER_QUAD) qls[nq++] = (const XrCompositionLayerQuad *)info->layers[j];
                     if (vk_diferido()) vk_defer(s, pl, qls, nq, info->displayTime);   /* (se copia al empezar el cuadro siguiente) */
                     else { vk_flush_deferred(); vk_readback(s, pl, qls, nq, info->displayTime, 0); }
                 }
                 else if (s->gl) gl_readback(s, pl, info->displayTime);
                 else {
                     EnterCriticalSection(&g_gpuLock);
-                    readback(s, pl, info->displayTime);
+                    readback(s, pl, qls, nq, info->displayTime);
                     LeaveCriticalSection(&g_gpuLock);
                 }
                 break;
