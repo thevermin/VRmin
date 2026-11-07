@@ -1,0 +1,103 @@
+name: DXMT para VRmin
+
+# DXMT (DirectX 11 → Metal) compilado desde el código de 3Shain/dxmt, con el arreglo de la ventana de Metal para el
+# Wine de Gcenx (mac/dxmt/vista-metal.patch). Mismos pasos que el CI de DXMT. Deja un .tar.gz con la misma forma que el
+# que instala instalar_motor.sh (x86_64-windows/, i386-windows/, x86_64-unix/winemetal.so).
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Commit de 3Shain/dxmt
+        default: 647b0020ba5764e5593b12407afd76964fa11e20
+  push:
+    branches: [main]
+    paths: ['mac/dxmt/**', '.github/workflows/dxmt.yml']
+
+env:
+  DXMT_COMMIT: ${{ inputs.commit || '647b0020ba5764e5593b12407afd76964fa11e20' }}
+  LLVM_VERSION: llvmorg-15.0.7
+  WINE_VERSION: v8.16-3shain
+  WINE_URL: https://github.com/3Shain/wine/releases/download/v8.16-3shain/wine.tar.gz
+
+jobs:
+  llvm:
+    runs-on: macos-15
+    steps:
+      - name: LLVM para la Mac (x86_64), guardado entre compilaciones
+        id: cache
+        uses: actions/cache@v4
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64
+          path: toolchains/llvm-darwin
+      - name: Compilar LLVM (≈40 minutos la primera vez)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone -q --depth 1 --branch $LLVM_VERSION https://github.com/llvm/llvm-project.git toolchains/llvm-project
+          cmake -B toolchains/llvm-darwin-build -S toolchains/llvm-project/llvm \
+            -DCMAKE_INSTALL_PREFIX="$(pwd)/toolchains/llvm-darwin" -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DLLVM_HOST_TRIPLE=x86_64-apple-darwin -DLLVM_ENABLE_ASSERTIONS=On -DLLVM_ENABLE_ZSTD=Off \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-D_LIBCPP_KEEP_TRANSITIVE_INCLUDES_LLVM23" \
+            -DLLVM_TARGETS_TO_BUILD="" -DLLVM_BUILD_TOOLS=Off -DLLVM_INCLUDE_BENCHMARKS=Off \
+            -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off -G Ninja
+          cmake --build toolchains/llvm-darwin-build
+          cmake --install toolchains/llvm-darwin-build
+
+  build:
+    runs-on: macos-15
+    needs: llvm
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: vrmin }
+      - uses: actions/checkout@v4
+        with:
+          repository: 3Shain/dxmt
+          ref: ${{ env.DXMT_COMMIT }}
+          submodules: true
+          path: dxmt
+      - name: LLVM
+        uses: actions/cache/restore@v4
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64
+          path: dxmt/toolchains/llvm-darwin
+          fail-on-cache-miss: true
+      - name: Herramientas
+        run: |
+          brew install mingw-w64 ninja >/dev/null
+          pip3 install meson==1.10.0 --break-system-packages >/dev/null
+          sudo xcode-select -s /Applications/Xcode_16.1.app
+          mkdir -p dxmt/toolchains/wine && curl -sSL "$WINE_URL" | tar -xz -C dxmt/toolchains/wine
+      - name: Arreglo de la ventana de Metal (Wine de Gcenx)
+        working-directory: dxmt
+        run: git apply ../vrmin/mac/dxmt/vista-metal.patch
+      - name: 64 bits (y winemetal.so)
+        working-directory: dxmt
+        run: |
+          meson setup --cross-file build-win64.txt -Dnative_llvm_path=toolchains/llvm-darwin -Dwine_install_path=toolchains/wine \
+            build64 --buildtype release --prefix "$(pwd)/install" --strip
+          meson compile -C build64 && meson install -C build64
+      - name: 32 bits
+        working-directory: dxmt
+        run: |
+          meson setup --cross-file build-win32.txt -Dwine_install_path=toolchains/wine build32 --buildtype release --prefix "$(pwd)/install" --strip
+          meson compile -C build32 && meson install -C build32
+      - name: Paquete
+        run: |
+          cd dxmt/install && find . -type f | sort | head -60
+          mkdir -p "$GITHUB_WORKSPACE/pkg"
+          # (la misma forma que el paquete que instala instalar_motor.sh)
+          for d in x86_64-windows i386-windows x86_64-unix; do
+            src=$(find . -type d -name "$d" | head -1)
+            [ -n "$src" ] && cp -R "$src" "$GITHUB_WORKSPACE/pkg/$d"
+          done
+          cd "$GITHUB_WORKSPACE/pkg"
+          test -f x86_64-unix/winemetal.so && test -f x86_64-windows/d3d11.dll && test -f x86_64-windows/winemetal.dll
+          cp "$GITHUB_WORKSPACE/dxmt/LICENSE" LICENSE-DXMT.txt
+          echo "DXMT ${DXMT_COMMIT} + VRmin mac/dxmt/vista-metal.patch" > VERSION.txt
+          tar -czf "$GITHUB_WORKSPACE/dxmt-vrmin.tar.gz" .
+          cd "$GITHUB_WORKSPACE" && shasum -a 256 dxmt-vrmin.tar.gz | tee dxmt-vrmin.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dxmt-vrmin
+          path: |
+            dxmt-vrmin.tar.gz
+            dxmt-vrmin.tar.gz.sha256

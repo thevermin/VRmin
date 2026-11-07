@@ -1,0 +1,213 @@
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -1,5 +1,6 @@
+ #include <stdatomic.h>
+ #include <dlfcn.h>
++#include <pthread.h>
+ #import <Cocoa/Cocoa.h>
+ #import <ColorSync/ColorSync.h>
+ #import <CoreFoundation/CFRunLoop.h>
+@@ -1661,12 +1662,7 @@
+ typedef struct macdrv_opaque_window_data *macdrv_window_data;
+ typedef struct opaque_window_surface *window_surface;
+ typedef struct opaque_HWND *HWND;
+-struct macdrv_win_data {
+-  HWND hwnd; /* hwnd that this private data belongs to */
+-  macdrv_window cocoa_window;
+-  macdrv_view cocoa_view;
+-  macdrv_view client_cocoa_view;
+-};
++struct macdrv_win_data;
+ 
+ struct macdrv_functions_t {
+   void (*macdrv_init_display_devices)(BOOL);
+@@ -1684,36 +1680,147 @@
+ static NTSTATUS
+ _CreateMetalViewFromHWND(void *obj) {
+   struct unixcall_create_metal_view_from_hwnd *params = obj;
++  HWND hwnd = (HWND)(uintptr_t)params->hwnd;
++  macdrv_metal_device device = (macdrv_metal_device)params->device;
++
++  params->ret_view = 0;
++  params->ret_layer = 0;
+ 
+-  struct macdrv_win_data *(*pfn_get_win_data)(HWND hwnd) = NULL;
+-  void (*pfn_release_win_data)(struct macdrv_win_data *data) = NULL;
+-  macdrv_metal_view (*pfn_macdrv_view_create_metal_view)(macdrv_view v, macdrv_metal_device d) = NULL;
+-  macdrv_metal_layer (*pfn_macdrv_view_get_metal_layer)(macdrv_metal_view v) = NULL;
++  /*
++   * We avoid reading the internal `struct macdrv_win_data` — its layout
++   * drifted between 3Shain's Wine fork and upstream Wine, and
++   * `client_cocoa_view` / `client_view` is only populated from Wine's
++   * GDI present path, so it is NULL at IDXGISwapChain creation time.
++   *
++   * Instead we use the stable public accessor
++   * `macdrv_get_cocoa_window(HWND, BOOL)` (part of macdrv.h since Wine 8),
++   * fetch the NSWindow's contentView on the AppKit main thread, and
++   * ask macdrv to build a Metal view on top of it.
++   *
++   * Important: `macdrv_view_create_metal_view` and
++   * `macdrv_view_get_metal_layer` already call `OnMainThread(^…)`
++   * internally (see dlls/winemac.drv/cocoa_window.m). `OnMainThread`
++   * is *not* re-entrant — it posts the block via `OnMainThreadAsync`
++   * and waits for it, so calling it from the main thread deadlocks
++   * against the same block it just posted. That means this unixlib
++   * must **not** wrap the macdrv calls in its own `OnMainThread`;
++   * we call them directly from the Wine NtUser thread and let
++   * macdrv hop to the main thread by itself.
++   *
++   * The only AppKit call we have to do ourselves is reading
++   * `[NSWindow contentView]`. `contentView` is documented as
++   * main-thread only, so we dispatch that single lookup through
++   * `OnMainThread` (or a `dispatch_sync` fallback) and then let the
++   * rest of the path run on the Wine caller thread.
++   */
++  macdrv_window (*pfn_get_cocoa_window)(HWND, BOOL) = NULL;
++  macdrv_metal_view (*pfn_create_metal_view)(macdrv_view, macdrv_metal_device) = NULL;
++  macdrv_metal_layer (*pfn_get_metal_layer)(macdrv_metal_view) = NULL;
++  /* `OnMainThread` posts the block via `OnMainThreadAsync` and waits
++   * for it to finish. It is *not* re-entrant and must never be called
++   * from the main thread. We only use it for the single `contentView`
++   * lookup, and we do that from the Wine NtUser caller thread
++   * (which is always non-main in practice). */
++  void (*pfn_on_main_thread)(dispatch_block_t) = NULL;
+ 
+   struct macdrv_functions_t *macdrv_functions;
+   if ((macdrv_functions = dlsym(RTLD_DEFAULT, "macdrv_functions"))) {
+-    pfn_get_win_data = macdrv_functions->get_win_data;
+-    pfn_release_win_data = macdrv_functions->release_win_data;
+-    pfn_macdrv_view_create_metal_view = macdrv_functions->macdrv_view_create_metal_view;
+-    pfn_macdrv_view_get_metal_layer = macdrv_functions->macdrv_view_get_metal_layer;
++    pfn_get_cocoa_window = macdrv_functions->macdrv_get_cocoa_window;
++    pfn_create_metal_view = macdrv_functions->macdrv_view_create_metal_view;
++    pfn_get_metal_layer = macdrv_functions->macdrv_view_get_metal_layer;
++    pfn_on_main_thread = macdrv_functions->on_main_thread;
+   } else {
+-    pfn_get_win_data = dlsym(RTLD_DEFAULT, "get_win_data");
+-    pfn_release_win_data = dlsym(RTLD_DEFAULT, "release_win_data");
+-    pfn_macdrv_view_create_metal_view = dlsym(RTLD_DEFAULT, "macdrv_view_create_metal_view");
+-    pfn_macdrv_view_get_metal_layer = dlsym(RTLD_DEFAULT, "macdrv_view_get_metal_layer");
+-  }
+-
+-  if (pfn_get_win_data && pfn_release_win_data && pfn_macdrv_view_create_metal_view &&
+-      pfn_macdrv_view_get_metal_layer) {
+-    struct macdrv_win_data *win_data = pfn_get_win_data((HWND)params->hwnd);
+-    macdrv_metal_view view =
+-        pfn_macdrv_view_create_metal_view(win_data->client_cocoa_view, (macdrv_metal_device)params->device);
+-    params->ret_view = (obj_handle_t)view;
+-    if (view) {
+-      params->ret_layer = (obj_handle_t)pfn_macdrv_view_get_metal_layer(view);
+-    }
+-    pfn_release_win_data(win_data);
++    pfn_get_cocoa_window = dlsym(RTLD_DEFAULT, "macdrv_get_cocoa_window");
++    pfn_create_metal_view = dlsym(RTLD_DEFAULT, "macdrv_view_create_metal_view");
++    pfn_get_metal_layer = dlsym(RTLD_DEFAULT, "macdrv_view_get_metal_layer");
++    pfn_on_main_thread = dlsym(RTLD_DEFAULT, "OnMainThread");
++  }
++
++  int debug_metal_view = getenv("DXMT_DEBUG_METAL_VIEW") != NULL;
++  if (debug_metal_view) {
++    fprintf(stderr,
++            "[dxmt/winemetal] CreateMetalViewFromHWND: hwnd=%p macdrv_functions=%p "
++            "get_cocoa_window=%p create_metal_view=%p get_metal_layer=%p on_main_thread=%p\n",
++            (void *)(uintptr_t)params->hwnd, (void *)macdrv_functions,
++            (void *)pfn_get_cocoa_window,
++            (void *)pfn_create_metal_view,
++            (void *)pfn_get_metal_layer,
++            (void *)pfn_on_main_thread);
++  }
++
++  if (!pfn_get_cocoa_window || !pfn_create_metal_view || !pfn_get_metal_layer) {
++    fprintf(stderr,
++            "[dxmt/winemetal] CreateMetalViewFromHWND: failed to resolve macdrv "
++            "symbols (get_cocoa_window=%p create_metal_view=%p get_metal_layer=%p). "
++            "Your Wine runtime likely hides these symbols; see "
++            "https://github.com/notpop/steam-on-m1-wine/blob/main/docs/dxmt-diagnosis.md\n",
++            (void *)pfn_get_cocoa_window,
++            (void *)pfn_create_metal_view,
++            (void *)pfn_get_metal_layer);
++    return STATUS_SUCCESS;
++  }
++
++  macdrv_window window = pfn_get_cocoa_window(hwnd, FALSE);
++  if (debug_metal_view)
++    fprintf(stderr, "[dxmt/winemetal] CreateMetalViewFromHWND: cocoa_window=%p\n", (void *)window);
++  if (!window) {
++    fprintf(stderr,
++            "[dxmt/winemetal] CreateMetalViewFromHWND: macdrv_get_cocoa_window "
++            "returned NULL for hwnd=%p. The window is probably still in the "
++            "middle of being created; the caller will retry on the next "
++            "swapchain use.\n",
++            (void *)(uintptr_t)params->hwnd);
++    return STATUS_SUCCESS;
++  }
++
++  /* `[NSWindow contentView]` is documented as main-thread only, so it
++   * is the one Cocoa call we must hop to the main thread for.
++   * macdrv_view_create_metal_view / _get_metal_layer below handle the
++   * dispatch internally, so we invoke them directly. */
++  __block NSView *content_view = nil;
++  dispatch_block_t fetch_content_view = ^{
++    content_view = [(NSWindow *)window contentView];
++  };
++  if (pfn_on_main_thread) {
++    pfn_on_main_thread(fetch_content_view);
++  } else if (pthread_main_np()) {
++    fetch_content_view();
++  } else {
++    dispatch_sync(dispatch_get_main_queue(), fetch_content_view);
+   }
++  if (debug_metal_view)
++    fprintf(stderr, "[dxmt/winemetal] CreateMetalViewFromHWND: content_view=%p\n", (void *)content_view);
++  if (!content_view) {
++    fprintf(stderr,
++            "[dxmt/winemetal] CreateMetalViewFromHWND: NSWindow %p has no "
++            "contentView. The window will stay transparent.\n",
++            (void *)window);
++    return STATUS_SUCCESS;
++  }
++
++  macdrv_metal_view view = pfn_create_metal_view((macdrv_view)content_view, device);
++  if (debug_metal_view)
++    fprintf(stderr, "[dxmt/winemetal] CreateMetalViewFromHWND: view=%p\n", (void *)view);
++  if (!view) {
++    fprintf(stderr,
++            "[dxmt/winemetal] CreateMetalViewFromHWND: macdrv_view_create_metal_view "
++            "returned NULL for contentView=%p. The window will stay transparent.\n",
++            (void *)content_view);
++    return STATUS_SUCCESS;
++  }
++
++  macdrv_metal_layer layer = pfn_get_metal_layer(view);
++
++  params->ret_view = (obj_handle_t)view;
++  params->ret_layer = (obj_handle_t)layer;
++
++  if (debug_metal_view)
++    fprintf(stderr,
++            "[dxmt/winemetal] CreateMetalViewFromHWND: done hwnd=%p cocoa_window=%p "
++            "content_view=%p view=%p layer=%p\n",
++            (void *)(uintptr_t)params->hwnd, (void *)window,
++            (void *)content_view, (void *)view,
++            (void *)(uintptr_t)params->ret_layer);
+ 
+   return STATUS_SUCCESS;
+ }
+@@ -1731,8 +1838,15 @@
+     pfn_macdrv_view_release_metal_view = dlsym(RTLD_DEFAULT, "macdrv_view_release_metal_view");
+   }
+ 
+-  if (pfn_macdrv_view_release_metal_view)
+-    pfn_macdrv_view_release_metal_view((macdrv_metal_view)params->handle);
++  macdrv_metal_view victim = (macdrv_metal_view)params->handle;
++  if (!pfn_macdrv_view_release_metal_view || !victim)
++    return STATUS_SUCCESS;
++
++  /* `macdrv_view_release_metal_view` hops to the main thread internally
++   * via `OnMainThread`, so call it directly. Wrapping it in another
++   * `OnMainThread` here would be a re-entrant deadlock — the same
++   * issue described in `_CreateMetalViewFromHWND` above. */
++  pfn_macdrv_view_release_metal_view(victim);
+ 
+   return STATUS_SUCCESS;
+ }
