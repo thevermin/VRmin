@@ -132,7 +132,11 @@ static void sendLog(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof msg, fmt, ap); va_end(ap);
     LOGI("%s", msg);
     std::string s = "{\"type\":\"log\",\"msg\":\"";
-    for (const char *p = msg; *p; p++) { if (*p == '"' || *p == '\\') s += '\\'; s += *p; }
+    for (const char *p = msg; *p; p++) {
+        if ((unsigned char)*p < 0x20) { s += ' '; continue; }   // (un tab o un salto no valen dentro de un texto JSON)
+        if (*p == '"' || *p == '\\') s += '\\';
+        s += *p;
+    }
     s += "\"}";
     sendPacket(s);
 }

@@ -53,6 +53,7 @@ final class Loading {
     private TextView name, status, tip, sub;
     private ImageView cover;
     private View bar;
+    private android.animation.Animator barAnim, sepAnim;   // (se cortan al cerrar la pantalla de carga)
     private final List<String> tips = new ArrayList<>();
     private int tipAt = 0;
 
@@ -122,6 +123,9 @@ final class Loading {
         ui.removeCallbacksAndMessages(null);
         host.nativeLoading(false);
         host.loadingPanel(false);
+        if (barAnim != null) barAnim.cancel();
+        if (sepAnim != null) sepAnim.cancel();
+        barAnim = sepAnim = null;
         ctx = null; name = null; status = null; sub = null; tip = null; cover = null; bar = null;
     }
 
@@ -181,6 +185,8 @@ final class Loading {
         card.addView(track, tlp);
         // La barrita barre de izquierda a derecha: la punta sale primero y la cola la alcanza (con aceleración suave)
         bar.setPivotX(0);
+        final View b = bar;
+        if (barAnim != null) barAnim.cancel();
         android.animation.ValueAnimator a = android.animation.ValueAnimator.ofFloat(0f, 1f);
         a.setDuration(1400);
         a.setRepeatCount(android.animation.ValueAnimator.INFINITE);
@@ -188,10 +194,11 @@ final class Loading {
         a.addUpdateListener(an -> {
             float u = (float) an.getAnimatedValue();
             float h = smooth(Math.min(1f, u * 1.25f)), t = smooth(Math.max(0f, Math.min(1f, u * 1.25f - 0.25f)));
-            bar.setTranslationX(t * trackW);
-            bar.setScaleX(Math.max(0.001f, h - t));
+            b.setTranslationX(t * trackW);
+            b.setScaleX(Math.max(0.001f, h - t));
         });
         a.start();
+        barAnim = a;
 
         status = Ui.label(c, "", 19, Ui.TEXT2, false);
         status.setGravity(Gravity.CENTER);
@@ -222,6 +229,8 @@ final class Loading {
         br.setRepeatCount(android.animation.ValueAnimator.INFINITE);
         br.setInterpolator(new android.view.animation.AccelerateDecelerateInterpolator());
         br.start();
+        if (sepAnim != null) sepAnim.cancel();
+        sepAnim = br;
         LinearLayout tipText = new LinearLayout(c);
         tipText.setOrientation(LinearLayout.VERTICAL);
         tipText.addView(Ui.label(c, I18n.t("Consejo"), 14, Ui.ACCENT_TEXT, true));

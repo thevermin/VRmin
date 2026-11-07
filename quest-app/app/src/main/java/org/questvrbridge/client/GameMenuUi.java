@@ -55,6 +55,7 @@ final class GameMenuUi implements Link.Listener {
     private static final int[] EYES = {1024, 1280, 1536, 1832, 2048, 2304, 2560}, FPSS = {72, 90, 120}, MBPSS = {40, 70, 100, 150, 200};
     private int selEye = -1, selFps = -1, selMbps = -1, selFov = 0, selFovC = 1;
     private boolean showDetail = false, applied = false;
+    private int custEye = -1, custFps = -1, custMbps = -1;   // lo último personalizado
     private int qAll = -1;                 // la imagen se cambia para: 1 = todos los juegos · 0 = este juego (-1 = según tenga la suya)
     private boolean screensPage = false;   // página «Ventanas y pantallas»
     private boolean advPage = false;       // página «Avanzado» (de este juego)
@@ -526,14 +527,20 @@ final class GameMenuUi implements Link.Listener {
         int curFov = MenuUi.fovLevel(q), curFovC = MenuUi.fovSize(q);
         if (selEye < 0) { selEye = curEye; selFps = curFps; selMbps = curMbps; selFov = curFov; selFovC = curFovC; }
         int prof = MenuUi.presetOf(selEye, selFps, selMbps);
-        String[] pn = new String[MenuUi.PRESETS.length];
-        for (int i = 0; i < pn.length; i++) pn[i] = I18n.t(MenuUi.PRESET_NAMES[i]) + (i == MenuUi.recommendedPreset() ? " ★" : "");
-        pills(I18n.t("Calidad"), prof < 0 ? I18n.t("Personalizado (abajo)") : I18n.t(MenuUi.PRESET_FOR[prof]),
-                pn, prof, i -> { selEye = MenuUi.PRESETS[i][0]; selFps = MenuUi.PRESETS[i][1]; selMbps = MenuUi.PRESETS[i][2]; applied = false; });
-        TextView more = Ui.label(ctx, showDetail ? I18n.t("Ocultar el detalle") : I18n.t("Personalizado"), 14, Ui.ACCENT_TEXT, true);
-        more.setPadding(dp(ctx, 18), dp(ctx, 8), 0, dp(ctx, 4));
-        more.setOnClickListener(v -> { showDetail = !showDetail; drawnKey = ""; render(); });
-        right.addView(more);
+        if (prof < 0) { custEye = selEye; custFps = selFps; custMbps = selMbps; }   // (para volver a «Personalizado» con lo tuyo)
+        final int nP = MenuUi.PRESETS.length;
+        String[] pn = new String[nP + 1];
+        for (int i = 0; i < nP; i++) pn[i] = I18n.t(MenuUi.PRESET_NAMES[i]) + (i == MenuUi.recommendedPreset() ? " ★" : "");
+        pn[nP] = I18n.t("Personalizado");
+        final boolean custom = showDetail || prof < 0;
+        pills(I18n.t("Calidad"), custom ? I18n.t("Elegí cada ajuste a tu gusto") : I18n.t(MenuUi.PRESET_FOR[prof]),
+                pn, custom ? nP : prof, i -> {
+                    if (i == nP) {
+                        showDetail = true;
+                        if (custEye >= 0) { selEye = custEye; selFps = custFps; selMbps = custMbps; }
+                    } else { showDetail = false; selEye = MenuUi.PRESETS[i][0]; selFps = MenuUi.PRESETS[i][1]; selMbps = MenuUi.PRESETS[i][2]; }
+                    applied = false;
+                });
         if (showDetail || prof < 0) {
             pills(I18n.t("Nitidez"), I18n.t("Píxeles por ojo · más = la Mac trabaja más") + "\n" + I18n.t("Hay que volver a abrir el juego para que se aplique."),
                     new String[]{"1024", "1280", "1536", "1832", "2048", "2304", "2560"}, selEye, i -> { selEye = i; applied = false; });

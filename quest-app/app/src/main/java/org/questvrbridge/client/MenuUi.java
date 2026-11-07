@@ -1397,7 +1397,8 @@ final class MenuUi implements Link.Listener {
         for (int i = 0; i < PRESETS.length; i++) if (PRESETS[i][0] == eye && PRESETS[i][1] == fps && PRESETS[i][2] == mbps) return i;
         return -1;
     }
-    private boolean qCustom = false;   // «Personalizado» elegido (aunque coincida con uno)
+    private boolean qCustom = false;
+    private int custEye = -1, custFps = -1, custMbps = -1;   // lo último personalizado (calidad general)   // «Personalizado» elegido (aunque coincida con uno)
 
     private static final float[] SEATED_HEIGHTS = {1.60f, 1.70f, 1.75f, 1.80f, 1.90f};
     /// Altura que se aplica: sentado = la elegida; de pie = la real (0) o la elegida
@@ -1753,6 +1754,7 @@ final class MenuUi implements Link.Listener {
     /// Calidad de los juegos (para todos): perfil, nitidez, fluidez, Mbps, sonido y foveated encoding, con «Aplicar»
     private void qualityBlock(JSONObject cfg) {
         int prof = presetOf(selEye, selFps, selMbps);
+        if (prof < 0) { custEye = selEye; custFps = selFps; custMbps = selMbps; }   // (para volver a «Personalizado» con lo tuyo)
         int sel = qCustom || prof < 0 ? PRESETS.length : prof;
         String[] labels = new String[PRESETS.length + 1];
         for (int i = 0; i < PRESETS.length; i++) labels[i] = presetLabel(i);
@@ -1760,6 +1762,7 @@ final class MenuUi implements Link.Listener {
         choice(content, I18n.t("Calidad"), I18n.t("Elegí uno según tu Mac"), labels, sel, i -> {
             qCustom = i == PRESETS.length;
             if (!qCustom) { selEye = PRESETS[i][0]; selFps = PRESETS[i][1]; selMbps = PRESETS[i][2]; }
+            else if (custEye >= 0) { selEye = custEye; selFps = custFps; selMbps = custMbps; }
             redraw();
         }, true);
         if (sel == PRESETS.length) qualityDetail(selEye, selFps, selMbps, selFov, selFovC, i -> selEye = i, i -> selFps = i, i -> selMbps = i, i -> selFov = i, i -> selFovC = i);

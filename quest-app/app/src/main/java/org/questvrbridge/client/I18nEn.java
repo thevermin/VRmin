@@ -783,6 +783,7 @@ final class I18nEn {
         m.put("MacBook Air, Mac mini e iMac (M1 a M4)", "MacBook Air, Mac mini and iMac (M1 to M4)");
         m.put("MacBook Pro y Mac mini con chip Pro", "MacBook Pro and Mac mini with a Pro chip");
         m.put("Chip Max o Ultra (MacBook Pro, Mac Studio)", "Max or Ultra chip (MacBook Pro, Mac Studio)");
+        m.put("Elegí cada ajuste a tu gusto", "Choose each setting yourself");
         m.put("Más", "More");
     }
 }
