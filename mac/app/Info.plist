@@ -16,6 +16,7 @@
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSPrincipalClass</key><string>NSApplication</string>
 	<key>NSCameraUsageDescription</key><string>En el Modo Centinela, VRmin Host usa la cámara para seguir tu cabeza (no se guarda ni se envía ninguna imagen).</string>
+	<key>NSMicrophoneUsageDescription</key><string>Los juegos que usan micrófono (chat de voz, comandos de voz) escuchan el micrófono de la Mac.</string>
 	<key>NSAudioCaptureUsageDescription</key><string>VRmin Host envía el sonido de la Mac y de los juegos al Quest.</string>
 	<key>NSLocalNetworkUsageDescription</key><string>VRmin Host se comunica con tu Quest por la red local.</string>
 </dict>
