@@ -1533,6 +1533,78 @@ Java_org_questvrbridge_client_VrActivity_nativeExitVR(JNIEnv *, jclass) { g_exit
 // ---------------------------------------------------------------------------
 // Hilo de red: descubrir la Mac, conectarse y recibir video/sonido/config
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Micrófono del visor: cuando la Mac lo pide (hay un juego abierto y en VRmin Host se eligió el del visor), se graba
+// y se le manda en pedazos de 10 ms: [0x0B] + PCM de 16 bits, 48 kHz, mono. La Mac lo saca por «VRmin Mic».
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_micWant{false}, g_micAsked{false}, g_micThread{false};
+static std::atomic<int> g_micAllowed{-1};   // permiso de grabar: -1 sin preguntar, 0 no, 1 sí
+static jmethodID g_jAskMic = nullptr;
+extern "C" JNIEXPORT void JNICALL
+Java_org_questvrbridge_client_VrActivity_nativeSetMicAllowed(JNIEnv *, jclass, jboolean ok) { g_micAllowed = ok ? 1 : 0; }
+static void micLoop() {
+    AAudioStream *st = nullptr;
+    int rate = 48000;
+    bool warned = false;
+    std::vector<int16_t> in(960);
+    std::string pkt;
+    auto closeStream = [&]() { if (st) { AAudioStream_requestStop(st); AAudioStream_close(st); st = nullptr; sendLog("Micrófono del visor: apagado"); } };
+    while (g_running) {
+        if (!g_micWant || g_sock < 0) { closeStream(); usleep(100000); continue; }
+        if (g_micAllowed != 1) {
+            if (!g_micAsked.exchange(true)) {   // (lo pide la parte Java: aparece el permiso en el visor)
+                JNIEnv *e = jenv();
+                if (e && g_act && g_jAskMic) { e->CallVoidMethod(g_act, g_jAskMic); if (e->ExceptionCheck()) e->ExceptionClear(); }
+            }
+            if (g_micAllowed == 0 && !warned) { warned = true; sendLog("Micrófono del visor: sin permiso para grabar (se pide en el visor)"); }
+            usleep(200000);
+            continue;
+        }
+        if (!st) {
+            AAudioStreamBuilder *b = nullptr;
+            if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) { usleep(1000000); continue; }
+            AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_INPUT);
+            AAudioStreamBuilder_setSampleRate(b, 48000);
+            AAudioStreamBuilder_setChannelCount(b, 1);
+            AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
+            AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+            AAudioStreamBuilder_setInputPreset(b, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);   // (con cancelación de eco)
+            aaudio_result_t r = AAudioStreamBuilder_openStream(b, &st);
+            AAudioStreamBuilder_delete(b);
+            if (r != AAUDIO_OK || !st) {
+                st = nullptr;
+                if (!warned) { warned = true; sendLog("Micrófono del visor: no se pudo abrir (%d)", (int)r); }
+                usleep(2000000);
+                continue;
+            }
+            rate = AAudioStream_getSampleRate(st);
+            AAudioStream_requestStart(st);
+            sendLog("Micrófono del visor: grabando (%d Hz)", rate);
+        }
+        const int want = std::max(1, rate / 100);   // 10 ms
+        if ((int)in.size() < want) in.resize(want);
+        aaudio_result_t n = AAudioStream_read(st, in.data(), want, 200000000LL);
+        if (n < 0) { closeStream(); continue; }
+        if (n == 0) continue;
+        pkt.assign(1, (char)0x0B);
+        if (rate == 48000) pkt.append((const char *)in.data(), (size_t)n * 2);
+        else {   // (otra frecuencia: se pasa a 48 kHz, lineal)
+            int m = (int)((int64_t)n * 48000 / rate);
+            for (int i = 0; i < m; i++) {
+                float x = (float)i * rate / 48000.f; int a = (int)x; float f = x - a;
+                int16_t v = (int16_t)(in[std::min<int>(a, n - 1)] * (1 - f) + in[std::min<int>(a + 1, n - 1)] * f);
+                pkt.append((const char *)&v, 2);
+            }
+        }
+        sendPacket(pkt);
+    }
+    closeStream();
+}
+static void micSet(bool on) {
+    g_micWant = on;
+    if (on && !g_micThread.exchange(true)) std::thread(micLoop).detach();
+}
+
 static void networkLoop() {
     jenv();   // este hilo también le habla a la parte Java
     while (g_running) {
@@ -1641,6 +1713,7 @@ static void networkLoop() {
                     }
                     else if (t.find("\"panels\"") != std::string::npos) receivePanels(t);
                     else if (t.find("\"exitvr\"") != std::string::npos) g_exitVR = true;
+                    else if (t.find("\"type\":\"mic\"") != std::string::npos) micSet(t.find("\"on\":true") != std::string::npos);
                     else if (t.find("\"config\"") != std::string::npos) {
                         size_t q = t.find("\"fps\":");
                         if (q != std::string::npos) { int f = atoi(t.c_str() + q + 6); if (f >= 60 && f <= 144) g_targetFps = f; }
@@ -1675,6 +1748,7 @@ static void networkLoop() {
         }
         LOGI("Se cortó la conexión con la Mac");
         g_sock = -1;
+        g_micWant = false;
         close(fd);
         decoderDestroy();
         { std::lock_guard<std::mutex> lk(g_panelLock); g_lobby = false; }
@@ -9142,6 +9216,7 @@ void android_main(android_app *a) {
     g_jGameState = env->GetMethodID(ac, "onGameState", "(Z)V");
     g_jGameMenu = env->GetMethodID(ac, "onGameMenu", "(Z)V");
     g_jInputLock = env->GetMethodID(ac, "onInputLock", "(Z)V");
+    g_jAskMic = env->GetMethodID(ac, "askMic", "()V");
     if (env->ExceptionCheck()) { env->ExceptionClear(); g_jPacket = g_jConn = g_jPointer = nullptr; LOGE("Sin VrActivity: la sala no tendrá menú"); }
 
     initEGL(app);

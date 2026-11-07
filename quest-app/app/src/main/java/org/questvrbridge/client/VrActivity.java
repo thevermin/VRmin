@@ -52,6 +52,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
     static native void nativeSetGameHidden(boolean on);
     static native void nativeSetVersion(String v);
     static native void nativeSetCrashFile(String path);
+    static native void nativeSetMicAllowed(boolean ok);
     static native void nativeSetCrashNote(String note);
     static native void nativeSetHandGestures(boolean on);
     static native void nativeSetHeight(float m);
@@ -424,11 +425,26 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
         }
     }
 
+    /// Micrófono del visor (lo pide la parte nativa cuando la Mac quiere tu voz para un juego)
+    private static final int MIC_REQUEST = 42;
+    @SuppressWarnings("unused")   // (desde la parte nativa)
+    public void askMic() {
+        runOnUiThread(() -> {
+            try {
+                if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) nativeSetMicAllowed(true);
+                else requestPermissions(new String[] { android.Manifest.permission.RECORD_AUDIO }, MIC_REQUEST);
+            } catch (Exception e) {
+                nativeSetMicAllowed(false);
+            }
+        });
+    }
+
     @Override
     public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
         super.onRequestPermissionsResult(code, perms, results);
-        if (code != CAMERA_REQUEST) return;
         boolean ok = results.length > 0 && results[0] == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        if (code == MIC_REQUEST) { nativeSetMicAllowed(ok); return; }
+        if (code != CAMERA_REQUEST) return;
         nativeSetCameraAllowed(ok);
     }
 

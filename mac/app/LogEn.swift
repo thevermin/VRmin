@@ -4,6 +4,19 @@ import Foundation
 
 enum LogEn {
     private static let pairs: [(String, String)] = [
+        ("No encontré «VRmin Mic»", "Couldn't find “VRmin Mic”"),
+        (": instalalo en VRmin Host › Ajustes › Micrófono", ": install it in VRmin Host › Settings › Microphone"),
+        ("Pidiendo el micrófono del visor (hay un juego abierto)", "Asking for the headset microphone (a game is open)"),
+        ("Micrófono del visor: sin permiso para grabar (se pide en el visor)", "Headset microphone: no permission to record (asked in the headset)"),
+        ("No se pudo abrir la salida del micrófono", "Couldn't open the microphone output"),
+        ("No arrancó la salida del micrófono", "The microphone output didn't start"),
+        ("Micrófono del visor → VRmin Mic", "Headset microphone → VRmin Mic"),
+        ("Micrófono del visor: no se pudo abrir", "Headset microphone: couldn't open it"),
+        ("Micrófono del visor: grabando", "Headset microphone: recording"),
+        ("Micrófono del visor apagado", "Headset microphone off"),
+        ("Micrófono del visor: apagado", "Headset microphone: off"),
+        ("Micrófono de los juegos: el de macOS", "Games microphone: macOS default"),
+        ("Micrófono de los juegos", "Games microphone"),
         ("El visor perdió el seguimiento (no sabe dónde está): asegurate de que vea la habitación con luz; si sigue, levantalo, mové un poco la cabeza con él y volvé a apoyarlo", "The headset lost tracking (it doesn't know where it is): make sure it sees a lit room; if it continues, pick it up, move it around a bit and set it down again"),
         ("Si el juego mira para otro lado o te ves desde afuera: mirá al visor con los controles delante del pecho y mantené el botón de menú izquierdo (centra y calibra", "If the game faces the wrong way or you see yourself from outside: look at the headset with the controllers in front of your chest and hold the left menu button (centers and calibrates"),
         ("Los juegos se pueden abrir cuando el visor esté listo. Si tarda, tocá «Empezar» en VRmin Host otra vez o apretá una vez el botón de encendido del visor.", "Games can be opened once the headset is ready. If it takes long, click “Start” in VRmin Host again or press the headset's power button once."),

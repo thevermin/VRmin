@@ -9,6 +9,7 @@
 import SwiftUI
 import AppKit
 import ServiceManagement
+import CoreAudio
 
 // MARK: - Juegos
 struct SteamGame: Identifiable, Hashable {
@@ -347,7 +348,55 @@ final class AppModel: ObservableObject {
     @Published var pendingRestart = false
     private var restartAfterStop = false
     private var runningWith = ""
-    private var settingsKey: String { "\(runFps)/\(runEye)/\(runMbps)/\(audioMac)/\(audioOnlyMac)/\(cableOnly)/\(runFov)/\(codec)" }
+    private var settingsKey: String { "\(runFps)/\(runEye)/\(runMbps)/\(audioMac)/\(audioOnlyMac)/\(cableOnly)/\(runFov)/\(codec)/\(micSource == "quest")" }
+    /// Micrófono de los juegos: "quest" (el del visor, por «VRmin Mic»), "" (el que use macOS) o el UID de uno de la Mac
+    @Published var micSource: String = UserDefaults.standard.string(forKey: "micSource") ?? "" {
+        didSet { UserDefaults.standard.set(micSource, forKey: "micSource"); writeMicFile(); settingsChanged() } }
+    /// Para Wine (jugar.sh lo aplica al abrir un juego): el UID del micrófono, o vacío
+    func writeMicFile() {
+        let uid = micSource == "quest" ? "VRminMic_UID" : micSource
+        try? uid.write(to: data.appendingPathComponent("microfono"), atomically: true, encoding: .utf8)
+    }
+    var micDriverInstalled: Bool { FileManager.default.fileExists(atPath: "/Library/Audio/Plug-Ins/HAL/VRminMic.driver") }
+    /// Instala (o quita) «VRmin Mic»: macOS pide la contraseña de administrador
+    func installMic(remove: Bool = false) {
+        let script = res.appendingPathComponent("instalar_mic.sh").path, drv = res.appendingPathComponent("VRminMic.driver").path
+        let cmd = remove ? "bash '\(script)' --quitar" : "bash '\(script)' '\(drv)'"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", "do shell script \"\(cmd.replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges"]
+        p.terminationHandler = { pr in
+            DispatchQueue.main.async {
+                self.append(pr.terminationStatus == 0 ? (remove ? L("Micrófono VRmin Mic quitado") : L("Micrófono VRmin Mic instalado"))
+                            : L("No se instaló el micrófono (¿se canceló la contraseña?)"))
+                self.objectWillChange.send()
+            }
+        }
+        try? p.run()
+    }
+    /// Los micrófonos de la Mac (nombre y UID), sin «VRmin Mic»
+    func macMics() -> [(uid: String, name: String)] {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size) == noErr else { return [] }
+        var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &ids) == noErr else { return [] }
+        var out: [(String, String)] = []
+        for id in ids {
+            var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: kAudioObjectPropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+            var n: UInt32 = 0
+            guard AudioObjectGetPropertyDataSize(id, &a, 0, nil, &n) == noErr, n > 0 else { continue }
+            func str(_ sel: AudioObjectPropertySelector) -> String? {
+                var pa = AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+                var v: Unmanaged<CFString>?; var sz = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+                guard AudioObjectGetPropertyData(id, &pa, 0, nil, &sz, &v) == noErr, let v else { return nil }
+                return v.takeRetainedValue() as String
+            }
+            guard let uid = str(kAudioDevicePropertyDeviceUID), let name = str(kAudioObjectPropertyName), !uid.hasPrefix("VRminMic") else { continue }
+            out.append((uid, name))
+        }
+        return out
+    }
     /// Conexión con el Quest solo por el cable USB-C (rechaza la conexión por Wi-Fi de la sala VR)
     @Published var cableOnly: Bool = UserDefaults.standard.bool(forKey: "cableOnly") {
         didSet {
@@ -746,11 +795,13 @@ final class AppModel: ObservableObject {
     func startServer() {
         guard server == nil else { return }
         killLeftovers()   // por si quedó algo abierto de una vez anterior (ocupando los puertos)
+        writeMicFile()
         append(L("▶︎ Encendiendo el servidor · %ld×%ld por ojo · %ld Hz · %ld Mbps", runEye, runEye, runFps, runMbps) + (audioMac ? L(" · sonido también en la Mac") : ""))
         let p = makeProcess(["/bin/bash", res.appendingPathComponent("servidor.sh").path], tag: "srv",
                             extraEnv: ["VR_FPS": "\(runFps)", "VR_EYE": "\(runEye)", "VR_MBPS": "\(runMbps)",
                                        "VR_AUDIO_MAC": audioMac ? "1" : "0", "VR_AUDIO": audioOnlyMac ? "0" : "1",
                                        "VR_CABLE_ONLY": cableOnly ? "1" : "0", "VR_FOV": runFov, "VR_CODEC": codec,
+                                       "VR_MIC": micSource == "quest" ? "quest" : "",
                                        "VR_GEN_EYE": "\(eye)", "VR_GEN_FPS": "\(fps)", "VR_GEN_MBPS": "\(mbps)", "VR_GEN_FOV": fov])
         p.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
@@ -1813,6 +1864,39 @@ struct SettingsView: View {
     }
 
     @State private var showCustom = false
+    @State private var mics: [(uid: String, name: String)] = []
+    /// Micrófono de los juegos: el del visor (por «VRmin Mic») o uno de la Mac (auriculares con micrófono, por ejemplo)
+    private var micCard: some View {
+        Card(title: L("Micrófono de los juegos"), icon: "mic") {
+            Picker(L("Micrófono"), selection: $m.micSource) {
+                Text(L("El del visor (Quest)")).tag("quest")
+                Text(L("El que use macOS")).tag("")
+                ForEach(mics, id: \.uid) { Text($0.name).tag($0.uid) }
+                if !m.micSource.isEmpty && m.micSource != "quest" && !mics.contains(where: { $0.uid == m.micSource }) {
+                    Text(L("Uno que no está conectado")).tag(m.micSource)
+                }
+            }.labelsHidden()
+            if m.micSource == "quest" {
+                if m.micDriverInstalled {
+                    HStack {
+                        Label(L("VRmin Mic instalado"), systemImage: "checkmark.circle.fill").font(.caption).foregroundStyle(Theme.amberText)
+                        Spacer()
+                        Button(L("Quitar")) { m.installMic(remove: true) }.buttonStyle(Pill())
+                    }
+                    Text(L("El visor graba solo mientras hay un juego abierto. Si tenés auriculares con micrófono conectados al Quest por USB-C, usa esos.")).font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+                } else {
+                    HStack {
+                        Text(L("Falta instalar «VRmin Mic», el micrófono por donde llega tu voz desde el visor. macOS pide tu contraseña una vez.")).font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        Button(L("Instalar")) { m.installMic() }.buttonStyle(Pill(primary: true))
+                    }
+                }
+            } else {
+                Text(L("Para auriculares con micrófono conectados a la Mac, elegilos acá. macOS pide permiso la primera vez que un juego usa el micrófono.")).font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .onAppear { mics = m.macMics() }
+    }
     /// Avanzado: para todos los juegos (los de un juego, en su menú de Juegos)
     private var advancedCard: some View {
         Card(title: L("Rendimiento (todos los juegos)"), icon: "speedometer") {
@@ -1890,6 +1974,7 @@ struct SettingsView: View {
                 }
             }
 
+            micCard
             advancedCard
 
             Card(title: L("Esta Mac"), icon: "laptopcomputer") {

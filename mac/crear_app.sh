@@ -35,6 +35,16 @@ echo "2/3 Compilando el renderizador..."
 swc renderer/compilacion.log -O renderer/main.swift -o "$R/QuestRenderer" || falla renderer/compilacion.log
 echo "3/3 Copiando archivos..."
 xcrun clang -arch x86_64 -arch arm64 -mmacosx-version-min=$MIN_MACOS -O2 -dynamiclib app/recursos/arreglo_errores.c -o "$R/arreglo_errores.dylib" 2> app/compilacion_arreglo.log || falla app/compilacion_arreglo.log
+# Micrófono virtual «VRmin Mic» (BlackHole, ver mic/README.md): entrada visible de 1 canal y una salida oculta
+# donde VRmin Host pone lo que llega del micrófono del visor
+D="$R/VRminMic.driver/Contents"; mkdir -p "$D/MacOS" "$D/Resources"
+xcrun clang -bundle -arch x86_64 -arch arm64 -mmacosx-version-min=$MIN_MACOS -O2 -w \
+  -DkDriver_Name='"VRminMic"' -DkPlugIn_BundleID='"com.thevermin.vrmin.mic"' -DkPlugIn_Icon='"VRminMic.icns"' \
+  -DkHas_Driver_Name_Format=0 -DkDevice_Name='"VRmin Mic"' -DkDevice2_Name='"VRmin Mic (Quest)"' -DkManufacturer_Name='"VRmin"' \
+  -DkDevice_HasInput=1 -DkDevice_HasOutput=0 -DkDevice2_HasInput=0 -DkDevice2_HasOutput=1 -DkDevice2_IsHidden=1 \
+  -DkNumber_Of_Channels=1 -DkCanBeDefaultSystemDevice=0 \
+  mic/BlackHole.c -framework CoreAudio -framework CoreFoundation -framework Accelerate -o "$D/MacOS/VRminMic" 2> app/compilacion_mic.log || falla app/compilacion_mic.log
+cp mic/Info.plist "$D/Info.plist"
 cp app/recursos/*.sh app/recursos/*.py app/recursos/*.json "$R/"
 cp app/recursos/LICENCIAS_DE_TERCEROS.md "$R/"
 mkdir -p "$R/steam" && cp app/recursos/steam/steamwebhelper.exe "$R/steam/"
@@ -50,6 +60,8 @@ for s in 16 32 128 256 512; do
   sips -z $((s*2)) $((s*2)) app/AppIcon.png --out "$I/icon_${s}x${s}@2x.png" >/dev/null
 done
 iconutil -c icns "$I" -o "$NUEVA/Contents/Resources/AppIcon.icns" || echo "Aviso: no se pudo armar el ícono"
+cp "$NUEVA/Contents/Resources/AppIcon.icns" "$R/VRminMic.driver/Contents/Resources/VRminMic.icns" 2>/dev/null || true
+codesign --force --sign - "$R/VRminMic.driver" || { echo "Falló la firma del micrófono"; exit 1; }
 if [ $PAQUETE = 1 ]; then
   # Sin cuenta de desarrollador de Apple: quien la baje la abre con clic derecho → Abrir.
   codesign --force --sign - "$R/arreglo_errores.dylib" || { echo "Falló la firma"; exit 1; }

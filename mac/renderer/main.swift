@@ -4001,6 +4001,72 @@ final class Perf {
     }
 }
 
+// MARK: - Micrófono del visor
+/// Lo que manda el micrófono del Quest (PCM de 16 bits, 48 kHz, mono) sale por «VRmin Mic»: se escribe en su salida
+/// oculta y los juegos lo escuchan en su entrada (ver mic/README.md). Solo con VR_MIC=quest.
+final class MicOut {
+    static let shared = MicOut()
+    static let enabled = env["VR_MIC"] == "quest"
+    private let lock = NSLock()
+    private var ring = [Int16](repeating: 0, count: 48000)   // (1 s)
+    private var rd = 0, wr = 0, count = 0, primed = false, started = false, failed = false
+    private var q: AudioQueueRef?
+    private let aq = DispatchQueue(label: "mic", qos: .userInteractive)
+    func push(_ d: Data) {
+        guard MicOut.enabled, !failed else { return }
+        let n = d.count / 2
+        guard n > 0 else { return }
+        lock.lock()
+        d.withUnsafeBytes { raw in
+            let s = raw.bindMemory(to: Int16.self)
+            for i in 0..<n { ring[wr] = s[i]; wr = (wr + 1) % ring.count }
+        }
+        count += n
+        if count > 9600 { rd = (rd + count - 2400) % ring.count; count = 2400 }   // (si se atrasa más de 200 ms, se pone al día)
+        let first = !started
+        started = true
+        lock.unlock()
+        if first { aq.async { self.open() } }
+    }
+    private func open() {
+        var fmt = AudioStreamBasicDescription(mSampleRate: 48000, mFormatID: kAudioFormatLinearPCM,
+                                              mFormatFlags: kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,
+                                              mBytesPerPacket: 2, mFramesPerPacket: 1, mBytesPerFrame: 2, mChannelsPerFrame: 1, mBitsPerChannel: 16, mReserved: 0)
+        var queue: AudioQueueRef?
+        var st = AudioQueueNewOutputWithDispatchQueue(&queue, &fmt, 0, aq) { [weak self] q, b in self?.fill(q, b) }
+        guard st == noErr, let queue else { print("[mic] No se pudo abrir la salida del micrófono (\(st))"); failed = true; return }
+        var uid = "VRminMic_2_UID" as CFString
+        st = AudioQueueSetProperty(queue, kAudioQueueProperty_CurrentDevice, &uid, UInt32(MemoryLayout<CFString>.size))
+        if st != noErr {
+            print("[mic] No encontré «VRmin Mic» (\(st)): instalalo en VRmin Host › Ajustes › Micrófono")
+            AudioQueueDispose(queue, true); failed = true; return
+        }
+        for _ in 0..<3 {
+            var b: AudioQueueBufferRef?
+            if AudioQueueAllocateBuffer(queue, 960, &b) == noErr, let b { fill(queue, b) }   // (10 ms cada uno)
+        }
+        st = AudioQueueStart(queue, nil)
+        if st != noErr { print("[mic] No arrancó la salida del micrófono (\(st))"); AudioQueueDispose(queue, true); failed = true; return }
+        q = queue
+        print("[mic] Micrófono del visor → VRmin Mic")
+    }
+    private func fill(_ queue: AudioQueueRef, _ b: AudioQueueBufferRef) {
+        let frames = Int(b.pointee.mAudioDataBytesCapacity) / 2
+        let p = b.pointee.mAudioData.assumingMemoryBound(to: Int16.self)
+        lock.lock()
+        if !primed && count >= 1440 { primed = true }   // (30 ms de colchón antes de empezar)
+        var k = 0
+        if primed {
+            while k < frames && count > 0 { p[k] = ring[rd]; rd = (rd + 1) % ring.count; count -= 1; k += 1 }
+            if count == 0 { primed = false }
+        }
+        lock.unlock()
+        while k < frames { p[k] = 0; k += 1 }
+        b.pointee.mAudioDataByteSize = UInt32(frames * 2)
+        AudioQueueEnqueueBuffer(queue, b, 0, nil)
+    }
+}
+
 // MARK: - Teclado del visor
 /// Escribe en la Mac lo que se toca en el teclado del Quest, y avisa cuándo hay un campo de texto activo
 /// (para abrir el teclado solo). Usa el permiso de Accesibilidad (el mismo del mouse).
@@ -4129,6 +4195,7 @@ let renderQueue = DispatchQueue(label: "render", qos: .userInteractive)
 let questDecoder = JSONDecoder()
 let questLock = NSLock()
 func handleQuestMessage(_ line: Data) {
+    if line.first == 0x0B { MicOut.shared.push(line.dropFirst()); return }   // micrófono del visor (PCM)
     questLock.lock(); defer { questLock.unlock() }
     guard let m = try? questDecoder.decode(InMsg.self, from: line) else { return }
     if m.type == "key" {
@@ -4206,6 +4273,24 @@ native.onDeskDrop = { p in
     } else { renderer.lobby?.requestDeskKey() }
 }
 native.start(handler: handleQuestMessage)
+
+// Micrófono del visor: el Quest graba solo mientras hay un juego abierto (y se le vuelve a avisar si se reconecta)
+let micQueue = DispatchQueue(label: "mic.estado")
+var micSent: Bool? = nil
+native.onConnect = { [prev = native.onConnect] in prev?(); micQueue.async { micSent = nil } }
+let micTimer = DispatchSource.makeTimerSource(queue: micQueue)
+micTimer.schedule(deadline: .now() + 1, repeating: 1)
+micTimer.setEventHandler {
+    guard MicOut.enabled else { return }
+    let want = native.isConnected && shared.gameActive
+    if micSent != want, native.isConnected {
+        var d = Data([3]); d.append(Data("{\"type\":\"mic\",\"on\":\(want)}".utf8)); native.send(d)
+        micSent = want
+        print(want ? "[mic] Pidiendo el micrófono del visor (hay un juego abierto)" : "[mic] Micrófono del visor apagado")
+    }
+    if !native.isConnected { micSent = nil }
+}
+micTimer.resume()
 
 let t0 = DispatchTime.now().uptimeNanoseconds
 let timer = DispatchSource.makeTimerSource(flags: .strict, queue: renderQueue)

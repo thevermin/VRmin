@@ -43,6 +43,7 @@ preparar_runtime "$RUNTIME" 2>&1 | tee -a "$LOG"
 #  la carpeta desde donde se abre el juego)
 [ "$RUNTIME" = "openvr" ] && /usr/bin/python3 "$RES/vrjuegos.py" controles_oc "$CARPETA" "$CARPETA/$(dirname "${EXE:-.}")" 2>&1 | tee -a "$LOG"
 gpu_luid_dxmt 2>&1 | tee -a "$LOG"
+microfono_wine 2>&1 | tee -a "$LOG"
 
 if [ "$LANZAR" = "directo" ] && [ -n "$EXE" ] && [ -f "$CARPETA/$EXE" ]; then
   # Directo: el juego es hijo de este proceso, así que recibe las variables de entorno y el diagnóstico.

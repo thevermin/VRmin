@@ -34,6 +34,32 @@ JSON
 }
 
 # openxr_activo RUTA_JSON [RUTA_JSON_32] (rutas de Windows; la segunda, para juegos de 32 bits)
+# Micrófono de los juegos: el que se eligió en VRmin Host (archivo «microfono»: el UID de CoreAudio del micrófono,
+# «VRminMic_UID» para el del visor; vacío = el de macOS). Wine lo toma como el micrófono predeterminado de Windows
+# (DefaultInput / DefaultVoiceInput de winecoreaudio, con el número de dispositivo que Wine le da a ese UID).
+microfono_wine() {
+  local uid; uid="$(cat "$P/microfono" 2>/dev/null)"
+  [ "$uid" = "$(cat "$Q/.microfono" 2>/dev/null)" ] && [ -f "$Q/.microfono" ] && return 0
+  local base='HKCU\Software\Wine\Drivers\winecoreaudio.drv'
+  if [ -z "$uid" ]; then
+    "$WINE" reg delete "$base" /v DefaultInput /f >/dev/null 2>&1
+    "$WINE" reg delete "$base" /v DefaultVoiceInput /f >/dev/null 2>&1
+  else
+    local hex id
+    hex="$("$WINE" reg query "$base\\devices\\1,$uid" /v guid 2>/dev/null | tr -d '\r' | awk '/REG_BINARY/ {print $3}')"
+    if [ ${#hex} -ne 32 ]; then   # (Wine todavía no lo vio: se le da un número fijo, el mismo que va a usar Wine)
+      hex="$(printf '%s' "$uid" | md5 -q 2>/dev/null || printf '%s' "$uid" | md5sum | cut -c1-32)"
+      "$WINE" reg add "$base\\devices\\1,$uid" /v guid /t REG_BINARY /d "$hex" /f >/dev/null 2>&1
+    fi
+    # bytes del GUID → {0.0.1.00000000}.{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX} (los tres primeros campos, al revés)
+    id="$(/usr/bin/python3 -c "import sys,uuid; print('{0.0.1.00000000}.{%s}' % str(uuid.UUID(bytes_le=bytes.fromhex(sys.argv[1]))).upper())" "$hex")"
+    "$WINE" reg add "$base" /v DefaultInput /t REG_SZ /d "$id" /f >/dev/null 2>&1
+    "$WINE" reg add "$base" /v DefaultVoiceInput /t REG_SZ /d "$id" /f >/dev/null 2>&1
+  fi
+  printf '%s' "$uid" > "$Q/.microfono"
+  if [ -n "$uid" ]; then say "Micrófono de los juegos: $uid" "Games microphone: $uid"; else say "Micrófono de los juegos: el de macOS" "Games microphone: macOS default"; fi
+}
+
 openxr_activo() {
   "$WINE" reg add 'HKLM\Software\Khronos\OpenXR\1' /v ActiveRuntime /t REG_SZ /d "$1" /f >/dev/null 2>&1
   [ -n "$2" ] && "$WINE" reg add 'HKLM\Software\Wow6432Node\Khronos\OpenXR\1' /v ActiveRuntime /t REG_SZ /d "$2" /f >/dev/null 2>&1

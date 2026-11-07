@@ -15,6 +15,19 @@ func L(_ es: String, _ args: CVarArg...) -> String {
 }
 
 private let EN: [String: String] = [
+    "El del visor (Quest)": "The headset's (Quest)",
+    "El que use macOS": "Whatever macOS uses",
+    "El visor graba solo mientras hay un juego abierto. Si tenés auriculares con micrófono conectados al Quest por USB-C, usa esos.": "The headset records only while a game is open. If you have a headset with a microphone plugged into the Quest's USB-C port, it uses that one.",
+    "Falta instalar «VRmin Mic», el micrófono por donde llega tu voz desde el visor. macOS pide tu contraseña una vez.": "“VRmin Mic” needs to be installed: it's the microphone your voice arrives through from the headset. macOS asks for your password once.",
+    "Micrófono": "Microphone",
+    "Micrófono VRmin Mic instalado": "VRmin Mic microphone installed",
+    "Micrófono VRmin Mic quitado": "VRmin Mic microphone removed",
+    "Micrófono de los juegos": "Games microphone",
+    "No se instaló el micrófono (¿se canceló la contraseña?)": "The microphone wasn't installed (was the password cancelled?)",
+    "Para auriculares con micrófono conectados a la Mac, elegilos acá. macOS pide permiso la primera vez que un juego usa el micrófono.": "For a headset with a microphone connected to the Mac, choose it here. macOS asks for permission the first time a game uses the microphone.",
+    "Quitar": "Remove",
+    "Uno que no está conectado": "One that isn't connected",
+    "VRmin Mic instalado": "VRmin Mic installed",
     "Abrir Steam": "Open Steam",
     "Abrí Steam, iniciá sesión y bajá tus juegos": "Open Steam, sign in and download your games",
     "Ahora no": "Not now",
