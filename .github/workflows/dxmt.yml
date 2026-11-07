@@ -58,7 +58,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64
-          path: dxmt/toolchains/llvm-darwin
+          path: toolchains/llvm-darwin   # (la misma ruta con que se guardó: si no, no la encuentra)
           fail-on-cache-miss: true
       - name: Herramientas
         run: |
@@ -72,7 +72,7 @@ jobs:
       - name: 64 bits (y winemetal.so)
         working-directory: dxmt
         run: |
-          meson setup --cross-file build-win64.txt -Dnative_llvm_path=toolchains/llvm-darwin -Dwine_install_path=toolchains/wine \
+          meson setup --cross-file build-win64.txt -Dnative_llvm_path="$GITHUB_WORKSPACE/toolchains/llvm-darwin" -Dwine_install_path=toolchains/wine \
             build64 --buildtype release --prefix "$(pwd)/install" --strip
           meson compile -C build64 && meson install -C build64
       - name: 32 bits
