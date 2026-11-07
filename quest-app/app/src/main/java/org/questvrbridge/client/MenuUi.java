@@ -553,6 +553,11 @@ final class MenuUi implements Link.Listener {
         int W = rootView.getWidth(), H = rootView.getHeight();
         if (W <= 0 || H <= 0) return;
         boolean vis = deskShowing && !panelOpen;
+        // Solo la pantalla de la Mac, sin barras negras: lo que sobra alrededor queda transparente (la pantalla toma la
+        // forma del monitor que se muestre, también en las salas con la pantalla fija), y el botón del menú va a su esquina
+        rootView.setBackgroundColor(vis ? Color.TRANSPARENT : Ui.BG);
+        menuButton.setTranslationX(vis ? deskFrame.getLeft() : 0);
+        menuButton.setTranslationY(vis ? deskFrame.getTop() : 0);
         host.onDeskRect(vis, deskFrame.getLeft() / (float) W, deskFrame.getTop() / (float) H,
                 deskFrame.getRight() / (float) W, deskFrame.getBottom() / (float) H);
     }

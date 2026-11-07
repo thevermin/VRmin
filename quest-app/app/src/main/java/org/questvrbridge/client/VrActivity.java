@@ -155,6 +155,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
         // La TV: el menú (Escritorio y Juegos) y la pantalla principal de la Mac
         Panel tv = createPanel(TV_ID, 1600, 1000, 2.2f, true);
         if (tv != null) {
+            tv.pres.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));   // (sin barras negras: ver MenuUi.reportDesk)
             tv.menu = new MenuUi(tv.pres.getContext(), this);
             show(tv, tv.menu.view());
             tv.menu.start();

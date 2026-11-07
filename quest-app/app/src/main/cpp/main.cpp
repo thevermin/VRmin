@@ -91,7 +91,7 @@ static std::mutex g_histLock;
 static std::atomic<int> g_sock{-1};
 static std::mutex g_sendLock;
 static std::atomic<bool> g_running{true};
-static std::atomic<int> g_targetFps{72};
+static std::atomic<int> g_targetFps{90};
 static std::atomic<bool> g_needKey{true};
 static std::atomic<uint32_t> g_framesIn{0}, g_framesDecoded{0}, g_framesDropped{0}, g_audioChunks{0};
 static std::string g_serverName;
@@ -8950,7 +8950,7 @@ static void renderFrame(App &app) {
             XrCompositionLayerCylinderKHR &c = cyls[ncyl++];
             c = {XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
             c.next = chain;
-            if (fading) c.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            if (fading || (p->tv && g_deskVisible)) c.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;   // (la TV: lo que sobra del escritorio, transparente)
             c.space = app.space;
             c.eyeVisibility = eye;
             c.subImage.swapchain = sc;
@@ -8968,7 +8968,7 @@ static void renderFrame(App &app) {
             q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
             q.next = chain;
             q.space = app.space;
-            if (p->parent || fading || p->id == GAME_MENU_ID || p->id == LOADING_ID) q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;   // barra de botones y menú del juego: bordes redondos
+            if (p->parent || fading || p->id == GAME_MENU_ID || p->id == LOADING_ID || (p->tv && g_deskVisible)) q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;   // barra de botones y menú del juego: bordes redondos
             q.eyeVisibility = eye;
             q.subImage.swapchain = sc;
             q.subImage.imageRect = {{0, 0}, {p->w, p->h}};

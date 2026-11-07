@@ -17,7 +17,7 @@
 #include <vector>
 #include "json.h"
 
-#define VRMIN_WIN_VERSION "0.1"
+#define VRMIN_WIN_VERSION "0.2"
 
 // ---------- Textos y registro ----------
 extern bool IDIOMA_ES;

@@ -80,6 +80,8 @@ Put the Quest on your monitor: it tracks you with its cameras while the game sho
 - **Direct GPU copy**: game frames go from the game to the video encoder without leaving the GPU
 - **Foveated encoding**: sharper in the center, where you look
 - **Your Mac's sound** in the headset, and the **headset keyboard** types on your Mac
+- **Your microphone in games**: the Quest's own, or any microphone on your Mac
+- **Simple quality settings**: Low, Medium, High or Ultra, with the right one for your Mac marked
 - English and Spanish
 
 ## How it works
