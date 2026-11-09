@@ -843,6 +843,7 @@ typedef struct Swapchain {
     VkImage vimg[3]; VkDeviceMemory vmem[3];   /* (sesión Vulkan) */
     GLuint gltex[3]; int isGl;                 /* (sesión OpenGL) */
     uint32_t next, released;
+    uint32_t gen;   /* (cuántas imágenes entregó: si no cambió, la imagen es la misma) */
     /* (OpenComposite de VRmin: la imagen de srcIdx no se copió a la swapchain; se lee directo de la textura del juego) */
     ID3D11Texture2D *src; UINT srcSub; UINT srcX, srcY; uint32_t srcIdx;
 } Swapchain;
@@ -856,6 +857,8 @@ typedef struct Space {
 } Space;
 
 #define NQ 6   /* (paneles flotantes que se pegan sobre la imagen, en el orden del juego) */
+/* (de qué imagen es la copia de un panel flotante: swapchain, imagen entregada y recorte) */
+typedef struct { const void *sc; uint32_t gen; int x, y, w, h; } QKey;
 typedef struct Session {
     ID3D11Device *dev;
     ID3D11DeviceContext *ctx;
@@ -880,6 +883,10 @@ typedef struct Session {
     struct { int on, rgba, blend, premul, flip; uint32_t w, h; XrPosef pose; XrExtent2Df size; XrPosef eye[2]; XrFovf fov[2]; } vkQ[STAGES][NQ];
     /* (D3D11: la imagen de cada panel se copia a una textura de lectura; vkQ guarda dónde cae) */
     ID3D11Texture2D *dQ[STAGES][NQ]; uint32_t dQw[STAGES][NQ], dQh[STAGES][NQ]; DXGI_FORMAT dQf[STAGES][NQ];
+    /* (D3D11: la última imagen leída de cada panel. Si el juego no lo cambió desde entonces, no se vuelve a leer de la
+     * GPU: los menús quietos no frenan cada cuadro) */
+    struct { QKey key; uint8_t *px; size_t cap; int ok; } dQc[NQ];
+    int dQskip[STAGES][NQ]; QKey dQkey[STAGES][NQ];   /* (de qué imagen es cada copia, para guardarla al leerla) */
     /* OpenGL: el contexto del juego, y para leer la imagen un framebuffer y dos PBO */
     int gl; HDC gldc; HGLRC glrc;
     GLuint glFbo, glPbo[STAGES]; GLsync glSync[STAGES];
@@ -2297,6 +2304,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroySession(XrSession session) {
     }
     for (int k = 0; k < 3; k++) if (s->staging[k]) ID3D11Texture2D_Release(s->staging[k]);
     for (int k = 0; k < STAGES; k++) for (int j = 0; j < NQ; j++) if (s->dQ[k][j]) ID3D11Texture2D_Release(s->dQ[k][j]);
+    for (int j = 0; j < NQ; j++) free(s->dQc[j].px);
     EnterCriticalSection(&g_gpuLock); gpu_release(); g_gpuShmGen = -1; g_gpuCtx = NULL; LeaveCriticalSection(&g_gpuLock);
     if (s->ctx) ID3D11DeviceContext_Release(s->ctx);
     if (s->dev) ID3D11Device_Release(s->dev);
@@ -2731,6 +2739,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrReleaseSwapchainImage(XrSwapchain h, const X
     (void)i;
     Swapchain *sc = (Swapchain *)h;
     sc->released = (sc->next + sc->count - 1) % sc->count;
+    sc->gen++;
     return XR_SUCCESS;
 }
 
@@ -2774,7 +2783,6 @@ static int d3d_quads_copy(Session *s, int k, const XrCompositionLayerProjection 
 static uint32_t d3d_quads_write(Session *s, int k, uint8_t *dst, size_t room, size_t *used);
 static void quad_eyes(Session *s, int k, int qn, const XrCompositionLayerProjection *pl, uint32_t id);
 
-/* Copia los dos ojos (en la GPU) lado a lado en dst. 0 = algo no coincide (se descarta el cuadro) */
 /* La imagen que hay que leer de una swapchain (D3D11): la última entregada, o la textura del juego si OpenComposite de
  * VRmin no la copió (vrmin_image_source). Ajusta sub y el recorte. */
 static ID3D11Resource *sc_image(Swapchain *sc, UINT *sub, D3D11_BOX *box) {
@@ -2814,6 +2822,7 @@ __declspec(dllexport) void __cdecl vrmin_log(const char *msg) {
     if (msg) logmsg("%s", msg);
 }
 
+/* Copia los dos ojos (en la GPU) lado a lado en dst. 0 = algo no coincide (se descarta el cuadro) */
 static int copy_eyes(Session *s, const XrCompositionLayerProjection *pl, ID3D11Texture2D *dst, uint32_t ew, uint32_t eh, DXGI_FORMAT fmt) {
     for (int e = 0; e < 2; e++) {
         const XrSwapchainSubImage *si = &pl->views[e].subImage;
@@ -3208,6 +3217,10 @@ static int d3d_quads_copy(Session *s, int k, const XrCompositionLayerProjection 
         if (!qs || !qs->img[0] || (qs->dxgi != DXGI_FORMAT_R8G8B8A8_TYPELESS && qs->dxgi != DXGI_FORMAT_B8G8R8A8_TYPELESS)
             || qx < 0 || qy < 0 || qw <= 0 || qh <= 0 || qx + qw > (int)qs->w || qy + qh > (int)qs->h || qw > 4096 || qh > 4096) continue;
         int j = qn;
+        const QKey key = { qs, qs->gen, qx, qy, qw, qh };
+        s->dQskip[k][j] = s->dQc[j].ok && !memcmp(&s->dQc[j].key, &key, sizeof key);
+        if (s->dQskip[k][j]) { quad_meta(s, k, j, pl, ql, qs, qw, qh, qflip, &tk); qn++; continue; }   /* (igual que la última vez) */
+        s->dQkey[k][j] = key;
         /* (la textura de lectura solo crece: los paneles cambian de tamaño seguido) */
         if (!s->dQ[k][j] || s->dQw[k][j] < (uint32_t)qw || s->dQh[k][j] < (uint32_t)qh || s->dQf[k][j] != qs->dxgi) {
             if (s->dQ[k][j]) ID3D11Texture2D_Release(s->dQ[k][j]);
@@ -3234,18 +3247,27 @@ static int d3d_quads_copy(Session *s, int k, const XrCompositionLayerProjection 
 static uint32_t d3d_quads_write(Session *s, int k, uint8_t *dst, size_t room, size_t *used) {
     uint32_t n = 0; size_t at = 0;
     int64_t q0 = now_ns(); int any = 0;
-    for (int j = 0; j < NQ; j++) if (s->vkQ[k][j].on && s->dQ[k][j]) {
-        any = 1;
+    for (int j = 0; j < NQ; j++) if (s->vkQ[k][j].on && (s->dQ[k][j] || s->dQskip[k][j])) {
         uint32_t w = s->vkQ[k][j].w, h = s->vkQ[k][j].h;
         size_t px = (size_t)w * h * 4;
         if (at + sizeof(QuadHdr) + px > room) break;
+        QuadHdr *qh = (QuadHdr *)(dst + at);
+        uint8_t *o = dst + at + sizeof(QuadHdr);
+        if (s->dQskip[k][j]) {   /* (no cambió: la copia guardada) */
+            if (!s->dQc[j].ok || s->dQc[j].cap < px) continue;
+            vk_quad_header(s, k, j, qh);
+            memcpy(o, s->dQc[j].px, px);
+            at += sizeof(QuadHdr) + px; n++;
+            continue;
+        }
+        any = 1;
         D3D11_MAPPED_SUBRESOURCE m;
         if (FAILED(ID3D11DeviceContext_Map(s->ctx, (ID3D11Resource *)s->dQ[k][j], 0, D3D11_MAP_READ, 0, &m))) continue;
-        QuadHdr *qh = (QuadHdr *)(dst + at);
         vk_quad_header(s, k, j, qh);
-        uint8_t *o = dst + at + sizeof(QuadHdr);
         for (uint32_t y = 0; y < h; y++) memcpy(o + (size_t)y * w * 4, (const uint8_t *)m.pData + (size_t)y * m.RowPitch, (size_t)w * 4);
         ID3D11DeviceContext_Unmap(s->ctx, (ID3D11Resource *)s->dQ[k][j], 0);
+        if (s->dQc[j].cap < px) { free(s->dQc[j].px); s->dQc[j].px = (uint8_t *)malloc(px); s->dQc[j].cap = s->dQc[j].px ? px : 0; }
+        if (s->dQc[j].px) { memcpy(s->dQc[j].px, o, px); s->dQc[j].key = s->dQkey[k][j]; s->dQc[j].ok = 1; }
         at += sizeof(QuadHdr) + px; n++;
     }
     if (any) { g_dgQuadMs += (now_ns() - q0) / 1e6; g_dgQuadN++; }
