@@ -52,6 +52,7 @@ cp server.py "$R/"
 cp web/index.html "$R/web/"
 cp openxr/questvrbridge_openxr.dll openxr/questvrbridge_openxr.json "$R/openxr/"
 [ -f openxr/questvrbridge_openxr32.dll ] && cp openxr/questvrbridge_openxr32.dll openxr/questvrbridge_openxr32.json "$R/openxr/"
+mkdir -p "$R/opencomposite" && cp opencomposite/vrclient_x64.dll opencomposite/vrclient.dll opencomposite/README.md opencomposite/LICENSE-OpenComposite.txt "$R/opencomposite/"
 chmod +x "$R"/*.sh "$R/QuestRenderer"
 # Ícono (a partir de app/AppIcon.png)
 I="$(mktemp -d)/AppIcon.iconset"; mkdir -p "$I"

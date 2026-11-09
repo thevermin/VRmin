@@ -27,10 +27,6 @@ TPL_SHA="bbe996e4e4375318485953d0c7818b7b4b0a4dc1f13303bcc584f99f7602f78d"
 DXMT_URL="https://github.com/ramiabih/play-windows-steam-on-mac/releases/download/dxmt-fork-v1/dxmt-fork-macos-arm64.tar.gz"
 DXMT_SHA="51043dd4cf585d52b1415c452052a0953dc01f9f9663ae0c3d6984907c25fab5"
 DXMT_DIR="$P/dxmt/fork-v1"
-# OpenComposite 64 bits: la versión de GameNative (v10). La de znix.xyz que se usaba antes sólo llega a
-# IVRSystem_022, y los juegos de 2026 piden IVRSystem_026 (No Man's Sky se cierra al arrancar)
-OC_URL="https://github.com/GameNative/opencomposite/releases/download/v10/opencomposite_x64.dll"
-OC_SHA="0d395d267734bba3efa514edb836e728ac8c94ae2228c5ea31fca51a2d2819d8"
 export WINEDEBUG=-all
 
 paso() { echo; say "==> $1" "==> ${2:-$1}"; }
@@ -117,7 +113,7 @@ Q="$WINEPREFIX/drive_c/questvrbridge"
 mkdir -p "$Q"
 cp "$RES/openxr/questvrbridge_openxr.dll" "$RES/openxr/questvrbridge_openxr.json" "$Q/"
 "$WINE" reg add 'HKLM\Software\Khronos\OpenXR\1' /v ActiveRuntime /t REG_SZ /d 'C:\questvrbridge\questvrbridge_openxr.json' /f
-# (y el de 32 bits, para juegos de 32 bits; jugar.sh baja OpenComposite de 32 bits la primera vez)
+# (y el de 32 bits, para juegos de 32 bits; jugar.sh pone OpenComposite de 32 bits la primera vez)
 if [ -f "$RES/openxr/questvrbridge_openxr32.dll" ]; then
   cp "$RES/openxr/questvrbridge_openxr32.dll" "$RES/openxr/questvrbridge_openxr32.json" "$Q/"
   "$WINE" reg add 'HKLM\Software\Wow6432Node\Khronos\OpenXR\1' /v ActiveRuntime /t REG_SZ /d 'C:\questvrbridge\questvrbridge_openxr32.json' /f && touch "$Q/.runtime32"
@@ -125,13 +121,12 @@ fi
 "$WINESERVER" -w
 
 paso "OpenComposite (para juegos de SteamVR/OpenVR)" "OpenComposite (for SteamVR/OpenVR games)"
-OC="$P/descargas/opencomposite_x64_v10.dll"
-mkdir -p "$P/descargas"
-[ "$(shasum -a 256 "$OC" 2>/dev/null | cut -d' ' -f1)" = "$OC_SHA" ] || curl -fL --progress-bar -o "$OC" "$OC_URL" || true
-if [ "$(shasum -a 256 "$OC" 2>/dev/null | cut -d' ' -f1)" = "$OC_SHA" ] && file -b "$OC" 2>/dev/null | grep -qE 'PE32\+.*DLL'; then
+# (el que viene con VRmin Host, compilado por VRmin desde el código de GameNative: ver opencomposite/README.md)
+OC="$RES/opencomposite/vrclient_x64.dll"
+if [ -f "$OC" ]; then
   mkdir -p "$Q/opencomposite/bin"
   cp "$OC" "$Q/opencomposite/bin/vrclient_x64.dll"
-  echo "$OC_SHA" > "$Q/opencomposite/.version64"
+  shasum -a 256 "$OC" | cut -d' ' -f1 > "$Q/opencomposite/.version64"
   U="$WINEPREFIX/drive_c/users/$USER/AppData/Local/openvr"
   mkdir -p "$U"
   cat > "$U/openvrpaths.vrpath" <<'JSON'
@@ -146,8 +141,7 @@ if [ "$(shasum -a 256 "$OC" 2>/dev/null | cut -d' ' -f1)" = "$OC_SHA" ] && file 
 JSON
   say "OpenComposite instalado (los juegos de SteamVR lo usan sin modificar sus archivos)" "OpenComposite installed (SteamVR games use it without changing their files)"
 else
-  say "AVISO: no pude descargar OpenComposite. Los juegos de OpenXR andan igual; los de SteamVR/OpenVR no." "WARNING: couldn't download OpenComposite. OpenXR games still work; SteamVR/OpenVR games don't."
-  rm -f "$OC"
+  say "AVISO: a VRmin Host le falta OpenComposite. Los juegos de OpenXR andan igual; los de SteamVR/OpenVR no." "WARNING: VRmin Host is missing OpenComposite. OpenXR games still work; SteamVR/OpenVR games don't."
 fi
 
 echo

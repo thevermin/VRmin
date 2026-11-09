@@ -66,11 +66,20 @@ openxr_activo() {
   return 0
 }
 
+# OpenComposite: el que viene con VRmin Host (compilado por VRmin desde el código de GameNative, ver
+# opencomposite/README.md; GPLv3). Se copia al motor cuando cambia.
+poner_oc() { # archivo-de-VRmin nombre-en-el-motor marca
+  local f="$RES/opencomposite/$1" sha
+  sha="$(shasum -a 256 "$f" 2>/dev/null | cut -d' ' -f1)"
+  [ -n "$sha" ] || { echo "Falta $1 en VRmin Host"; return 0; }
+  [ "$(cat "$Q/opencomposite/$3" 2>/dev/null)" = "$sha" ] && return 0
+  mkdir -p "$Q/opencomposite/bin"
+  cp "$f" "$Q/opencomposite/bin/$2" && echo "$sha" > "$Q/opencomposite/$3" && echo "OpenComposite instalado ($2)"
+  return 0
+}
+
 # Juegos de 32 bits (Half-Life 2: VR Mod): nuestro runtime de 32 bits registrado y OpenComposite de 32 bits
-# (vrclient.dll, al lado del de 64). Una sola vez; OpenComposite se baja si falta.
-# (32 bits: la versión de GameNative, con las interfaces de OpenVR nuevas que pide Half-Life 2: VR Mod; GPLv3)
-OC_URL_32="https://github.com/GameNative/opencomposite/releases/download/v10/opencomposite_x86.dll"
-OC_SHA_32="86a77b58c817ed0b14f4e7963c1364d47f86b53cc75fed0ba6d04e87d1040059"
+# (vrclient.dll, al lado del de 64). Una sola vez.
 asegurar_32bits() {
   [ -f "$Q/questvrbridge_openxr32.dll" ] || return 0
   if [ ! -f "$Q/.runtime32" ]; then
@@ -84,40 +93,12 @@ asegurar_32bits() {
     "$WINE" reg add 'HKCU\Software\Wine\AppDefaults\hl2.exe\Direct3D' /v renderer /t REG_SZ /d vulkan /f >/dev/null 2>&1 \
       && "$WINE" reg add 'HKCU\Software\Wine\AppDefaults\hl2.exe\Direct3D' /v csmt /t REG_DWORD /d 0 /f >/dev/null 2>&1 && touch "$Q/.hl2vk2"
   fi
-  local oc="$P/descargas/opencomposite_x86_v10.dll"
-  if [ "$(cat "$Q/opencomposite/.version32" 2>/dev/null)" != "$OC_SHA_32" ]; then
-    mkdir -p "$P/descargas" "$Q/opencomposite/bin"
-    [ "$(shasum -a 256 "$oc" 2>/dev/null | cut -d' ' -f1)" = "$OC_SHA_32" ] || curl -fsL -o "$oc" "$OC_URL_32" || true
-    if [ "$(shasum -a 256 "$oc" 2>/dev/null | cut -d' ' -f1)" = "$OC_SHA_32" ]; then
-      cp "$oc" "$Q/opencomposite/bin/vrclient.dll" && echo "$OC_SHA_32" > "$Q/opencomposite/.version32" \
-        && echo "OpenComposite de 32 bits instalado"
-    else
-      echo "No se pudo descargar OpenComposite de 32 bits"
-    fi
-  fi
-  return 0
+  poner_oc vrclient.dll vrclient.dll .version32
 }
 
-# Juegos de 64 bits: la misma versión de GameNative (v10), con las interfaces de OpenVR nuevas que piden los juegos
-# de 2026 (IVRSystem_026, IVRCompositor_029, IVROverlay_028, IVRInput_011). La compilación que se bajaba antes
-# (znix.xyz, rama openxr) sólo llega a IVRSystem_022, y un juego nuevo se cierra al arrancar con
-# «OpenComposite DLLMain ERROR: unknown/unsupported interface IVRSystem_026» (No Man's Sky).
-# (GPLv3)
-OC_URL_64="https://github.com/GameNative/opencomposite/releases/download/v10/opencomposite_x64.dll"
-OC_SHA_64="0d395d267734bba3efa514edb836e728ac8c94ae2228c5ea31fca51a2d2819d8"
-asegurar_64bits() {
-  local oc="$P/descargas/opencomposite_x64_v10.dll"
-  [ "$(cat "$Q/opencomposite/.version64" 2>/dev/null)" = "$OC_SHA_64" ] && return 0
-  mkdir -p "$P/descargas" "$Q/opencomposite/bin"
-  [ "$(shasum -a 256 "$oc" 2>/dev/null | cut -d' ' -f1)" = "$OC_SHA_64" ] || curl -fsL -o "$oc" "$OC_URL_64" || true
-  if [ "$(shasum -a 256 "$oc" 2>/dev/null | cut -d' ' -f1)" = "$OC_SHA_64" ]; then
-    cp "$oc" "$Q/opencomposite/bin/vrclient_x64.dll" && echo "$OC_SHA_64" > "$Q/opencomposite/.version64" \
-      && echo "OpenComposite de 64 bits instalado"
-  else
-    echo "No se pudo descargar OpenComposite de 64 bits (sigo con el que ya estaba)"
-  fi
-  return 0
-}
+# Juegos de 64 bits (con las interfaces de OpenVR nuevas que piden los juegos de 2026, como IVRSystem_026 de
+# No Man's Sky)
+asegurar_64bits() { poner_oc vrclient_x64.dll vrclient_x64.dll .version64; }
 
 # Copia directa (texturas compartidas de DXMT): DXMT reconoce la GPU por su número de Metal (registryID, dado vuelta),
 # y Wine le había puesto otro número propio (LUID). Si no coinciden, DXMT no puede compartir texturas. Se le pone a

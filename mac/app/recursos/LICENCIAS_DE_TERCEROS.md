@@ -11,7 +11,7 @@ Host downloads them from their official releases when you install the engine.
 | [Wine](https://www.winehq.org) (macOS build by [Gcenx](https://github.com/Gcenx/macOS_Wine_builds)) | LGPL 2.1 or later | Downloaded separately when installing the engine |
 | [DXMT](https://github.com/3Shain/dxmt) ([notpop](https://github.com/notpop/dxmt)'s fork, built by [ramiabih](https://github.com/ramiabih/play-windows-steam-on-mac)) | MIT (the version VRmin uses; current DXMT is LGPL 2.1) | Downloaded separately when installing the engine |
 | [Sikarugir](https://github.com/Sikarugir-App) libraries (GStreamer and others) | Various (LGPL and other free licenses) | Downloaded separately when installing the engine |
-| [OpenComposite](https://gitlab.com/znixian/OpenOVR) ([GameNative](https://github.com/GameNative/opencomposite)'s build) | GPL 3 | Downloaded separately when installing the engine |
+| [OpenComposite](https://gitlab.com/znixian/OpenOVR) (built by VRmin from [GameNative](https://github.com/GameNative/opencomposite)'s source, see `opencomposite/README.md`) | GPL 3 | Included (`opencomposite/`) |
 | [BlackHole](https://github.com/ExistentialAudio/BlackHole) (Existential Audio) | GPL 3 | Included, compiled as the “VRmin Mic” virtual microphone (source in `mac/mic`) |
 | steamwebhelper wrapper, from [play-windows-steam-on-mac](https://github.com/ramiabih/play-windows-steam-on-mac) | MIT | Included (steam/steamwebhelper.exe) |
 | [OpenXR SDK](https://github.com/KhronosGroup/OpenXR-SDK) (headers and loader) | Apache 2.0 | Included in the Quest app and the runtime |
