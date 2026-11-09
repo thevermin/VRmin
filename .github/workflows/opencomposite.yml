@@ -1,0 +1,75 @@
+name: OpenComposite para VRmin
+# OpenComposite compilado desde el código de GameNative/opencomposite (el commit de mac/opencomposite/COMMIT), con
+# los cambios de VRmin (mac/opencomposite/*.patch). Guarda vrclient_x64.dll y vrclient.dll en mac/opencomposite
+# (los usa crear_app.sh).
+on:
+  push:
+    branches: [main]
+    paths: ['mac/opencomposite/COMMIT', 'mac/opencomposite/*.patch', '.github/workflows/opencomposite.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  VULKAN_SDK_VERSION: 1.3.296.0
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: vrmin }
+      - name: Commit de OpenComposite
+        id: commit
+        shell: bash
+        run: echo "sha=$(tr -d '[:space:]' < vrmin/mac/opencomposite/COMMIT)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: GameNative/opencomposite
+          ref: ${{ steps.commit.outputs.sha }}
+          submodules: recursive
+          path: oc
+      - name: Vulkan SDK, guardado entre compilaciones
+        id: vulkan-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}
+          key: vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}-with-32bit
+      - name: Instalar el Vulkan SDK
+        if: steps.vulkan-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $v = $env:VULKAN_SDK_VERSION
+          $installer = "$env:RUNNER_TEMP\VulkanSDK-$v-Installer.exe"
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/$v/windows/VulkanSDK-$v-Installer.exe" -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList @("--accept-licenses", "--default-answer", "--confirm-command", "install", "com.lunarg.vulkan.32bit") -Wait -NoNewWindow
+          if (-not (Test-Path "C:\VulkanSDK\$v\Lib32\vulkan-1.lib")) { throw "Vulkan SDK install failed" }
+      - name: Cambios de VRmin
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for p in vrmin/mac/opencomposite/*.patch; do echo "== $p"; git -C oc apply --whitespace=nowarn "../$p"; done
+      - name: Compilar (64 y 32 bits)
+        shell: pwsh
+        run: |
+          .\oc\gamenative\build.ps1 -VulkanSdk "C:\VulkanSDK\$env:VULKAN_SDK_VERSION" -Version vrmin -Arch x64
+          .\oc\gamenative\build.ps1 -VulkanSdk "C:\VulkanSDK\$env:VULKAN_SDK_VERSION" -Version vrmin -Arch x86
+          Get-Content oc\build\out\*.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opencomposite-vrmin
+          path: |
+            oc/build/out/opencomposite_x64.dll
+            oc/build/out/opencomposite_x86.dll
+          retention-days: 7
+      - name: Guardar los DLL en el repositorio (los usa crear_app.sh)
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          cd vrmin
+          cp ../oc/build/out/opencomposite_x64.dll mac/opencomposite/vrclient_x64.dll
+          cp ../oc/build/out/opencomposite_x86.dll mac/opencomposite/vrclient.dll
+          cp ../oc/LICENSE.txt mac/opencomposite/LICENSE-OpenComposite.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mac/opencomposite
+          git commit -qm "Build OpenComposite" || exit 0
+          for i in 1 2 3; do git pull -q --rebase && git push -q && break; sleep 3; done
