@@ -283,7 +283,8 @@ final class Foveator {
     }
     private var quadTex: [MTLTexture?] = Array(repeating: nil, count: 8)
     /// Lo mismo, con el cuadro ya en la GPU (copia directa: una textura compartida con el juego, los dos ojos lado a lado)
-    func warpTexture(_ src: MTLTexture, ew: Int, eh: Int, rects: [SIMD4<Float>], into pb: CVPixelBuffer, quads: [GameQuad] = []) -> Bool {
+    /// onSourceRead: se llama cuando la GPU terminó de copiar src (el juego ya puede volver a usar su textura)
+    func warpTexture(_ src: MTLTexture, ew: Int, eh: Int, rects: [SIMD4<Float>], into pb: CVPixelBuffer, quads: [GameQuad] = [], onSourceRead: (() -> Void)? = nil) -> Bool {
         // (se lee como colores sin convertir, igual que los píxeles por memoria)
         let view: MTLPixelFormat = src.pixelFormat == .rgba8Unorm_srgb ? .rgba8Unorm : src.pixelFormat == .bgra8Unorm_srgb ? .bgra8Unorm : src.pixelFormat
         var qt: [(MTLTexture, GameQuad)] = []   // (paneles flotantes: los sube el procesador, son chicos)
@@ -294,7 +295,7 @@ final class Foveator {
             tx.replace(region: MTLRegionMake2D(0, 0, q.w, q.h), mipmapLevel: 0, withBytes: q.pixels, bytesPerRow: q.w * 4)
             qt.append((tx, q))
         }
-        return warpCore(ew: ew, eh: eh, store: src.pixelFormat, view: view, inMode: .private, rects: rects, into: pb, quads: qt) { cb, e, inT in
+        return warpCore(ew: ew, eh: eh, store: src.pixelFormat, view: view, inMode: .private, rects: rects, into: pb, quads: qt, onFilled: onSourceRead) { cb, e, inT in
             guard let b = cb.makeBlitCommandEncoder() else { return }
             b.copy(from: src, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: e * ew, y: 0, z: 0), sourceSize: MTLSize(width: ew, height: eh, depth: 1),
                    to: inT, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
@@ -305,13 +306,15 @@ final class Foveator {
     /// store: formato de la imagen de cada ojo · view: cómo se lee (sin pasar de sRGB a lineal) · fill: la llena (en cb)
     /// inMode: memoria de la imagen de cada ojo (compartida si la llena la CPU; privada si la llena la GPU)
     private func warpCore(ew: Int, eh: Int, store: MTLPixelFormat, view: MTLPixelFormat, inMode: MTLStorageMode, rects: [SIMD4<Float>], into pb: CVPixelBuffer,
-                          quads: [(MTLTexture, GameQuad)] = [], fill: (MTLCommandBuffer, Int, MTLTexture) -> Void) -> Bool {
+                          quads: [(MTLTexture, GameQuad)] = [], onFilled: (() -> Void)? = nil, fill: (MTLCommandBuffer, Int, MTLTexture) -> Void) -> Bool {
         let fmt = view
         guard let full = source(SW, SH, .bgra8Unorm) else { fail("no se pudo crear la imagen completa"); return false }
         var cvt: CVMetalTexture?
         let cr = CVMetalTextureCacheCreateTextureFromImage(nil, cache, pb, nil, .bgra8Unorm, W, H, 0, &cvt)
         guard let c = cvt, let dst = CVMetalTextureGetTexture(c) else { fail("la imagen a codificar no se pudo usar en la GPU (\(cr))"); return false }
-        guard let cb = queue.makeCommandBuffer() else { fail("sin buffer de comandos"); return false }
+        // (la copia de cada ojo va en su propio buffer de comandos: al terminar, la imagen del juego queda libre
+        // antes de que termine el resto)
+        guard let cbFill = queue.makeCommandBuffer(), let cb = queue.makeCommandBuffer() else { fail("sin buffer de comandos"); return false }
         var draw: [(MTLTexture, MTLViewport)] = []
         for e in 0..<2 {
             let r = rects[e]
@@ -319,7 +322,7 @@ final class Foveator {
             let tw = max(16, Int((r.z * Float(EYE)).rounded())), th = max(16, Int((r.w * Float(SH)).rounded()))
             guard let inStore = tex(ew, eh, store, store == view ? [.shaderRead] : [.shaderRead, .pixelFormatView], inMode, reuse: eyeIn[e]) else { fail("no se pudo crear la imagen del ojo"); return false }
             eyeIn[e] = inStore
-            fill(cb, e, inStore)
+            fill(cbFill, e, inStore)
             if store != view && (eyeView[e] == nil || eyeView[e]?.parent !== inStore) { eyeView[e] = inStore.makeTextureView(pixelFormat: view) }
             guard let inT = store == view ? inStore : eyeView[e] else { fail("no se pudo leer la imagen del ojo"); return false }
             var use: MTLTexture = inT
@@ -337,6 +340,8 @@ final class Foveator {
             }
             draw.append((use, MTLViewport(originX: Double(e * EYE + tx), originY: Double(ty), width: Double(tw), height: Double(th), znear: 0, zfar: 1)))
         }
+        if let onFilled { cbFill.addCompletedHandler { _ in onFilled() } }
+        cbFill.commit()   // (antes que cb: la GPU los hace en ese orden)
         // La imagen completa de los dos ojos (negro donde el campo de visión se recortó)
         let rp = MTLRenderPassDescriptor()
         rp.colorAttachments[0].texture = full
@@ -374,6 +379,7 @@ final class Foveator {
         cb.commit()
         cb.waitUntilCompleted()
         withExtendedLifetime(c) { }
+        if cb.gpuEndTime > cb.gpuStartTime { Perf.shared.addMacGpu((cb.gpuEndTime - max(cb.gpuStartTime, cbFill.gpuStartTime)) * 1000) }
         if cb.status == .error { fail("la GPU dio un error: \(cb.error.map { "\($0)" } ?? "?")"); return false }
         okFrames += 1
         if okFrames == 1 { print("[juego] Imagen del juego en la GPU: \(ew)x\(eh) por ojo → \(W)x\(H) para el visor") }
@@ -383,6 +389,20 @@ final class Foveator {
     private func fail(_ why: String) {
         failCount += 1
         if why != lastFail || failCount % 300 == 1 { lastFail = why; print("[juego] ERROR armando la imagen del juego: \(why) (\(failCount) veces)") }
+    }
+}
+/// Libera una sola vez un lugar de la memoria compartida (lo puede pedir la GPU al terminar de copiar, o el hilo que
+/// recibe el cuadro)
+final class SlotRelease {
+    private let state: UnsafeMutablePointer<Int32>, lock = NSLock()
+    private var done = false
+    init(_ state: UnsafeMutablePointer<Int32>) { self.state = state }
+    func fire() {
+        lock.lock(); defer { lock.unlock() }
+        if done { return }
+        done = true
+        OSMemoryBarrier()
+        state.pointee = 0
     }
 }
 /// Copia directa: abre las texturas que el juego comparte (DXMT las registra en el sistema con un nombre)
@@ -1409,11 +1429,16 @@ final class GameLink {
                     frameLock.lock()
                     setStage("procesando imagen")
                     let quads = buf[0] == 13 ? readQuads(UnsafeRawPointer(m + 64 + slot * shmSlot), slot: slot, slotSize: shmSlot, from: 0, count: Int(buf[11])) : []
-                    handleTexture(gpuTex[slot], poseId: poseId, ew: ew, eh: eh, quads: quads)
+                    // (el lugar se libera apenas la GPU copió la imagen, así el juego no tiene que descartar cuadros
+                    // mientras se termina de armar este)
+                    let free = SlotRelease(state)
+                    handleTexture(gpuTex[slot], poseId: poseId, ew: ew, eh: eh, quads: quads, release: free.fire)
                     frameLock.unlock()
+                    free.fire()   // (si no se llegó a copiar; si se copió, la GPU ya terminó: warpTexture espera)
+                } else {
+                    OSMemoryBarrier()
+                    state.pointee = 0
                 }
-                OSMemoryBarrier()
-                state.pointee = 0   // (la GPU ya terminó de leerla: warpTexture espera)
             case 2:
                 if n > 10 {
                     setStage("esperando turno")
@@ -1534,7 +1559,7 @@ final class GameLink {
         }
         return quads
     }
-    private func handleTexture(_ tex: MTLTexture, poseId: UInt32, ew: Int, eh: Int, quads: [Foveator.GameQuad] = []) {
+    private func handleTexture(_ tex: MTLTexture, poseId: UInt32, ew: Int, eh: Int, quads: [Foveator.GameQuad] = [], release: (() -> Void)? = nil) {
         guard ew > 0, eh > 0, let fv = Foveator.shared else { return }
         frames += 1
         if frames == 1 { print("[juego] Primer cuadro recibido: \(ew)x\(eh) por ojo, copia directa en la GPU · se manda \(W)x\(H)") }
@@ -1543,7 +1568,7 @@ final class GameLink {
         let start = DispatchTime.now().uptimeNanoseconds
         var po: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(nil, pool, &po)
-        guard let pb = po, fv.warpTexture(tex, ew: ew, eh: eh, rects: eyeRects(), into: pb, quads: quads) else { shared.endFrame(); return }
+        guard let pb = po, fv.warpTexture(tex, ew: ew, eh: eh, rects: eyeRects(), into: pb, quads: quads, onSourceRead: release) else { shared.endFrame(); return }
         Perf.shared.addMac(Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
         let fn = shared.nextFrameNo(), key = shared.takeKey(), enc = encoder
         hold(pb, poseId); encodeQueue.async { enc.encode(pb, frameNo: fn, poseId: poseId, forceKey: key, start: start) }
@@ -3975,7 +4000,7 @@ final class Perf {
     static let shared = Perf()
     private let lock = NSLock()
     private var runtime: [String: Any] = [:]
-    private var sumMac = 0.0, nMac = 0, sumEnc = 0.0, nEnc = 0, dropped = 0
+    private var sumMac = 0.0, nMac = 0, sumEnc = 0.0, nEnc = 0, dropped = 0, sumMacGpu = 0.0, nMacGpu = 0
     private var last: [String: Any] = [:], lastAt: UInt64 = 0
     func setRuntime(_ d: Data) {
         guard let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return }
@@ -3984,6 +4009,7 @@ final class Perf {
     func addMac(_ ms: Double) { lock.lock(); sumMac += ms; nMac += 1; lock.unlock() }
     func addEnc(_ ms: Double) { lock.lock(); sumEnc += ms; nEnc += 1; lock.unlock() }
     func addDrop() { lock.lock(); dropped += 1; lock.unlock() }
+    func addMacGpu(_ ms: Double) { lock.lock(); sumMacGpu += ms; nMacGpu += 1; lock.unlock() }
     /// Promedios del último segundo (se calculan una vez por segundo)
     func snapshot() -> [String: Any] {
         lock.lock(); defer { lock.unlock() }
@@ -3992,10 +4018,11 @@ final class Perf {
         var o = runtime
         o["mac"] = nMac > 0 ? (sumMac / Double(nMac) * 100).rounded() / 100 : 0
         o["video"] = nEnc > 0 ? (sumEnc / Double(nEnc) * 100).rounded() / 100 : 0
+        o["macGpu"] = nMacGpu > 0 ? (sumMacGpu / Double(nMacGpu) * 100).rounded() / 100 : 0   // (de "mac", lo que la GPU estuvo trabajando)
         o["recibidos"] = nMac
         o["saltados"] = dropped
         o["termico"] = ProcessInfo.processInfo.thermalState.rawValue   // (0 normal · 1 tibia · 2 caliente: baja la velocidad · 3 crítica)
-        sumMac = 0; nMac = 0; sumEnc = 0; nEnc = 0; dropped = 0
+        sumMac = 0; nMac = 0; sumEnc = 0; nEnc = 0; dropped = 0; sumMacGpu = 0; nMacGpu = 0
         last = o; lastAt = now
         return o
     }
