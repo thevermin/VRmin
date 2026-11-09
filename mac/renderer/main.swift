@@ -379,13 +379,15 @@ final class Foveator {
         cb.commit()
         cb.waitUntilCompleted()
         withExtendedLifetime(c) { }
-        if cb.gpuEndTime > cb.gpuStartTime { Perf.shared.addMacGpu((cb.gpuEndTime - max(cb.gpuStartTime, cbFill.gpuStartTime)) * 1000) }
+        lastGpuMs = cb.gpuEndTime > cb.gpuStartTime ? (cb.gpuEndTime - min(cb.gpuStartTime, cbFill.gpuStartTime > 0 ? cbFill.gpuStartTime : cb.gpuStartTime)) * 1000 : 0
         if cb.status == .error { fail("la GPU dio un error: \(cb.error.map { "\($0)" } ?? "?")"); return false }
         okFrames += 1
         if okFrames == 1 { print("[juego] Imagen del juego en la GPU: \(ew)x\(eh) por ojo → \(W)x\(H) para el visor") }
         return true
     }
     private var okFrames = 0, failCount = 0, lastFail = ""
+    /// Lo que la GPU tardó en armar el último cuadro (ms)
+    private(set) var lastGpuMs = 0.0
     private func fail(_ why: String) {
         failCount += 1
         if why != lastFail || failCount % 300 == 1 { lastFail = why; print("[juego] ERROR armando la imagen del juego: \(why) (\(failCount) veces)") }
@@ -1570,6 +1572,7 @@ final class GameLink {
         CVPixelBufferPoolCreatePixelBuffer(nil, pool, &po)
         guard let pb = po, fv.warpTexture(tex, ew: ew, eh: eh, rects: eyeRects(), into: pb, quads: quads, onSourceRead: release) else { shared.endFrame(); return }
         Perf.shared.addMac(Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
+        if fv.lastGpuMs > 0 { Perf.shared.addMacGpu(fv.lastGpuMs) }
         let fn = shared.nextFrameNo(), key = shared.takeKey(), enc = encoder
         hold(pb, poseId); encodeQueue.async { enc.encode(pb, frameNo: fn, poseId: poseId, forceKey: key, start: start) }
     }
