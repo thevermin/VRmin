@@ -843,6 +843,8 @@ typedef struct Swapchain {
     VkImage vimg[3]; VkDeviceMemory vmem[3];   /* (sesión Vulkan) */
     GLuint gltex[3]; int isGl;                 /* (sesión OpenGL) */
     uint32_t next, released;
+    /* (OpenComposite de VRmin: la imagen de srcIdx no se copió a la swapchain; se lee directo de la textura del juego) */
+    ID3D11Texture2D *src; UINT srcSub; UINT srcX, srcY; uint32_t srcIdx;
 } Swapchain;
 
 typedef struct Space {
@@ -2679,6 +2681,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSwapchain(XrSession session, const XrS
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroySwapchain(XrSwapchain h) {
     Swapchain *sc = (Swapchain *)h;
+    if (sc->src) ID3D11Texture2D_Release(sc->src);
     for (uint32_t k = 0; k < sc->count; k++) if (sc->img[k]) ID3D11Texture2D_Release(sc->img[k]);
     if (sc->isGl && g_session && g_session->gl) {
         GlPrev p;
@@ -2772,6 +2775,45 @@ static uint32_t d3d_quads_write(Session *s, int k, uint8_t *dst, size_t room, si
 static void quad_eyes(Session *s, int k, int qn, const XrCompositionLayerProjection *pl, uint32_t id);
 
 /* Copia los dos ojos (en la GPU) lado a lado en dst. 0 = algo no coincide (se descarta el cuadro) */
+/* La imagen que hay que leer de una swapchain (D3D11): la última entregada, o la textura del juego si OpenComposite de
+ * VRmin no la copió (vrmin_image_source). Ajusta sub y el recorte. */
+static ID3D11Resource *sc_image(Swapchain *sc, UINT *sub, D3D11_BOX *box) {
+    if (sc->src && sc->srcIdx == sc->released) {
+        *sub = sc->srcSub;
+        box->left += sc->srcX; box->right += sc->srcX;
+        box->top += sc->srcY; box->bottom += sc->srcY;
+        return (ID3D11Resource *)sc->src;
+    }
+    return (ID3D11Resource *)sc->img[sc->released];
+}
+
+/* Para OpenComposite de VRmin (mac/opencomposite): la imagen recién pedida de esta swapchain no se copia; se lee directo
+ * de la textura del juego (texture, su subrecurso y el recorte x, y, w, h) al cerrar el cuadro. Devuelve 1 si se puede
+ * (si no, OpenComposite la copia como siempre). Con texture NULL, se vuelve a usar la imagen de la swapchain. */
+__declspec(dllexport) int __cdecl vrmin_image_source(XrSwapchain h, void *texture, uint32_t sub, uint32_t x, uint32_t y, uint32_t w, uint32_t hh) {
+    Swapchain *sc = (Swapchain *)h;
+    if (!sc || !sc->img[0] || !sc->count) return 0;   /* (solo D3D11) */
+    if (sc->src) { ID3D11Texture2D_Release(sc->src); sc->src = NULL; }
+    if (!texture) return 1;
+    ID3D11Texture2D *t = (ID3D11Texture2D *)texture;
+    D3D11_TEXTURE2D_DESC d;
+    ID3D11Texture2D_GetDesc(t, &d);
+    int dep = 0;
+    DXGI_FORMAT tl = typeless_of(d.Format, &dep);
+    if (tl == DXGI_FORMAT_UNKNOWN) tl = d.Format;
+    if (tl != sc->dxgi || d.SampleDesc.Count != 1 || sub >= d.MipLevels * d.ArraySize
+        || w < sc->w || hh < sc->h || x + w > d.Width || y + hh > d.Height) return 0;
+    ID3D11Texture2D_AddRef(t);
+    sc->src = t; sc->srcSub = sub; sc->srcX = x; sc->srcY = y;
+    sc->srcIdx = (sc->next + sc->count - 1) % sc->count;   /* (la imagen recién pedida) */
+    return 1;
+}
+
+/* Para OpenComposite de VRmin: una línea en el registro de VRmin (sus estadísticas) */
+__declspec(dllexport) void __cdecl vrmin_log(const char *msg) {
+    if (msg) logmsg("%s", msg);
+}
+
 static int copy_eyes(Session *s, const XrCompositionLayerProjection *pl, ID3D11Texture2D *dst, uint32_t ew, uint32_t eh, DXGI_FORMAT fmt) {
     for (int e = 0; e < 2; e++) {
         const XrSwapchainSubImage *si = &pl->views[e].subImage;
@@ -2793,8 +2835,8 @@ static int copy_eyes(Session *s, const XrCompositionLayerProjection *pl, ID3D11T
         if (box.right > sc->w) box.right = sc->w;
         if (box.bottom > sc->h) box.bottom = sc->h;
         if (box.right <= box.left || box.bottom <= box.top) { InterlockedIncrement(&g_skipFmt); return 0; }
-        ID3D11DeviceContext_CopySubresourceRegion(s->ctx, (ID3D11Resource *)dst, 0, e * ew, 0, 0,
-                                                  (ID3D11Resource *)sc->img[sc->released], sub, &box);
+        ID3D11Resource *from = sc_image(sc, &sub, &box);
+        ID3D11DeviceContext_CopySubresourceRegion(s->ctx, (ID3D11Resource *)dst, 0, e * ew, 0, 0, from, sub, &box);
     }
     return 1;
 }
@@ -3178,8 +3220,9 @@ static int d3d_quads_copy(Session *s, int k, const XrCompositionLayerProjection 
             s->dQw[k][j] = d.Width; s->dQh[k][j] = d.Height; s->dQf[k][j] = qs->dxgi;
         }
         D3D11_BOX box = { (UINT)qx, (UINT)qy, 0, (UINT)(qx + qw), (UINT)(qy + qh), 1 };
-        ID3D11DeviceContext_CopySubresourceRegion(s->ctx, (ID3D11Resource *)s->dQ[k][j], 0, 0, 0, 0,
-                                                  (ID3D11Resource *)qs->img[qs->released], ql->subImage.imageArrayIndex * qs->mips, &box);
+        UINT qsub = ql->subImage.imageArrayIndex * qs->mips;
+        ID3D11Resource *from = sc_image(qs, &qsub, &box);
+        ID3D11DeviceContext_CopySubresourceRegion(s->ctx, (ID3D11Resource *)s->dQ[k][j], 0, 0, 0, 0, from, qsub, &box);
         quad_meta(s, k, j, pl, ql, qs, qw, qh, qflip, &tk);
         qn++;
     }

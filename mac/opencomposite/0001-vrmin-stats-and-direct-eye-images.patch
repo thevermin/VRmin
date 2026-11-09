@@ -1,0 +1,344 @@
+diff --git a/DrvOpenXR/XrBackend.cpp b/DrvOpenXR/XrBackend.cpp
+index c4bf8ca..331dc85 100644
+--- a/DrvOpenXR/XrBackend.cpp
++++ b/DrvOpenXR/XrBackend.cpp
+@@ -27,6 +27,7 @@
+ // FIXME find a better way to send the OnPostFrame call?
+ #include "../OpenOVR/Reimpl/BaseInput.h"
+ #include "../OpenOVR/Reimpl/BaseOverlay.h"
++#include "../OpenOVR/Misc/vrmin.h"
+ #include "../OpenOVR/Reimpl/BaseSystem.h"
+ #include "../OpenOVR/convert.h"
+ #include "generated/static_bases.gen.h"
+@@ -384,6 +385,7 @@ void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
+ 
+ void XrBackend::WaitForTrackingData()
+ {
++	vrmin::Timer vrminTimer(vrmin::STAT_WAIT);
+ 	// Make sure the OpenXR session is active before doing anything else, and if not then skip
+ 	if (!sessionActive) {
+ 		renderingFrame = false;
+@@ -546,7 +548,11 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
+ 	info.layers = headers;
+ 	info.layerCount = layer_count;
+ 
+-	OOVR_FAILED_XR_SOFT_ABORT(xrEndFrame(xr_session.get(), &info));
++	{
++		vrmin::Timer vrminTimer(vrmin::STAT_END);
++		OOVR_FAILED_XR_SOFT_ABORT(xrEndFrame(xr_session.get(), &info));
++	}
++	vrmin::OnFrame();
+ 
+ 	BaseSystem* sys = GetUnsafeBaseSystem();
+ 	if (sys) {
+diff --git a/OpenOVR/Compositor/dx11compositor.cpp b/OpenOVR/Compositor/dx11compositor.cpp
+index 2ed44d2..f7df8ce 100644
+--- a/OpenOVR/Compositor/dx11compositor.cpp
++++ b/OpenOVR/Compositor/dx11compositor.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "../Misc/Config.h"
+ #include "../Misc/xr_ext.h"
++#include "../Misc/vrmin.h"
+ 
+ #include <d3dcompiler.h> // For compiling shaders! D3DCompile
+ 
+@@ -311,6 +312,9 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 	if (res == XR_TIMEOUT_EXPIRED)
+ 		OOVR_ABORTF("xrWaitSwapchainImage timeout");
+ 
++	// (VRmin: by default the runtime uses the swapchain image; ImageSource below can point it at the game's texture)
++	vrmin::ClearImageSource(chain);
++
+ 	// Copy the source to the destination image
+ 	D3D11_BOX sourceRegion;
+ 	if (bounds) {
+@@ -392,8 +396,14 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 			resDesc.SampleDesc.Count = 1;
+ 			context->ResolveSubresource(resolvedMSAATextures[currentIndex], 0, src, arrayIndex, resDesc.Format);
+ 			context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0, 0, 0, 0, resolvedMSAATextures[currentIndex], arrayIndex, &sourceRegion);
++		} else if (eye.has_value() && vrmin::EyeCanBeDirect((int)*eye, src, arrayIndex, sourceRegion.left)
++		    && vrmin::ImageSource(chain, src, arrayIndex, sourceRegion.left, sourceRegion.top,
++		        sourceRegion.right - sourceRegion.left, sourceRegion.bottom - sourceRegion.top)) {
++			// VRmin's runtime reads this image straight from the game's texture: no copy needed
++			vrmin::GetStats().directEyes++;
+ 		} else {
+ 			context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0, 0, 0, 0, src, arrayIndex, &sourceRegion);
++			vrmin::GetStats().copiedEyes++;
+ 		}
+ 	}
+ 
+diff --git a/OpenOVR/Misc/vrmin.h b/OpenOVR/Misc/vrmin.h
+new file mode 100644
+index 0000000..dfe58f8
+--- /dev/null
++++ b/OpenOVR/Misc/vrmin.h
+@@ -0,0 +1,148 @@
++#pragma once
++// VRmin: direct links between OpenComposite and VRmin's OpenXR runtime (questvrbridge_openxr.dll), plus per-frame
++// timing statistics written to VRmin's log. Everything here is optional: with another OpenXR runtime the functions
++// aren't found and OpenComposite behaves as upstream.
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <openxr/openxr.h>
++
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
++namespace vrmin {
++
++typedef int(__cdecl* ImageSourceFn)(XrSwapchain swapchain, void* texture, uint32_t subresource, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
++typedef void(__cdecl* LogFn)(const char* message);
++
++struct Runtime {
++	ImageSourceFn imageSource = nullptr;
++	LogFn log = nullptr;
++	bool looked = false;
++};
++
++inline Runtime& GetRuntime()
++{
++	static Runtime rt;
++	if (!rt.looked) {
++		rt.looked = true;
++#ifdef _WIN32
++		HMODULE m = GetModuleHandleA("questvrbridge_openxr.dll");
++		if (!m)
++			m = GetModuleHandleA("questvrbridge_openxr32.dll");
++		if (m) {
++			rt.imageSource = (ImageSourceFn)GetProcAddress(m, "vrmin_image_source");
++			rt.log = (LogFn)GetProcAddress(m, "vrmin_log");
++		}
++#endif
++	}
++	return rt;
++}
++
++// Lets the runtime read the image straight from the game's texture (the image the swapchain image was just acquired
++// for), so it doesn't have to be copied into the swapchain first. Returns false if the runtime can't (then copy).
++inline bool ImageSource(XrSwapchain swapchain, void* texture, uint32_t subresource, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
++{
++	Runtime& rt = GetRuntime();
++	return rt.imageSource && rt.imageSource(swapchain, texture, subresource, x, y, w, h) != 0;
++}
++
++// The runtime reads the eye images when the frame ends, after both eyes are submitted. That's only safe if the game
++// doesn't draw the second eye into the same image it handed over for the first one: the left eye goes direct only if,
++// in the previous frame, the right eye came from a different texture or region. (The right eye is always safe.)
++inline bool EyeCanBeDirect(int eye, void* texture, uint32_t subresource, uint32_t left)
++{
++	struct Last {
++		void* tex = nullptr;
++		uint32_t sub = 0, left = 0;
++	};
++	static Last last[2];
++	bool ok = eye != 0 || (last[1].tex && (last[1].tex != texture || last[1].sub != subresource || last[1].left != left));
++	if (eye == 0 || eye == 1)
++		last[eye] = { texture, subresource, left };
++	return ok;
++}
++
++// The swapchain image was filled by a copy: the runtime must use it (not an earlier game texture).
++inline void ClearImageSource(XrSwapchain swapchain)
++{
++	Runtime& rt = GetRuntime();
++	if (rt.imageSource)
++		rt.imageSource(swapchain, nullptr, 0, 0, 0, 0, 0);
++}
++
++// ---- Timing statistics ----
++
++enum Stat {
++	STAT_SUBMIT, // Submit (handing over each eye's image)
++	STAT_WAIT, // WaitGetPoses (xrWaitFrame + xrBeginFrame)
++	STAT_END, // xrEndFrame
++	STAT_INPUT, // input calls (actions and legacy controller state)
++	STAT_OVERLAY, // SetOverlayTexture
++	STAT_COUNT
++};
++
++struct Stats {
++	std::atomic<int64_t> us[STAT_COUNT]{};
++	std::atomic<int64_t> calls[STAT_COUNT]{};
++	std::atomic<int64_t> frames{ 0 };
++	std::atomic<int64_t> directEyes{ 0 }, copiedEyes{ 0 };
++	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++};
++
++inline Stats& GetStats()
++{
++	static Stats s;
++	return s;
++}
++
++struct Timer {
++	Stat stat;
++	std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++	explicit Timer(Stat s)
++	    : stat(s)
++	{
++	}
++	~Timer()
++	{
++		Stats& s = GetStats();
++		s.us[stat] += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
++		s.calls[stat]++;
++	}
++};
++
++// Called once per frame (after xrEndFrame): every 5 seconds, writes the averages per frame to VRmin's log
++inline void OnFrame()
++{
++	Stats& s = GetStats();
++	int64_t frames = ++s.frames;
++	auto now = std::chrono::steady_clock::now();
++	double secs = std::chrono::duration<double>(now - s.start).count();
++	if (secs < 5.0)
++		return;
++	Runtime& rt = GetRuntime();
++	if (rt.log && frames > 0) {
++		auto ms = [&](Stat k) { return s.us[k].load() / 1000.0 / frames; };
++		auto per = [&](Stat k) { return (double)s.calls[k].load() / frames; };
++		char line[512];
++		snprintf(line, sizeof line,
++		    "OpenComposite: %.0f cuadros/s \xc2""\xb7"" por cuadro: entregar im\xc3""\xa1""genes %.2f ms, esperar turno %.2f ms, cerrar cuadro %.2f ms (dentro de entregar), "
++		    "controles %.2f ms (%.0f llamadas), paneles %.2f ms (%.1f actualizaciones) \xc2""\xb7"" ojos sin copia %lld, con copia %lld",
++		    frames / secs, ms(STAT_SUBMIT), ms(STAT_WAIT), ms(STAT_END), ms(STAT_INPUT), per(STAT_INPUT), ms(STAT_OVERLAY), per(STAT_OVERLAY),
++		    (long long)s.directEyes.load(), (long long)s.copiedEyes.load());
++		rt.log(line);
++	}
++	for (int k = 0; k < STAT_COUNT; k++) {
++		s.us[k] = 0;
++		s.calls[k] = 0;
++	}
++	s.frames = 0;
++	s.directEyes = 0;
++	s.copiedEyes = 0;
++	s.start = now;
++}
++
++} // namespace vrmin
+diff --git a/OpenOVR/Reimpl/BaseCompositor.cpp b/OpenOVR/Reimpl/BaseCompositor.cpp
+index 5d6b957..8ddd60a 100644
+--- a/OpenOVR/Reimpl/BaseCompositor.cpp
++++ b/OpenOVR/Reimpl/BaseCompositor.cpp
+@@ -3,6 +3,7 @@
+ #define BASE_IMPL
+ 
+ #include "Misc/Config.h"
++#include "Misc/vrmin.h"
+ 
+ #include "convert.h"
+ 
+@@ -239,6 +240,7 @@ std::unique_ptr<Compositor> BaseCompositor::CreateCompositorAPI(const vr::Textur
+ 
+ ovr_enum_t BaseCompositor::Submit(EVREye eye, const Texture_t* texture, const VRTextureBounds_t* bounds, EVRSubmitFlags submitFlags)
+ {
++	vrmin::Timer vrminTimer(vrmin::STAT_SUBMIT);
+ 	if (BaseClientCore::appType == vr::VRApplication_Background) {
+ 		OOVR_ABORT("Error - application with type VRApplication_Background should not be submitting!");
+ 	}
+diff --git a/OpenOVR/Reimpl/BaseInput.cpp b/OpenOVR/Reimpl/BaseInput.cpp
+index 8f33037..de2d483 100644
+--- a/OpenOVR/Reimpl/BaseInput.cpp
++++ b/OpenOVR/Reimpl/BaseInput.cpp
+@@ -4,6 +4,7 @@
+ #include "json/json.h"
+ #define BASE_IMPL
+ #include "BaseInput.h"
++#include "Misc/vrmin.h"
+ #include <string>
+ 
+ #include <convert.h>
+@@ -1297,6 +1298,7 @@ EVRInputError BaseInput::GetInputSourceHandle(const char* pchInputSourcePath, VR
+ EVRInputError BaseInput::UpdateActionState(VR_ARRAY_COUNT(unSetCount) VRActiveActionSet_t* pSets,
+     uint32_t unSizeOfVRSelectedActionSet_t, uint32_t unSetCount)
+ {
++	vrmin::Timer vrminTimer(vrmin::STAT_INPUT);
+ 	// TODO if the game is using legacy input, call this every frame
+ 
+ 	OOVR_FALSE_ABORT(sizeof(*pSets) == unSizeOfVRSelectedActionSet_t);
+@@ -1588,6 +1590,7 @@ XrResult BaseInput::getBooleanOrDpadData(const InteractionProfile* profile, Acti
+ EVRInputError BaseInput::GetDigitalActionData(VRActionHandle_t action, InputDigitalActionData_t* pActionData, uint32_t unActionDataSize,
+     VRInputValueHandle_t ulRestrictToDevice)
+ {
++	vrmin::Timer vrminTimer(vrmin::STAT_INPUT);
+ 	GET_ACTION_FROM_HANDLE(act, action);
+ 
+ 	ZeroMemory(pActionData, unActionDataSize);
+@@ -1640,6 +1643,7 @@ EVRInputError BaseInput::GetDigitalActionData(VRActionHandle_t action, InputDigi
+ EVRInputError BaseInput::GetAnalogActionData(VRActionHandle_t action, InputAnalogActionData_t* pActionData, uint32_t unActionDataSize,
+     VRInputValueHandle_t ulRestrictToDevice)
+ {
++	vrmin::Timer vrminTimer(vrmin::STAT_INPUT);
+ 
+ 	GET_ACTION_FROM_HANDLE(act, action);
+ 	ZeroMemory(pActionData, unActionDataSize);
+@@ -1782,6 +1786,7 @@ EVRInputError BaseInput::GetAnalogActionData(VRActionHandle_t action, InputAnalo
+ EVRInputError BaseInput::GetPoseActionData(VRActionHandle_t action, ETrackingUniverseOrigin eOrigin, float fPredictedSecondsFromNow,
+     InputPoseActionData_t* pActionData, uint32_t unActionDataSize, VRInputValueHandle_t ulRestrictToDevice)
+ {
++	vrmin::Timer vrminTimer(vrmin::STAT_INPUT);
+ 	GET_ACTION_FROM_HANDLE(act, action);
+ 
+ 	ZeroMemory(pActionData, unActionDataSize);
+@@ -1924,6 +1929,7 @@ EVRInputError BaseInput::GetSkeletalActionData(VRActionHandle_t action, InputSke
+ }
+ EVRInputError BaseInput::GetSkeletalActionData(VRActionHandle_t actionHandle, InputSkeletalActionData_t* out, uint32_t unActionDataSize)
+ {
++	vrmin::Timer vrminTimer(vrmin::STAT_INPUT);
+ 	// Make sure the target struct is the right size, in case it grows in the future
+ 	// Note: CVRInput_004 has a manual override for this in CVRInput.cpp to deal with an old struct version, it
+ 	// sets unActionDataSize to what we're expecting so we don't have to handle that here.
+@@ -2061,6 +2067,7 @@ EVRInputError BaseInput::GetSkeletalBoneData(VRActionHandle_t action, EVRSkeleta
+ EVRInputError BaseInput::GetSkeletalBoneData(VRActionHandle_t actionHandle, EVRSkeletalTransformSpace eTransformSpace,
+     EVRSkeletalMotionRange eMotionRange, VR_ARRAY_COUNT(unTransformArrayCount) VRBoneTransform_t* pTransformArray, uint32_t unTransformArrayCount)
+ {
++	vrmin::Timer vrminTimer(vrmin::STAT_INPUT);
+ 	ZeroMemory(pTransformArray, sizeof(VRBoneTransform_t) * unTransformArrayCount);
+ 	GET_ACTION_FROM_HANDLE(action, actionHandle);
+ 
+diff --git a/OpenOVR/Reimpl/BaseOverlay.cpp b/OpenOVR/Reimpl/BaseOverlay.cpp
+index c6d6760..3fdab6c 100644
+--- a/OpenOVR/Reimpl/BaseOverlay.cpp
++++ b/OpenOVR/Reimpl/BaseOverlay.cpp
+@@ -8,6 +8,7 @@
+ #include "Drivers/Backend.h"
+ #include "Misc/Config.h"
+ #include "Misc/ScopeGuard.h"
++#include "Misc/vrmin.h"
+ #include "convert.h"
+ #include "generated/static_bases.gen.h"
+ #include <string>
+@@ -724,6 +725,7 @@ EVROverlayError BaseOverlay::ClearOverlayCursorPositionOverride(VROverlayHandle_
+ }
+ EVROverlayError BaseOverlay::SetOverlayTexture(VROverlayHandle_t ulOverlayHandle, const Texture_t* pTexture)
+ {
++	vrmin::Timer vrminTimer(vrmin::STAT_OVERLAY);
+ 	USEH();
+ 	overlay->texture = *pTexture;
+ 
+diff --git a/OpenOVR/Reimpl/BaseSystem.cpp b/OpenOVR/Reimpl/BaseSystem.cpp
+index 7fec3d5..b832564 100644
+--- a/OpenOVR/Reimpl/BaseSystem.cpp
++++ b/OpenOVR/Reimpl/BaseSystem.cpp
+@@ -7,6 +7,7 @@
+ #include "BaseSystem.h"
+ #include "Drivers/Backend.h"
+ #include "Misc/Config.h"
++#include "Misc/vrmin.h"
+ #include "convert.h"
+ #include "generated/static_bases.gen.h"
+ 
+@@ -683,6 +684,7 @@ HiddenAreaMesh_t BaseSystem::GetHiddenAreaMesh(EVREye eEye, EHiddenAreaMeshType
+ 
+ bool BaseSystem::GetControllerState(vr::TrackedDeviceIndex_t controllerDeviceIndex, vr::VRControllerState_t* controllerState, uint32_t controllerStateSize)
+ {
++	vrmin::Timer vrminTimer(vrmin::STAT_INPUT);
+ 	if (sizeof(VRControllerState_t) != controllerStateSize)
+ 		OOVR_ABORT("Bad controller state size - was the host compiled with an older version of OpenVR?");
+ 

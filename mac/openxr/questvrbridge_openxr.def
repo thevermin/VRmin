@@ -61,3 +61,5 @@ EXPORTS
     xrInitializeLoaderKHR=rt_xrInitializeLoaderKHR
     xrConvertWin32PerformanceCounterToTimeKHR=rt_xrConvertWin32PerformanceCounterToTimeKHR
     xrConvertTimeToWin32PerformanceCounterKHR=rt_xrConvertTimeToWin32PerformanceCounterKHR
+    vrmin_image_source
+    vrmin_log
