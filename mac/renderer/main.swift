@@ -4010,6 +4010,7 @@ final class MicOut {
     private let lock = NSLock()
     private var ring = [Int16](repeating: 0, count: 48000)   // (1 s)
     private var rd = 0, wr = 0, count = 0, primed = false, started = false, failed = false
+    private var cuts = 0, droppedMs = 0, lastStat = Date()
     private var q: AudioQueueRef?
     private let aq = DispatchQueue(label: "mic", qos: .userInteractive)
     func push(_ d: Data) {
@@ -4022,7 +4023,7 @@ final class MicOut {
             for i in 0..<n { ring[wr] = s[i]; wr = (wr + 1) % ring.count }
         }
         count += n
-        if count > 9600 { rd = (rd + count - 2400) % ring.count; count = 2400 }   // (si se atrasa más de 200 ms, se pone al día)
+        if count > 12000 { droppedMs += (count - 3840) / 48; rd = (rd + count - 3840) % ring.count; count = 3840 }   // (si se atrasa más de 250 ms, se pone al día)
         let first = !started
         started = true
         lock.unlock()
@@ -4054,13 +4055,19 @@ final class MicOut {
         let frames = Int(b.pointee.mAudioDataBytesCapacity) / 2
         let p = b.pointee.mAudioData.assumingMemoryBound(to: Int16.self)
         lock.lock()
-        if !primed && count >= 1440 { primed = true }   // (30 ms de colchón antes de empezar)
+        if !primed && count >= 2880 { primed = true }   // (60 ms de colchón antes de empezar: el Wi-Fi entrega el audio a tirones)
         var k = 0
         if primed {
             while k < frames && count > 0 { p[k] = ring[rd]; rd = (rd + 1) % ring.count; count -= 1; k += 1 }
-            if count == 0 { primed = false }
+            if count == 0 { primed = false; cuts += 1 }
+        }
+        var stat: String?
+        if Date().timeIntervalSince(lastStat) >= 5 {
+            if cuts > 0 || droppedMs > 0 { stat = "[mic] últimos 5 s: \(cuts) cortes por falta de audio, \(droppedMs) ms descartados por atraso, colchón \(count / 48) ms" }
+            cuts = 0; droppedMs = 0; lastStat = Date()
         }
         lock.unlock()
+        if let stat { print(stat) }
         while k < frames { p[k] = 0; k += 1 }
         b.pointee.mAudioDataByteSize = UInt32(frames * 2)
         AudioQueueEnqueueBuffer(queue, b, 0, nil)
