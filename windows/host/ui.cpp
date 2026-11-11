@@ -182,8 +182,20 @@ bool uiRun(HINSTANCE inst) {
         HICON icon = LoadIconW(inst, MAKEINTRESOURCEW(1));
         if (hw && icon) { SendMessageW(hw, WM_SETICON, ICON_BIG, (LPARAM)icon); SendMessageW(hw, WM_SETICON, ICON_SMALL, (LPARAM)icon); }
         w.set_title("VRmin Host");
-        w.set_size(980, 760, WEBVIEW_HINT_NONE);
-        w.set_size(820, 600, WEBVIEW_HINT_MIN);
+        // (que entre en la pantalla, centrada: en pantallas chicas, más chica)
+        RECT wa{0, 0, 1280, 800};
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+        UINT dpi = hw ? GetDpiForWindow(hw) : 96;
+        int aw = MulDiv(wa.right - wa.left, 96, dpi ? dpi : 96), ah = MulDiv(wa.bottom - wa.top, 96, dpi ? dpi : 96);
+        int ww = std::min(980, aw - 40), wh = std::min(760, ah - 60);
+        w.set_size(std::min(720, ww), std::min(520, wh), WEBVIEW_HINT_MIN);
+        w.set_size(ww, wh, WEBVIEW_HINT_NONE);
+        if (hw) {
+            RECT r;
+            GetWindowRect(hw, &r);
+            SetWindowPos(hw, nullptr, wa.left + (wa.right - wa.left - (r.right - r.left)) / 2, wa.top + (wa.bottom - wa.top - (r.bottom - r.top)) / 2, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER);
+        }
         w.bind("vrmin", [](const std::string &req) -> std::string {
             Json a = Json::parse(req);   // ["acción", dato]
             if (a.t != Json::Arr || a.a.empty()) return "null";

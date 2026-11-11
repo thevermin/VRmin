@@ -10,7 +10,8 @@ What you need
 - The VRmin app on the Quest (the same one used with the Mac).
 
 How to use it
-1. Unzip this folder anywhere (for example in Documents) and open "VRmin Host.exe".
+1. Unzip this folder anywhere (for example in Documents) and open "VRmin Host.exe". Its window shows the connection,
+   your Steam games and the settings (it uses WebView2, which comes with Windows 10 and 11).
    If Windows says the app isn't recognized: "More info" › "Run anyway".
 2. When Windows Firewall asks, allow access on private networks.
 3. Open VRmin on the Quest. The first time, type the code shown in the PC window into the headset.
