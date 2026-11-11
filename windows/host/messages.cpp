@@ -120,8 +120,10 @@ void handleQuestMessage(const std::string &line) {
     } else if (t == "vigia") {
         if (m.has("on")) { sentinelSet(m["on"].boolean(false)); if (m["on"].boolean(false)) questRequestKey(); }
         if (m.has("msg")) sentinelSay(m["msg"].str());
-    } else if (t == "monitor" || t == "depth3d" || t == "record") {
-        // (monitor virtual, 3D y grabar: todavía solo en la Mac)
+    } else if (t == "record") {   // ajustes rápidos del visor: empezar o terminar la grabación
+        recordSet(m["on"].boolean(false));
+    } else if (t == "monitor" || t == "depth3d") {
+        // (monitor virtual y 3D: todavía solo en la Mac)
     }
 }
 

@@ -35,6 +35,7 @@ button { font: inherit; }
 .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; border: 2px solid rgba(255,255,255,.25); }
 .dot.on { background: var(--amber); border-color: var(--amber); }
 .dot.warn { border-color: var(--amber); }
+.dot.rec { display: inline-block; width: 8px; height: 8px; background: #e5484d; border-color: #e5484d; vertical-align: middle; }
 header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
 .logo { font-size: 30px; font-weight: 700; letter-spacing: -.5px; display: flex; align-items: baseline; gap: 8px; }
 .logo .thin { font-weight: 200; }
@@ -109,6 +110,8 @@ const I = {
   dial: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 12l4-3"/></svg>',
   speed: '<svg viewBox="0 0 24 24"><path d="M4 16a8 8 0 1 1 16 0M12 16l3-5"/></svg>',
   cable: '<svg viewBox="0 0 24 24"><path d="M7 3v4M11 3v4M5 7h8v4a4 4 0 0 1-8 0zM9 15v2a4 4 0 0 0 4 4h2a4 4 0 0 0 4-4V9"/></svg>',
+  rec: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4" style="fill:currentColor"/></svg>',
+  folder: '<svg viewBox="0 0 24 24"><path d="M3 6h6l2 2h10v11H3z"/></svg>',
   pc: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>',
   bubble: '<svg viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4z"/><path d="M12 8v4M12 14h0"/></svg>',
   dots: '<svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>',
@@ -241,6 +244,17 @@ function render() {
     </div>
   </div>`;
 
+  // Grabar un video: una sola fila
+  const R = S.rec, mm = Math.floor(R.secs / 60), ss = String(R.secs % 60).padStart(2, "0");
+  const recRow = `<div class="card" style="padding:10px 14px"><div class="row">
+    <span class="small b" style="color:var(--text2)">${I.rec}</span><span class="small b" style="color:var(--text2)">${t("Grabación", "Recording")}</span>
+    <button class="pill ${R.on ? "" : "primary"}" data-act="record">${R.on ? t("Detener", "Stop") : t("Grabar", "Record")}</button>
+    ${R.on ? `<span class="small b"><span class="dot rec"></span> ${mm}:${ss}</span>` : ""}
+    ${R.on ? "" : sw("recQuest", t("También el visor", "The headset too"), R.quest, R.quest ? (adbOk ? t("Puede bajar los fps del visor", "It can lower the headset's fps") : t("Solo con el visor por cable", "Only with the headset on the cable")) : "")}
+    <span class="grow"></span>
+    <button class="pill icon" data-act="recFolder" title="${t("Abrir la carpeta de las grabaciones (Videos › VRmin)", "Open the recordings folder (Videos › VRmin)")}">${I.folder}</button>
+  </div></div>`;
+
   const log = `<div class="col" style="gap:8px">
     <button class="link" data-act="log">${showLog ? I.chevD : I.chevR} ${t("Registro", "Log")} ${!showLog && S.lastLog ? `<span class="tiny ell" style="font-weight:400">${h(S.lastLog)}</span>` : ""}</button>
     <div class="row"><button class="pill" data-act="report">${I.bubble} ${t("Algo anda mal", "Something's wrong")}</button>
@@ -250,7 +264,7 @@ function render() {
 
   const app = document.getElementById("app");
   const y = window.scrollY;
-  app.innerHTML = header + `<div class="col"><div class="two">${conn}${prep}</div>${games}${cable}${log}</div>`;
+  app.innerHTML = header + `<div class="col"><div class="two">${conn}${prep}</div>${games}${cable}${recRow}${log}</div>`;
   window.scrollTo(0, y);
   const l = document.getElementById("log");
   if (l) l.scrollTop = l.scrollHeight;
@@ -473,7 +487,7 @@ document.addEventListener("change", e => {
   const k = e.target.dataset.sw;
   if (!k) return;
   const on = e.target.checked;
-  if (k === "openAtLogin" || k === "keepAwake" || k === "beta") return act(() => call(k, on));
+  if (k === "openAtLogin" || k === "keepAwake" || k === "beta" || k === "recQuest") return act(() => call(k, on));
   const scope = e.target.closest("[data-scope]").dataset.scope;
   const o = { scope, [k]: on };
   if (on && k === "index") o.vive = false;

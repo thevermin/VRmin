@@ -115,6 +115,7 @@ void loadSettings() {
     if (j.has("lang")) s.lang = j["lang"].str();
     if (j.has("keepAwake")) s.keepAwake = j["keepAwake"].boolean(true);
     if (j.has("beta")) s.beta = j["beta"].boolean(false);
+    if (j.has("recQuest")) s.recQuest = j["recQuest"].boolean(true);
     if (s.lang == "es" || s.lang == "en") IDIOMA_ES = s.lang == "es";
 }
 void saveSettings() {
@@ -124,7 +125,7 @@ void saveSettings() {
         const Settings &s = g_set;
         j.set("eye", s.eye).set("fps", s.fps).set("mbps", s.mbps).set("codec", s.hevc ? "hevc" : "h264").set("fov", s.fov)
          .set("audio", s.audio).set("deskMaxW", s.deskMaxW).set("deskFps", s.deskFps).set("deskMbps", s.deskMbps).set("deskAudio", s.deskAudio).set("mic", s.mic)
-         .set("lang", s.lang).set("keepAwake", s.keepAwake).set("beta", s.beta);
+         .set("lang", s.lang).set("keepAwake", s.keepAwake).set("beta", s.beta).set("recQuest", s.recQuest);
     }
     writeFile(dataDir() + L"\\settings.json", j.dump());
 }

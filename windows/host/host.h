@@ -43,6 +43,7 @@ struct Settings {
     std::string lang;                   // idioma de la ventana: "es", "en" o "" (el de Windows)
     bool keepAwake = true;              // no suspender la PC mientras el Quest la usa
     bool beta = false;                  // recibir también las versiones beta
+    bool recQuest = true;               // al grabar, también el visor (si está por cable con adb)
 };
 extern Settings g_set;
 extern std::mutex g_setLock;
@@ -222,6 +223,12 @@ Json updatesState();                          // {host, hostBack, apk, apkBack, 
 bool updatesInstallHost();
 bool updatesInstallQuestApp();
 void updatesSetBeta(bool on);
+
+// ---------- Grabar un video (record.cpp): la PC y, por el cable, el visor ----------
+bool recording();
+uint64_t recordingSince();
+void recordSet(bool on);
+void recordOpenFolder();
 
 // ---------- Ventana ----------
 void uiRefresh();

@@ -106,7 +106,8 @@ static Json stateJson() {
      .set("gpu", Json::object().set("name", pcGpu()).set("vram", pcVram())).set("prof", prof)
      .set("mic", Json::object().set("on", micEnabled()).set("cable", micCableInstalled()))
      .set("pc", Json::object().set("openAtLogin", openAtLogin()).set("keepAwake", s.keepAwake)).set("dataDir", utf8(dataDir()))
-     .set("cable", cableState()).set("upd", updatesState()).set("sentinel", sentinelOn());
+     .set("cable", cableState()).set("upd", updatesState()).set("sentinel", sentinelOn())
+     .set("rec", Json::object().set("on", recording()).set("secs", recording() ? (double)((nowNs() - recordingSince()) / 1000000000ull) : 0.0).set("quest", s.recQuest));
     return o;
 }
 
@@ -157,6 +158,13 @@ static std::string handle(const std::string &cmd, const Json &a) {
     if (cmd == "questApp") { std::thread(updatesInstallQuestApp).detach(); return "true"; }
     if (cmd == "checkUpdates") { std::thread([] { updatesCheck(true); }).detach(); return "true"; }
     if (cmd == "beta") { updatesSetBeta(a.boolean(false)); return "true"; }
+    if (cmd == "record") { recordSet(!recording()); return "true"; }
+    if (cmd == "recFolder") { recordOpenFolder(); return "true"; }
+    if (cmd == "recQuest") {
+        { std::lock_guard<std::mutex> g(g_setLock); g_set.recQuest = a.boolean(true); }
+        saveSettings();
+        return "true";
+    }
     if (cmd == "openAtLogin") { setOpenAtLogin(a.boolean(false)); return "true"; }
     if (cmd == "keepAwake") {
         { std::lock_guard<std::mutex> g(g_setLock); g_set.keepAwake = a.boolean(false); }
