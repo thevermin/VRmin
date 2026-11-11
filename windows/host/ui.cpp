@@ -106,7 +106,7 @@ static Json stateJson() {
      .set("gpu", Json::object().set("name", pcGpu()).set("vram", pcVram())).set("prof", prof)
      .set("mic", Json::object().set("on", micEnabled()).set("cable", micCableInstalled()))
      .set("pc", Json::object().set("openAtLogin", openAtLogin()).set("keepAwake", s.keepAwake)).set("dataDir", utf8(dataDir()))
-     .set("cable", cableState()).set("sentinel", sentinelOn());
+     .set("cable", cableState()).set("upd", updatesState()).set("sentinel", sentinelOn());
     return o;
 }
 
@@ -153,6 +153,10 @@ static std::string handle(const std::string &cmd, const Json &a) {
     }
     if (cmd == "cableInstall") { std::thread(cableInstallTools).detach(); return "true"; }
     if (cmd == "sentinelStart") { std::thread(cableStartSentinel).detach(); return "true"; }
+    if (cmd == "updateHost") { std::thread(updatesInstallHost).detach(); return "true"; }
+    if (cmd == "questApp") { std::thread(updatesInstallQuestApp).detach(); return "true"; }
+    if (cmd == "checkUpdates") { std::thread([] { updatesCheck(true); }).detach(); return "true"; }
+    if (cmd == "beta") { updatesSetBeta(a.boolean(false)); return "true"; }
     if (cmd == "openAtLogin") { setOpenAtLogin(a.boolean(false)); return "true"; }
     if (cmd == "keepAwake") {
         { std::lock_guard<std::mutex> g(g_setLock); g_set.keepAwake = a.boolean(false); }

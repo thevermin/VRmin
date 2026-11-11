@@ -42,6 +42,7 @@ struct Settings {
     std::string mic = "pc";             // micrófono de los juegos: "pc" (el de Windows) o "quest" (el del visor, por VB-CABLE)
     std::string lang;                   // idioma de la ventana: "es", "en" o "" (el de Windows)
     bool keepAwake = true;              // no suspender la PC mientras el Quest la usa
+    bool beta = false;                  // recibir también las versiones beta
 };
 extern Settings g_set;
 extern std::mutex g_setLock;
@@ -213,6 +214,14 @@ void sentinelSay(const std::string &code);
 void sentinelPose();
 bool sentinelFrame(const uint8_t *src, bool rgba, int ew, int eh);   // true: también va al visor
 void sentinelSelfTest();
+
+// ---------- Actualizaciones (update.cpp): VRmin Host y la app del Quest ----------
+void updatesStart();
+void updatesCheck(bool manual);
+Json updatesState();                          // {host, hostBack, apk, apkBack, apkAction, msg, busy, beta}
+bool updatesInstallHost();
+bool updatesInstallQuestApp();
+void updatesSetBeta(bool on);
 
 // ---------- Ventana ----------
 void uiRefresh();

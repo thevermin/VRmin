@@ -161,6 +161,8 @@ function render() {
     <span class="small">v${h(S.version)} · Windows</span>
     <span class="grow"></span>
     ${S.busy ? `<span class="small ell">${h(S.busy)}</span>` : ""}
+    ${S.upd.host && !S.upd.busy ? `<button class="pill primary" data-act="updateHost" title="${t("Se baja, VRmin Host se cierra y se abre la versión nueva", "It downloads, VRmin Host closes and the new version opens")}">${S.upd.hostBack ? t("Volver a la estable ", "Back to stable ") : t("Actualizar a ", "Update to ")}${h(S.upd.host)}</button>` : ""}
+    ${S.upd.busy ? `<span class="small ell amber">${h(S.upd.busy)}</span>` : ""}
     <button class="status ${falta ? "fix" : ""}" data-act="fix" ${falta ? "" : "disabled"} title="${falta ? t("Tocá para hacerlo ahora", "Click to do it now") : ""}">
       ${dot(S.quest.connected && !falta, !!falta || !S.quest.connected)} ${h(pill)} ${falta ? `<span class="amber">${I.arrow}</span>` : ""}</button>
     <button class="pill primary" data-url="https://ko-fi.com/thevermin" title="${t("VRmin es gratis. Si te sirve, podés invitarme un café en Ko-fi", "VRmin is free. If it helps you, you can buy me a coffee on Ko-fi")}">${I.cup} ${t("Apoyar en Ko-fi", "Support on Ko-fi")}</button>
@@ -217,6 +219,13 @@ function render() {
   const C = S.cable, adbOk = C.adb && C.state === "device";
   const cableStatus = !C.adb ? t("Sin instalar", "Not installed") : C.state === "device" ? t("Listo", "Ready")
     : C.state === "unauthorized" ? t("Tocá «Permitir» en el visor", "Tap \"Allow\" in the headset") : t("Conectá el Quest por cable USB-C", "Connect the Quest with the USB-C cable");
+  const v = C.questApp, U = S.upd;
+  const appStatus = !C.adb ? t("Para instalarla desde acá: las herramientas del Modo Centinela", "To install it from here: Sentinel Mode's tools")
+    : C.state === "unauthorized" ? t("Tocá «Permitir» en el visor", "Tap \"Allow\" in the headset")
+    : C.state !== "device" || v === "?" ? t("Conectá el Quest por cable USB-C para ver su versión", "Connect the Quest with the USB-C cable to see its version")
+    : v === "" ? t("No está instalada en el visor", "Not installed on the headset")
+    : U.apkBack ? t(`Versión ${v} (beta) · estable: ${U.apk}`, `Version ${v} (beta) · stable: ${U.apk}`)
+    : U.apkAction ? t(`Versión ${v} · hay una nueva: ${U.apk}`, `Version ${v} · there's a new one: ${U.apk}`) : t(`Versión ${v} · al día`, `Version ${v} · up to date`);
   const cable = `<div class="card"><h2>${I.cable} ${t("Visor por cable USB-C", "Headset over USB-C cable")}</h2>
     <div class="row">${dot(adbOk || S.sentinel, !adbOk)}<div class="grow"><div class="b">${t("Modo Centinela", "Sentinel Mode")}</div>
       <div class="small">${t("Jugar con el visor apoyado", "Play with the headset resting on your desk")} · ${S.sentinel ? t("Funcionando: el juego se ve en la ventana «VRmin · Modo Centinela» (Esc para salir)", "Running: the game shows in the \"VRmin · Sentinel Mode\" window (Esc to exit)") : h(cableStatus)}</div></div>
@@ -224,6 +233,11 @@ function render() {
       ${C.busy ? `<span class="small ell">${h(C.busy)}</span>`
         : !C.adb ? `<button class="pill primary" data-act="cableInstall">${t("Instalar", "Install")}</button>`
         : adbOk && !S.sentinel ? `<button class="pill primary" data-act="sentinelStart" title="${t("Abre VRmin en el visor directo en el Modo Centinela, sin tocarlo. Después elegí un juego.", "Opens VRmin on the headset straight in Sentinel Mode, without touching it. Then pick a game.")}">${t("Empezar", "Start")}</button>` : ""}
+    </div>
+    <div class="row">${dot(adbOk && v !== "?" && v !== "" && !U.apkAction, U.apkAction)}<div class="grow"><div class="b">${t("App del Quest", "Quest app")}</div>
+      <div class="small">${h(appStatus)}</div></div>
+      ${U.apkAction && !U.busy ? `<button class="pill primary" data-act="questApp" title="${U.apkBack ? t("Se desinstala la beta del visor y se instala la estable, por el cable USB-C. Los ajustes del visor vuelven a los de fábrica.", "The beta is uninstalled from the headset and the stable one installed, over the USB-C cable. The headset's settings go back to defaults.")
+        : t("Se instala por el cable USB-C, sin SideQuest. Tus ajustes del visor se conservan.", "It installs over the USB-C cable, without SideQuest. Your headset settings are kept.")}">${v === "" ? t("Instalar", "Install") : U.apkBack ? t("Volver a la estable", "Back to stable") : t("Actualizar", "Update")}</button>` : ""}
     </div>
   </div>`;
 
@@ -316,6 +330,8 @@ function settingsSheet() {
       <div class="row"><span class="grow">${es ? "Idioma" : "Language"}</span>${seg("lang", [["en", "English"], ["es", "Español"]], S.lang)}</div>
       ${sw("openAtLogin", t("Abrir VRmin Host al iniciar Windows", "Open VRmin Host when Windows starts"), S.pc.openAtLogin)}
       ${sw("keepAwake", t("No suspender mientras el Quest la usa", "Don't sleep while the Quest is using it"), S.pc.keepAwake)}
+      ${sw("beta", t("Recibir versiones beta", "Get beta versions"), S.upd.beta, t("Las versiones de prueba, antes que todos. Apagado: solo las estables.", "Test versions, before everyone else. Off: stable versions only."))}
+      <div class="row"><button class="pill" data-act="checkUpdates">${t("Buscar actualizaciones", "Check for updates")}</button><span class="tiny grow">${h(S.upd.msg || "")}</span></div>
       <div class="row"><span class="tiny grow ell">${h(S.dataDir)}</span><button class="pill" data-act="data">${t("Mostrar datos", "Show data")}</button></div>
       <div class="row"><span class="grow">${t("Quest emparejados con esta PC", "Quests paired with this PC")}</span><button class="pill" data-act="forget">${t("Olvidar todos", "Forget all")}</button></div>
     </div>
@@ -457,7 +473,7 @@ document.addEventListener("change", e => {
   const k = e.target.dataset.sw;
   if (!k) return;
   const on = e.target.checked;
-  if (k === "openAtLogin" || k === "keepAwake") return act(() => call(k, on));
+  if (k === "openAtLogin" || k === "keepAwake" || k === "beta") return act(() => call(k, on));
   const scope = e.target.closest("[data-scope]").dataset.scope;
   const o = { scope, [k]: on };
   if (on && k === "index") o.vive = false;

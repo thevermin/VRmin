@@ -20,10 +20,10 @@ fi
 x86_64-w64-mingw32-windres host.rc -O coff -o "$OUT/host.res"
 x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -Wno-unknown-pragmas -municode -mwindows -static \
     -I"$DEPS/webview/core/include" -I"$DEPS/wv2/build/native/include" -Icompat \
-    common.cpp quest.cpp messages.cpp game.cpp convert.cpp encoder.cpp desktop.cpp audio.cpp mic.cpp report.cpp windows.cpp cable.cpp sentinel.cpp games.cpp setup.cpp ui.cpp main.cpp "$OUT/host.res" \
+    common.cpp quest.cpp messages.cpp game.cpp convert.cpp encoder.cpp desktop.cpp audio.cpp mic.cpp report.cpp windows.cpp cable.cpp sentinel.cpp update.cpp games.cpp setup.cpp ui.cpp main.cpp "$OUT/host.res" \
     -o "$OUT/VRmin Host.exe" \
     -lws2_32 -liphlpapi -lbcrypt -lmfplat -lmfuuid -lole32 -loleaut32 -luuid -ld3d11 -ldxgi -lshlwapi -lshell32 \
-    -luser32 -lgdi32 -lwinmm -lstrmiids -ladvapi32 -lversion -ldwmapi -ld2d1 -ldwrite -lurlmon
+    -luser32 -lgdi32 -lwinmm -lstrmiids -ladvapi32 -lversion -ldwmapi -ld2d1 -ldwrite -lurlmon -lwinhttp
 # El runtime de OpenXR es el mismo que usa la Mac (dentro de Wine)
 cp ../../mac/openxr/questvrbridge_openxr.dll ../../mac/openxr/questvrbridge_openxr.json \
    ../../mac/openxr/questvrbridge_openxr32.dll ../../mac/openxr/questvrbridge_openxr32.json "$OUT/runtime/"

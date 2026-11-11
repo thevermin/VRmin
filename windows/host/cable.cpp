@@ -80,6 +80,7 @@ Json cableState() {
     std::lock_guard<std::mutex> g(cLock);
     return Json::object().set("adb", !adbPath().empty()).set("state", g_adbState).set("questApp", g_questApp).set("busy", g_cableBusy);
 }
+std::string cableQuestApp() { std::lock_guard<std::mutex> g(cLock); return g_questApp; }
 bool cableReady() { std::lock_guard<std::mutex> g(cLock); return g_adbState == "device"; }
 void cableForgetVersion() { std::lock_guard<std::mutex> g(cLock); g_questApp = "?"; }
 

@@ -121,6 +121,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     audioStart();
     micStart();
     cableStart();
+    updatesStart();
     lobbyStart();
     std::thread(gamesScan).detach();
     // Si Windows ya estaba preparado de otra vez, OpenComposite vuelve a quedar activo (al cerrar se saca)
