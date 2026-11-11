@@ -37,4 +37,4 @@ If something goes wrong: click "Something's wrong". It saves a report on the Des
 send it in an Issue.
 https://github.com/thevermin/VRmin/issues
 
-Not on Windows yet: separate windows, virtual monitor, desktop 3D and Sentinel Mode.
+Not on Windows yet: virtual monitor, desktop 3D and Sentinel Mode.

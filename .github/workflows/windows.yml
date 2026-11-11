@@ -52,6 +52,9 @@ jobs:
         run: |
           Expand-Archive -Path (Get-ChildItem zip\*.zip)[0].FullName -DestinationPath app
           $exe = (Get-ChildItem app -Recurse -Filter "VRmin Host.exe")[0].FullName
+          Start-Process -FilePath notepad.exe
+          Start-Process -FilePath $exe -ArgumentList "--selftest" -Wait
+          Get-Content "$env:LOCALAPPDATA\VRmin\VRmin.log"
           Start-Process -FilePath $exe
           Start-Sleep -Seconds 20
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing

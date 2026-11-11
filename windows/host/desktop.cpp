@@ -80,7 +80,7 @@ static void setErr(const std::string &e) {
 }
 
 static void onDeskEncoded(const uint8_t *d, size_t n, bool key, uint64_t tag) {
-    int w = (int)(tag >> 16) & 0xFFFF, h = (int)tag & 0xFFFF;
+    int w = (int)(tag >> 16) & 0xFFFF, h = (int)(tag & 0xFFFF);
     std::vector<uint8_t> p(6 + n);
     p[0] = 7; p[1] = key ? 1 : 0;
     p[2] = (uint8_t)(w >> 8); p[3] = (uint8_t)w; p[4] = (uint8_t)(h >> 8); p[5] = (uint8_t)h;
@@ -109,8 +109,11 @@ static void drawCursor(uint8_t *img, int w, int h, int stride, int cx, int cy, f
         }
 }
 
-static void captureThread() {
+/// Captura un monitor (con la Duplicación de escritorio de Windows) y lo manda codificado mientras c.want() diga que sí.
+/// La usan la pantalla principal del Quest y las pantallas de monitores que se abren como ventanas (windows.cpp).
+void displayCaptureLoop(const DisplayCapture &c) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    RECT bounds{0, 0, 1920, 1080};
     ID3D11Device *dev = nullptr;
     ID3D11DeviceContext *ctx = nullptr;
     IDXGIOutputDuplication *dup = nullptr;
@@ -126,12 +129,17 @@ static void captureThread() {
         if (dev) { dev->Release(); dev = nullptr; }
     };
     while (true) {
-        bool want = questConnected() && g_deskOn && lobbyShowsDesk() && !gameActive();
-        if (!want) { if (dup) cleanup(); Sleep(50); continue; }
-        if (dup && showing != g_deskTarget) { cleanup(); frame.clear(); }   // (se eligió otro monitor)
+        bool want = c.want();
+        if (!want) {
+            if (dup) cleanup();
+            if (c.stop && c.stop()) break;
+            Sleep(50);
+            continue;
+        }
+        if (dup && showing != c.target()) { cleanup(); frame.clear(); }   // (se eligió otro monitor)
         if (!dup) {
             // El monitor elegido (o el principal) y la placa de video a la que está conectado
-            showing = g_deskTarget;
+            showing = c.target();
             IDXGIFactory1 *fac = nullptr;
             IDXGIAdapter1 *ad = nullptr;
             IDXGIOutput *out = nullptr;
@@ -150,10 +158,13 @@ static void captureThread() {
                 }
                 fac->Release();
             }
-            if (!out && showing) { g_deskTarget = 0; continue; }   // (ese monitor ya no está: el principal)
+            if (!out && showing) {   // (ese monitor ya no está)
+                if (c.main) g_deskTarget = 0; else Sleep(1000);
+                continue;
+            }
             D3D_FEATURE_LEVEL fl;
             if (FAILED(D3D11CreateDevice(ad, ad ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, &fl, &ctx))) {
-                setErr(tr("No pude usar la placa de video para capturar la pantalla", "Couldn't use the graphics card to capture the screen"));
+                if (c.main) setErr(tr("No pude usar la placa de video para capturar la pantalla", "Couldn't use the graphics card to capture the screen"));
                 if (out) out->Release();
                 if (ad) ad->Release();
                 Sleep(2000); continue;
@@ -163,19 +174,19 @@ static void captureThread() {
             if (out) {
                 DXGI_OUTPUT_DESC od;
                 out->GetDesc(&od);
-                std::lock_guard<std::mutex> g(boundsLock);
-                g_deskBounds = od.DesktopCoordinates;
+                bounds = od.DesktopCoordinates;
+                if (c.main) { std::lock_guard<std::mutex> g(boundsLock); g_deskBounds = bounds; }
             }
             if (out1) out1->Release();
             if (out) out->Release();
             if (ad) ad->Release();
             if (FAILED(hr)) {
-                setErr(tr("Windows no deja capturar la pantalla (¿otra app la usa, o la pantalla está en otra placa de video?)",
+                if (c.main) setErr(tr("Windows no deja capturar la pantalla (¿otra app la usa, o la pantalla está en otra placa de video?)",
                           "Windows won't let VRmin capture the screen (is another app using it, or is the screen on another graphics card?)"));
                 cleanup(); Sleep(2000); continue;
             }
-            setErr("");
-            deskRequestKey();
+            if (c.main) setErr("");
+            c.enc->requestKey();
         }
         DXGI_OUTDUPL_FRAME_INFO fi;
         IDXGIResource *res = nullptr;
@@ -226,7 +237,7 @@ static void captureThread() {
         std::vector<uint8_t> withCursor;
         POINT cp;
         RECT b;
-        { std::lock_guard<std::mutex> g(boundsLock); b = g_deskBounds; }
+        b = bounds;
         if (ow == sw && oh == sh) {
             withCursor = frame;
             if (GetCursorPos(&cp)) drawCursor(withCursor.data(), sw, sh, sw * 4, cp.x - b.left, cp.y - b.top, sh / 1080.f);
@@ -254,13 +265,21 @@ static void captureThread() {
         }
         nv.resize((size_t)ow * oh * 3 / 2);
         bgraToNv12(src, ow * 4, ow, oh, nv.data());
-        g_deskEnc->encode(nv.data(), ow, oh, s.deskFps, s.deskMbps * 1000000, false, false, ((uint64_t)ow << 16) | (uint64_t)oh);
+        c.enc->encode(nv.data(), ow, oh, s.deskFps, s.deskMbps * 1000000, false, false, ((uint64_t)c.sid << 32) | ((uint64_t)ow << 16) | (uint64_t)oh);
     }
+    cleanup();
 }
 
 void deskStart() {
     g_deskEnc = new VideoEncoder("desktop", onDeskEncoded);
-    std::thread(captureThread).detach();
+    std::thread([] {
+        DisplayCapture c;
+        c.main = true;
+        c.enc = g_deskEnc;
+        c.want = [] { return questConnected() && g_deskOn && lobbyShowsDesk() && !gameActive(); };
+        c.target = [] { return (uint32_t)g_deskTarget; };
+        displayCaptureLoop(c);
+    }).detach();
 }
 
 // ---------------- Mouse ----------------
@@ -268,6 +287,9 @@ static bool mouseDownNow = false;
 void deskMouse(float u, float v, const Json &down, float scroll) {
     RECT b;
     { std::lock_guard<std::mutex> g(boundsLock); b = g_deskBounds; }
+    mouseAt(b, u, v, down, scroll);
+}
+void mouseAt(const RECT &b, float u, float v, const Json &down, float scroll) {
     u = std::min(1.f, std::max(0.f, u)); v = std::min(1.f, std::max(0.f, v));
     int px = b.left + (int)(u * (b.right - b.left)), py = b.top + (int)(v * (b.bottom - b.top));
     int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);

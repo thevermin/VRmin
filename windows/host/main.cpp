@@ -97,6 +97,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     HANDLE single = CreateMutexW(nullptr, TRUE, L"VRminHostWindows");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND other = FindWindowW(L"VRminHost", nullptr);
+        if (!other) other = FindWindowW(nullptr, L"VRmin Host");   // (la ventana completa)
         if (other) { ShowWindow(other, SW_RESTORE); SetForegroundWindow(other); }
         return 0;
     }
@@ -109,6 +110,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     timeBeginPeriod(1);
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);   // (es video en vivo: que Windows lo atienda primero)
     logmsg("VRmin Host for Windows %s", VRMIN_WIN_VERSION);
+    if (wcsstr(GetCommandLineW(), L"--selftest")) { winSelfTest(); return 0; }   // (prueba de la compilación en Windows)
     loadSettings();
     applySettings();
 

@@ -107,8 +107,18 @@ void handleQuestMessage(const std::string &line) {
         if (m["on"].boolean()) deskRequestKey();
     } else if (t == "mouse") {
         deskMouse((float)m["u"].num(0.5), (float)m["v"].num(0.5), m["down"], (float)m["scroll"].num(0));
-    } else if (t == "wmouse" || t == "win" || t == "wsize" || t == "monitor" || t == "depth3d" || t == "deskdisp" || t == "dispswap" || t == "vigia" || t == "winkey" || t == "record") {
-        // (ventanas sueltas, monitor virtual, 3D y Modo Centinela: todavía solo en la Mac)
+    } else if (t == "win") {
+        winOpen((uint32_t)m["id"].num(0), m["on"].boolean(false));
+    } else if (t == "winkey") {
+        winOpen((uint32_t)m["id"].num(0), true);   // (ya abierta: manda una imagen completa)
+    } else if (t == "wmouse") {
+        winMouse((uint32_t)m["id"].num(0), (float)m["u"].num(0.5), (float)m["v"].num(0.5), m["down"], (float)m["scroll"].num(0));
+    } else if (t == "wsize") {
+        winResize((uint32_t)m["id"].num(0), (int)m["w"].num(0), (int)m["h"].num(0));
+    } else if (t == "dispswap") {
+        winSwap((uint32_t)m["id"].num(0), (uint32_t)m["to"].num(0));
+    } else if (t == "monitor" || t == "depth3d" || t == "vigia" || t == "record") {
+        // (monitor virtual, 3D, Modo Centinela y grabar: todavía solo en la Mac)
     }
 }
 
@@ -161,7 +171,7 @@ static void lobbyThread() {
          .set("depth3d", false).set("depthStatus", "").set("cfg", cfg).set("games", games).set("monitor", false)
          .set("monitorErr", tr("Todavía no está en Windows", "Not available on Windows yet")).set("displays", others)
          .set("mainDisplay", mainD).set("deskDisplay", (double)deskDisplayId()).set("monitorId", 0).set("typing", typingActive()).set("vigia", false).set("ll", Json::array())
-         .set("perf", active ? perfSnapshot() : Json::object()).set("adv", profilesState()).set("windows", Json::array()).set("os", "windows")
+         .set("perf", active ? perfSnapshot() : Json::object()).set("adv", profilesState()).set("windows", windowsListJson()).set("os", "windows")
          .set("pcGpu", g_gpu).set("pcVram", pcVramMb);
         std::string sj = o.dump();
         uint64_t now = nowNs();

@@ -145,6 +145,25 @@ void deskRequestKey();
 std::string deskError();
 void deskMouse(float u, float v, const Json &down, float scroll);
 struct DisplayInfo { uint32_t id; std::string name; RECT r; bool primary; };
+/// Una captura de monitor: la pantalla principal del Quest (main) o un monitor abierto como ventana (sid)
+struct DisplayCapture {
+    bool main = false;
+    uint32_t sid = 0;
+    VideoEncoder *enc = nullptr;
+    std::function<bool()> want;          // mandar ahora
+    std::function<bool()> stop;          // terminar (sin esto, espera a que want vuelva a ser sí)
+    std::function<uint32_t()> target;    // el monitor (0: el principal)
+};
+void displayCaptureLoop(const DisplayCapture &c);
+void mouseAt(const RECT &r, float u, float v, const Json &down, float scroll);   // el mouse del Quest en ese rectángulo de la pantalla
+
+// ---------- Ventanas sueltas (windows.cpp): cada ventana o monitor de la PC en su propia pantalla del Quest ----------
+Json windowsListJson();                                  // [{id, app, title, w, h}]
+void winOpen(uint32_t sid, bool on);
+void winMouse(uint32_t sid, float u, float v, const Json &down, float scroll);
+void winResize(uint32_t sid, int qw, int qh);
+void winSwap(uint32_t sid, uint32_t to);
+void winSelfTest();   // (prueba: anota los monitores y ventanas que ve y si puede capturar una)
 std::vector<DisplayInfo> displaysList();      // los monitores de la PC
 uint32_t deskDisplayId();                     // el que se ve en la pantalla principal del Quest
 void deskSetDisplay(uint32_t id);
