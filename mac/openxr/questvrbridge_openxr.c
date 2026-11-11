@@ -3114,7 +3114,9 @@ static void quad_meta(Session *s, int k, int j, const XrCompositionLayerProjecti
     XrPosef pw = space_world((const Space *)pl->space, tk, &v1), qw0 = space_world((const Space *)ql->space, tk, &v2);
     /* el giro: el que fijó el juego (si se lo vio fijarlo), o si no, mirando a la cabeza con el «arriba» del mundo */
     XrPosef qpose = ql->pose; XrExtent2Df qsize = ql->size; int real = 0;
-    const OvXf *xf = ovxf_find(ql->pose.position);
+    /* (el OpenComposite de VRmin ya manda el giro y el tamaño reales: si el giro no es el neutro, se usa tal cual) */
+    if (fabsf(ql->pose.orientation.w) < 0.99999f) real = 1;
+    const OvXf *xf = real ? NULL : ovxf_find(ql->pose.position);
     if (xf) {
         const float *m = xf->m;
         XrVector3f cx = { m[0], m[4], m[8] }, cy = { m[1], m[5], m[9] }, cz = { m[2], m[6], m[10] };
@@ -3130,6 +3132,9 @@ static void quad_meta(Session *s, int k, int j, const XrCompositionLayerProjecti
             real = 1;
         }
     }
+    /* (sin giro conocido, el panel mira a la cabeza: un tamaño negativo lo mostraría al revés, como un espejo) */
+    if (qsize.width < 0) qsize.width = -qsize.width;
+    if (qsize.height < 0) qsize.height = -qsize.height;
     s->vkQ[k][j].pose = pmul(pinv(pw), pmul(qw0, qpose));
     if (!real) {
         XrVector3f P = s->vkQ[k][j].pose.position;

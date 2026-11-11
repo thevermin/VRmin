@@ -1,0 +1,53 @@
+diff --git a/OpenOVR/Reimpl/BaseOverlay.cpp b/OpenOVR/Reimpl/BaseOverlay.cpp
+index 3fdab6c..50a80b4 100644
+--- a/OpenOVR/Reimpl/BaseOverlay.cpp
++++ b/OpenOVR/Reimpl/BaseOverlay.cpp
+@@ -141,12 +141,44 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
+ 			// ... and use that to set the size of the overlay, as it will appear to the user
+ 			// Note we shouldn't do this when setting the texture, as the user may change the width of
+ 			//  the overlay without changing the texture.
+-			overlay.layerQuad.size.width = overlay.widthMeters * overlay.overlayTransform[0][0];
+-			overlay.layerQuad.size.height = overlay.widthMeters * overlay.overlayTransform[1][1] / aspect;
++			// VRmin: the overlay's rotation and scale come from its transform (upstream used only the diagonal, so an
++			// overlay turned more than 90 degrees got a negative width and showed mirrored, and every rotation was lost)
++			const MfMatrix4f& m = overlay.overlayTransform;
++			float ax[3][3]; // the three axes (columns), normalised
++			float len[3];
++			for (int c = 0; c < 3; c++) {
++				len[c] = sqrtf(m[0][c] * m[0][c] + m[1][c] * m[1][c] + m[2][c] * m[2][c]);
++				for (int r = 0; r < 3; r++)
++					ax[c][r] = len[c] > 1e-6f ? m[r][c] / len[c] : (r == c ? 1.f : 0.f);
++			}
++			XrQuaternionf rot = { 0.f, 0.f, 0.f, 1.f };
++			float det = ax[0][0] * (ax[1][1] * ax[2][2] - ax[2][1] * ax[1][2]) - ax[1][0] * (ax[0][1] * ax[2][2] - ax[2][1] * ax[0][2])
++			    + ax[2][0] * (ax[0][1] * ax[1][2] - ax[1][1] * ax[0][2]);
++			if (det > 0.5f) {
++				// (a proper rotation: its quaternion; a mirrored transform keeps the old behaviour)
++				float m00 = ax[0][0], m11 = ax[1][1], m22 = ax[2][2], tr = m00 + m11 + m22;
++				if (tr > 0) {
++					float sq = sqrtf(tr + 1.f) * 2;
++					rot = { (ax[1][2] - ax[2][1]) / sq, (ax[2][0] - ax[0][2]) / sq, (ax[0][1] - ax[1][0]) / sq, 0.25f * sq };
++				} else if (m00 > m11 && m00 > m22) {
++					float sq = sqrtf(1.f + m00 - m11 - m22) * 2;
++					rot = { 0.25f * sq, (ax[1][0] + ax[0][1]) / sq, (ax[2][0] + ax[0][2]) / sq, (ax[1][2] - ax[2][1]) / sq };
++				} else if (m11 > m22) {
++					float sq = sqrtf(1.f + m11 - m00 - m22) * 2;
++					rot = { (ax[1][0] + ax[0][1]) / sq, 0.25f * sq, (ax[2][1] + ax[1][2]) / sq, (ax[2][0] - ax[0][2]) / sq };
++				} else {
++					float sq = sqrtf(1.f + m22 - m00 - m11) * 2;
++					rot = { (ax[2][0] + ax[0][2]) / sq, (ax[2][1] + ax[1][2]) / sq, 0.25f * sq, (ax[0][1] - ax[1][0]) / sq };
++				}
++				overlay.layerQuad.size.width = overlay.widthMeters * len[0];
++				overlay.layerQuad.size.height = overlay.widthMeters * len[1] / aspect;
++			} else {
++				overlay.layerQuad.size.width = overlay.widthMeters * m[0][0];
++				overlay.layerQuad.size.height = overlay.widthMeters * m[1][1] / aspect;
++			}
+ 
+ 			// Finally, add it to the list of layers to be sent to LibOVR
+-			overlay.layerQuad.pose = { { 0.f, 0.f, 0.f, 1.f },
+-				{ overlay.overlayTransform[0][3], overlay.overlayTransform[1][3], overlay.overlayTransform[2][3] } };
++			overlay.layerQuad.pose = { rot, { m[0][3], m[1][3], m[2][3] } };
+ 
+ 			layerHeaders.push_back((XrCompositionLayerBaseHeader*)&overlay.layerQuad);
+ 		}
