@@ -263,6 +263,7 @@ void displayCaptureLoop(const DisplayCapture &c) {
             if (GetCursorPos(&cp)) drawCursor(scaled.data(), ow, oh, ow * 4, (int)((cp.x - b.left) * k), (int)((cp.y - b.top) * k), oh / 1080.f);
             src = scaled.data();
         }
+        depthSubmit(c.main ? 0 : c.sid, src, ow, oh);   // (3D: la IA calcula su profundidad, si está activado)
         nv.resize((size_t)ow * oh * 3 / 2);
         bgraToNv12(src, ow * 4, ow, oh, nv.data());
         c.enc->encode(nv.data(), ow, oh, s.deskFps, s.deskMbps * 1000000, false, false, ((uint64_t)c.sid << 32) | ((uint64_t)ow << 16) | (uint64_t)oh);

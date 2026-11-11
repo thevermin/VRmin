@@ -230,6 +230,15 @@ uint64_t recordingSince();
 void recordSet(bool on);
 void recordOpenFolder();
 
+// ---------- 3D automático con IA (depth.cpp) ----------
+void depthPrepare();                          // baja y carga la IA (la primera vez)
+void depthSetDesktop(bool on);
+void depthSetWindow(uint32_t sid, bool on);
+void depthSubmit(uint32_t sid, const uint8_t *bgra, int w, int h);   // una imagen nueva de la pantalla (0) o de una ventana
+bool depthEnabled();
+std::string depthStatus();
+void depthSelfTest();
+
 // ---------- Ventana ----------
 void uiRefresh();
 bool uiRun(HINSTANCE inst);   // la ventana completa (WebView2); false si no se pudo abrir

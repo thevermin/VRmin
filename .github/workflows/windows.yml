@@ -73,6 +73,8 @@ jobs:
           Start-Process -FilePath $exe -ArgumentList "--record-test" -Wait
           Get-Content "$env:LOCALAPPDATA\VRmin\VRmin.log" | Select-String "record"
           Get-ChildItem "$([Environment]::GetFolderPath('MyVideos'))\VRmin" | Format-Table Name, Length
+          Start-Process -FilePath $exe -ArgumentList "--depth-test" -Wait
+          Get-Content "$env:LOCALAPPDATA\VRmin\VRmin.log" | Select-String "3D"
           Start-Process -FilePath $exe
           Start-Sleep -Seconds 20
           Shot "captura.png"

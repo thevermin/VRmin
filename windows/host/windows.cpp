@@ -208,6 +208,7 @@ static void windowLoop(uint32_t sid, std::shared_ptr<WinStream> st) {
             for (int y = 0; y < oh; y++) memcpy(scaled.data() + (size_t)y * ow * 4, crop.data() + (size_t)y * cw * 4, (size_t)ow * 4);
             src = scaled.data();
         }
+        depthSubmit(sid, src, ow, oh);   // (3D de esta ventana, si está activado)
         nv.resize((size_t)ow * oh * 3 / 2);
         bgraToNv12(src, ow * 4, ow, oh, nv.data());
         st->enc->encode(nv.data(), ow, oh, fps, s.deskMbps * 1000000, false, false, ((uint64_t)ow << 16) | (uint64_t)oh);

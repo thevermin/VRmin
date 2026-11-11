@@ -122,8 +122,14 @@ void handleQuestMessage(const std::string &line) {
         if (m.has("msg")) sentinelSay(m["msg"].str());
     } else if (t == "record") {   // ajustes rápidos del visor: empezar o terminar la grabación
         recordSet(m["on"].boolean(false));
-    } else if (t == "monitor" || t == "depth3d") {
-        // (monitor virtual y 3D: todavía solo en la Mac)
+    } else if (t == "depth3d") {
+        bool on = m["on"].boolean(false);
+        if (on) depthPrepare();
+        uint32_t sid = (uint32_t)m["id"].num(0);
+        if (sid) { depthSetWindow(sid, on); logmsg("[3D] Window %u in 3D: %s", sid, on ? "on" : "off"); }
+        else { depthSetDesktop(on); logmsg("[3D] Desktop in 3D: %s", on ? "on" : "off"); }
+    } else if (t == "monitor") {
+        // (monitor virtual: todavía solo en la Mac)
     }
 }
 
@@ -173,7 +179,7 @@ static void lobbyThread() {
         Json o = Json::object();
         o.set("type", "lobby2d").set("launching", gamesLaunchingInfo(active)).set("game", active).set("gameName", active ? gamesRunningName() : std::string())
          .set("macModel", pcModel).set("busy", gamesBusy()).set("status", gamesStatus()).set("desk", deskOn()).set("deskErr", deskError())
-         .set("depth3d", false).set("depthStatus", "").set("cfg", cfg).set("games", games).set("monitor", false)
+         .set("depth3d", depthEnabled()).set("depthStatus", depthStatus()).set("cfg", cfg).set("games", games).set("monitor", false)
          .set("monitorErr", tr("Todavía no está en Windows", "Not available on Windows yet")).set("displays", others)
          .set("mainDisplay", mainD).set("deskDisplay", (double)deskDisplayId()).set("monitorId", 0).set("typing", typingActive()).set("vigia", sentinelOn()).set("ll", Json::array())
          .set("perf", active ? perfSnapshot() : Json::object()).set("adv", profilesState()).set("windows", windowsListJson()).set("os", "windows")
