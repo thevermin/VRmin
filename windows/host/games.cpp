@@ -177,6 +177,52 @@ static void forEachGameProcess(const std::function<void(DWORD pid, const std::st
     CloseHandle(snap);
 }
 
+/// Las carpetas (en minúsculas) de los juegos abiertos ahora
+std::set<std::string> gamesOpenDirs() {
+    std::set<std::string> out;
+    forEachGameProcess([&](DWORD, const std::string &f) {
+        std::string low = f;
+        for (auto &c : low) c = (char)tolower((unsigned char)c);
+        out.insert(low);
+    });
+    return out;
+}
+
+// ---------- Si cada juego funciona (lo marca el usuario; queda en game_status.json) ----------
+static std::mutex stLock;
+static Json g_status;
+static bool stLoaded = false;
+std::string gameStatusOf(const std::string &id) {
+    std::lock_guard<std::mutex> g(stLock);
+    if (!stLoaded) { stLoaded = true; g_status = Json::parse(readFile(dataDir() + L"\\game_status.json")); if (g_status.t != Json::Obj) g_status = Json::object(); }
+    return g_status[id].str();
+}
+void gameStatusSet(const std::string &id, const std::string &st) {
+    gameStatusOf(id);
+    std::lock_guard<std::mutex> g(stLock);
+    if (st == "sin probar" || st.empty()) g_status.o.erase(id); else g_status.set(id, st);
+    writeFile(dataDir() + L"\\game_status.json", g_status.dump());
+}
+
+// ---------- Steam ----------
+bool steamInstalled() { return GetFileAttributesW((steamPath() + L"\\steam.exe").c_str()) != INVALID_FILE_ATTRIBUTES; }
+bool steamRunning() {
+    bool found = false;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof pe;
+    for (BOOL ok = Process32FirstW(snap, &pe); ok && !found; ok = Process32NextW(snap, &pe)) found = _wcsicmp(pe.szExeFile, L"steam.exe") == 0;
+    CloseHandle(snap);
+    return found;
+}
+void steamOpen() { ShellExecuteW(nullptr, L"open", L"steam://open/main", nullptr, nullptr, SW_SHOWNORMAL); }
+void steamClose() {
+    std::wstring exe = steamPath() + L"\\steam.exe";
+    ShellExecuteW(nullptr, L"open", exe.c_str(), L"-shutdown", nullptr, SW_HIDE);
+    logmsg("[steam] Closing Steam");
+}
+
 std::string gamesRunningName() {
     std::string name;
     forEachGameProcess([&](DWORD, const std::string &f) { if (name.empty()) name = f; });

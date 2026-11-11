@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VRmin Host</title>
+<style>
+:root {
+  --bg: #141416; --card: rgba(255,255,255,.055); --line: rgba(255,255,255,.08);
+  --text: #f3f3f4; --text2: rgba(243,243,244,.62); --amber: #e6a84a; --amberText: #f2c27a; --amberDark: #1a1308;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+body { padding: 10px 22px 22px; user-select: none; }
+button { font: inherit; }
+.row { display: flex; align-items: center; gap: 10px; }
+.top { align-items: flex-start; }
+.grow { flex: 1; min-width: 0; }
+.col { display: flex; flex-direction: column; gap: 16px; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 760px) { .two { grid-template-columns: 1fr; } }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 9px; padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+.card > h2 { margin: 0; font-size: 15px; font-weight: 600; color: var(--text2); display: flex; gap: 8px; align-items: center; }
+.small { font-size: 12px; color: var(--text2); }
+.tiny { font-size: 11px; color: var(--text2); }
+.amber { color: var(--amberText); }
+.big { font-size: 17px; font-weight: 600; }
+.b { font-weight: 600; font-size: 14px; }
+.pill { border: 0; border-radius: 6px; padding: 7px 14px; font-weight: 600; font-size: 13px; color: var(--text); background: rgba(255,255,255,.10); cursor: pointer; white-space: nowrap; }
+.pill:hover { background: rgba(255,255,255,.16); }
+.pill.primary { background: var(--amber); color: var(--amberDark); }
+.pill.primary:hover { background: #f0b65c; }
+.pill:disabled { opacity: .4; cursor: default; }
+.icon { width: 32px; padding: 7px 0; text-align: center; }
+.dot { width: 10px; height: 10px; border-radius: 50%; flex: none; border: 2px solid rgba(255,255,255,.25); }
+.dot.on { background: var(--amber); border-color: var(--amber); }
+.dot.warn { border-color: var(--amber); }
+header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.logo { font-size: 30px; font-weight: 700; letter-spacing: -.5px; display: flex; align-items: baseline; gap: 8px; }
+.logo .thin { font-weight: 200; }
+.logo .host { font-size: 19px; font-weight: 400; color: var(--text2); }
+.status { display: flex; gap: 8px; align-items: center; background: rgba(255,255,255,.07); border-radius: 6px; padding: 7px 12px; font-weight: 600; border: 0; color: var(--text); }
+.status.fix { cursor: pointer; }
+.games { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; }
+.game { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.cover { position: relative; height: 70px; border-radius: 6px; overflow: hidden; background: rgba(255,255,255,.06); border: 2px solid transparent; }
+.cover.open { border-color: var(--amber); }
+.cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.cover .pill { position: absolute; top: 6px; right: 6px; }
+.ell { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ask { background: rgba(230,168,74,.12); border-radius: 8px; padding: 10px; }
+.seg { display: inline-flex; background: rgba(255,255,255,.07); border-radius: 6px; padding: 2px; flex-wrap: wrap; }
+.seg button { border: 0; background: none; color: var(--text); padding: 5px 11px; border-radius: 5px; cursor: pointer; font-weight: 500; }
+.seg button.sel { background: rgba(255,255,255,.18); font-weight: 600; }
+.presets { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+.preset { text-align: left; border: 1.5px solid transparent; background: rgba(255,255,255,.05); border-radius: 8px; padding: 10px; color: var(--text); cursor: pointer; min-height: 84px; display: flex; flex-direction: column; gap: 4px; }
+.preset.sel { background: rgba(230,168,74,.14); border-color: var(--amber); }
+.preset .name { font-weight: 700; font-size: 14px; display: flex; justify-content: space-between; align-items: flex-end; }
+.bars { display: flex; gap: 3px; align-items: flex-end; }
+.bars i { display: block; width: 5px; border-radius: 1.5px; background: rgba(255,255,255,.15); }
+.bars i.on { background: var(--amber); }
+.switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; }
+.switch input { display: none; }
+.switch .knob { width: 34px; height: 20px; border-radius: 10px; background: rgba(255,255,255,.18); position: relative; flex: none; transition: background .15s; }
+.switch .knob::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .15s; }
+.switch input:checked + .knob { background: var(--amber); }
+.switch input:checked + .knob::after { left: 16px; }
+.menu { position: relative; }
+.menu .list { position: absolute; left: 0; top: 34px; z-index: 5; background: #232326; border: 1px solid var(--line); border-radius: 8px; padding: 6px; min-width: 240px; box-shadow: 0 10px 30px rgba(0,0,0,.5); display: none; }
+.menu.open .list { display: block; }
+.menu .list button { display: block; width: 100%; text-align: left; border: 0; background: none; color: var(--text); padding: 7px 10px; border-radius: 5px; cursor: pointer; }
+.menu .list button:hover { background: rgba(255,255,255,.08); }
+.menu .list .sep { height: 1px; background: var(--line); margin: 4px 0; }
+.menu .list .sel::before { content: "✓ "; color: var(--amberText); }
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 10; }
+.sheet { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; width: 560px; max-width: calc(100vw - 32px); max-height: calc(100vh - 40px); overflow: auto; padding: 22px; display: flex; flex-direction: column; gap: 18px; }
+.sheet h1 { margin: 0; font-size: 21px; }
+.code { font: 700 44px/1 Consolas, monospace; color: var(--amberText); letter-spacing: 6px; text-align: center; }
+.log { background: rgba(0,0,0,.25); border-radius: 6px; padding: 10px; height: 220px; overflow: auto; font: 11px/1.45 Consolas, monospace; color: var(--text2); user-select: text; white-space: pre-wrap; }
+.link { color: var(--text2); background: none; border: 0; cursor: pointer; padding: 0; font-weight: 600; display: flex; gap: 6px; align-items: center; }
+.steps { display: flex; flex-direction: column; gap: 10px; }
+.step { display: flex; gap: 10px; align-items: flex-start; }
+.num { width: 22px; height: 22px; border-radius: 50%; background: rgba(255,255,255,.1); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 12px; flex: none; }
+.num.done { background: var(--amber); color: var(--bg); }
+svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; vertical-align: -3px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="layer"></div>
+<script>
+// ---------- Puente con VRmin Host (C++) ----------
+const call = (cmd, arg) => (window.vrmin ? window.vrmin(cmd, arg === undefined ? null : arg) : Promise.resolve(null));
+let S = null;            // último estado
+let es = navigator.language.startsWith("es");
+const t = (a, b) => (es ? a : b);
+const h = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const I = {
+  gear: '<svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>',
+  help: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.6v.6M12 17h0"/></svg>',
+  cup: '<svg viewBox="0 0 24 24"><path d="M4 8h13v5a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5zM17 10h1.5a2.5 2.5 0 0 1 0 5H17M8 3v2M12 3v2"/></svg>',
+  arrow: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M10 8l4 4-4 4"/></svg>',
+  chevR: '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>',
+  chevD: '<svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>',
+  headset: '<svg viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="10" rx="4"/><path d="M10 17c.5-2 3.5-2 4 0"/></svg>',
+  steam: '<svg viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="11" rx="3"/><path d="M8 11v3M6.5 12.5h3M15 12h0M17 13.5h0"/></svg>',
+  grid: '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1"/><rect x="4" y="13" width="7" height="7" rx="1"/><rect x="13" y="13" width="7" height="7" rx="1"/></svg>',
+  mic: '<svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>',
+  dial: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 12l4-3"/></svg>',
+  speed: '<svg viewBox="0 0 24 24"><path d="M4 16a8 8 0 1 1 16 0M12 16l3-5"/></svg>',
+  pc: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>',
+  bubble: '<svg viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4z"/><path d="M12 8v4M12 14h0"/></svg>',
+  dots: '<svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>',
+};
+
+// ---------- Calidad: los mismos ajustes que en la Mac y el Quest ----------
+const PRESETS = [
+  { id: "bajo", name: ["Bajo", "Low"], level: 1, eye: 1024, fps: 72, mbps: 40, pc: ["Gráficos integrados, o si el Wi-Fi es lento", "Integrated graphics, or slow Wi-Fi"] },
+  { id: "medio", name: ["Medio", "Medium"], level: 2, eye: 1280, fps: 90, mbps: 70, pc: ["GTX 1660, RTX 2060, RX 5600 o parecida", "GTX 1660, RTX 2060, RX 5600 or similar"] },
+  { id: "alto", name: ["Alto", "High"], level: 3, eye: 1536, fps: 90, mbps: 100, pc: ["RTX 3060 a 4060, RX 6600 a 7700 o parecida", "RTX 3060 to 4060, RX 6600 to 7700 or similar"] },
+  { id: "ultra", name: ["Ultra", "Ultra"], level: 4, eye: 2048, fps: 90, mbps: 150, pc: ["RTX 4070 o más, RX 7800 o más", "RTX 4070 or better, RX 7800 or better"] },
+];
+function recommended(gpu, vram) {   // (la misma cuenta que el Quest)
+  const m = /(RTX|GTX|RX)\s*(\d{3,4})/.exec((gpu || "").toUpperCase());
+  if (m) {
+    const n = +m[2];
+    if (m[1] === "RX") { const g = Math.floor(n / 1000), k = n % 1000; return g >= 9 || (g === 7 && k >= 800) ? 3 : g >= 6 ? 2 : 1; }
+    const g = Math.floor(n / 100), k = n % 100;
+    if (m[1] === "RTX" && g >= 40 && k >= 70) return 3;
+    if (m[1] === "RTX" && g >= 30) return 2;
+    return 1;
+  }
+  return vram >= 12000 ? 3 : vram >= 6000 ? 2 : vram >= 2000 ? 1 : 0;
+}
+const presetOf = (eye, fps, mbps) => PRESETS.findIndex(p => p.eye === eye && p.fps === fps && p.mbps === mbps);
+const bars = n => `<span class="bars">${[1, 2, 3, 4].map(i => `<i class="${i <= n ? "on" : ""}" style="height:${5 + i * 3}px"></i>`).join("")}</span>`;
+function presetCards(sel, rec, extra) {
+  const card = (id, name, hint, level, isRec) => `<button class="preset ${sel === id ? "sel" : ""}" data-preset="${id}">
+      <span class="name">${h(name)}${level ? bars(level) : ""}</span><span class="small">${hint}</span>
+      ${isRec ? `<span class="tiny amber b">${t("Recomendado para tu PC", "Recommended for your PC")}</span>` : ""}</button>`;
+  let o = extra ? card(extra.id, extra.name, h(extra.hint), 0, false) : "";
+  PRESETS.forEach((p, i) => { o += card(p.id, t(...p.name), h(t(...p.pc)) + `<br>${p.eye} px · ${p.fps} Hz · ${p.mbps} Mbps`, p.level, i === rec); });
+  return o + card("custom", t("Personalizado", "Custom"), t("Elegí cada ajuste a tu gusto", "Choose each setting yourself"), 0, false);
+}
+const seg = (key, opts, cur) => `<span class="seg">${opts.map(([v, l]) => `<button data-seg="${key}" data-v="${v}" class="${String(v) === String(cur) ? "sel" : ""}">${h(l)}</button>`).join("")}</span>`;
+const sw = (key, label, on, hint) => `<label class="switch"><span>${h(label)}${hint ? `<br><span class="tiny">${h(hint)}</span>` : ""}</span><input type="checkbox" data-sw="${key}" ${on ? "checked" : ""}><span class="knob"></span></label>`;
+const dot = (on, warn) => `<span class="dot ${on ? "on" : warn ? "warn" : ""}"></span>`;
+
+// ---------- Pantalla principal ----------
+let showLog = false, openMenu = null, sheet = null, logLines = [];
+function render() {
+  if (!S) return;
+  es = S.lang === "es";
+  document.documentElement.lang = S.lang;
+  const ready = S.setup.runtimeOk && S.setup.ocOk;
+  const falta = !S.steam.installed ? t("Falta instalar Steam", "Steam isn't installed") : !ready ? t("Falta preparar Windows", "Windows isn't set up yet") : null;
+  const pill = falta || (S.quest.connected ? t("Quest conectado", "Quest connected") : t("Esperando al Quest", "Waiting for the Quest"));
+  const header = `<header>
+    <div class="logo"><span>VR<span class="thin">min</span></span><span class="host">Host</span></div>
+    <span class="small">v${h(S.version)} · Windows</span>
+    <span class="grow"></span>
+    ${S.busy ? `<span class="small ell">${h(S.busy)}</span>` : ""}
+    <button class="status ${falta ? "fix" : ""}" data-act="fix" ${falta ? "" : "disabled"} title="${falta ? t("Tocá para hacerlo ahora", "Click to do it now") : ""}">
+      ${dot(S.quest.connected && !falta, !!falta || !S.quest.connected)} ${h(pill)} ${falta ? `<span class="amber">${I.arrow}</span>` : ""}</button>
+    <button class="pill primary" data-url="https://ko-fi.com/thevermin" title="${t("VRmin es gratis. Si te sirve, podés invitarme un café en Ko-fi", "VRmin is free. If it helps you, you can buy me a coffee on Ko-fi")}">${I.cup} ${t("Apoyar en Ko-fi", "Support on Ko-fi")}</button>
+    <button class="pill icon" data-act="help" title="${t("Ayuda", "Help")}">${I.help}</button>
+    <button class="pill icon" data-act="settings" title="${t("Ajustes", "Settings")}">${I.gear}</button>
+  </header>`;
+
+  const conn = `<div class="card"><h2>${I.headset} ${t("Conexión", "Connection")}</h2>
+    <div class="row top"><div class="grow">
+      <div class="big">${S.quest.connected ? t("El Quest está usando esta PC", "The Quest is using this PC") : t("Abrí VRmin en el Quest y tocá Conectar", "Open VRmin on the Quest and tap Connect")}</div>
+      <div class="small">${S.quest.connected ? (S.quest.wifi ? t("Por Wi-Fi.", "Over Wi-Fi.") : t("Por cable USB-C.", "Over the USB-C cable.")) + " " + t("Se desconecta sola cuando cerrás esta app.", "It disconnects when you close this app.")
+        : t("No hace falta tocar nada acá: la PC se prepara sola cuando el Quest se conecta. El Quest y la PC tienen que estar en la misma red.", "Nothing to do here: the PC gets ready when the Quest connects. The Quest and the PC must be on the same network.")}</div>
+    </div></div>
+    ${S.stats ? `<div class="tiny" style="font-family:Consolas,monospace">${h(S.stats)}</div>` : ""}
+  </div>`;
+
+  const steps = (n, done, title, sub, btn) => `<div class="step"><span class="num ${done ? "done" : ""}">${done ? "✓" : n}</span>
+      <div class="grow"><div class="b">${title}</div><div class="small">${sub}</div></div>${btn || ""}</div>`;
+  const prep = `<div class="card"><h2>${I.steam} ${ready && S.steam.installed ? "Steam" : t("Primera vez", "First time")}</h2>
+    ${ready && S.steam.installed ? `
+      <div class="row">${dot(S.steam.running, !S.steam.running)}<div class="grow"><div class="b">Steam</div>
+        <div class="small">${S.steam.running ? t("Abierto", "Open") : t("Cerrado", "Closed")}</div></div>
+        ${S.steam.running ? `<button class="pill" data-act="steamShow">${t("Mostrar", "Show")}</button><button class="pill" data-act="steamClose">${t("Cerrar", "Close")}</button>`
+          : `<button class="pill primary" data-act="steamOpen">${t("Abrir", "Open")}</button>`}</div>
+      <div class="row">${dot(true)}<div class="grow"><div class="b">${t("Juegos VR", "VR games")}</div>
+        <div class="small">${t("Usan VRmin en lugar de SteamVR mientras esta app esté abierta.", "They use VRmin instead of SteamVR while this app is open.")}</div></div>
+        <button class="pill" data-act="restore" title="${t("Deshace lo que VRmin cambió en Windows", "Undoes what VRmin changed in Windows")}">${t("Volver a SteamVR", "Back to SteamVR")}</button></div>`
+    : `<div class="steps">
+      ${steps(1, S.steam.installed, t("Steam para Windows", "Steam for Windows"), S.steam.installed ? t("Instalado", "Installed") : t("Sin instalar", "Not installed"),
+        S.steam.installed ? "" : `<button class="pill primary" data-url="https://store.steampowered.com/about/">${t("Descargar", "Download")}</button>`)}
+      ${steps(2, ready, t("Preparar Windows para los juegos VR", "Set up Windows for VR games"), t("Windows pide permiso de administrador una vez", "Windows asks for administrator permission once"),
+        ready ? "" : `<button class="pill primary" data-act="prepare" ${S.busy ? "disabled" : ""}>${t("Preparar", "Set up")}</button>`)}
+      ${steps(3, S.steam.running && S.games.length > 0, t("Abrí Steam, iniciá sesión y bajá tus juegos", "Open Steam, sign in and download your games"), t("Aparecen acá y en el Quest", "They show up here and on the Quest"),
+        S.steam.installed && !S.steam.running ? `<button class="pill" data-act="steamOpen">${t("Abrir Steam", "Open Steam")}</button>` : "")}
+    </div>`}
+  </div>`;
+
+  let games = `<div class="card"><h2>${I.grid} ${t("Juegos", "Games")}</h2>`;
+  if (S.askWorked) games += `<div class="row ask"><span class="amber">✋</span><span class="b grow ell">${h(t("¿Funcionó bien ", "Did ") + S.askWorked.name + t("?", " work well?"))}</span>
+      <button class="pill primary" data-worked="funciona">👍 ${t("Sí", "Yes")}</button><button class="pill" data-worked="con problemas">👎 ${t("Tuvo problemas", "It had problems")}</button>
+      <button class="pill icon" data-worked="">✕</button></div>`;
+  const vrGames = S.games.filter(g => g.vr), flat = S.games.filter(g => !g.vr);
+  const order = l => l.slice().sort((a, b) => (b.open - a.open) || a.name.localeCompare(b.name));
+  if (!S.games.length) games += `<div class="row"><span class="small grow">${t("Todavía no hay juegos. Instalalos desde Steam y aparecen acá (y en el Quest).", "No games yet. Install them from Steam and they show up here (and on the Quest).")}</span>
+      ${S.steam.installed && !S.steam.running ? `<button class="pill primary" data-act="steamOpen">${t("Abrir Steam", "Open Steam")}</button>` : ""}</div>`;
+  else {
+    games += `<div class="games">${order(vrGames).map(gameCard).join("")}</div>`;
+    if (flat.length) games += `<div class="small b" style="margin-top:6px">${t("Juegos planos · en el visor se ven en el escritorio", "Flat games · in the headset they show on the desktop")}</div><div class="games">${order(flat).map(gameCard).join("")}</div>`;
+    games += `<div class="tiny">${t("Lo más cómodo es elegirlos desde el Quest, en Juegos. ¿No aparece un juego? Abrilo directamente desde Steam.", "The easiest way is to pick them from the Quest, in Games. A game doesn't show up? Open it straight from Steam.")}</div>`;
+  }
+  games += `</div>`;
+
+  const log = `<div class="col" style="gap:8px">
+    <button class="link" data-act="log">${showLog ? I.chevD : I.chevR} ${t("Registro", "Log")} ${!showLog && S.lastLog ? `<span class="tiny ell" style="font-weight:400">${h(S.lastLog)}</span>` : ""}</button>
+    <div class="row"><button class="pill" data-act="report">${I.bubble} ${t("Algo anda mal", "Something's wrong")}</button>
+      <span class="tiny">${t("Junta los registros en un .zip en el Escritorio y abre la página para mandarlo cuando pidas ayuda. No incluye claves ni datos personales.", "Puts the logs in a .zip on the Desktop and opens the page to send it when you ask for help. It doesn't include passwords or personal data.")}</span></div>
+    ${showLog ? `<div class="log" id="log">${h(logLines.join("\n"))}</div><div class="row"><button class="pill" data-act="logs">${t("Carpeta de registros", "Logs folder")}</button></div>` : ""}
+  </div>`;
+
+  const app = document.getElementById("app");
+  const y = window.scrollY;
+  app.innerHTML = header + `<div class="col"><div class="two">${conn}${prep}</div>${games}${log}</div>`;
+  window.scrollTo(0, y);
+  const l = document.getElementById("log");
+  if (l) l.scrollTop = l.scrollHeight;
+  renderLayer();
+}
+
+function gameCard(g) {
+  const st = { "funciona": t("Funciona", "Works"), "con problemas": t("Anda con problemas", "Has problems"), "no funciona": t("No funciona por ahora", "Doesn't work yet") }[g.status] || t("Sin probar todavía", "Not tried yet");
+  return `<div class="game">
+    <div class="cover ${g.open ? "open" : ""}"><img src="https://cdn.cloudflare.steamstatic.com/steam/apps/${h(g.id)}/header.jpg" onerror="this.style.display='none'" alt="">
+      ${g.open ? `<button class="pill primary" data-quit="1" title="${t("Cierra el juego aunque no responda (Steam sigue abierto)", "Closes the game even if it doesn't respond (Steam stays open)")}">${t("Forzar cierre", "Force quit")}</button>` : ""}</div>
+    <div class="row" style="gap:6px">${dot(g.status === "funciona", g.status !== "funciona")}<span class="b ell grow" style="font-size:12px" title="${h(g.name)}">${h(g.name)}</span>${g.open ? `<span class="tiny amber b">${t("Abierto", "Open")}</span>` : ""}</div>
+    <div class="tiny ell">${h(st)}${g.own ? " · " + t("ajustes propios", "own settings") : ""}</div>
+    <div class="row" style="gap:6px">
+      ${!g.open ? `<button class="pill primary" data-play="${h(g.id)}" ${S.steam.installed ? "" : "disabled"}>${t("Jugar", "Play")}</button>` : ""}
+      ${g.vr ? `<span class="menu ${openMenu === g.id ? "open" : ""}"><button class="pill icon" data-menu="${h(g.id)}" title="${t("Ajustes de este juego", "This game's settings")}">${I.dots}</button>
+        <span class="list">
+          <button data-gameq="${h(g.id)}">${t("Calidad y rendimiento de este juego…", "Quality and performance for this game…")}</button>
+          <span class="sep"></span>
+          ${["funciona", "con problemas", "no funciona", "sin probar"].map(e => `<button class="${(g.status || "sin probar") === e ? "sel" : ""}" data-status="${h(g.id)}" data-v="${e}">${{ "funciona": t("Funciona", "Works"), "con problemas": t("Anda con problemas", "Has problems"), "no funciona": t("No funciona", "Doesn't work"), "sin probar": t("Sin probar", "Not tried") }[e]}</button>`).join("")}
+        </span></span>` : ""}
+    </div></div>`;
+}
+
+// ---------- Hojas: ajustes, un juego, ayuda, código ----------
+let customOpen = false, gameCustom = false;
+function renderLayer() {
+  const L = document.getElementById("layer");
+  let o = "";
+  if (S.pairCode >= 0) {
+    const c = String(S.pairCode).padStart(6, "0");
+    o = `<div class="overlay"><div class="sheet" style="width:380px;align-items:center;text-align:center">
+      <div class="b" style="font-size:20px">${t("Emparejar un Quest", "Pair a Quest")}</div>
+      <div class="small">${t("Escribí este código en el Quest para permitirle usar esta PC:", "Type this code on the Quest to let it use this PC:")}</div>
+      <div class="code">${c.slice(0, 3)} ${c.slice(3)}</div>
+      <div class="tiny">${t("Vence en 5 minutos. Si no lo pediste vos, no lo compartas.", "It expires in 5 minutes. If you didn't ask for it, don't share it.")}</div></div></div>`;
+  } else if (sheet === "settings") o = settingsSheet();
+  else if (sheet && sheet.game) o = gameSheet(sheet.game);
+  else if (sheet === "help") o = helpSheet();
+  const old = L.querySelector(".sheet"), top = old ? old.scrollTop : 0;   // (al redibujar, la hoja queda donde estaba)
+  L.innerHTML = o;
+  const now = L.querySelector(".sheet");
+  if (now) now.scrollTop = top;
+}
+
+function settingsSheet() {
+  const c = S.cfg, rec = recommended(S.gpu.name, S.gpu.vram), cur = presetOf(c.eye, c.fps, c.mbps);
+  const sel = customOpen || cur < 0 ? "custom" : PRESETS[cur].id;
+  const fovLevel = +(String(c.fov).split(",")[0] || 0);
+  const all = S.prof.all || {};
+  return `<div class="overlay" data-close="1"><div class="sheet">
+    <div class="row"><h1 class="grow">${t("Ajustes", "Settings")}</h1><button class="pill primary" data-act="close">${t("Listo", "Done")}</button></div>
+    <div class="card"><h2>${I.dial} ${t("Calidad de los juegos VR", "VR game quality")}</h2>
+      <div class="tiny">${t("Elegí uno según tu PC. También se cambia desde el Quest, en Ajustes.", "Pick one for your PC. You can also change it from the Quest, in Settings.")}</div>
+      <div class="presets" data-scope="all">${presetCards(sel, rec)}</div>
+      <div class="tiny">${t("Tu placa de video: ", "Your graphics card: ")}${h(S.gpu.name || "?")}${S.gpu.vram ? ` (${Math.round(S.gpu.vram / 1024)} GB)` : ""}</div>
+      ${sel === "custom" ? `
+        <div class="b">${t("Nitidez (píxeles por ojo)", "Sharpness (pixels per eye)")}</div>${seg("eye", [1024, 1280, 1536, 1832, 2048, 2304, 2560].map(v => [v, v]), c.eye)}
+        <div class="b">${t("Fluidez (cuadros por segundo)", "Smoothness (frames per second)")}</div>${seg("fps", [72, 80, 90, 120].map(v => [v, v]), c.fps)}
+        <div class="b">${t("Calidad de imagen (Mbps)", "Image quality (Mbps)")}</div>${seg("mbps", [40, 70, 100, 150, 200].map(v => [v, v]), c.mbps)}
+        <div class="b">Foveated encoding</div>${seg("fov", [[0, t("Apagado", "Off")], [1, t("Suave", "Light")], [2, t("Medio", "Medium")], [3, t("Fuerte", "Strong")]], fovLevel)}
+        <div class="tiny">${t("El borde de cada ojo va más liviano: menos demora y un centro más nítido.", "Each eye's edge is lighter: less delay and a sharper center.")}</div>
+        <div class="b">${t("Códec de video", "Video codec")}</div>${seg("codec", [["hevc", "HEVC"], ["h264", "H.264"]], c.codec)}
+        <div class="tiny">${t("HEVC da mejor imagen con los mismos Mbps. H.264, por si HEVC anda mal.", "HEVC gives a better picture at the same Mbps. H.264, in case HEVC misbehaves.")}</div>` : ""}
+      <div class="b">${t("Sonido de los juegos", "Game sound")}</div>${seg("audio", [["quest", t("Visor", "Headset")], ["mac", "PC"], ["both", t("Los dos", "Both")]], c.audio)}
+      <div><button class="pill" data-act="recommended">${t("Recomendado", "Recommended")}</button></div>
+    </div>
+    <div class="card"><h2>${I.mic} ${t("Micrófono de los juegos", "Games microphone")}</h2>
+      ${seg("mic", [["quest", t("El del visor (Quest)", "The headset's (Quest)")], ["pc", t("El de Windows", "Windows' microphone")]], S.mic.on ? "quest" : "pc")}
+      ${S.mic.on ? (S.mic.cable ? `<div class="tiny">${t("VB-CABLE instalado. Mientras jugás, el micrófono de Windows es «CABLE Output» (tu voz desde el visor); al terminar, vuelve el de antes.", "VB-CABLE installed. While you play, Windows' microphone is \"CABLE Output\" (your voice from the headset); when you stop, yours comes back.")}</div>`
+        : `<div class="row"><span class="tiny grow">${t("Falta instalar VB-CABLE (gratis), el micrófono virtual por donde llega tu voz desde el visor.", "Install VB-CABLE (free), the virtual microphone your voice comes through from the headset.")}</span><button class="pill primary" data-url="https://vb-audio.com/Cable/">${t("Descargar", "Download")}</button></div>`)
+        : `<div class="tiny">${t("Los juegos usan el micrófono que elegiste en Windows (por ejemplo, unos auriculares con micrófono).", "Games use the microphone you picked in Windows (for example, a headset with a mic).")}</div>`}
+    </div>
+    <div class="card"><h2>${I.speed} ${t("Rendimiento (todos los juegos)", "Performance (all games)")}</h2>${advanced("all", all, all)}
+      <div class="tiny">${t("Para un solo juego: el botón de ajustes de su portada, en Juegos.", "For one game: the settings button on its cover, in Games.")}</div></div>
+    <div class="card"><h2>${I.pc} ${t("Esta PC", "This PC")}</h2>
+      <div class="row"><span class="grow">${es ? "Idioma" : "Language"}</span>${seg("lang", [["en", "English"], ["es", "Español"]], S.lang)}</div>
+      ${sw("openAtLogin", t("Abrir VRmin Host al iniciar Windows", "Open VRmin Host when Windows starts"), S.pc.openAtLogin)}
+      ${sw("keepAwake", t("No suspender mientras el Quest la usa", "Don't sleep while the Quest is using it"), S.pc.keepAwake)}
+      <div class="row"><span class="tiny grow ell">${h(S.dataDir)}</span><button class="pill" data-act="data">${t("Mostrar datos", "Show data")}</button></div>
+      <div class="row"><span class="grow">${t("Quest emparejados con esta PC", "Quests paired with this PC")}</span><button class="pill" data-act="forget">${t("Olvidar todos", "Forget all")}</button></div>
+    </div>
+    <div class="tiny">VRmin Host ${h(S.version)} (Windows, beta) · VRmin by thevermin · github.com/thevermin/vrmin · GPL-3.0</div>
+  </div></div>`;
+}
+
+function advanced(scope, own, all) {
+  const v = k => (own[k] !== undefined ? own[k] : all[k]);
+  const scale = Math.round((v("scale") || 1) * 100), fovk = Math.round((v("fovk") || 1) * 100);
+  return `<div data-scope="${h(scope)}" class="col" style="gap:10px">
+    <div class="b">${t("Escala de render", "Render scale")}</div>${seg("scale", [50, 60, 70, 80, 90, 100].map(x => [x, x + " %"]), scale)}
+    <div class="tiny">${t("El juego dibuja menos píxeles y se agrandan antes de mandarlos: más cuadros por segundo.", "The game draws fewer pixels and they're scaled up before sending: more frames per second.")}</div>
+    <div class="b">${t("Campo de visión", "Field of view")}</div>${seg("fovk", [80, 85, 90, 95, 100].map(x => [x, x + " %"]), fovk)}
+    <div class="tiny">${t("Las esquinas casi no se ven por las lentes: si el juego no las dibuja, rinde más.", "The corners are barely visible through the lenses: if the game doesn't draw them, it runs faster.")}</div>
+    ${sw("auto", t("Escala automática", "Automatic scale"), !!v("auto"))}
+    ${sw("index", t("Emular controles de Valve Index", "Emulate Valve Index controllers"), !!v("index"))}
+    ${sw("vive", t("Emular controles de HTC Vive", "Emulate HTC Vive controllers"), !!v("vive"), t("Para juegos hechos para los controles de Vive: el stick hace de trackpad", "For games made for Vive controllers: the stick works as the trackpad"))}
+    <div class="tiny">${t("Hay que volver a abrir el juego para que se aplique.", "Reopen the game for it to apply.")}</div></div>`;
+}
+
+function gameSheet(id) {
+  const g = S.games.find(x => x.id === id);
+  if (!g) return "";
+  const own = (S.prof.own || {})[g.dir] || {}, all = S.prof.all || {}, c = S.cfg;
+  const e = own.eye || c.eye, f = own.fps || c.fps, mb = own.mbps || c.mbps;
+  const hasQ = own.eye || own.fps || own.mbps;
+  const p = presetOf(e, f, mb);
+  const sel = !hasQ && !gameCustom ? "all" : gameCustom || p < 0 ? "custom" : PRESETS[p].id;
+  return `<div class="overlay" data-close="1"><div class="sheet">
+    <div class="row"><h1 class="grow ell">${h(t("Ajustes de ", "Settings for ") + g.name)}</h1><button class="pill primary" data-act="close">${t("Listo", "Done")}</button></div>
+    <div class="small">${t("Solo para este juego. La calidad se aplica mientras el juego está abierto; lo demás, la próxima vez que lo abras.", "Only for this game. The quality applies while the game is open; the rest, the next time you open it.")}</div>
+    <div class="card"><h2>${I.dial} ${t("Calidad", "Quality")}</h2>
+      <div class="presets" data-scope="key:${h(g.dir)}">${presetCards(sel, recommended(S.gpu.name, S.gpu.vram), { id: "all", name: t("Como todos los juegos", "Same as all games"), hint: t("Usa la calidad general de Ajustes", "Uses the general quality from Settings") })}</div>
+      ${sel === "custom" ? `<div data-scope="key:${h(g.dir)}" class="col" style="gap:8px">
+        <div class="b">${t("Nitidez (píxeles por ojo)", "Sharpness (pixels per eye)")}</div>${seg("geye", [1024, 1280, 1536, 1832, 2048, 2304, 2560].map(v => [v, v]), e)}
+        <div class="b">${t("Fluidez (cuadros por segundo)", "Smoothness (frames per second)")}</div>${seg("gfps", [72, 90, 120].map(v => [v, v]), f)}
+        <div class="b">${t("Calidad de imagen (Mbps)", "Image quality (Mbps)")}</div>${seg("gmbps", [40, 70, 100, 150, 200].map(v => [v, v]), mb)}</div>` : ""}
+    </div>
+    <div class="card"><h2>${I.speed} ${t("Rendimiento", "Performance")}</h2>${advanced("key:" + g.dir, own, all)}</div>
+    ${Object.keys(own).length ? `<div><button class="pill" data-reset="key:${h(g.dir)}">${t("Usar los de todos los juegos", "Use the ones for all games")}</button></div>` : ""}
+  </div></div>`;
+}
+
+const TUTS = [
+  { es: "Bienvenido a VRmin Host", en: "Welcome to VRmin Host", steps: [
+    ["VRmin Host es la parte de la PC: le pasa al Quest tu pantalla y los juegos VR de Steam.", "VRmin Host is the PC side: it sends your screen and Steam VR games to the Quest."],
+    ["La primera vez, «Preparar» hace que los juegos VR usen VRmin en lugar de SteamVR (Windows pide permiso de administrador).", "The first time, \"Set up\" makes VR games use VRmin instead of SteamVR (Windows asks for administrator permission)."],
+    ["En el Quest, abrí VRmin y elegí esta PC. No hace falta encender nada acá.", "On the Quest, open VRmin and pick this PC. Nothing to turn on here."],
+    ["La primera vez aparece acá un código de 6 números: escribilo en el Quest.", "The first time, a 6-digit code shows up here: type it on the Quest."]] },
+  { es: "Jugar un juego VR", en: "Playing a VR game", steps: [
+    ["Los juegos VR que instales en Steam aparecen en «Juegos». Tocá «Jugar» (o elegilo desde el Quest).", "VR games you install in Steam show up in \"Games\". Click \"Play\" (or pick it from the Quest)."],
+    ["Si un juego se traba, «Forzar cierre» sobre su imagen lo cierra.", "If a game hangs, \"Force quit\" on its picture closes it."],
+    ["Cada juego puede tener su propia calidad: el botón de ajustes de su portada.", "Each game can have its own quality: the settings button on its cover."]] },
+  { es: "Wi-Fi o cable", en: "Wi-Fi or cable", steps: [
+    ["Por Wi-Fi: el Quest y la PC en la misma red (mejor si la PC va por cable al router).", "Over Wi-Fi: the Quest and the PC on the same network (best with the PC wired to the router)."],
+    ["Por cable USB-C: más estable y con menos demora. VRmin lo usa solo cuando está conectado.", "Over USB-C cable: steadier, with less delay. VRmin uses it on its own when it's plugged in."]] },
+  { es: "Si algo no anda", en: "If something isn't working", steps: [
+    ["«Algo anda mal» (abajo de todo) junta los registros en un .zip para mandarlo en un Issue.", "\"Something's wrong\" (at the very bottom) puts the logs in a .zip to send in an Issue."],
+    ["Sin sonido en el visor: revisá «Sonido de los juegos» en los ajustes.", "No sound in the headset: check \"Game sound\" in settings."],
+    ["«Volver a SteamVR» deja Windows como estaba antes de VRmin.", "\"Back to SteamVR\" puts Windows back the way it was before VRmin."]] },
+];
+function helpSheet() {
+  return `<div class="overlay" data-close="1"><div class="sheet">
+    <div class="row"><h1 class="grow">${t("Ayuda", "Help")}</h1><button class="pill primary" data-act="close">${t("Listo", "Done")}</button></div>
+    ${TUTS.map(x => `<div class="card"><h2>${h(t(x.es, x.en))}</h2><div class="steps">${x.steps.map((s, i) => `<div class="step"><span class="num">${i + 1}</span><span>${h(t(...s))}</span></div>`).join("")}</div></div>`).join("")}
+  </div></div>`;
+}
+
+// ---------- Acciones ----------
+document.addEventListener("click", async e => {
+  const el = e.target.closest("button, [data-close]");
+  if (!el) { if (openMenu) { openMenu = null; render(); } return; }
+  const d = el.dataset;
+  if (d.close && e.target === el) { sheet = null; customOpen = false; gameCustom = false; return renderLayer(); }
+  if (d.url) return call("openUrl", d.url);
+  if (d.menu) { openMenu = openMenu === d.menu ? null : d.menu; return render(); }
+  if (d.play) return act(() => call("play", d.play));
+  if (d.quit) return act(() => call("quit"));
+  if (d.gameq) { openMenu = null; sheet = { game: d.gameq }; gameCustom = false; return render(); }
+  if (d.status) { openMenu = null; return act(() => call("gameStatus", { id: d.status, status: d.v })); }
+  if (d.worked !== undefined) return act(() => call("worked", d.worked));
+  if (d.reset) { gameCustom = false; return act(() => call("prof", { scope: d.reset, reset: true })); }
+  if (d.preset) {
+    const scope = el.closest("[data-scope]").dataset.scope, p = PRESETS.find(x => x.id === d.preset);
+    if (scope === "all") {
+      customOpen = d.preset === "custom";
+      if (p) return act(() => call("settings", { eye: p.eye, fps: p.fps, mbps: p.mbps }));
+      return renderLayer();
+    }
+    gameCustom = d.preset === "custom";
+    if (d.preset === "all") return act(() => call("prof", { scope, eye: 0 }));
+    if (p) return act(() => call("prof", { scope, eye: p.eye, fps: p.fps, mbps: p.mbps }));
+    const c = S.cfg, own = (S.prof.own || {})[scope.slice(4)] || {};
+    return act(() => call("prof", { scope, eye: own.eye || c.eye, fps: own.fps || c.fps, mbps: own.mbps || c.mbps }));
+  }
+  if (d.seg) {
+    const v = d.v, scopeEl = el.closest("[data-scope]"), scope = scopeEl ? scopeEl.dataset.scope : "all";
+    if (d.seg === "lang") { es = v === "es"; return act(() => call("lang", v)); }
+    if (d.seg === "mic") return act(() => call("mic", v === "quest"));
+    if (["eye", "fps", "mbps", "codec", "audio"].includes(d.seg)) return act(() => call("settings", { [d.seg]: isNaN(+v) ? v : +v }));
+    if (d.seg === "fov") {
+      const parts = String(S.cfg.fov).split(",");
+      const fov = +v === 0 ? "0" : parts.length >= 2 ? [v, ...parts.slice(1)].join(",") : v + ",1";
+      return act(() => call("settings", { fov }));
+    }
+    if (d.seg === "scale" || d.seg === "fovk") return act(() => call("prof", { scope, [d.seg]: +v / 100 }));
+    if (["geye", "gfps", "gmbps"].includes(d.seg)) {
+      const c = S.cfg, own = (S.prof.own || {})[scope.slice(4)] || {};
+      const q = { eye: own.eye || c.eye, fps: own.fps || c.fps, mbps: own.mbps || c.mbps };
+      q[d.seg.slice(1)] = +v;
+      return act(() => call("prof", Object.assign({ scope }, q)));
+    }
+  }
+  switch (d.act) {
+    case "settings": sheet = "settings"; customOpen = false; return renderLayer();
+    case "help": sheet = "help"; return renderLayer();
+    case "close": sheet = null; customOpen = false; gameCustom = false; return renderLayer();
+    case "log": showLog = !showLog; if (showLog) logLines = (await call("log")) || []; return render();
+    case "recommended": {
+      customOpen = false;
+      const p = PRESETS[Math.max(1, recommended(S.gpu.name, S.gpu.vram))];
+      return act(() => call("settings", { eye: p.eye, fps: p.fps, mbps: p.mbps, fov: "0", codec: "hevc", audio: "quest" }));
+    }
+    case "fix": return act(() => call(S.steam.installed ? "prepare" : "openUrl", S.steam.installed ? null : "https://store.steampowered.com/about/"));
+    default: if (d.act) return act(() => call(d.act));
+  }
+});
+document.addEventListener("change", e => {
+  const k = e.target.dataset.sw;
+  if (!k) return;
+  const on = e.target.checked;
+  if (k === "openAtLogin" || k === "keepAwake") return act(() => call(k, on));
+  const scope = e.target.closest("[data-scope]").dataset.scope;
+  const o = { scope, [k]: on };
+  if (on && k === "index") o.vive = false;
+  if (on && k === "vive") o.index = false;
+  act(() => call("prof", o));
+});
+document.addEventListener("keydown", e => { if (e.key === "Escape" && sheet) { sheet = null; renderLayer(); } });
+
+async function act(f) { await f(); await refresh(true); }
+let lastJson = "";
+async function refresh(force) {
+  const s = await call("state");
+  if (!s) return;
+  const j = JSON.stringify(s);
+  if (!force && j === lastJson) return;
+  lastJson = j;
+  S = s;
+  if (showLog) logLines = (await call("log")) || logLines;
+  // (con un menú abierto, solo se redibuja la hoja de arriba; si no, todo)
+  if (openMenu) renderLayer(); else render();
+}
+setInterval(refresh, 1000);
+refresh(true);
+</script>
+</body>
+</html>

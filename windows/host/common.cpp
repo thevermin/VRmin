@@ -72,6 +72,8 @@ uint64_t nowNs() {
 
 static std::mutex g_logLock;
 static FILE *g_logFile;
+static std::vector<std::string> g_tail;   // (las últimas líneas, para la ventana)
+std::vector<std::string> logTail() { std::lock_guard<std::mutex> g(g_logLock); return g_tail; }
 void logmsg(const char *fmt, ...) {
     char buf[2048];
     va_list ap;
@@ -87,6 +89,10 @@ void logmsg(const char *fmt, ...) {
     SYSTEMTIME t;
     GetLocalTime(&t);
     if (g_logFile) { fprintf(g_logFile, "%02d:%02d:%02d %s\n", t.wHour, t.wMinute, t.wSecond, buf); fflush(g_logFile); }
+    char line[2100];
+    snprintf(line, sizeof line, "%02d:%02d:%02d %s", t.wHour, t.wMinute, t.wSecond, buf);
+    g_tail.push_back(line);
+    if (g_tail.size() > 400) g_tail.erase(g_tail.begin(), g_tail.begin() + 100);
     OutputDebugStringA(buf);
 }
 
@@ -106,6 +112,9 @@ void loadSettings() {
     if (j.has("deskMbps")) s.deskMbps = std::min(80, std::max(4, (int)j["deskMbps"].num()));
     if (j.has("deskAudio")) s.deskAudio = j["deskAudio"].str("mac");
     if (j.has("mic")) s.mic = j["mic"].str("pc") == "quest" ? "quest" : "pc";
+    if (j.has("lang")) s.lang = j["lang"].str();
+    if (j.has("keepAwake")) s.keepAwake = j["keepAwake"].boolean(true);
+    if (s.lang == "es" || s.lang == "en") IDIOMA_ES = s.lang == "es";
 }
 void saveSettings() {
     Json j = Json::object();
@@ -113,7 +122,8 @@ void saveSettings() {
         std::lock_guard<std::mutex> g(g_setLock);
         const Settings &s = g_set;
         j.set("eye", s.eye).set("fps", s.fps).set("mbps", s.mbps).set("codec", s.hevc ? "hevc" : "h264").set("fov", s.fov)
-         .set("audio", s.audio).set("deskMaxW", s.deskMaxW).set("deskFps", s.deskFps).set("deskMbps", s.deskMbps).set("deskAudio", s.deskAudio).set("mic", s.mic);
+         .set("audio", s.audio).set("deskMaxW", s.deskMaxW).set("deskFps", s.deskFps).set("deskMbps", s.deskMbps).set("deskAudio", s.deskAudio).set("mic", s.mic)
+         .set("lang", s.lang).set("keepAwake", s.keepAwake);
     }
     writeFile(dataDir() + L"\\settings.json", j.dump());
 }

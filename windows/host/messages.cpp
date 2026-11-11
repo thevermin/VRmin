@@ -4,7 +4,7 @@
 #include <thread>
 
 static std::atomic<bool> mode2D{false}, uiInHeadset{false}, hiddenSent{false};
-static std::string pcModel, pcGpu;
+static std::string pcModel, g_gpu;
 static int pcVramMb = 0;
 
 /// La placa de video de la PC (la de más memoria propia): el Quest recomienda la calidad con eso
@@ -15,26 +15,28 @@ static void findGpu() {
     SIZE_T best = 0;
     for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
         DXGI_ADAPTER_DESC1 d;
-        if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && (pcGpu.empty() || d.DedicatedVideoMemory > best)) {
+        if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && (g_gpu.empty() || d.DedicatedVideoMemory > best)) {
             best = d.DedicatedVideoMemory;
-            pcGpu = utf8(d.Description);
+            g_gpu = utf8(d.Description);
             pcVramMb = (int)(d.DedicatedVideoMemory >> 20);
         }
         a->Release();
     }
     f->Release();
-    logmsg("[pc] Graphics card: %s (%d MB)", pcGpu.c_str(), pcVramMb);
+    logmsg("[pc] Graphics card: %s (%d MB)", g_gpu.c_str(), pcVramMb);
 }
 
 bool lobbyShowsDesk() { return mode2D || uiInHeadset; }
 bool reportMake(bool fromHeadset);
-std::string pcGpuName() { return pcGpu.empty() ? "?" : pcGpu + " (" + std::to_string(pcVramMb) + " MB)"; }
+std::string pcGpu() { return g_gpu; }
+int pcVram() { return pcVramMb; }
+std::string pcGpuName() { return g_gpu.empty() ? "?" : g_gpu + " (" + std::to_string(pcVramMb) + " MB)"; }
 bool lobbyInGame() { return gameActive(); }
 
 void questOnConnect() { mode2D = false; uiInHeadset = false; hiddenSent = false; deskRequestKey(); }
 void questOnDisconnect() {}
 
-static void applyQuestSettings(const Json &m) {
+void settingsApply(const Json &m) {
     {
         std::lock_guard<std::mutex> g(g_setLock);
         Settings &s = g_set;
@@ -76,7 +78,7 @@ void handleQuestMessage(const std::string &line) {
     } else if (t == "gamecfg") {
         profilesApply(m);
     } else if (t == "settings") {
-        applyQuestSettings(m);
+        settingsApply(m);
     } else if (t == "deskcfg") {
         {
             std::lock_guard<std::mutex> g(g_setLock);
@@ -143,7 +145,7 @@ static void lobbyThread() {
          .set("mainDisplay", Json::object().set("id", 0x40000001).set("name", pcModel).set("w", GetSystemMetrics(SM_CXSCREEN)).set("h", GetSystemMetrics(SM_CYSCREEN)))
          .set("deskDisplay", 0x40000001).set("monitorId", 0).set("typing", typingActive()).set("vigia", false).set("ll", Json::array())
          .set("perf", active ? perfSnapshot() : Json::object()).set("adv", profilesState()).set("windows", Json::array()).set("os", "windows")
-         .set("pcGpu", pcGpu).set("pcVram", pcVramMb);
+         .set("pcGpu", g_gpu).set("pcVram", pcVramMb);
         std::string sj = o.dump();
         uint64_t now = nowNs();
         if (sj != last || now - lastAt > 2000000000ull) { last = sj; lastAt = now; questSendText(sj); }

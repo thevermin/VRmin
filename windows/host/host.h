@@ -40,6 +40,8 @@ struct Settings {
     int deskMaxW = 2560, deskFps = 60, deskMbps = 20;
     std::string deskAudio = "mac";
     std::string mic = "pc";             // micrófono de los juegos: "pc" (el de Windows) o "quest" (el del visor, por VB-CABLE)
+    std::string lang;                   // idioma de la ventana: "es", "en" o "" (el de Windows)
+    bool keepAwake = true;              // no suspender la PC mientras el Quest la usa
 };
 extern Settings g_set;
 extern std::mutex g_setLock;
@@ -176,3 +178,4 @@ void setupOnExit();
 
 // ---------- Ventana ----------
 void uiRefresh();
+bool uiRun(HINSTANCE inst);   // la ventana completa (WebView2); false si no se pudo abrir

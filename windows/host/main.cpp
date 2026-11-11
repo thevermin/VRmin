@@ -122,6 +122,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     // Si Windows ya estaba preparado de otra vez, OpenComposite vuelve a quedar activo (al cerrar se saca)
     if (setupCheck().runtimeOk) std::thread([] { setupActivate(); }).detach();
 
+    // La ventana completa (WebView2); si Windows no lo tiene, la ventana chica de siempre
+    if (uiRun(inst)) {
+        setupOnExit();
+        micOnExit();
+        logmsg("VRmin Host closed");
+        return 0;
+    }
+
     WNDCLASSW wc{};
     wc.lpfnWndProc = wndProc;
     wc.hInstance = inst;

@@ -39,3 +39,36 @@ jobs:
           name: VRmin-Windows
           path: ${{ env.ZIP }}
           retention-days: 30
+
+  # Prueba en un Windows de verdad: abre VRmin Host, saca una captura de la ventana y guarda el registro
+  probar:
+    runs-on: windows-2022
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: VRmin-Windows, path: zip }
+      - name: Abrir VRmin Host y sacar una captura
+        shell: pwsh
+        run: |
+          Expand-Archive -Path (Get-ChildItem zip\*.zip)[0].FullName -DestinationPath app
+          $exe = (Get-ChildItem app -Recurse -Filter "VRmin Host.exe")[0].FullName
+          Start-Process -FilePath $exe
+          Start-Sleep -Seconds 20
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $bmp.Save("$PWD\captura.png")
+          Get-Process "VRmin Host" -ErrorAction SilentlyContinue | Stop-Process
+          Copy-Item "$env:LOCALAPPDATA\VRmin\VRmin.log" . -ErrorAction SilentlyContinue
+          Get-Content VRmin.log -ErrorAction SilentlyContinue
+          if (-not (Select-String -Path VRmin.log -Pattern "window open" -Quiet)) { throw "The window didn't open with WebView2" }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: VRmin-Windows-prueba
+          path: |
+            captura.png
+            VRmin.log
+          retention-days: 7
