@@ -144,6 +144,10 @@ bool deskOn();
 void deskRequestKey();
 std::string deskError();
 void deskMouse(float u, float v, const Json &down, float scroll);
+struct DisplayInfo { uint32_t id; std::string name; RECT r; bool primary; };
+std::vector<DisplayInfo> displaysList();      // los monitores de la PC
+uint32_t deskDisplayId();                     // el que se ve en la pantalla principal del Quest
+void deskSetDisplay(uint32_t id);
 void typeKeys(const Json &m);
 bool typingActive();
 

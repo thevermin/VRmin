@@ -14,6 +14,58 @@ static VideoEncoder *g_deskEnc;
 static std::mutex boundsLock;
 static RECT g_deskBounds{0, 0, 1920, 1080};   // la pantalla que se manda (coordenadas del escritorio)
 
+// ---------- Monitores ----------
+// Cada monitor se identifica como en la Mac (el Quest usa el mismo número): 0x40000000 | el número de «\\.\DISPLAYn»
+static const uint32_t DISPLAY_BIT = 0x40000000;
+static std::atomic<uint32_t> g_deskTarget{0};   // el monitor que se ve en la pantalla principal del Quest (0: el principal)
+
+static uint32_t displayIdOf(const wchar_t *dev) {
+    const wchar_t *p = wcsstr(dev, L"DISPLAY");
+    return DISPLAY_BIT | (p ? (uint32_t)_wtoi(p + 7) : 0);
+}
+std::vector<DisplayInfo> displaysList() {
+    std::vector<DisplayInfo> out;
+    IDXGIFactory1 *f = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&f))) return out;
+    IDXGIAdapter1 *a = nullptr;
+    for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+        IDXGIOutput *o = nullptr;
+        for (UINT j = 0; a->EnumOutputs(j, &o) != DXGI_ERROR_NOT_FOUND; j++) {
+            DXGI_OUTPUT_DESC d;
+            if (SUCCEEDED(o->GetDesc(&d)) && d.AttachedToDesktop) {
+                DisplayInfo di;
+                di.id = displayIdOf(d.DeviceName);
+                di.r = d.DesktopCoordinates;
+                di.primary = d.DesktopCoordinates.left == 0 && d.DesktopCoordinates.top == 0;
+                DISPLAY_DEVICEW dd{};
+                dd.cb = sizeof dd;
+                std::wstring nm = EnumDisplayDevicesW(d.DeviceName, 0, &dd, 0) && dd.DeviceString[0] ? dd.DeviceString : L"";
+                if (nm.empty() || nm.find(L"Generic") != std::wstring::npos || nm.find(L"genérico") != std::wstring::npos)
+                    nm = L"Monitor " + std::to_wstring(di.id & ~DISPLAY_BIT);
+                di.name = utf8(nm);
+                out.push_back(di);
+            }
+            o->Release();
+        }
+        a->Release();
+    }
+    f->Release();
+    return out;
+}
+uint32_t deskDisplayId() {
+    uint32_t t = g_deskTarget;
+    if (t) return t;
+    for (auto &d : displaysList()) if (d.primary) return d.id;
+    return DISPLAY_BIT | 1;
+}
+void deskSetDisplay(uint32_t id) {
+    uint32_t t = id;
+    for (auto &d : displaysList()) if (d.id == id && d.primary) t = 0;
+    if (t != g_deskTarget) logmsg("[desktop] Main screen in the Quest: %s", t ? ("monitor " + std::to_string(t & ~DISPLAY_BIT)).c_str() : "the main monitor");
+    g_deskTarget = t;
+    deskRequestKey();
+}
+
 void deskSetOn(bool on) {
     if (on != g_deskOn) logmsg("[desktop] %s", on ? "on" : "off");
     g_deskOn = on;
@@ -66,6 +118,7 @@ static void captureThread() {
     int sw = 0, sh = 0;
     std::vector<uint8_t> frame, scaled, nv;
     uint64_t lastSent = 0;
+    uint32_t showing = 0;   // el monitor que se está capturando (g_deskTarget cuando se abrió)
     auto cleanup = [&] {
         if (dup) { dup->Release(); dup = nullptr; }
         if (staging) { staging->Release(); staging = nullptr; }
@@ -75,19 +128,36 @@ static void captureThread() {
     while (true) {
         bool want = questConnected() && g_deskOn && lobbyShowsDesk() && !gameActive();
         if (!want) { if (dup) cleanup(); Sleep(50); continue; }
+        if (dup && showing != g_deskTarget) { cleanup(); frame.clear(); }   // (se eligió otro monitor)
         if (!dup) {
-            D3D_FEATURE_LEVEL fl;
-            if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, &fl, &ctx))) {
-                setErr(tr("No pude usar la placa de video para capturar la pantalla", "Couldn't use the graphics card to capture the screen"));
-                Sleep(2000); continue;
-            }
-            IDXGIDevice *dd = nullptr;
-            IDXGIAdapter *ad = nullptr;
+            // El monitor elegido (o el principal) y la placa de video a la que está conectado
+            showing = g_deskTarget;
+            IDXGIFactory1 *fac = nullptr;
+            IDXGIAdapter1 *ad = nullptr;
             IDXGIOutput *out = nullptr;
             IDXGIOutput1 *out1 = nullptr;
-            dev->QueryInterface(IID_PPV_ARGS(&dd));
-            if (dd) dd->GetAdapter(&ad);
-            if (ad) ad->EnumOutputs(0, &out);
+            if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&fac))) {
+                IDXGIAdapter1 *a = nullptr;
+                for (UINT i = 0; !out && fac->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+                    IDXGIOutput *o = nullptr;
+                    for (UINT j = 0; !out && a->EnumOutputs(j, &o) != DXGI_ERROR_NOT_FOUND; j++) {
+                        DXGI_OUTPUT_DESC od;
+                        bool pick = SUCCEEDED(o->GetDesc(&od)) && od.AttachedToDesktop &&
+                                    (showing ? displayIdOf(od.DeviceName) == showing : od.DesktopCoordinates.left == 0 && od.DesktopCoordinates.top == 0);
+                        if (pick) { out = o; ad = a; a->AddRef(); } else o->Release();
+                    }
+                    a->Release();
+                }
+                fac->Release();
+            }
+            if (!out && showing) { g_deskTarget = 0; continue; }   // (ese monitor ya no está: el principal)
+            D3D_FEATURE_LEVEL fl;
+            if (FAILED(D3D11CreateDevice(ad, ad ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, &fl, &ctx))) {
+                setErr(tr("No pude usar la placa de video para capturar la pantalla", "Couldn't use the graphics card to capture the screen"));
+                if (out) out->Release();
+                if (ad) ad->Release();
+                Sleep(2000); continue;
+            }
             if (out) out->QueryInterface(IID_PPV_ARGS(&out1));
             HRESULT hr = out1 ? out1->DuplicateOutput(dev, &dup) : E_FAIL;
             if (out) {
@@ -99,7 +169,6 @@ static void captureThread() {
             if (out1) out1->Release();
             if (out) out->Release();
             if (ad) ad->Release();
-            if (dd) dd->Release();
             if (FAILED(hr)) {
                 setErr(tr("Windows no deja capturar la pantalla (¿otra app la usa, o la pantalla está en otra placa de video?)",
                           "Windows won't let VRmin capture the screen (is another app using it, or is the screen on another graphics card?)"));

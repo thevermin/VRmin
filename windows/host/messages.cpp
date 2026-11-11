@@ -99,6 +99,9 @@ void handleQuestMessage(const std::string &line) {
         std::thread(gamesQuit).detach();
     } else if (t == "report") {
         std::thread([] { reportMake(true); }).detach();
+    } else if (t == "deskdisp") {
+        // «Cambiar de monitor» en la pantalla principal del Quest
+        deskSetDisplay((uint32_t)m["id"].num(0));
     } else if (t == "desk") {
         if (m.has("on")) deskSetOn(m["on"].boolean());
         if (m["on"].boolean()) deskRequestKey();
@@ -137,13 +140,27 @@ static void lobbyThread() {
         cfg.set("eye", s.eye).set("fps", s.fps).set("mbps", s.mbps).set("audioMac", s.audio == "both").set("fov", s.fov)
            .set("codec", s.hevc ? "hevc" : "h264").set("run", run).set("audio", s.audio).set("deskMaxW", s.deskMaxW)
            .set("deskFps", s.deskFps).set("deskMbps", s.deskMbps).set("deskAudio", s.deskAudio);
+        // Los monitores de la PC (se revisan cada 2 s): el principal y los demás
+        static uint64_t dispAt = 0;
+        static std::vector<DisplayInfo> disps;
+        if (nowNs() - dispAt > 2000000000ull) {
+            dispAt = nowNs();
+            std::vector<DisplayInfo> l = displaysList();
+            if (l.size() != disps.size()) for (auto &d : l) logmsg("[pc] Monitor %u: %s, %ldx%ld%s", d.id & 0xFFFF, d.name.c_str(), d.r.right - d.r.left, d.r.bottom - d.r.top, d.primary ? " (main)" : "");
+            disps = l;
+        }
+        Json mainD = Json::object().set("id", 0x40000001).set("name", pcModel).set("w", GetSystemMetrics(SM_CXSCREEN)).set("h", GetSystemMetrics(SM_CYSCREEN));
+        Json others = Json::array();
+        for (auto &d : disps) {
+            Json j = Json::object().set("id", (double)d.id).set("name", d.primary ? pcModel : d.name).set("w", (int)(d.r.right - d.r.left)).set("h", (int)(d.r.bottom - d.r.top));
+            if (d.primary) mainD = j; else others.push(j);
+        }
         Json o = Json::object();
         o.set("type", "lobby2d").set("launching", gamesLaunchingInfo(active)).set("game", active).set("gameName", active ? gamesRunningName() : std::string())
          .set("macModel", pcModel).set("busy", gamesBusy()).set("status", gamesStatus()).set("desk", deskOn()).set("deskErr", deskError())
          .set("depth3d", false).set("depthStatus", "").set("cfg", cfg).set("games", games).set("monitor", false)
-         .set("monitorErr", tr("Todavía no está en Windows", "Not available on Windows yet")).set("displays", Json::array())
-         .set("mainDisplay", Json::object().set("id", 0x40000001).set("name", pcModel).set("w", GetSystemMetrics(SM_CXSCREEN)).set("h", GetSystemMetrics(SM_CYSCREEN)))
-         .set("deskDisplay", 0x40000001).set("monitorId", 0).set("typing", typingActive()).set("vigia", false).set("ll", Json::array())
+         .set("monitorErr", tr("Todavía no está en Windows", "Not available on Windows yet")).set("displays", others)
+         .set("mainDisplay", mainD).set("deskDisplay", (double)deskDisplayId()).set("monitorId", 0).set("typing", typingActive()).set("vigia", false).set("ll", Json::array())
          .set("perf", active ? perfSnapshot() : Json::object()).set("adv", profilesState()).set("windows", Json::array()).set("os", "windows")
          .set("pcGpu", g_gpu).set("pcVram", pcVramMb);
         std::string sj = o.dump();
