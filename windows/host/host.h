@@ -17,7 +17,7 @@
 #include <vector>
 #include "json.h"
 
-#define VRMIN_WIN_VERSION "0.2"
+#define VRMIN_WIN_VERSION "0.3"
 
 // ---------- Textos y registro ----------
 extern bool IDIOMA_ES;
@@ -39,6 +39,7 @@ struct Settings {
     std::string audio = "quest";        // juegos: "quest", "both" o "mac" (acá: la PC)
     int deskMaxW = 2560, deskFps = 60, deskMbps = 20;
     std::string deskAudio = "mac";
+    std::string mic = "pc";             // micrófono de los juegos: "pc" (el de Windows) o "quest" (el del visor, por VB-CABLE)
 };
 extern Settings g_set;
 extern std::mutex g_setLock;
@@ -146,6 +147,14 @@ bool typingActive();
 
 // ---------- Sonido ----------
 void audioStart();
+
+// ---------- Micrófono del visor en los juegos (mic.cpp) ----------
+void micStart();
+void micPush(const uint8_t *pcm, size_t n);   // lo que grabó el Quest (48 kHz, mono, 16 bits)
+bool micEnabled();
+void micSetEnabled(bool on);
+bool micCableInstalled();                     // VB-CABLE (el micrófono virtual) está instalado
+void micOnExit();
 
 // ---------- Juegos de Steam ----------
 struct GameEntry { std::string id, name, dir; bool vr = true; };

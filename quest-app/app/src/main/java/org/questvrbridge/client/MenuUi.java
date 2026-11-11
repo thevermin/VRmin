@@ -1384,18 +1384,50 @@ final class MenuUi implements Link.Listener {
     static final String[] PRESET_NAMES = {"Bajo", "Medio", "Alto", "Ultra"};
     static final String[] PRESET_FOR = {"MacBook Air con M1, o si el Wi-Fi es lento", "MacBook Air, Mac mini e iMac (M1 a M4)",
             "MacBook Pro y Mac mini con chip Pro", "Chip Max o Ultra (MacBook Pro, Mac Studio)"};
-    /// El ajuste pensado para el chip de la Mac conectada
+    static final String[] PRESET_FOR_PC = {"Gráficos integrados, o si el Wi-Fi es lento", "GTX 1660, RTX 2060, RX 5600 o parecida",
+            "RTX 3060 a 4060, RX 6600 a 7700 o parecida", "RTX 4070 o más, RX 7800 o más"};
+    static boolean onWindows() {
+        JSONObject st = Link.I.state();
+        return st != null && "windows".equals(st.optString("os", ""));
+    }
+    /// Para qué computadoras es cada ajuste (Mac o PC, según la que esté conectada)
+    static String presetFor(int i) { return (onWindows() ? PRESET_FOR_PC : PRESET_FOR)[i]; }
+    /// El ajuste pensado para la Mac (por su chip) o la PC (por su placa de video) conectada
     static int recommendedPreset() {
         JSONObject st = Link.I.state();
+        if (onWindows()) return pcPreset(st.optString("pcGpu", ""), st.optInt("pcVram", 0));
         String c = st == null ? "" : st.optString("macChip", "");
         return c.contains("Max") || c.contains("Ultra") ? 3 : c.contains("Pro") ? 2 : 1;
+    }
+    /// Por el nombre de la placa de video (y su memoria, en MB): RTX/GTX de NVIDIA, RX de AMD; lo demás, por la memoria
+    static int pcPreset(String gpu, int vramMb) {
+        String g = gpu.toUpperCase(java.util.Locale.ROOT);
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(RTX|GTX|RX)\\s*(\\d{3,4})").matcher(g);
+        if (m.find()) {
+            String fam = m.group(1);
+            int n = Integer.parseInt(m.group(2));
+            if (fam.equals("RX")) {   // RX 5600, 6700, 7800, 9070…
+                int gen = n / 1000, tier = n % 1000;
+                if (gen >= 9 || (gen == 7 && tier >= 800)) return 3;
+                if (gen >= 6) return 2;
+                return 1;
+            }
+            int gen = n / 100, tier = n % 100;   // RTX 2060, 3070, 4090, 5070…
+            if (fam.equals("RTX") && gen >= 40 && tier >= 70) return 3;
+            if (fam.equals("RTX") && gen >= 30) return 2;
+            return 1;
+        }
+        if (vramMb >= 12000) return 3;
+        if (vramMb >= 6000) return 2;
+        if (vramMb >= 2000) return 1;
+        return 0;   // (gráficos integrados)
     }
     /// «Medio ●●○○ · Recomendado para tu Mac\nMacBook Air… · 1280 px · 90 Hz · 70 Mbps»
     static String presetLabel(int i) {
         StringBuilder b = new StringBuilder(I18n.t(PRESET_NAMES[i])).append("  ");
         for (int k = 0; k < 4; k++) b.append(k <= i ? '●' : '○');
-        if (i == recommendedPreset()) b.append(" · ").append(I18n.t("Recomendado para tu Mac"));
-        return b.append('\n').append(I18n.t(PRESET_FOR[i])).append(" · ").append(EYES[PRESETS[i][0]]).append(" px · ")
+        if (i == recommendedPreset()) b.append(" · ").append(I18n.t(onWindows() ? "Recomendado para tu PC" : "Recomendado para tu Mac"));
+        return b.append('\n').append(I18n.t(presetFor(i))).append(" · ").append(EYES[PRESETS[i][0]]).append(" px · ")
                 .append(FPSS[PRESETS[i][1]]).append(" Hz · ").append(MBPSS[PRESETS[i][2]]).append(" Mbps").toString();
     }
     static int presetOf(int eye, int fps, int mbps) {

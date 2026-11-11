@@ -1,15 +1,13 @@
 // Preparar Windows para los juegos VR:
 //  - el runtime de OpenXR de VRmin como el activo (es una clave de Windows para todos: pide permiso de administrador)
-//  - OpenComposite en lugar de SteamVR, para los juegos de SteamVR (archivo openvrpaths.vrpath del usuario: sin permisos)
+//  - OpenComposite en lugar de SteamVR, para los juegos de SteamVR (archivo openvrpaths.vrpath del usuario: sin permisos).
+//    Es el que compila VRmin (mac/opencomposite) y viene en la carpeta de VRmin Host: se copia a la carpeta de datos.
 // «Volver a SteamVR» deja las dos cosas como estaban. Al cerrar VRmin Host, SteamVR vuelve solo.
 #include "host.h"
 #include <shellapi.h>
 #include <shlobj.h>
-#include <urlmon.h>
 
 static const wchar_t *XR_KEY = L"SOFTWARE\\Khronos\\OpenXR\\1";
-static const char *OC_URL_64 = "https://znix.xyz/OpenComposite/download.php?arch=x64&branch=openxr";
-static const char *OC_URL_32 = "https://github.com/GameNative/opencomposite/releases/download/v10/opencomposite_x86.dll";
 
 static std::wstring ourJson(bool b32) { return exeDir() + (b32 ? L"\\runtime\\questvrbridge_openxr32.json" : L"\\runtime\\questvrbridge_openxr.json"); }
 static std::wstring ocDir() { return dataDir() + L"\\OpenComposite"; }
@@ -70,12 +68,18 @@ static bool setRuntimes(const std::wstring &j64, const std::wstring &j32) {
     return runElevated(std::wstring(sys) + L"\\cmd.exe", args);
 }
 
-static bool download(const char *url, const std::wstring &to) {
-    HRESULT hr = URLDownloadToFileW(nullptr, wide(url).c_str(), to.c_str(), 0, nullptr);
-    if (FAILED(hr)) { logmsg("[setup] Couldn't download %s (0x%08lx)", url, (unsigned long)hr); return false; }
-    // (que sea una DLL de verdad y no una página de error)
-    std::string head = readFile(to).substr(0, 2);
-    if (head != "MZ") { logmsg("[setup] What I downloaded from %s isn't a DLL", url); DeleteFileW(to.c_str()); return false; }
+/// Copia un OpenComposite de la carpeta de VRmin Host si cambió (mientras un juego lo usa, Windows no deja: queda el de antes)
+static bool installOc(const wchar_t *name) {
+    std::wstring from = exeDir() + L"\\OpenComposite\\bin\\" + name, to = ocDir() + L"\\bin\\" + name;
+    std::string a = readFile(from);
+    if (a.size() < 2 || a.compare(0, 2, "MZ") != 0) { logmsg("[setup] VRmin Host is missing OpenComposite (%s)", utf8(name).c_str()); return false; }
+    if (readFile(to) == a) return true;
+    if (!CopyFileW(from.c_str(), to.c_str(), FALSE)) {
+        logmsg("[setup] Couldn't update OpenComposite %s (error %lu)%s", utf8(name).c_str(), GetLastError(),
+               GetFileAttributesW(to.c_str()) != INVALID_FILE_ATTRIBUTES ? ": keeping the one already installed" : "");
+        return GetFileAttributesW(to.c_str()) != INVALID_FILE_ATTRIBUTES;
+    }
+    logmsg("[setup] OpenComposite installed (%s)", utf8(name).c_str());
     return true;
 }
 
@@ -112,14 +116,11 @@ bool setupActivate() {
         logmsg("[setup] Asking for permission to activate VRmin's OpenXR runtime");
         if (!setRuntimes(ourJson(false), ourJson(true))) { logmsg("[setup] The OpenXR runtime wasn't activated (was the permission prompt cancelled?)"); ok = false; }
     }
-    // 2) OpenComposite (la primera vez se baja)
-    if (!ocFilesOk()) {
-        CreateDirectoryW(ocDir().c_str(), nullptr);
-        CreateDirectoryW((ocDir() + L"\\bin").c_str(), nullptr);
-        logmsg("[setup] Downloading OpenComposite…");
-        if (!download(OC_URL_64, ocDir() + L"\\bin\\vrclient_x64.dll")) ok = false;
-        download(OC_URL_32, ocDir() + L"\\bin\\vrclient.dll");   // (los juegos de 32 bits son pocos: si falla, sigue)
-    }
+    // 2) OpenComposite: el que viene con VRmin Host (se actualiza solo cuando VRmin Host trae uno nuevo)
+    CreateDirectoryW(ocDir().c_str(), nullptr);
+    CreateDirectoryW((ocDir() + L"\\bin").c_str(), nullptr);
+    if (!installOc(L"vrclient_x64.dll")) ok = false;
+    installOc(L"vrclient.dll");   // (32 bits: los juegos son pocos; si falla, sigue)
     if (ocFilesOk() && !setVrpath(true)) { logmsg("[setup] Couldn't activate OpenComposite"); ok = false; }
     SetupState s = setupCheck();
     logmsg("[setup] OpenXR: %s · OpenComposite: %s", s.runtimeOk ? "VRmin" : "other", s.ocOk ? "active" : "no");

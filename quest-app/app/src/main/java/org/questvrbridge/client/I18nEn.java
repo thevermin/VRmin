@@ -784,6 +784,11 @@ final class I18nEn {
         m.put("MacBook Pro y Mac mini con chip Pro", "MacBook Pro and Mac mini with a Pro chip");
         m.put("Chip Max o Ultra (MacBook Pro, Mac Studio)", "Max or Ultra chip (MacBook Pro, Mac Studio)");
         m.put("Elegí cada ajuste a tu gusto", "Choose each setting yourself");
+        m.put("Recomendado para tu PC", "Recommended for your PC");
+        m.put("Gráficos integrados, o si el Wi-Fi es lento", "Integrated graphics, or slow Wi-Fi");
+        m.put("GTX 1660, RTX 2060, RX 5600 o parecida", "GTX 1660, RTX 2060, RX 5600 or similar");
+        m.put("RTX 3060 a 4060, RX 6600 a 7700 o parecida", "RTX 3060 to 4060, RX 6600 to 7700 or similar");
+        m.put("RTX 4070 o más, RX 7800 o más", "RTX 4070 or better, RX 7800 or better");
         m.put("Más", "More");
     }
 }

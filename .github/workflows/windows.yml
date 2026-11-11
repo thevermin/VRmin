@@ -5,7 +5,7 @@ name: VRmin para Windows
 on:
   push:
     branches: [main]
-    paths: ['windows/**', 'mac/openxr/questvrbridge_openxr.c', '.github/workflows/windows.yml']
+    paths: ['windows/**', 'mac/openxr/questvrbridge_openxr.c', 'mac/opencomposite/*.dll', '.github/workflows/windows.yml']
   workflow_dispatch:
 jobs:
   build:

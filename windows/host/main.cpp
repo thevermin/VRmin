@@ -6,8 +6,9 @@
 #include <thread>
 
 void lobbyStart();
+bool reportMake(bool fromHeadset);
 
-static HWND g_wnd, g_btnPrep, g_btnRestore, g_btnLogs;
+static HWND g_wnd, g_btnPrep, g_btnRestore, g_btnLogs, g_btnMic, g_btnReport;
 static HFONT g_font, g_fontBig, g_fontTitle;
 static const COLORREF BG = RGB(18, 18, 20), FG = RGB(235, 235, 235), DIM = RGB(150, 150, 155), AMBER = RGB(255, 183, 77);
 
@@ -51,6 +52,18 @@ static void paint(HWND w) {
     drawLine(dc, y, s.runtimeOk && s.ocOk ? tr("Juegos VR: listos (VRmin reemplaza a SteamVR mientras esta ventana esté abierta)", "VR games: ready (VRmin replaces SteamVR while this window is open)")
                                           : tr("Juegos VR: falta preparar Windows (se hace solo al abrir el primer juego, o con el botón)", "VR games: Windows isn't set up yet (it happens when you open your first game, or with the button)"),
              g_font, s.runtimeOk && s.ocOk ? DIM : AMBER, 44);
+    if (!micEnabled())
+        drawLine(dc, y, tr("Micrófono de los juegos: el de la PC", "Games microphone: the PC's"), g_font, DIM, 24);
+    else if (micCableInstalled())
+        drawLine(dc, y, tr("Micrófono de los juegos: el del visor (mientras jugás, el micrófono de Windows es «CABLE Output»)",
+                           "Games microphone: the headset's (while you play, Windows' microphone is \"CABLE Output\")"), g_font, DIM, 44);
+    else
+        drawLine(dc, y, tr("Micrófono del visor: falta instalar VB-CABLE (gratis), el micrófono virtual que usa VRmin",
+                           "Headset microphone: install VB-CABLE (free), the virtual microphone VRmin uses"), g_font, AMBER, 44);
+    // (el botón del micrófono dice lo que hace ahora)
+    const char *mt = !micEnabled() ? tr("Usar el micrófono del visor", "Use the headset's microphone")
+                   : micCableInstalled() ? tr("Usar el micrófono de la PC", "Use the PC's microphone") : tr("Descargar VB-CABLE", "Download VB-CABLE");
+    SetWindowTextW(g_btnMic, wide(mt).c_str());
     EndPaint(w, &ps);
 }
 
@@ -64,9 +77,16 @@ static LRESULT CALLBACK wndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         if ((HWND)lp == g_btnPrep) CreateThread(nullptr, 0, [](LPVOID) -> DWORD { setupActivate(); return 0; }, nullptr, 0, nullptr);
         else if ((HWND)lp == g_btnRestore) CreateThread(nullptr, 0, [](LPVOID) -> DWORD { setupRestoreSteamVR(); return 0; }, nullptr, 0, nullptr);
         else if ((HWND)lp == g_btnLogs) ShellExecuteW(nullptr, L"open", dataDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        else if ((HWND)lp == g_btnReport) CreateThread(nullptr, 0, [](LPVOID) -> DWORD { reportMake(false); return 0; }, nullptr, 0, nullptr);
+        else if ((HWND)lp == g_btnMic) {
+            if (micEnabled() && !micCableInstalled()) ShellExecuteW(nullptr, L"open", L"https://vb-audio.com/Cable/", nullptr, nullptr, SW_SHOWNORMAL);
+            else micSetEnabled(!micEnabled());
+            InvalidateRect(w, nullptr, FALSE);
+        }
         return 0;
     case WM_DESTROY:
         setupOnExit();
+        micOnExit();
         PostQuitMessage(0);
         return 0;
     }
@@ -96,6 +116,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     gameStart();
     deskStart();
     audioStart();
+    micStart();
     lobbyStart();
     std::thread(gamesScan).detach();
     // Si Windows ya estaba preparado de otra vez, OpenComposite vuelve a quedar activo (al cerrar se saca)
@@ -114,16 +135,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g_fontTitle = CreateFontW(-px(26), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     g_fontBig = CreateFontW(-px(44), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Consolas");
     g_wnd = CreateWindowW(L"VRminHost", L"VRmin Host", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
-                          px(580), px(500), nullptr, nullptr, inst, nullptr);
+                          px(580), px(600), nullptr, nullptr, inst, nullptr);
     // (los botones se acomodan con el mismo tamaño de letra que el resto)
     auto button = [&](const char *t, int x, int y, int w) {
         HWND b = CreateWindowW(L"BUTTON", wide(t).c_str(), WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, px(x), px(y), px(w), px(32), g_wnd, nullptr, inst, nullptr);
         SendMessageW(b, WM_SETFONT, (WPARAM)g_font, TRUE);
         return b;
     };
-    g_btnPrep = button(tr("Preparar juegos VR", "Set up VR games"), 24, 390, 170);
-    g_btnRestore = button(tr("Volver a SteamVR", "Back to SteamVR"), 204, 390, 160);
-    g_btnLogs = button(tr("Registros", "Logs"), 374, 390, 120);
+    g_btnPrep = button(tr("Preparar juegos VR", "Set up VR games"), 24, 450, 170);
+    g_btnRestore = button(tr("Volver a SteamVR", "Back to SteamVR"), 204, 450, 160);
+    g_btnLogs = button(tr("Registros", "Logs"), 374, 450, 120);
+    g_btnMic = button(tr("Usar el micrófono del visor", "Use the headset's microphone"), 24, 492, 250);
+    g_btnReport = button(tr("Algo anda mal", "Something's wrong"), 284, 492, 210);
     SetTimer(g_wnd, 1, 1000, nullptr);
     ShowWindow(g_wnd, show);
     UpdateWindow(g_wnd);

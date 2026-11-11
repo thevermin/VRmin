@@ -533,7 +533,7 @@ final class GameMenuUi implements Link.Listener {
         for (int i = 0; i < nP; i++) pn[i] = I18n.t(MenuUi.PRESET_NAMES[i]) + (i == MenuUi.recommendedPreset() ? " ★" : "");
         pn[nP] = I18n.t("Personalizado");
         final boolean custom = showDetail || prof < 0;
-        pills(I18n.t("Calidad"), custom ? I18n.t("Elegí cada ajuste a tu gusto") : I18n.t(MenuUi.PRESET_FOR[prof]),
+        pills(I18n.t("Calidad"), custom ? I18n.t("Elegí cada ajuste a tu gusto") : I18n.t(MenuUi.presetFor(prof)),
                 pn, custom ? nP : prof, i -> {
                     if (i == nP) {
                         showDetail = true;

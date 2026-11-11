@@ -20,7 +20,20 @@ How to use it
 While the VRmin Host window is open, SteamVR games use VRmin. When you close it, SteamVR is back as it was.
 The "Back to SteamVR" button undoes everything VRmin changed in Windows.
 
-If something goes wrong: "Logs" button, and send the VRmin.log file in a GitHub Issue.
+Quality
+- Pick Low, Medium, High or Ultra in the headset (Settings, or the in-game menu). The one for your graphics card is
+  marked as recommended. Each game can also have its own quality.
+
+Headset microphone in games
+- Games normally use the PC's microphone. To use the Quest's microphone instead, install VB-CABLE (free,
+  https://vb-audio.com/Cable/), then click "Use the headset's microphone" in VRmin Host.
+- While you play, Windows' microphone becomes "CABLE Output" (the headset's microphone). When you stop playing, the
+  microphone you had comes back.
+
+SteamVR games use OpenComposite, built by VRmin and included in this folder (OpenComposite, GPL 3).
+
+If something goes wrong: click "Something's wrong". It saves a report on the Desktop and opens the GitHub page to
+send it in an Issue.
 https://github.com/thevermin/VRmin/issues
 
 Not on Windows yet: separate windows, virtual monitor, desktop 3D and Sentinel Mode.

@@ -251,6 +251,7 @@ static void readerThread(SOCKET c) {
         if (n == 0 || n > (1u << 20)) break;
         body.resize(n);
         if (!readExact(c, body.data(), n)) break;
+        if (body[0] == 0x0B) { micPush(body.data() + 1, n - 1); continue; }   // (lo que graba el micrófono del visor)
         handleQuestMessage(std::string((const char *)body.data(), n));
     }
     bool gone;

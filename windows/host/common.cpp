@@ -105,6 +105,7 @@ void loadSettings() {
     if (j.has("deskFps")) s.deskFps = std::min(60, std::max(15, (int)j["deskFps"].num()));
     if (j.has("deskMbps")) s.deskMbps = std::min(80, std::max(4, (int)j["deskMbps"].num()));
     if (j.has("deskAudio")) s.deskAudio = j["deskAudio"].str("mac");
+    if (j.has("mic")) s.mic = j["mic"].str("pc") == "quest" ? "quest" : "pc";
 }
 void saveSettings() {
     Json j = Json::object();
@@ -112,7 +113,7 @@ void saveSettings() {
         std::lock_guard<std::mutex> g(g_setLock);
         const Settings &s = g_set;
         j.set("eye", s.eye).set("fps", s.fps).set("mbps", s.mbps).set("codec", s.hevc ? "hevc" : "h264").set("fov", s.fov)
-         .set("audio", s.audio).set("deskMaxW", s.deskMaxW).set("deskFps", s.deskFps).set("deskMbps", s.deskMbps).set("deskAudio", s.deskAudio);
+         .set("audio", s.audio).set("deskMaxW", s.deskMaxW).set("deskFps", s.deskFps).set("deskMbps", s.deskMbps).set("deskAudio", s.deskAudio).set("mic", s.mic);
     }
     writeFile(dataDir() + L"\\settings.json", j.dump());
 }
@@ -175,9 +176,18 @@ std::vector<float> Fovea::forward(double c) const {
 
 static int round64(double v) { return std::max(256, (int)std::lround(v / 64) * 64); }
 Stream currentStream() { std::lock_guard<std::mutex> g(g_runLock); return g_run; }
+// Calidad propia del juego abierto (la que eligió para ese juego): va encima de la general mientras el juego corre
+static Json g_gameQ;
 static void computeStream() {
     Settings s;
-    { std::lock_guard<std::mutex> g(g_setLock); s = g_set; }
+    {
+        std::lock_guard<std::mutex> g(g_setLock);
+        s = g_set;
+        if (g_gameQ.has("eye")) s.eye = (int)g_gameQ["eye"].num();
+        if (g_gameQ.has("fps")) s.fps = (int)g_gameQ["fps"].num();
+        if (g_gameQ.has("mbps")) s.mbps = (int)g_gameQ["mbps"].num();
+        if (g_gameQ.has("fov")) s.fov = g_gameQ["fov"].str();
+    }
     Stream st;
     st.eye = s.eye; st.fps = s.fps; st.bitrate = s.mbps * 1000000; st.hevc = s.hevc;
     st.fov = Fovea(s.fov);
@@ -273,17 +283,44 @@ std::string profilesConfigLine(int fps, bool hello) {
     return b;
 }
 std::string profilesCurrent() { std::lock_guard<std::mutex> g(g_profLock); return g_current; }
+/// La calidad propia de un juego (lo que haya elegido; lo que falte sale de la general). Con g_profLock tomado.
+static Json qualityOf(const std::string &key) {
+    Json q = Json::object();
+    if (key.empty()) return q;
+    const Json &p = g_prof[key];
+    for (const char *k : {"eye", "fps", "mbps", "fov"}) if (p.has(k)) q.set(k, p[k]);
+    return q;
+}
+/// Usa la calidad del juego (o la general, con un objeto vacío) y la aplica si cambió. Sin g_profLock tomado.
+static void useGameQuality(const Json &q) {
+    {
+        std::lock_guard<std::mutex> g(g_setLock);
+        if (g_gameQ.dump() == q.dump()) return;
+        g_gameQ = q;
+    }
+    if (q.has("eye") || q.has("fps") || q.has("mbps") || q.has("fov")) logmsg("[game] This game has its own quality: %s", q.dump().c_str());
+    else logmsg("[game] Back to the general quality");
+    applySettings();
+}
 void profilesBegin(const std::string &app) {
     std::string key = gamesRunningName();
     if (key.empty()) key = app;
-    std::lock_guard<std::mutex> g(g_profLock);
-    profLoad();
-    g_current = key;
-    Eff e = effective(key);
-    logmsg("[game] Settings for \"%s\": scale %d %%, field of view %d %%%s%s", key.c_str(), (int)(e.scale * 100), (int)(e.fovk * 100),
-           e.index ? ", Index controllers" : "", e.vive ? ", Vive controllers" : "");
+    Json q;
+    {
+        std::lock_guard<std::mutex> g(g_profLock);
+        profLoad();
+        g_current = key;
+        Eff e = effective(key);
+        logmsg("[game] Settings for \"%s\": scale %d %%, field of view %d %%%s%s", key.c_str(), (int)(e.scale * 100), (int)(e.fovk * 100),
+               e.index ? ", Index controllers" : "", e.vive ? ", Vive controllers" : "");
+        q = qualityOf(key);
+    }
+    useGameQuality(q);
 }
-void profilesEnd() { std::lock_guard<std::mutex> g(g_profLock); g_current.clear(); }
+void profilesEnd() {
+    { std::lock_guard<std::mutex> g(g_profLock); g_current.clear(); }
+    useGameQuality(Json::object());
+}
 Json profilesState() {
     std::lock_guard<std::mutex> g(g_profLock);
     profLoad();
@@ -300,8 +337,17 @@ Json profilesState() {
     }
     return o;
 }
+static void profilesApplyLocked(const Json &m, Json &live, bool &liveSet);
 void profilesApply(const Json &m) {
-    std::lock_guard<std::mutex> g(g_profLock);
+    Json live;
+    bool liveSet = false;
+    {
+        std::lock_guard<std::mutex> g(g_profLock);
+        profilesApplyLocked(m, live, liveSet);
+    }
+    if (liveSet) useGameQuality(live);
+}
+static void profilesApplyLocked(const Json &m, Json &live, bool &liveSet) {
     profLoad();
     std::string scope = m["scope"].str("all");
     std::string key = scope == "game" ? g_current : scope.rfind("key:", 0) == 0 ? scope.substr(4) : "";
@@ -315,14 +361,18 @@ void profilesApply(const Json &m) {
         if (m.has("fovk")) p.set("fovk", std::min(1.0, std::max(0.75, m["fovk"].num())));
         if (m.has("index")) p.set("index", m["index"].boolean());
         if (m.has("vive")) p.set("vive", m["vive"].boolean());
-        if (!key.empty()) {
-            if (m.has("eye")) p.set("eye", (int)m["eye"].num());
-            if (m.has("fps")) p.set("fps", (int)m["fps"].num());
-            if (m.has("mbps")) p.set("mbps", (int)m["mbps"].num());
-            if (m.has("fov")) p.set("fov", m["fov"].str());
+        if (!key.empty()) {   // (la calidad de «todos» es la general de VRmin Host, no va acá)
+            if (m.has("eye") && (int)m["eye"].num() == 0) for (const char *k : {"eye", "fps", "mbps", "fov"}) p.o.erase(k);   // («Como todos los juegos»)
+            int eye = (int)m["eye"].num(0), fps = (int)m["fps"].num(0), mbps = (int)m["mbps"].num(0);
+            if (eye >= 512 && eye <= 2560) p.set("eye", eye);
+            if (fps == 72 || fps == 80 || fps == 90 || fps == 120) p.set("fps", fps);
+            if (mbps >= 10 && mbps <= 300) p.set("mbps", mbps);
+            if (m.has("fov") && m["fov"].str().size() < 80) p.set("fov", m["fov"].str());
         }
         g_prof.set(key, p);
     }
     writeFile(profFile(), g_prof.dump());
-    logmsg("[game] Advanced settings for %s saved (they apply the next time the game opens)", key.empty() ? "all games" : key.c_str());
+    logmsg("[game] Advanced settings for %s saved", key.empty() ? "all games" : key.c_str());
+    // La calidad del juego abierto se aplica ya (lo demás, la próxima vez que se abra)
+    if (!key.empty() && key == g_current) live = qualityOf(key), liveSet = true;
 }
