@@ -85,6 +85,7 @@ static LRESULT CALLBACK wndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_DESTROY:
+        vmonCleanup();
         setupOnExit();
         micOnExit();
         PostQuitMessage(0);
@@ -129,6 +130,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     audioStart();
     micStart();
     cableStart();
+    vmonStart();
     updatesStart();
     lobbyStart();
     std::thread(gamesScan).detach();
@@ -137,6 +139,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
     // La ventana completa (WebView2); si Windows no lo tiene, la ventana chica de siempre
     if (uiRun(inst)) {
+        vmonCleanup();
         setupOnExit();
         micOnExit();
         logmsg("VRmin Host closed");

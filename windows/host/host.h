@@ -44,6 +44,7 @@ struct Settings {
     bool keepAwake = true;              // no suspender la PC mientras el Quest la usa
     bool beta = false;                  // recibir también las versiones beta
     bool recQuest = true;               // al grabar, también el visor (si está por cable con adb)
+    bool vmonOurs = false;              // el monitor virtual está en el escritorio porque VRmin lo puso
 };
 extern Settings g_set;
 extern std::mutex g_setLock;
@@ -238,6 +239,18 @@ void depthSubmit(uint32_t sid, const uint8_t *bgra, int w, int h);   // una imag
 bool depthEnabled();
 std::string depthStatus();
 void depthSelfTest();
+
+// ---------- Monitor virtual (vmonitor.cpp, con Virtual Display Driver) ----------
+static const uint32_t VMON_SID = 0x7FFF0002;   // la ventana del Quest del monitor virtual (como en la Mac)
+void vmonStart();
+void vmonCleanup();                           // (al cerrar) sacarlo del escritorio si lo puso VRmin
+void vmonSet(bool on);
+bool vmonOn();
+bool vmonInstalled();
+uint32_t vmonDisplayId();                     // su número de pantalla mientras está abierto (0 si no)
+std::string vmonError();
+Json vmonState();                             // {installed, on, busy}
+bool vmonInstall();
 
 // ---------- Ventana ----------
 void uiRefresh();

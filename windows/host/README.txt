@@ -31,10 +31,19 @@ Headset microphone in games
 - While you play, Windows' microphone becomes "CABLE Output" (the headset's microphone). When you stop playing, the
   microphone you had comes back.
 
+Virtual monitor
+- One more PC screen that only shows in the headset. Windows needs a driver for that: VRmin uses Virtual Display
+  Driver (free, MIT, https://github.com/VirtualDrivers/Virtual-Display-Driver). Click "Install" in "Virtual monitor"
+  once (Windows asks for administrator permission). Then open it from the headset with "Add monitor".
+- VRmin only adds it to the desktop while the headset shows it. To remove the driver: Device Manager, Display
+  adapters, Virtual Display Driver, Uninstall device.
+
 SteamVR games use OpenComposite, built by VRmin and included in this folder (OpenComposite, GPL 3).
+3D with AI uses ONNX Runtime (MIT) and DirectML (Microsoft), in the "ai" folder, and downloads the Depth Anything V2
+small model (Apache 2.0) the first time. Licenses are in the "licenses" folder.
 
 If something goes wrong: click "Something's wrong". It saves a report on the Desktop and opens the GitHub page to
 send it in an Issue.
 https://github.com/thevermin/VRmin/issues
 
-Not on Windows yet: virtual monitor and following your head with the camera in Sentinel Mode.
+Not on Windows yet: following your head with the camera in Sentinel Mode.

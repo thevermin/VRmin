@@ -238,13 +238,15 @@ void winOpen(uint32_t sid, bool on) {
     }
     if (isDisplay(sid)) {
         std::thread([sid, st] {
-            logmsg("[windows] Showing monitor %u in its own screen", sid & ~DISPLAY_BIT);
+            bool virt = sid == VMON_SID;   // (el monitor virtual: el que haya puesto VRmin en el escritorio)
+            if (virt) logmsg("[windows] Showing the virtual monitor");
+            else logmsg("[windows] Showing monitor %u in its own screen", sid & ~DISPLAY_BIT);
             DisplayCapture c;
             c.sid = sid;
             c.enc = st->enc;
-            c.want = [st] { return st->run && questConnected(); };
+            c.want = [st, virt] { return st->run && questConnected() && (!virt || vmonDisplayId()); };
             c.stop = [st] { return !st->run || !questConnected(); };
-            c.target = [st] { return (uint32_t)st->target; };
+            c.target = [st, virt] { return virt ? vmonDisplayId() : (uint32_t)st->target; };
             displayCaptureLoop(c);
             finished(sid, st);
         }).detach();
@@ -254,7 +256,7 @@ void winOpen(uint32_t sid, bool on) {
 void winSwap(uint32_t sid, uint32_t to) {
     std::lock_guard<std::mutex> g(streamsLock);
     auto it = g_streams.find(sid);
-    if (it == g_streams.end() || !isDisplay(sid)) return;
+    if (it == g_streams.end() || !isDisplay(sid) || sid == VMON_SID) return;
     it->second->target = isDisplay(to) ? to : sid;
     it->second->enc->requestKey();
     logmsg("[windows] Screen %u now shows monitor %u", sid & ~DISPLAY_BIT, (uint32_t)it->second->target & ~DISPLAY_BIT);
@@ -263,8 +265,8 @@ void winSwap(uint32_t sid, uint32_t to) {
 void winMouse(uint32_t sid, float u, float v, const Json &down, float scroll) {
     RECT r;
     if (isDisplay(sid)) {
-        uint32_t target = sid;
-        {
+        uint32_t target = sid == VMON_SID ? vmonDisplayId() : sid;
+        if (sid != VMON_SID) {
             std::lock_guard<std::mutex> g(streamsLock);
             auto it = g_streams.find(sid);
             if (it != g_streams.end()) target = it->second->target;

@@ -255,6 +255,15 @@ function render() {
     <button class="pill icon" data-act="recFolder" title="${t("Abrir la carpeta de las grabaciones (Videos › VRmin)", "Open the recordings folder (Videos › VRmin)")}">${I.folder}</button>
   </div></div>`;
 
+  // Monitor virtual: una pantalla más, solo en el Quest (necesita un driver, que se instala una vez)
+  const V = S.vmon;
+  const vmonRow = `<div class="card" style="padding:10px 14px"><div class="row">
+    ${dot(V.installed, !V.installed)}<div class="grow"><div class="b">${t("Monitor virtual", "Virtual monitor")}</div>
+      <div class="small">${V.on ? t("Abierto en el Quest", "Open in the Quest") : V.installed ? t("Instalado: se abre desde el visor, con «Agregar monitor»", "Installed: open it from the headset, with \"Add monitor\"")
+        : t("Una pantalla más de la PC que solo se ve en el Quest. Usa Virtual Display Driver (gratis): se instala una vez, con permiso de administrador.", "One more PC screen that only shows in the Quest. It uses Virtual Display Driver (free): it installs once, with administrator permission.")}</div></div>
+    ${V.busy ? `<span class="small ell amber">${h(V.busy)}</span>` : V.installed ? "" : `<button class="pill primary" data-act="vmonInstall">${t("Instalar", "Install")}</button>`}
+  </div></div>`;
+
   const log = `<div class="col" style="gap:8px">
     <button class="link" data-act="log">${showLog ? I.chevD : I.chevR} ${t("Registro", "Log")} ${!showLog && S.lastLog ? `<span class="tiny ell" style="font-weight:400">${h(S.lastLog)}</span>` : ""}</button>
     <div class="row"><button class="pill" data-act="report">${I.bubble} ${t("Algo anda mal", "Something's wrong")}</button>
@@ -264,7 +273,7 @@ function render() {
 
   const app = document.getElementById("app");
   const y = window.scrollY;
-  app.innerHTML = header + `<div class="col"><div class="two">${conn}${prep}</div>${games}${cable}${recRow}${log}</div>`;
+  app.innerHTML = header + `<div class="col"><div class="two">${conn}${prep}</div>${games}${cable}${vmonRow}${recRow}${log}</div>`;
   window.scrollTo(0, y);
   const l = document.getElementById("log");
   if (l) l.scrollTop = l.scrollHeight;

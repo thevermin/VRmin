@@ -129,7 +129,7 @@ void handleQuestMessage(const std::string &line) {
         if (sid) { depthSetWindow(sid, on); logmsg("[3D] Window %u in 3D: %s", sid, on ? "on" : "off"); }
         else { depthSetDesktop(on); logmsg("[3D] Desktop in 3D: %s", on ? "on" : "off"); }
     } else if (t == "monitor") {
-        // (monitor virtual: todavía solo en la Mac)
+        vmonSet(m["on"].boolean(false));
     }
 }
 
@@ -172,16 +172,18 @@ static void lobbyThread() {
         }
         Json mainD = Json::object().set("id", 0x40000001).set("name", pcModel).set("w", GetSystemMetrics(SM_CXSCREEN)).set("h", GetSystemMetrics(SM_CYSCREEN));
         Json others = Json::array();
+        uint32_t vmon = vmonDisplayId();
         for (auto &d : disps) {
+            if (d.id == vmon) continue;   // (el monitor virtual va aparte)
             Json j = Json::object().set("id", (double)d.id).set("name", d.primary ? pcModel : d.name).set("w", (int)(d.r.right - d.r.left)).set("h", (int)(d.r.bottom - d.r.top));
             if (d.primary) mainD = j; else others.push(j);
         }
         Json o = Json::object();
         o.set("type", "lobby2d").set("launching", gamesLaunchingInfo(active)).set("game", active).set("gameName", active ? gamesRunningName() : std::string())
          .set("macModel", pcModel).set("busy", gamesBusy()).set("status", gamesStatus()).set("desk", deskOn()).set("deskErr", deskError())
-         .set("depth3d", depthEnabled()).set("depthStatus", depthStatus()).set("cfg", cfg).set("games", games).set("monitor", false)
-         .set("monitorErr", tr("Todavía no está en Windows", "Not available on Windows yet")).set("displays", others)
-         .set("mainDisplay", mainD).set("deskDisplay", (double)deskDisplayId()).set("monitorId", 0).set("typing", typingActive()).set("vigia", sentinelOn()).set("ll", Json::array())
+         .set("depth3d", depthEnabled()).set("depthStatus", depthStatus()).set("cfg", cfg).set("games", games).set("monitor", vmonOn())
+         .set("monitorErr", vmonError()).set("displays", others)
+         .set("mainDisplay", mainD).set("deskDisplay", (double)deskDisplayId()).set("monitorId", (double)vmonDisplayId()).set("typing", typingActive()).set("vigia", sentinelOn()).set("ll", Json::array())
          .set("perf", active ? perfSnapshot() : Json::object()).set("adv", profilesState()).set("windows", windowsListJson()).set("os", "windows")
          .set("pcGpu", g_gpu).set("pcVram", pcVramMb);
         std::string sj = o.dump();
