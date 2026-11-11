@@ -70,6 +70,9 @@ jobs:
           Shot "centinela.png"
           $p.WaitForExit(30000)
           Get-Content "$env:LOCALAPPDATA\VRmin\VRmin.log" | Select-String "sentinel"
+          Start-Process -FilePath $exe -ArgumentList "--record-test" -Wait
+          Get-Content "$env:LOCALAPPDATA\VRmin\VRmin.log" | Select-String "record"
+          Get-ChildItem "$([Environment]::GetFolderPath('MyVideos'))\VRmin" | Format-Table Name, Length
           Start-Process -FilePath $exe
           Start-Sleep -Seconds 20
           Shot "captura.png"

@@ -112,6 +112,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     logmsg("VRmin Host for Windows %s", VRMIN_WIN_VERSION);
     if (wcsstr(GetCommandLineW(), L"--selftest")) { winSelfTest(); return 0; }   // (prueba de la compilación en Windows)
     if (wcsstr(GetCommandLineW(), L"--sentinel-test")) { sentinelSelfTest(); return 0; }
+    if (wcsstr(GetCommandLineW(), L"--record-test")) {   // (graba la pantalla 5 s)
+        recordSet(true);
+        Sleep(5000);
+        recordSet(false);
+        Sleep(4000);
+        return 0;
+    }
     loadSettings();
     applySettings();
 
