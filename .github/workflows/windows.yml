@@ -55,14 +55,24 @@ jobs:
           Start-Process -FilePath notepad.exe
           Start-Process -FilePath $exe -ArgumentList "--selftest" -Wait
           Get-Content "$env:LOCALAPPDATA\VRmin\VRmin.log"
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          function Shot($name) {
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save("$PWD\$name")
+          }
+          $p = Start-Process -FilePath $exe -ArgumentList "--sentinel-test" -PassThru
+          Start-Sleep -Seconds 2
+          Shot "centinela-lista.png"
+          Start-Sleep -Seconds 6
+          Shot "centinela.png"
+          $p.WaitForExit(30000)
+          Get-Content "$env:LOCALAPPDATA\VRmin\VRmin.log" | Select-String "sentinel"
           Start-Process -FilePath $exe
           Start-Sleep -Seconds 20
-          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
-          $g = [System.Drawing.Graphics]::FromImage($bmp)
-          $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
-          $bmp.Save("$PWD\captura.png")
+          Shot "captura.png"
           Get-Process "VRmin Host" -ErrorAction SilentlyContinue | Stop-Process
           Copy-Item "$env:LOCALAPPDATA\VRmin\VRmin.log" . -ErrorAction SilentlyContinue
           Get-Content VRmin.log -ErrorAction SilentlyContinue
@@ -72,6 +82,6 @@ jobs:
         with:
           name: VRmin-Windows-prueba
           path: |
-            captura.png
+            *.png
             VRmin.log
           retention-days: 7

@@ -11,7 +11,7 @@ static bool wantAudio() {
     if (!questConnected()) return false;
     Settings s;
     { std::lock_guard<std::mutex> g(g_setLock); s = g_set; }
-    if (gameActive()) return s.audio != "mac";
+    if (gameActive()) return s.audio != "mac" && !sentinelOn();   // (Modo Centinela: el sonido queda en la PC)
     return lobbyShowsDesk() && deskOn() && (s.deskAudio == "quest" || s.deskAudio == "both");
 }
 

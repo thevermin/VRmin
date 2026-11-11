@@ -208,6 +208,8 @@ static std::string pcName() {
     return out.empty() ? "PC" : out;
 }
 
+std::string questPcName() { return pcName(); }   // (el nombre con que el Quest encuentra a esta PC)
+
 static void beaconThread() {
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     BOOL one = TRUE;

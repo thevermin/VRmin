@@ -93,6 +93,8 @@ static void handlePixels(const uint8_t *src, uint32_t pose, bool rgba, int ew, i
     Stream st = currentStream();
     if (framesTotal == 1) logmsg("[game] First frame received: %dx%d per eye, %s · sending %dx%d", ew, eh, rgba ? "RGBA" : "BGRA", st.W, st.H);
     lastGameFrame = nowNs();
+    // Modo Centinela: el juego se ve en la ventana de la PC; al visor apoyado va solo 1 cuadro de cada 20
+    if (sentinelOn() && !sentinelFrame(src, rgba, ew, eh)) return;
     if (g_enc->busy() || !questConnected()) { perfAddDrop(); return; }   // (el codificador está atrasado: descartar)
     uint64_t start = nowNs();
     std::vector<uint8_t> &nv = nv12[nvIdx ^= 1];

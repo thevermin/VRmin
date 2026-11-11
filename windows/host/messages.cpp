@@ -61,7 +61,7 @@ void handleQuestMessage(const std::string &line) {
     }
     Json m = Json::parse(line);
     std::string t = m["type"].str();
-    if (t == "pose") { gameSendLine(line); return; }
+    if (t == "pose") { sentinelPose(); gameSendLine(line); return; }
     if (t == "key") questRequestKey();
     else if (t == "deskkey") deskRequestKey();
     else if (t == "log") logmsg("[headset] %s", m["msg"].str().c_str());
@@ -117,8 +117,11 @@ void handleQuestMessage(const std::string &line) {
         winResize((uint32_t)m["id"].num(0), (int)m["w"].num(0), (int)m["h"].num(0));
     } else if (t == "dispswap") {
         winSwap((uint32_t)m["id"].num(0), (uint32_t)m["to"].num(0));
-    } else if (t == "monitor" || t == "depth3d" || t == "vigia" || t == "record") {
-        // (monitor virtual, 3D, Modo Centinela y grabar: todavía solo en la Mac)
+    } else if (t == "vigia") {
+        if (m.has("on")) { sentinelSet(m["on"].boolean(false)); if (m["on"].boolean(false)) questRequestKey(); }
+        if (m.has("msg")) sentinelSay(m["msg"].str());
+    } else if (t == "monitor" || t == "depth3d" || t == "record") {
+        // (monitor virtual, 3D y grabar: todavía solo en la Mac)
     }
 }
 
@@ -170,7 +173,7 @@ static void lobbyThread() {
          .set("macModel", pcModel).set("busy", gamesBusy()).set("status", gamesStatus()).set("desk", deskOn()).set("deskErr", deskError())
          .set("depth3d", false).set("depthStatus", "").set("cfg", cfg).set("games", games).set("monitor", false)
          .set("monitorErr", tr("Todavía no está en Windows", "Not available on Windows yet")).set("displays", others)
-         .set("mainDisplay", mainD).set("deskDisplay", (double)deskDisplayId()).set("monitorId", 0).set("typing", typingActive()).set("vigia", false).set("ll", Json::array())
+         .set("mainDisplay", mainD).set("deskDisplay", (double)deskDisplayId()).set("monitorId", 0).set("typing", typingActive()).set("vigia", sentinelOn()).set("ll", Json::array())
          .set("perf", active ? perfSnapshot() : Json::object()).set("adv", profilesState()).set("windows", windowsListJson()).set("os", "windows")
          .set("pcGpu", g_gpu).set("pcVram", pcVramMb);
         std::string sj = o.dump();

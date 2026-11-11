@@ -199,6 +199,21 @@ bool setupActivate();          // pide permiso de administrador una vez (OpenXR)
 bool setupRestoreSteamVR();    // deja SteamVR como estaba
 void setupOnExit();
 
+// ---------- El visor por el cable USB-C (cable.cpp, con adb) y el Modo Centinela (sentinel.cpp) ----------
+void cableStart();
+Json cableState();                            // {adb, state, questApp, busy}
+bool cableReady();                            // Quest por cable con adb autorizado
+bool cableInstallTools();
+bool cableStartSentinel();
+std::wstring adbPath();
+std::string runCapture(const std::wstring &exe, const std::wstring &args, int timeoutMs, int *code);
+bool sentinelOn();
+void sentinelSet(bool on);
+void sentinelSay(const std::string &code);
+void sentinelPose();
+bool sentinelFrame(const uint8_t *src, bool rgba, int ew, int eh);   // true: también va al visor
+void sentinelSelfTest();
+
 // ---------- Ventana ----------
 void uiRefresh();
 bool uiRun(HINSTANCE inst);   // la ventana completa (WebView2); false si no se pudo abrir

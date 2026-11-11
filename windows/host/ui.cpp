@@ -105,7 +105,8 @@ static Json stateJson() {
      .set("cfg", Json::object().set("eye", s.eye).set("fps", s.fps).set("mbps", s.mbps).set("codec", s.hevc ? "hevc" : "h264").set("fov", s.fov).set("audio", s.audio))
      .set("gpu", Json::object().set("name", pcGpu()).set("vram", pcVram())).set("prof", prof)
      .set("mic", Json::object().set("on", micEnabled()).set("cable", micCableInstalled()))
-     .set("pc", Json::object().set("openAtLogin", openAtLogin()).set("keepAwake", s.keepAwake)).set("dataDir", utf8(dataDir()));
+     .set("pc", Json::object().set("openAtLogin", openAtLogin()).set("keepAwake", s.keepAwake)).set("dataDir", utf8(dataDir()))
+     .set("cable", cableState()).set("sentinel", sentinelOn());
     return o;
 }
 
@@ -150,6 +151,8 @@ static std::string handle(const std::string &cmd, const Json &a) {
         uiRefresh();
         return "true";
     }
+    if (cmd == "cableInstall") { std::thread(cableInstallTools).detach(); return "true"; }
+    if (cmd == "sentinelStart") { std::thread(cableStartSentinel).detach(); return "true"; }
     if (cmd == "openAtLogin") { setOpenAtLogin(a.boolean(false)); return "true"; }
     if (cmd == "keepAwake") {
         { std::lock_guard<std::mutex> g(g_setLock); g_set.keepAwake = a.boolean(false); }

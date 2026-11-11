@@ -111,6 +111,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);   // (es video en vivo: que Windows lo atienda primero)
     logmsg("VRmin Host for Windows %s", VRMIN_WIN_VERSION);
     if (wcsstr(GetCommandLineW(), L"--selftest")) { winSelfTest(); return 0; }   // (prueba de la compilación en Windows)
+    if (wcsstr(GetCommandLineW(), L"--sentinel-test")) { sentinelSelfTest(); return 0; }
     loadSettings();
     applySettings();
 
@@ -119,6 +120,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     deskStart();
     audioStart();
     micStart();
+    cableStart();
     lobbyStart();
     std::thread(gamesScan).detach();
     // Si Windows ya estaba preparado de otra vez, OpenComposite vuelve a quedar activo (al cerrar se saca)

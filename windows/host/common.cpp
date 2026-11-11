@@ -288,8 +288,8 @@ std::string profilesConfigLine(int fps, bool hello) {
     Stream st = currentStream();
     int eye = std::max(256, (int)std::lround(st.eye * e.scale * e.fovk / 8) * 8);
     char b[256];
-    snprintf(b, sizeof b, "{\"type\":\"config\",\"eye\":%d,\"fps\":%d,\"fovk\":%.3f,\"index\":%d,\"vive\":%d,\"vg\":0%s}", eye, fps, e.fovk,
-             e.index ? 1 : 0, e.vive ? 1 : 0, hello ? ",\"pv\":1" : "");
+    snprintf(b, sizeof b, "{\"type\":\"config\",\"eye\":%d,\"fps\":%d,\"fovk\":%.3f,\"index\":%d,\"vive\":%d,\"vg\":%d%s}", eye, fps, e.fovk,
+             e.index ? 1 : 0, e.vive ? 1 : 0, sentinelOn() ? 1 : 0, hello ? ",\"pv\":1" : "");
     return b;
 }
 std::string profilesCurrent() { std::lock_guard<std::mutex> g(g_profLock); return g_current; }

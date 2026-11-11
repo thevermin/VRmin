@@ -108,6 +108,7 @@ const I = {
   mic: '<svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>',
   dial: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 12l4-3"/></svg>',
   speed: '<svg viewBox="0 0 24 24"><path d="M4 16a8 8 0 1 1 16 0M12 16l3-5"/></svg>',
+  cable: '<svg viewBox="0 0 24 24"><path d="M7 3v4M11 3v4M5 7h8v4a4 4 0 0 1-8 0zM9 15v2a4 4 0 0 0 4 4h2a4 4 0 0 0 4-4V9"/></svg>',
   pc: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>',
   bubble: '<svg viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4z"/><path d="M12 8v4M12 14h0"/></svg>',
   dots: '<svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>',
@@ -212,6 +213,20 @@ function render() {
   }
   games += `</div>`;
 
+  // El visor por cable USB-C (adb): el Modo Centinela
+  const C = S.cable, adbOk = C.adb && C.state === "device";
+  const cableStatus = !C.adb ? t("Sin instalar", "Not installed") : C.state === "device" ? t("Listo", "Ready")
+    : C.state === "unauthorized" ? t("Tocá «Permitir» en el visor", "Tap \"Allow\" in the headset") : t("Conectá el Quest por cable USB-C", "Connect the Quest with the USB-C cable");
+  const cable = `<div class="card"><h2>${I.cable} ${t("Visor por cable USB-C", "Headset over USB-C cable")}</h2>
+    <div class="row">${dot(adbOk || S.sentinel, !adbOk)}<div class="grow"><div class="b">${t("Modo Centinela", "Sentinel Mode")}</div>
+      <div class="small">${t("Jugar con el visor apoyado", "Play with the headset resting on your desk")} · ${S.sentinel ? t("Funcionando: el juego se ve en la ventana «VRmin · Modo Centinela» (Esc para salir)", "Running: the game shows in the \"VRmin · Sentinel Mode\" window (Esc to exit)") : h(cableStatus)}</div></div>
+      <button class="pill icon" data-act="sentinelHelp" title="${t("Cómo activar el modo desarrollador", "How to turn on developer mode")}">${I.help}</button>
+      ${C.busy ? `<span class="small ell">${h(C.busy)}</span>`
+        : !C.adb ? `<button class="pill primary" data-act="cableInstall">${t("Instalar", "Install")}</button>`
+        : adbOk && !S.sentinel ? `<button class="pill primary" data-act="sentinelStart" title="${t("Abre VRmin en el visor directo en el Modo Centinela, sin tocarlo. Después elegí un juego.", "Opens VRmin on the headset straight in Sentinel Mode, without touching it. Then pick a game.")}">${t("Empezar", "Start")}</button>` : ""}
+    </div>
+  </div>`;
+
   const log = `<div class="col" style="gap:8px">
     <button class="link" data-act="log">${showLog ? I.chevD : I.chevR} ${t("Registro", "Log")} ${!showLog && S.lastLog ? `<span class="tiny ell" style="font-weight:400">${h(S.lastLog)}</span>` : ""}</button>
     <div class="row"><button class="pill" data-act="report">${I.bubble} ${t("Algo anda mal", "Something's wrong")}</button>
@@ -221,7 +236,7 @@ function render() {
 
   const app = document.getElementById("app");
   const y = window.scrollY;
-  app.innerHTML = header + `<div class="col"><div class="two">${conn}${prep}</div>${games}${log}</div>`;
+  app.innerHTML = header + `<div class="col"><div class="two">${conn}${prep}</div>${games}${cable}${log}</div>`;
   window.scrollTo(0, y);
   const l = document.getElementById("log");
   if (l) l.scrollTop = l.scrollHeight;
@@ -358,6 +373,14 @@ const TUTS = [
   { es: "Wi-Fi o cable", en: "Wi-Fi or cable", steps: [
     ["Por Wi-Fi: el Quest y la PC en la misma red (mejor si la PC va por cable al router).", "Over Wi-Fi: the Quest and the PC on the same network (best with the PC wired to the router)."],
     ["Por cable USB-C: más estable y con menos demora. VRmin lo usa solo cuando está conectado.", "Over USB-C cable: steadier, with less delay. VRmin uses it on its own when it's plugged in."]] },
+  { id: "sentinel", es: "Modo Centinela: jugar sin ponerte el visor", en: "Sentinel Mode: play without wearing the headset", steps: [
+    ["El visor queda apoyado en el escritorio mirándote, sigue los controles, y el juego se ve en una ventana de la PC.", "The headset rests on your desk facing you, tracks the controllers, and the game shows in a window on the PC."],
+    ["Se empieza desde el Quest (en el menú, Modo Centinela) o con «Empezar», en «Visor por cable USB-C».", "Start it from the Quest (in the menu, Sentinel Mode) or with \"Start\", in \"Headset over USB-C cable\"."],
+    ["Con el visor apoyado, el sensor entre las lentes cree que te lo sacaste y apaga la pantalla. Para evitarlo hace falta el modo desarrollador, una sola vez:", "With the headset resting, the sensor between the lenses thinks you took it off and turns off the display. To avoid that you need developer mode, once:"],
+    ["En el celular, abrí la app Meta Horizon › Dispositivos › tu Quest › Ajustes del visor › Modo desarrollador, y activalo. (Si te lo pide, creá una organización de desarrollador gratuita en developers.meta.com: solo hace falta un nombre.) Reiniciá el Quest.", "On your phone, open the Meta Horizon app › Devices › your Quest › Headset settings › Developer mode, and turn it on. (If it asks, create a free developer organization at developers.meta.com: it only needs a name.) Restart the Quest."],
+    ["Tocá «Instalar» en «Visor por cable USB-C» (baja adb, de Google, ≈15 MB).", "Click \"Install\" in \"Headset over USB-C cable\" (it downloads adb, from Google, about 15 MB)."],
+    ["Conectá el Quest a la PC con el cable USB-C, ponete el visor y tocá «Permitir» en el aviso de depuración USB (marcá «Permitir siempre desde esta computadora»).", "Connect the Quest to the PC with the USB-C cable, put on the headset and tap \"Allow\" on the USB debugging prompt (check \"Always allow from this computer\")."],
+    ["Sin modo desarrollador también funciona: tapá el sensor con cinta o un papel doblado.", "It also works without developer mode: cover the sensor with tape or a folded piece of paper."]] },
   { es: "Si algo no anda", en: "If something isn't working", steps: [
     ["«Algo anda mal» (abajo de todo) junta los registros en un .zip para mandarlo en un Issue.", "\"Something's wrong\" (at the very bottom) puts the logs in a .zip to send in an Issue."],
     ["Sin sonido en el visor: revisá «Sonido de los juegos» en los ajustes.", "No sound in the headset: check \"Game sound\" in settings."],
@@ -366,7 +389,7 @@ const TUTS = [
 function helpSheet() {
   return `<div class="overlay" data-close="1"><div class="sheet">
     <div class="row"><h1 class="grow">${t("Ayuda", "Help")}</h1><button class="pill primary" data-act="close">${t("Listo", "Done")}</button></div>
-    ${TUTS.map(x => `<div class="card"><h2>${h(t(x.es, x.en))}</h2><div class="steps">${x.steps.map((s, i) => `<div class="step"><span class="num">${i + 1}</span><span>${h(t(...s))}</span></div>`).join("")}</div></div>`).join("")}
+    ${TUTS.map(x => `<div class="card" ${x.id ? `id="tut-${x.id}"` : ""}><h2>${h(t(x.es, x.en))}</h2><div class="steps">${x.steps.map((s, i) => `<div class="step"><span class="num">${i + 1}</span><span>${h(t(...s))}</span></div>`).join("")}</div></div>`).join("")}
   </div></div>`;
 }
 
@@ -418,6 +441,7 @@ document.addEventListener("click", async e => {
   switch (d.act) {
     case "settings": sheet = "settings"; customOpen = false; return renderLayer();
     case "help": sheet = "help"; return renderLayer();
+    case "sentinelHelp": sheet = "help"; renderLayer(); { const c = document.getElementById("tut-sentinel"); if (c) c.scrollIntoView(); } return;
     case "close": sheet = null; customOpen = false; gameCustom = false; return renderLayer();
     case "log": showLog = !showLog; if (showLog) logLines = (await call("log")) || []; return render();
     case "recommended": {
