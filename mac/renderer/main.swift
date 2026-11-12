@@ -983,6 +983,8 @@ final class GameProfiles {
     private(set) var activeK = 1.0         // campo de visión del juego abierto (lo que se le pidió)
     private var autoN = 0, autoFps = 0.0, autoGame = 0.0, autoHz = 0.0, autoSince = 0.0
     private var mtime: Date?
+    /// Juegos que solo muestran sus controles y punteros con controles de Vive (vale si no se eligió otra cosa)
+    static let viveByDefault: Set<String> = ["Kayak VR"]
     init() { reload() }
     /// Lee el archivo si cambió (VRmin Host también lo edita, desde sus Ajustes)
     private func reload() {
@@ -1000,7 +1002,8 @@ final class GameProfiles {
         lock.lock(); defer { lock.unlock() }
         reload()
         let a = data[""] ?? P(), g = key.isEmpty ? P() : (data[key] ?? P())
-        return (min(1, max(0.5, g.scale ?? a.scale ?? 1)), g.auto ?? a.auto ?? false, min(1, max(0.75, g.fovk ?? a.fovk ?? 1)), g.index ?? a.index ?? false, g.vive ?? a.vive ?? false)
+        return (min(1, max(0.5, g.scale ?? a.scale ?? 1)), g.auto ?? a.auto ?? false, min(1, max(0.75, g.fovk ?? a.fovk ?? 1)), g.index ?? a.index ?? false,
+                g.vive ?? (GameProfiles.viveByDefault.contains(key) ? true : a.vive ?? false))
     }
     func hasOwn(_ key: String) -> Bool { lock.lock(); defer { lock.unlock() }; return !key.isEmpty && data[key] != nil }
     /// El juego que se abrió: por la carpeta de Steam (si se encuentra) o por el nombre que da el juego
