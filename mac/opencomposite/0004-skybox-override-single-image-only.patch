@@ -1,0 +1,17 @@
+diff --git a/DrvOpenXR/XrBackend.cpp b/DrvOpenXR/XrBackend.cpp
+index 331dc85..c9bbf94 100644
+--- a/DrvOpenXR/XrBackend.cpp
++++ b/DrvOpenXR/XrBackend.cpp
+@@ -604,6 +604,12 @@ void XrBackend::RecordFrameTiming()
+ IBackend::openvr_enum_t XrBackend::SetSkyboxOverride(const vr::Texture_t* pTextures, uint32_t unTextureCount)
+ {
+ 	// Needed for rFactor2 loading screens
++	// VRmin: only a single loading image is shown this way. Several textures are a real skybox (six cube faces, as
++	// SteamVR_Skybox sets during level loads in Unity games such as The Lab): drawing its first face as a 1 m quad
++	// near the floor origin put a huge tilted picture in front of the user, and it stayed there while the game was
++	// paused for the load. Without it the loading screen overlays show over black, like SteamVR's void.
++	if (unTextureCount > 1)
++		return 0;
+ 	if (unTextureCount && pTextures) {
+ 		CheckOrInitCompositors(pTextures);
+ 
