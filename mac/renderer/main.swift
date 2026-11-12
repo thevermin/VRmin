@@ -1213,9 +1213,13 @@ final class GameLink {
                 let now = DispatchTime.now().uptimeNanoseconds, age = now - at
                 guard age > 300_000_000, age < 120_000_000_000, shared.beginFrame() else { continue }
                 shared.markGameFrame()
-                // (la primera vez: una copia oscurecida con «Cargando…» en cada ojo, para que no parezca colgado)
-                if loadingFor != at { loadingPB = loadingFrame(from: pb); loadingFor = at }
-                let show = loadingPB ?? pb
+                // (después de 3 s: una copia oscurecida con «Cargando…» en cada ojo, para que no parezca colgado; antes, el
+                // cuadro tal cual, así una traba corta del juego no se nota)
+                var show = pb
+                if age > 3_000_000_000 {
+                    if loadingFor != at { loadingPB = loadingFrame(from: pb); loadingFor = at }
+                    show = loadingPB ?? pb
+                }
                 let fn = shared.nextFrameNo(), enc = encoder
                 encodeQueue.async { enc.encode(show, frameNo: fn, poseId: pose, forceKey: false, start: now) }
             }

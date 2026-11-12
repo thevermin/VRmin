@@ -523,22 +523,26 @@ static volatile LONG g_shmSentStat;
 /* ¿Corre dentro de Wine (Mac) o en Windows de verdad? (en Windows, VRmin Host es un programa de Windows y la memoria
    compartida es una con nombre, sin archivo en el disco) */
 static int running_in_wine(void) { return GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version") != NULL; }
-#define SHM_WIN_NAME "Local\\VRminCuadros"
+/* Una por proceso: un juego puede abrir otro programa con VR mientras sigue abierto (The Lab abre Robot Repair) */
+static char g_shmWinName[64];
+static wchar_t g_shmWinPath[64];
 
 static int shm_create(void) {
     if (g_shm) return 1;
     uint64_t total = SHM_HDR + SHM_SLOT_MAX * SHM_SLOTS;
     if (!running_in_wine()) {
-        g_shmMap = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, (DWORD)(total >> 32), (DWORD)total, SHM_WIN_NAME);
+        snprintf(g_shmWinName, sizeof g_shmWinName, "Local\\VRminCuadros%lu", GetCurrentProcessId());
+        g_shmMap = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, (DWORD)(total >> 32), (DWORD)total, g_shmWinName);
         if (!g_shmMap) { logmsg("Memoria compartida: CreateFileMapping falló (%lu)", GetLastError()); return 0; }
         g_shm = (uint8_t *)MapViewOfFile(g_shmMap, FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, (SIZE_T)total);
         if (!g_shm) { logmsg("Memoria compartida: MapViewOfFile falló (%lu)", GetLastError()); CloseHandle(g_shmMap); g_shmMap = NULL; return 0; }
         return 1;
     }
-    const wchar_t *path = L"C:\\questvrbridge\\cuadros.bin";
+    swprintf(g_shmWinPath, 64, L"C:\\questvrbridge\\cuadros_%lu.bin", GetCurrentProcessId());
     CreateDirectoryW(L"C:\\questvrbridge", NULL);
-    g_shmFile = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    /* (se borra solo cuando el proceso termina; la Mac ya lo tiene abierto por su cuenta) */
+    g_shmFile = CreateFileW(g_shmWinPath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL);
     if (g_shmFile == INVALID_HANDLE_VALUE) { logmsg("Memoria compartida: no se pudo crear el archivo (%lu)", GetLastError()); return 0; }
     g_shmMap = CreateFileMappingW(g_shmFile, NULL, PAGE_READWRITE, (DWORD)(total >> 32), (DWORD)total, NULL);
     if (!g_shmMap) { logmsg("Memoria compartida: CreateFileMapping falló (%lu)", GetLastError()); CloseHandle(g_shmFile); g_shmFile = INVALID_HANDLE_VALUE; return 0; }
@@ -601,9 +605,9 @@ static void shm_offer(void) {
     typedef char *(CDECL *wgufn_t)(LPCWSTR);
     wgufn_t wgufn = (wgufn_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "wine_get_unix_file_name");
     if (wgufn) {
-        char *u = wgufn(L"C:\\questvrbridge\\cuadros.bin");
+        char *u = wgufn(g_shmWinPath);
         if (u) { strncpy(unixPath, u, sizeof unixPath - 1); HeapFree(GetProcessHeap(), 0, u); }
-    } else if (!running_in_wine()) strcpy(unixPath, "mapa:" SHM_WIN_NAME);   /* (en Windows: el nombre de la memoria) */
+    } else if (!running_in_wine()) snprintf(unixPath, sizeof unixPath, "mapa:%s", g_shmWinName);   /* (en Windows: el nombre de la memoria) */
 #endif
     if (!unixPath[0]) { logmsg("Memoria compartida: no pude saber la ruta en la Mac; sigo por la red"); g_shmMode = -1; return; }
     uint8_t pkt[5 + 1 + 8 + 1024];

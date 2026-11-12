@@ -234,7 +234,8 @@ static void readLoop(SOCKET s) {
 
 void gameStart() {
     g_enc = new VideoEncoder("game", onEncoded);
-    // Juego cargando (conectado pero sin cuadros desde hace más de 0,3 s, hasta 2 min): repetir el último cuadro, más oscuro
+    // Juego cargando (conectado pero sin cuadros desde hace más de 0,3 s, hasta 2 min): repetir el último cuadro (más
+    // oscuro después de 3 s, así una traba corta del juego no se nota)
     std::thread([] {
         std::vector<uint8_t> dark;
         uint64_t darkFor = 0;
@@ -245,6 +246,11 @@ void gameStart() {
             if (holdNv.empty()) continue;
             uint64_t now = nowNs(), age = now - holdAt;
             if (age < 300000000ull || age > 120000000000ull || g_enc->busy()) continue;
+            if (age < 3000000000ull) {
+                lastGameFrame = now;
+                submit(holdNv, holdW, holdH, holdPose, now, false);
+                continue;
+            }
             if (darkFor != holdAt) {
                 dark = holdNv;
                 size_t ys = (size_t)holdW * holdH;
