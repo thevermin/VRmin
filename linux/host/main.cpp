@@ -11,10 +11,14 @@
 
 void vrSetupOnExit();
 bool uiRun(const sigset_t &quit);
+void audioStart();
+void micStart();
+void audioOnExit();
 
 /// Al salir (Ctrl+C, apagar o cerrar la ventana): lo que haya que dejar como estaba va acá, en un solo lugar
 static void onExit() {
     vrSetupOnExit();
+    audioOnExit();
 }
 
 int main() {
@@ -42,6 +46,8 @@ int main() {
     gameStart();
     lobbyStart();
     deskStart();
+    audioStart();
+    micStart();
     logmsg("%s", tr("Esperando al Quest: abrí VRmin en el visor (misma red Wi-Fi)", "Waiting for the Quest: open VRmin on the headset (same Wi-Fi)"));
     if (!uiRun(quit)) {   // (vuelve al cerrar la ventana; sin pantalla, enseguida)
         int sig = 0;
