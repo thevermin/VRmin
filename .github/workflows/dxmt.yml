@@ -76,7 +76,8 @@ jobs:
         working-directory: dxmt
         run: |
           git apply ../vrmin/mac/dxmt/msaa-8x-to-4x.patch
-          if [ "$DXMT_REPO" = 3Shain/dxmt ]; then git apply ../vrmin/mac/dxmt/vista-metal.patch; fi
+          if [ "$DXMT_REPO" = 3Shain/dxmt ]; then git apply ../vrmin/mac/dxmt/vista-metal.patch
+          else git apply ../vrmin/mac/dxmt/fork-iomanip.patch; fi   # (el fork no compila con el mingw de ahora sin esto)
       - name: 64 bits (y winemetal.so)
         working-directory: dxmt
         run: |

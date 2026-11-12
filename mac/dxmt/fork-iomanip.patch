@@ -1,0 +1,12 @@
+diff --git a/src/util/com/com_guid.cpp b/src/util/com/com_guid.cpp
+index 11bf4a7..05bda6c 100644
+--- a/src/util/com/com_guid.cpp
++++ b/src/util/com/com_guid.cpp
+@@ -8,6 +8,7 @@
+  * See <https://github.com/doitsujin/dxvk/blob/master/LICENSE>
+  */
+ 
++#include <iomanip>
+ #include <mutex>
+ #include <unordered_set>
+ 
