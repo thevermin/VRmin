@@ -1233,6 +1233,11 @@ final class GameLink {
             var lastFrames = 0
             while true {
                 sleep(3)
+                // (antes de tomar el candado de las conexiones: si alguien lo tiene trabado, igual se avisa)
+                acceptLock.lock(); let ast = acceptStage, asecs = Double(DispatchTime.now().uptimeNanoseconds - acceptSince) / 1e9; acceptLock.unlock()
+                if ast != "esperando" && asecs > 2 {
+                    print("[mac] Las conexiones nuevas de juegos no se están aceptando: el hilo que las acepta está «\(ast)» hace \(String(format: "%.1f", asecs)) s")
+                }
                 lock.lock(); let open = clients.count; lock.unlock()
                 if open == 0 { continue }
                 let secs = Double(DispatchTime.now().uptimeNanoseconds - stageSince) / 1e9
@@ -1240,10 +1245,6 @@ final class GameLink {
                 lastFrames = frames
                 if fps < 20 || (stage != "leyendo cabecera" && secs > 1) {
                     print("[mac] Cuadros del juego recibidos: \(fps)/s · paso actual: \(stage) (hace \(String(format: "%.1f", secs)) s) · en codificación: \(shared.inFlightCount)")
-                }
-                acceptLock.lock(); let ast = acceptStage, asecs = Double(DispatchTime.now().uptimeNanoseconds - acceptSince) / 1e9; acceptLock.unlock()
-                if ast != "esperando" && asecs > 2 {
-                    print("[mac] Las conexiones nuevas de juegos no se están aceptando: el hilo que las acepta está «\(ast)» hace \(String(format: "%.1f", asecs)) s")
                 }
             }
         }
@@ -1270,6 +1271,9 @@ final class GameLink {
                 setsockopt(c, Int32(IPPROTO_TCP), TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
                 var big: Int32 = 16 << 20
                 setsockopt(c, SOL_SOCKET, SO_RCVBUF, &big, socklen_t(MemoryLayout<Int32>.size))
+                // Que no bloquee nunca: un envío que esperara (con el candado de las conexiones tomado) frenaría todo
+                // lo demás; pasaba con el segundo programa de The Lab (Robot Repair) hasta que se cerraba
+                _ = fcntl(c, F_SETFL, fcntl(c, F_GETFL) | O_NONBLOCK)
                 // Nunca cerramos a nadie: cada conexión vive en su propio hilo hasta que el juego la corta. Este hilo solo
                 // acepta: lo demás va en el de la conexión, así nada demora a la siguiente (un juego puede abrir otro
                 // programa con VR mientras sigue abierto: The Lab abre Robot Repair)
@@ -1330,6 +1334,12 @@ final class GameLink {
         var off = 0
         while off < n {
             let r = Darwin.recv(fd, p + off, n - off, 0)
+            if r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                // (la conexión no bloquea: se espera a que lleguen datos, sin ningún candado tomado)
+                var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                _ = poll(&pfd, 1, -1)
+                continue
+            }
             if r <= 0 { return false }
             off += r
         }
