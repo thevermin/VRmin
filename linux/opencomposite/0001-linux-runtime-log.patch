@@ -1,0 +1,30 @@
+diff --git a/OpenOVR/Misc/vrmin.h b/OpenOVR/Misc/vrmin.h
+--- a/OpenOVR/Misc/vrmin.h
++++ b/OpenOVR/Misc/vrmin.h
+@@ -11,6 +11,11 @@
+
+ #ifdef _WIN32
+ #include <windows.h>
++#else
++#include <dlfcn.h>
++#ifndef __cdecl
++#define __cdecl
++#endif
+ #endif
+
+ namespace vrmin {
+@@ -37,6 +42,14 @@
+ 			rt.imageSource = (ImageSourceFn)GetProcAddress(m, "vrmin_image_source");
+ 			rt.log = (LogFn)GetProcAddress(m, "vrmin_log");
+ 		}
++#else
++		// Linux: VRmin's runtime is libvrmin_openxr.so, already loaded by the OpenXR loader (only the log is used here:
++		// direct eye images are a D3D11 feature)
++		void* m = dlopen("libvrmin_openxr.so", RTLD_NOW | RTLD_NOLOAD);
++		if (m) {
++			rt.log = (LogFn)dlsym(m, "vrmin_log");
++			dlclose(m);
++		}
+ #endif
+ 	}
+ 	return rt;

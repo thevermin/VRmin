@@ -1,0 +1,14 @@
+diff --git a/OpenOVR/Compositor/vkcompositor.cpp b/OpenOVR/Compositor/vkcompositor.cpp
+--- a/OpenOVR/Compositor/vkcompositor.cpp
++++ b/OpenOVR/Compositor/vkcompositor.cpp
+@@ -96,6 +96,10 @@
+
+ VkCompositor::~VkCompositor()
+ {
++	// The copies submitted in the last frames may still be pending: their command buffers can only be freed once they
++	// finish (with Mesa's lavapipe, the queue ran them after the pool was gone and crashed when the game closed)
++	if (appQueue)
++		vkQueueWaitIdle(appQueue);
+ 	// destroying command pool also frees command buffers
+ 	vkDestroyCommandPool(appDevice, appCommandPool, nullptr);
+ }

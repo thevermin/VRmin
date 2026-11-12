@@ -1,0 +1,7 @@
+{
+    "file_format_version": "1.0.0",
+    "runtime": {
+        "name": "VRmin",
+        "library_path": "./libvrmin_openxr.so"
+    }
+}

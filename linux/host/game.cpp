@@ -1,5 +1,5 @@
-// Conexión con el juego: el runtime de OpenXR de VRmin (la misma DLL que en la Mac, dentro de Wine o Proton) se conecta a
-// 127.0.0.1:9002.
+// Conexión con el juego: el runtime de OpenXR de VRmin (libvrmin_openxr.so, del mismo código que la DLL de la Mac; con
+// Proton, los juegos usan el runtime nativo de Linux) se conecta a 127.0.0.1:9002.
 // Le mandamos las poses del Quest (líneas JSON); nos manda cada cuadro (por memoria compartida o por la red).
 #include "host.h"
 #include <arpa/inet.h>
@@ -17,6 +17,7 @@
 
 std::atomic<bool> g_halfRate{false};
 bool questTakeKey();
+int openGameShm(const std::string &path);
 
 typedef int SOCKET;
 static const SOCKET INVALID_SOCKET = -1;
@@ -184,7 +185,7 @@ static void readLoop(SOCKET s) {
             unmap();
             size_t total = 64 + slot * 3;
             int err = 0;
-            int fd = where.rfind("/", 0) == 0 ? open(where.c_str(), O_RDWR) : -1;
+            int fd = where.rfind("/", 0) == 0 ? openGameShm(where) : -1;
             if (fd >= 0) {
                 void *m = lseek(fd, 0, SEEK_END) >= (off_t)total ? mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
                 if (m != MAP_FAILED) { shm = (uint8_t *)m; shmLen = total; } else err = errno ? errno : EINVAL;

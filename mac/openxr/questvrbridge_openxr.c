@@ -12,10 +12,15 @@
  *   x86_64-w64-mingw32-gcc -O2 -shared -o questvrbridge_openxr.dll questvrbridge_openxr.c questvrbridge_openxr.def \
  *       -I<OpenXR-SDK>/include -I<Vulkan-Headers>/include -ld3d11 -ldxgi -ldxguid -luuid -lws2_32 -lwinmm -static-libgcc -Wl,--kill-at
  * (GitHub Actions lo compila solo: «Runtime OpenXR (Windows)».)
+ *
+ * El mismo archivo es también el runtime nativo de Linux (libvrmin_openxr.so, solo Vulkan: lo usan los juegos con
+ * Proton por wineopenxr y por OpenComposite). Lo de Windows que hace falta está en linux/runtime/win32_linux.h;
+ * D3D11, OpenGL y los arreglos para juegos dentro de Wine quedan afuera (#ifdef _WIN32). Ver linux/runtime/build.sh.
  */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #define _USE_MATH_DEFINES
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -24,6 +29,15 @@
 #include <d3d11_4.h>
 #include <dxgi.h>
 #include <mmsystem.h>
+#else
+#include "win32_linux.h"
+#include <dirent.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +48,7 @@
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+#ifdef _WIN32
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include <GL/wglext.h>
@@ -42,6 +57,10 @@
 #define XR_USE_GRAPHICS_API_D3D11
 #define XR_USE_GRAPHICS_API_VULKAN
 #define XR_USE_GRAPHICS_API_OPENGL
+#else
+#define XR_USE_GRAPHICS_API_VULKAN
+#define XR_USE_TIMESPEC
+#endif
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/openxr_loader_negotiation.h>
@@ -74,6 +93,7 @@ static void logmsg(const char *fmt, ...) {
 /* ------------------------------------------------------------------ */
 /* Tiempo                                                              */
 /* ------------------------------------------------------------------ */
+#ifdef _WIN32
 static LARGE_INTEGER g_qpf;
 static int64_t qpc_to_ns(int64_t c) {
     return (int64_t)((double)c * 1e9 / (double)g_qpf.QuadPart);
@@ -81,6 +101,12 @@ static int64_t qpc_to_ns(int64_t c) {
 static int64_t now_ns(void) {
     LARGE_INTEGER c; QueryPerformanceCounter(&c); return qpc_to_ns(c.QuadPart);
 }
+#else
+/* (en Linux, el XrTime es el reloj CLOCK_MONOTONIC en nanosegundos: así lo convierte XR_KHR_convert_timespec_time) */
+static int64_t now_ns(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Matemática de poses                                                 */
@@ -405,7 +431,9 @@ static DWORD WINAPI net_thread(LPVOID arg) {
 /* Hilo de envío de cuadros: el hilo de dibujo deja el cuadro y sigue. */
 static HANDLE g_frameEvent;
 static uint8_t *g_frameBuf[2];
+#ifdef _WIN32
 static size_t g_frameCap;
+#endif
 static int g_frameReady = -1;       /* índice del buffer listo para enviar */
 static int g_frameSending = -1;
 static uint8_t g_frameHdr[2][9];
@@ -479,7 +507,9 @@ typedef struct {
     uint32_t reserved[3];
     volatile LONG state[SHM_SLOTS];   /* 0 libre · 2 escribiendo · 1 listo para la Mac */
 } ShmHdr;
+#ifdef _WIN32
 static HANDLE g_shmFile = INVALID_HANDLE_VALUE, g_shmMap;
+#endif
 static uint8_t *g_shm;
 static int g_shmMode;               /* 0 esperando confirmación · 1 activa · -1 no disponible (TCP) */
 #define OV_MAGIC 0x32564F50u   /* "POV2" en reserved[2]: la Mac sabe dibujar los paneles flotantes ella misma (tipo 12) */
@@ -489,6 +519,7 @@ static int64_t g_shmAsked;
 static int g_shmGen = -1;           /* conexión de imágenes donde se ofreció */
 static volatile LONG g_shmSentStat;
 
+#ifdef _WIN32
 /* ¿Corre dentro de Wine (Mac) o en Windows de verdad? (en Windows, VRmin Host es un programa de Windows y la memoria
    compartida es una con nombre, sin archivo en el disco) */
 static int running_in_wine(void) { return GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version") != NULL; }
@@ -515,6 +546,43 @@ static int shm_create(void) {
     if (!g_shm) { logmsg("Memoria compartida: MapViewOfFile falló (%lu)", GetLastError()); CloseHandle(g_shmMap); CloseHandle(g_shmFile); g_shmFile = INVALID_HANDLE_VALUE; return 0; }
     return 1;
 }
+#else
+/* Linux: un archivo en /dev/shm (el juego lo ve igual que VRmin Host aunque corra en el contenedor de Steam o en el
+ * Steam de Flatpak). Mientras el juego vive lo tiene trabado (flock): los que quedaron de juegos cerrados se borran. */
+static char g_shmPath[96];
+static void shm_cleanup(void) { if (g_shmPath[0]) unlink(g_shmPath); }
+static int shm_create(void) {
+    if (g_shm) return 1;
+    uint64_t total = SHM_HDR + SHM_SLOT_MAX * SHM_SLOTS;
+    DIR *d = opendir("/dev/shm");
+    for (struct dirent *e; d && (e = readdir(d)); ) {
+        if (strncmp(e->d_name, "vrmin-frames-", 13)) continue;
+        char p[300]; snprintf(p, sizeof p, "/dev/shm/%s", e->d_name);
+        int fd = open(p, O_RDWR | O_CLOEXEC);
+        if (fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) == 0) unlink(p);
+        if (fd >= 0) close(fd);
+    }
+    if (d) closedir(d);
+    snprintf(g_shmPath, sizeof g_shmPath, "/dev/shm/vrmin-frames-%u-%u", (unsigned)getuid(), (unsigned)getpid());
+    int fd = -1;
+    for (int i = 0; i < 3 && fd < 0; i++) {   /* (otro juego que arranca justo ahora pudo borrarlo antes de trabarlo) */
+        fd = open(g_shmPath, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        struct stat st;
+        if (fd >= 0 && (flock(fd, LOCK_EX) != 0 || fstat(fd, &st) != 0 || st.st_nlink == 0)) { close(fd); fd = -1; }
+    }
+    if (fd < 0 || ftruncate(fd, (off_t)total) != 0) {
+        logmsg("Shared memory: couldn't create %s (%s)", g_shmPath, strerror(errno));
+        if (fd >= 0) { close(fd); unlink(g_shmPath); }
+        g_shmPath[0] = 0;
+        return 0;
+    }
+    void *m = mmap(NULL, (size_t)total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) { logmsg("Shared memory: mmap failed (%s)", strerror(errno)); close(fd); shm_cleanup(); g_shmPath[0] = 0; return 0; }
+    g_shm = (uint8_t *)m;   /* (fd queda abierto: tiene la traba) */
+    atexit(shm_cleanup);
+    return 1;
+}
+#endif
 
 /* Ofrece la memoria compartida por la conexión de imágenes (paquete tipo 5: nonce, tamaño de cada lugar, ruta Unix) */
 static void shm_offer(void) {
@@ -527,12 +595,16 @@ static void shm_offer(void) {
     MemoryBarrier();
     h->nonce = nonce;
     char unixPath[1024] = "";
+#ifndef _WIN32
+    snprintf(unixPath, sizeof unixPath, "%s", g_shmPath);
+#else
     typedef char *(CDECL *wgufn_t)(LPCWSTR);
     wgufn_t wgufn = (wgufn_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "wine_get_unix_file_name");
     if (wgufn) {
         char *u = wgufn(L"C:\\questvrbridge\\cuadros.bin");
         if (u) { strncpy(unixPath, u, sizeof unixPath - 1); HeapFree(GetProcessHeap(), 0, u); }
     } else if (!running_in_wine()) strcpy(unixPath, "mapa:" SHM_WIN_NAME);   /* (en Windows: el nombre de la memoria) */
+#endif
     if (!unixPath[0]) { logmsg("Memoria compartida: no pude saber la ruta en la Mac; sigo por la red"); g_shmMode = -1; return; }
     uint8_t pkt[5 + 1 + 8 + 1024];
     uint32_t plen = (uint32_t)strlen(unixPath);
@@ -632,6 +704,7 @@ static void shm_notify_quads(int slot, uint32_t pid, uint8_t fmt, uint32_t ew, u
 /* ------------------------------------------------------------------ */
 #define GPU_MAGIC 0x31555047u   /* "GPU1": la Mac abrió las texturas (en reserved[0] del encabezado) */
 #define GPU_FAIL  0x4c494146u   /* "FAIL": la Mac no pudo abrirlas */
+#ifdef _WIN32
 typedef UINT KMT_HANDLE;
 typedef struct { LUID luid; KMT_HANDLE hAdapter; } KMT_OPENADAPTERFROMLUID;
 typedef struct { union { KMT_HANDLE hAdapter; void *pAdapter; } a; UINT Flags; KMT_HANDLE hDevice; void *pCommandBuffer; UINT CommandBufferSize;
@@ -644,10 +717,12 @@ typedef struct { KMT_HANDLE hDevice; KMT_HANDLE hGlobalShare; UINT NumAllocation
                  void *pTotalPrivateDriverDataBuffer; UINT TotalPrivateDriverDataBufferSize; KMT_HANDLE hResource; } KMT_OPENRESOURCE;
 typedef struct { KMT_HANDLE hDevice; KMT_HANDLE hResource; const KMT_HANDLE *phAllocationList; UINT AllocationCount; } KMT_DESTROYALLOCATION;
 typedef LONG (WINAPI *kmt_fn)(void *);
+#endif
 
 static uint8_t fmt_code(DXGI_FORMAT f) {
     return (f == DXGI_FORMAT_B8G8R8A8_TYPELESS) ? 0 : 1; /* 0 = BGRA, 1 = RGBA */
 }
+#ifdef _WIN32
 
 static int g_gpuState;              /* 0 sin probar · 1 esperando a la Mac · 2 activa · -1 no disponible */
 static ID3D11Texture2D *g_gpuTex[SHM_SLOTS];
@@ -789,6 +864,7 @@ static int gpu_done(ID3D11DeviceContext *ctx, int i) {   /* (con g_gpuLock tomad
     else shm_notify_t(11, i, g_gpuPose[i], fmt_code(g_gpuFmt), g_gpuEW[i], g_gpuEH[i]);
     return 1;
 }
+#endif
 
 static DWORD WINAPI send_thread(LPVOID arg) {
     (void)arg;
@@ -933,10 +1009,16 @@ static void set_state(Session *s, XrSessionState st) {
 #define FILL_STR(dst, src) do { strncpy((dst), (src), sizeof(dst) - 1); (dst)[sizeof(dst) - 1] = 0; } while (0)
 
 static const char *g_extensions[] = {
+#ifdef _WIN32
     XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
     XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
     XR_KHR_OPENGL_ENABLE_EXTENSION_NAME,
     XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME,
+#else
+    XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
+    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
+    XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME,
+#endif
 };
 #define N_EXT (sizeof g_extensions / sizeof g_extensions[0])
 
@@ -1044,6 +1126,7 @@ static int input_value(const Track *t, const char *b, float out[2], int *isPose)
 /* ------------------------------------------------------------------ */
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetInstanceProcAddr(XrInstance instance, const char *name, PFN_xrVoidFunction *function);
 static void init_once(void);
+#ifdef _WIN32
 static void install_gl_hook(void);
 static void install_dxvk_hooks(void);
 static void fix_opencomposite_32(void);
@@ -1052,6 +1135,7 @@ static void fix_opencomposite_stubs(void);
 static void fix_opencomposite_models(const char *app);
 static void install_wininet_fix(void);
 static void copy_unity_logs(int current);
+#endif
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrEnumerateInstanceExtensionProperties(const char *layerName, uint32_t cap, uint32_t *count, XrExtensionProperties *props) {
     init_once();
@@ -1079,6 +1163,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateInstance(const XrInstanceCreateInfo *i
         if (!ok) { logmsg("Extensión no soportada pedida: %s", info->enabledExtensionNames[i]); return XR_ERROR_EXTENSION_NOT_PRESENT; }
     }
     logmsg("xrCreateInstance de '%s' (%s)", info->applicationInfo.applicationName, info->applicationInfo.engineName);
+#ifdef _WIN32
     install_gl_hook();   /* (solo hace algo si el juego usa OpenGL) */
     install_dxvk_hooks();   /* (solo si el juego trae DXVK, como Half-Life 2: VR Mod) */
     fix_opencomposite_32();
@@ -1086,6 +1171,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateInstance(const XrInstanceCreateInfo *i
     fix_opencomposite_stubs();
     fix_opencomposite_models(info->applicationInfo.applicationName);
     install_wininet_fix();
+#endif
     /* Pedirle a la Mac los ajustes de este juego (resolución, campo de visión, controles) */
     snprintf(g_appName, sizeof g_appName, "%s", info->applicationInfo.applicationName[0] ? info->applicationInfo.applicationName : "?");
     g_helloVer = g_cfgVer;
@@ -1093,7 +1179,11 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateInstance(const XrInstanceCreateInfo *i
     *instance = (XrInstance)&g_instance;
     return XR_SUCCESS;
 }
+#ifdef _WIN32
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroyInstance(XrInstance i) { (void)i; logmsg("xrDestroyInstance"); copy_unity_logs(1); return XR_SUCCESS; }
+#else
+XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroyInstance(XrInstance i) { (void)i; logmsg("xrDestroyInstance"); return XR_SUCCESS; }
+#endif
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetInstanceProperties(XrInstance i, XrInstanceProperties *p) {
     (void)i;
@@ -1219,6 +1309,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEnumerateViewConfigurationViews(XrInstance i
     return XR_SUCCESS;
 }
 
+#ifdef _WIN32
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetD3D11GraphicsRequirementsKHR(XrInstance i, XrSystemId id, XrGraphicsRequirementsD3D11KHR *req) {
     (void)i; (void)id;
     memset(&req->adapterLuid, 0, sizeof req->adapterLuid);
@@ -1235,6 +1326,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetD3D11GraphicsRequirementsKHR(XrInstance i
     req->minFeatureLevel = D3D_FEATURE_LEVEL_11_0;
     return XR_SUCCESS;
 }
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Vulkan (XR_KHR_vulkan_enable). Los juegos con Vulkan (por ejemplo,  */
@@ -1243,8 +1335,12 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetD3D11GraphicsRequirementsKHR(XrInstance i
 /* leer y de ahí a la memoria compartida con la Mac.                   */
 /* ------------------------------------------------------------------ */
 static PFN_vkGetInstanceProcAddr g_vkGIPA;
+#ifdef _WIN32
 static void install_vulkan_hook(void);
 static int patch_iat(HMODULE mod, const char *dll, const char *fn, void *repl, void **orig);
+#else
+static void install_vulkan_hook(void) {}   /* (los arreglos de Vulkan son para la GPU de la Mac) */
+#endif
 static struct {
     PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
@@ -1269,9 +1365,16 @@ static struct {
 /* vkGetInstanceProcAddr del Vulkan de Wine (el mismo vulkan-1.dll que cargó el juego) */
 static int vk_loader(void) {
     if (g_vkGIPA) return 1;
+#ifdef _WIN32
     HMODULE m = LoadLibraryA("vulkan-1.dll");
     if (m) g_vkGIPA = (PFN_vkGetInstanceProcAddr)(void (*)(void))GetProcAddress(m, "vkGetInstanceProcAddr");
     if (!g_vkGIPA) logmsg("Vulkan: no se encontró vulkan-1.dll");
+#else
+    /* (en Linux, el cargador de Vulkan del sistema: el mismo que ya usa el juego) */
+    void *m = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (m) g_vkGIPA = (PFN_vkGetInstanceProcAddr)dlsym(m, "vkGetInstanceProcAddr");
+    if (!g_vkGIPA) logmsg("Vulkan: libvulkan.so.1 not found");
+#endif
     return g_vkGIPA != NULL;
 }
 
@@ -1315,7 +1418,9 @@ static XrResult ext_string(const char *str, uint32_t cap, uint32_t *count, char 
 }
 
 /* (no hace falta ninguna extensión de Vulkan: la imagen se lee con una copia común. En 32 bits igual se nombran
- *  algunas que la Mac tiene: Half-Life 2: VR Mod convertía la lista vacía en una extensión sin nombre y se cerraba) */
+ *  algunas que la Mac tiene: Half-Life 2: VR Mod convertía la lista vacía en una extensión sin nombre y se cerraba.
+ *  En Linux, también: OpenComposite busca la GPU con vkGetPhysicalDeviceProperties2 en su instancia de Vulkan, que
+ *  sin VK_KHR_get_physical_device_properties2 no la encuentra) */
 #ifdef _WIN64
 #define VK_EXT_INST ""
 #define VK_EXT_DEV ""
@@ -1334,10 +1439,26 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetVulkanGraphicsDeviceKHR(XrInstance i, XrS
     install_vulkan_hook();
     if (!vk_loader()) return XR_ERROR_RUNTIME_FAILURE;
     PFN_vkEnumeratePhysicalDevices en = (PFN_vkEnumeratePhysicalDevices)g_vkGIPA(inst, "vkEnumeratePhysicalDevices");
+#ifdef _WIN32
     uint32_t n = 1;
     VkPhysicalDevice pd = VK_NULL_HANDLE;
     if (!en || (en(inst, &n, &pd) < 0) || !pd) { logmsg("Vulkan: no hay GPU"); return XR_ERROR_RUNTIME_FAILURE; }
     *out = pd;   /* (en la Mac hay una sola) */
+#else
+    /* (en una PC con dos GPU, la dedicada: la misma que elige DXVK para el juego; OpenComposite exige que sea la misma) */
+    PFN_vkGetPhysicalDeviceProperties gp = (PFN_vkGetPhysicalDeviceProperties)g_vkGIPA(inst, "vkGetPhysicalDeviceProperties");
+    VkPhysicalDevice pds[8];
+    uint32_t n = 8;
+    if (!en || !gp || en(inst, &n, pds) < 0 || !n) { logmsg("Vulkan: no GPU found"); return XR_ERROR_RUNTIME_FAILURE; }
+    *out = pds[0];
+    for (uint32_t k = 0; k < n; k++) {
+        VkPhysicalDeviceProperties p;
+        gp(pds[k], &p);
+        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { *out = pds[k]; break; }
+    }
+    static VkPhysicalDevice dicho;
+    if (*out != dicho) { dicho = *out; VkPhysicalDeviceProperties p; gp(*out, &p); logmsg("Vulkan: GPU %s", p.deviceName); }
+#endif
     return XR_SUCCESS;
 }
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetVulkanGraphicsRequirementsKHR(XrInstance i, XrSystemId id, XrGraphicsRequirementsVulkanKHR *req) {
@@ -1346,6 +1467,30 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetVulkanGraphicsRequirementsKHR(XrInstance 
     req->maxApiVersionSupported = XR_MAKE_VERSION(1, 3, 0);
     return XR_SUCCESS;
 }
+
+#ifndef _WIN32
+/* XR_KHR_vulkan_enable2 (juegos nativos de Linux): el runtime crea la instancia y el dispositivo de Vulkan del juego,
+ * con las funciones que da el juego. No hace falta agregarles ninguna extensión (ver arriba) */
+static VkInstance g_vk2Inst;
+XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateVulkanInstanceKHR(XrInstance i, const XrVulkanInstanceCreateInfoKHR *ci, VkInstance *out, VkResult *vr) {
+    (void)i;
+    PFN_vkCreateInstance cr = (PFN_vkCreateInstance)ci->pfnGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
+    if (!cr) return XR_ERROR_RUNTIME_FAILURE;
+    *vr = cr(ci->vulkanCreateInfo, ci->vulkanAllocator, out);
+    return XR_SUCCESS;
+}
+XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetVulkanGraphicsDevice2KHR(XrInstance i, const XrVulkanGraphicsDeviceGetInfoKHR *gi, VkPhysicalDevice *out) {
+    g_vk2Inst = gi->vulkanInstance;
+    return rt_xrGetVulkanGraphicsDeviceKHR(i, gi->systemId, gi->vulkanInstance, out);
+}
+XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateVulkanDeviceKHR(XrInstance i, const XrVulkanDeviceCreateInfoKHR *ci, VkDevice *out, VkResult *vr) {
+    (void)i;
+    PFN_vkCreateDevice cr = (PFN_vkCreateDevice)ci->pfnGetInstanceProcAddr(g_vk2Inst, "vkCreateDevice");
+    if (!cr) return XR_ERROR_RUNTIME_FAILURE;
+    *vr = cr(ci->vulkanPhysicalDevice, ci->vulkanCreateInfo, ci->vulkanAllocator, out);
+    return XR_SUCCESS;
+}
+#endif
 
 /* Ejecuta en la cola del juego un cambio de diseño (layout) de una imagen y espera a que termine */
 static int vk_initial_layout(Session *s, VkImage img, VkImageAspectFlags aspect, VkImageLayout layout, uint32_t mips, uint32_t layers) {
@@ -1430,6 +1575,7 @@ static void vk_session_release(Session *s) {
     if (s->vkPool) vk.DestroyCommandPool(s->vkDev, s->vkPool, NULL);
 }
 
+#ifdef _WIN32   /* (hasta rt_xrCreateSession: OpenGL y los arreglos para OpenComposite y Wine, solo en Windows) */
 /* ------------------------------------------------------------------ */
 /* OpenGL (XR_KHR_opengl_enable). Los juegos con OpenGL (por ejemplo,  */
 /* Google Earth VR por OpenComposite) dibujan en texturas que crea el  */
@@ -2246,15 +2392,23 @@ static void install_wininet_fix(void) {
     if (patch_iat(exe, "wininet.dll", "InternetOpenA", (void *)h_InternetOpenA, &c)) memcpy(&o_InternetOpenA, &c, sizeof c);
     logmsg("Internet: arreglo para el wininet de Wine instalado");
 }
+#endif
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSession(XrInstance i, const XrSessionCreateInfo *info, XrSession *session) {
     (void)i;
     const XrBaseInStructure *n = (const XrBaseInStructure *)info->next;
+#ifdef _WIN32
     const XrGraphicsBindingD3D11KHR *gb = NULL;
+#else
+    const void *gb = NULL;   /* (en Linux, solo Vulkan) */
+#endif
     const XrGraphicsBindingVulkanKHR *vb = NULL;
     while (n) {
+#ifdef _WIN32
         if (n->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) gb = (const XrGraphicsBindingD3D11KHR *)n;
+#endif
         if (n->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) vb = (const XrGraphicsBindingVulkanKHR *)n;
+#ifdef _WIN32
         if (n->type == XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR) {
             const XrGraphicsBindingOpenGLWin32KHR *gb2 = (const XrGraphicsBindingOpenGLWin32KHR *)n;
             if (g_session) return XR_ERROR_LIMIT_REACHED;
@@ -2271,6 +2425,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSession(XrInstance i, const XrSessionC
             set_state(s, XR_SESSION_STATE_READY);
             return XR_SUCCESS;
         }
+#endif
         n = n->next;
     }
     if (g_session) return XR_ERROR_LIMIT_REACHED;
@@ -2284,6 +2439,10 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSession(XrInstance i, const XrSessionC
         set_state(s, XR_SESSION_STATE_READY);
         return XR_SUCCESS;
     }
+#ifndef _WIN32
+    logmsg("xrCreateSession without Vulkan");
+    return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+#else
     if (!gb || !gb->device) { logmsg("xrCreateSession sin D3D11 ni Vulkan"); return XR_ERROR_GRAPHICS_DEVICE_INVALID; }
     Session *s = calloc(1, sizeof *s);
     s->dev = gb->device;
@@ -2295,11 +2454,13 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSession(XrInstance i, const XrSessionC
     set_state(s, XR_SESSION_STATE_IDLE);
     set_state(s, XR_SESSION_STATE_READY);
     return XR_SUCCESS;
+#endif
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroySession(XrSession session) {
     Session *s = (Session *)session;
     if (s->vk) vk_session_release(s);
+#ifdef _WIN32
     if (s->gl) {
         GlPrev p;
         if (gl_begin(s, &p)) {
@@ -2311,7 +2472,9 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroySession(XrSession session) {
     }
     for (int k = 0; k < 3; k++) if (s->staging[k]) ID3D11Texture2D_Release(s->staging[k]);
     for (int k = 0; k < STAGES; k++) for (int j = 0; j < NQ; j++) if (s->dQ[k][j]) ID3D11Texture2D_Release(s->dQ[k][j]);
+#endif
     for (int j = 0; j < NQ; j++) free(s->dQc[j].px);
+#ifdef _WIN32
     EnterCriticalSection(&g_gpuLock); gpu_release(); g_gpuShmGen = -1; g_gpuCtx = NULL; LeaveCriticalSection(&g_gpuLock);
     /* La copia directa, solo en la primera sesión que la usó: en juegos que abren otra sesión al cambiar de nivel
        (The Lab y sus experiencias) las texturas compartidas nuevas se veían negras en el visor. Sigue la memoria
@@ -2319,6 +2482,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroySession(XrSession session) {
     if (g_gpuState > 0) { g_gpuState = -1; logmsg("Copia directa: solo en la primera sesión; la próxima sigue con la memoria compartida"); }
     if (s->ctx) ID3D11DeviceContext_Release(s->ctx);
     if (s->dev) ID3D11Device_Release(s->dev);
+#endif
     if (g_session == s) g_session = NULL;
     free(s);
     logmsg("Sesión destruida");
@@ -2551,12 +2715,14 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrLocateViews(XrSession s, const XrViewLocateI
 }
 
 /* --- Swapchains --- */
+#ifdef _WIN32
 static const int64_t g_formats[] = {
     DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM,
     DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
 };
 #define N_FMT (sizeof g_formats / sizeof g_formats[0])
+#endif
 static const int64_t g_vkFormats[] = {
     VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM,
     VK_FORMAT_D32_SFLOAT, VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT_S8_UINT,   /* (sin D24S8: Metal no lo tiene) */
@@ -2575,6 +2741,7 @@ static DXGI_FORMAT typeless_of_vk(int64_t f, int *isDepth) {
     }
 }
 
+#ifdef _WIN32
 static DXGI_FORMAT typeless_of(int64_t f, int *isDepth) {
     *isDepth = 0;
     switch (f) {
@@ -2587,8 +2754,12 @@ static DXGI_FORMAT typeless_of(int64_t f, int *isDepth) {
     default: return DXGI_FORMAT_UNKNOWN;
     }
 }
+#endif
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrEnumerateSwapchainFormats(XrSession s, uint32_t cap, uint32_t *count, int64_t *formats) {
+#ifndef _WIN32
+    (void)s;   /* (en Linux, siempre Vulkan) */
+#else
     if (((Session *)s)->gl) {
         *count = (uint32_t)N_GLFMT;
         if (cap == 0) return XR_SUCCESS;
@@ -2597,17 +2768,20 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEnumerateSwapchainFormats(XrSession s, uint3
         return XR_SUCCESS;
     }
     if (((Session *)s)->vk) {
+#endif
         *count = (uint32_t)N_VKFMT;
         if (cap == 0) return XR_SUCCESS;
         if (cap < N_VKFMT) return XR_ERROR_SIZE_INSUFFICIENT;
         for (uint32_t i = 0; i < N_VKFMT; i++) formats[i] = g_vkFormats[i];
         return XR_SUCCESS;
+#ifdef _WIN32
     }
     *count = (uint32_t)N_FMT;
     if (cap == 0) return XR_SUCCESS;
     if (cap < N_FMT) return XR_ERROR_SIZE_INSUFFICIENT;
     for (uint32_t i = 0; i < N_FMT; i++) formats[i] = g_formats[i];
     return XR_SUCCESS;
+#endif
 }
 
 static XrResult vk_create_swapchain(Session *s, const XrSwapchainCreateInfo *ci, XrSwapchain *out) {
@@ -2663,6 +2837,9 @@ static XrResult vk_create_swapchain(Session *s, const XrSwapchainCreateInfo *ci,
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSwapchain(XrSession session, const XrSwapchainCreateInfo *ci, XrSwapchain *out) {
     Session *s = (Session *)session;
     if (s->vk) return vk_create_swapchain(s, ci, out);
+#ifndef _WIN32
+    return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+#else
     if (s->gl) return gl_create_swapchain(s, ci, out);
     int isDepth;
     DXGI_FORMAT tl = typeless_of(ci->format, &isDepth);
@@ -2696,16 +2873,19 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSwapchain(XrSession session, const XrS
     logmsg("Swapchain %ux%u formato %lld capas %u%s", ci->width, ci->height, (long long)ci->format, sc->arraySize, isDepth ? " (profundidad)" : "");
     *out = (XrSwapchain)sc;
     return XR_SUCCESS;
+#endif
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroySwapchain(XrSwapchain h) {
     Swapchain *sc = (Swapchain *)h;
+#ifdef _WIN32
     if (sc->src) ID3D11Texture2D_Release(sc->src);
     for (uint32_t k = 0; k < sc->count; k++) if (sc->img[k]) ID3D11Texture2D_Release(sc->img[k]);
     if (sc->isGl && g_session && g_session->gl) {
         GlPrev p;
         if (gl_begin(g_session, &p)) { gl.DeleteTextures((GLsizei)sc->count, sc->gltex); gl_end(&p); }
     }
+#endif
     if (g_session && g_session->vk) {
         vk.QueueWaitIdle(g_session->vkQueue);
         for (uint32_t k = 0; k < sc->count; k++) {
@@ -2722,18 +2902,22 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEnumerateSwapchainImages(XrSwapchain h, uint
     *count = sc->count;
     if (cap == 0) return XR_SUCCESS;
     if (cap < sc->count) return XR_ERROR_SIZE_INSUFFICIENT;
+#ifdef _WIN32
     if (sc->isGl) {
         XrSwapchainImageOpenGLKHR *gi = (XrSwapchainImageOpenGLKHR *)images;
         for (uint32_t k = 0; k < sc->count; k++) gi[k].image = sc->gltex[k];
         return XR_SUCCESS;
     }
+#endif
     if (sc->vimg[0]) {
         XrSwapchainImageVulkanKHR *vi = (XrSwapchainImageVulkanKHR *)images;
         for (uint32_t k = 0; k < sc->count; k++) vi[k].image = sc->vimg[k];
         return XR_SUCCESS;
     }
+#ifdef _WIN32
     XrSwapchainImageD3D11KHR *im = (XrSwapchainImageD3D11KHR *)images;
     for (uint32_t k = 0; k < sc->count; k++) im[k].texture = sc->img[k];
+#endif
     return XR_SUCCESS;
 }
 
@@ -2758,6 +2942,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrReleaseSwapchainImage(XrSwapchain h, const X
 static int64_t g_nextFrame;
 
 /* Copia directa: ¿terminó la GPU alguna copia pendiente? Entonces se le avisa a la Mac ya (no en el próximo cuadro) */
+#ifdef _WIN32
 static void gpu_poll(void) {
     if (g_gpuState != 2 || !g_gpuCtx) return;
     if (!TryEnterCriticalSection(&g_gpuLock)) return;   /* (xrEndFrame está trabajando: se revisa en un momento) */
@@ -2765,6 +2950,9 @@ static void gpu_poll(void) {
         for (int i = 0; i < SHM_SLOTS; i++) gpu_done(g_gpuCtx, i);
     LeaveCriticalSection(&g_gpuLock);
 }
+#else
+static void gpu_poll(void) {}   /* (la copia directa es de D3D11) */
+#endif
 
 static void vk_flush_deferred(void);
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrWaitFrame(XrSession session, const XrFrameWaitInfo *i, XrFrameState *st) {
@@ -2790,10 +2978,13 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrBeginFrame(XrSession s, const XrFrameBeginIn
     g_inside = "xrBeginFrame"; (void)s; (void)i; return XR_SUCCESS; }
 
 
+#ifdef _WIN32
 static int d3d_quads_copy(Session *s, int k, const XrCompositionLayerProjection *pl, const XrCompositionLayerQuad *const *qls, int nq);
 static uint32_t d3d_quads_write(Session *s, int k, uint8_t *dst, size_t room, size_t *used);
+#endif
 static void quad_eyes(Session *s, int k, int qn, const XrCompositionLayerProjection *pl, uint32_t id);
 
+#ifdef _WIN32
 /* La imagen que hay que leer de una swapchain (D3D11): la última entregada, o la textura del juego si OpenComposite de
  * VRmin no la copió (vrmin_image_source). Ajusta sub y el recorte. */
 static ID3D11Resource *sc_image(Swapchain *sc, UINT *sub, D3D11_BOX *box) {
@@ -2827,11 +3018,14 @@ __declspec(dllexport) int __cdecl vrmin_image_source(XrSwapchain h, void *textur
     sc->srcIdx = (sc->next + sc->count - 1) % sc->count;   /* (la imagen recién pedida) */
     return 1;
 }
+#endif
 
 /* Para OpenComposite de VRmin: una línea en el registro de VRmin (sus estadísticas) */
 __declspec(dllexport) void __cdecl vrmin_log(const char *msg) {
     if (msg) logmsg("%s", msg);
 }
+
+#ifdef _WIN32
 
 /* Copia los dos ojos (en la GPU) lado a lado en dst. 0 = algo no coincide (se descarta el cuadro) */
 static int copy_eyes(Session *s, const XrCompositionLayerProjection *pl, ID3D11Texture2D *dst, uint32_t ew, uint32_t eh, DXGI_FORMAT fmt) {
@@ -3064,6 +3258,7 @@ static void readback(Session *s, const XrCompositionLayerProjection *pl, const X
     EnterCriticalSection(&g_lock); g_frameReady = slot; LeaveCriticalSection(&g_lock);
     SetEvent(g_frameEvent);
 }
+#endif
 
 /* Memoria de lectura (visible desde la CPU) para el panel flotante j, de al menos w×h (solo crece: los paneles
  * cambian de tamaño seguido y rehacerla en cada cuadro trababa todo) */
@@ -3227,6 +3422,7 @@ static void quad_eyes(Session *s, int k, int qn, const XrCompositionLayerProject
     if (vb) for (int j = 0; j < qn; j++) for (int e = 0; e < 2; e++) s->vkQ[k][j].eye[e] = pmul(pinvw, tr.eye[e]);
 }
 
+#ifdef _WIN32
 /* D3D11: copia (en la GPU) la imagen de cada panel flotante a su textura de lectura del lugar k, y anota dónde cae.
  * Devuelve cuántos quedaron (en orden: menú, HUD…). */
 static int d3d_quads_copy(Session *s, int k, const XrCompositionLayerProjection *pl, const XrCompositionLayerQuad *const *qls, int nq) {
@@ -3302,6 +3498,7 @@ static uint32_t d3d_quads_write(Session *s, int k, uint8_t *dst, size_t room, si
     *used += at;
     return n;
 }
+#endif
 
 static void vk_composite_quad(Session *s, int r, int j, uint8_t *dst, uint32_t ew, uint32_t eh, int dstRgba) {
     uint32_t qw = s->vkQ[r][j].w, qh = s->vkQ[r][j].h;
@@ -3390,6 +3587,9 @@ static void vk_composite_quad(Session *s, int r, int j, uint8_t *dst, uint32_t e
  * guardan 120 cuadros seguidos (ojo izquierdo, achicado a la cuarta parte) en C:\questvrbridge\cuadros_diag, con la
  * pose de cada uno, para comparar cuánto se corre la imagen entre cuadros con cuánto giroAhora la cabeza. Una vez por sesión. */
 static void vk_dump_frame(Session *s, int r, const uint8_t *img, uint32_t ew, uint32_t eh) {
+#ifndef _WIN32
+    (void)s; (void)r; (void)img; (void)ew; (void)eh;   /* (diagnóstico solo para Windows y la Mac) */
+#else
     static int n = -1, frames, on = -1;
     if (on < 0) on = GetFileAttributesA("C:\\questvrbridge\\diag_cuadros.txt") != INVALID_FILE_ATTRIBUTES;
     if (!on || n >= 120) return;
@@ -3422,6 +3622,7 @@ static void vk_dump_frame(Session *s, int r, const uint8_t *img, uint32_t ew, ui
     logmsg("diag %03d t=%.1f id=%u q=%.5f,%.5f,%.5f,%.5f ahora id=%u q=%.5f,%.5f,%.5f,%.5f", n, now_ns() / 1e6, s->stPose[r],
            qf.x, qf.y, qf.z, qf.w, idn, qn.x, qn.y, qn.z, qn.w);
     n++;
+#endif
 }
 
 static void vk_send_stage(Session *s, int r) {
@@ -3557,6 +3758,7 @@ static uint32_t vk_lagged_id(uint32_t id) {
 typedef struct { uint64_t dst, src; uint32_t layer; int64_t at; } OcCopy;
 static OcCopy g_ocCopy[24];
 static PFN_vkCmdCopyImage o_ocCmdCopyImage;
+#ifdef _WIN32
 static void VKAPI_CALL h_ocCmdCopyImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageCopy *r) {
     if (n == 1 && r && !r->srcOffset.x && !r->srcOffset.y && !r->dstOffset.x && !r->dstOffset.y && sl == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
         EnterCriticalSection(&g_lock);
@@ -3571,6 +3773,7 @@ static void VKAPI_CALL h_ocCmdCopyImage(VkCommandBuffer cb, VkImage src, VkImage
     }
     o_ocCmdCopyImage(cb, src, sl, dst, dl, n, r);
 }
+#endif
 static int oc_src_for(VkImage dst, VkImage *src, uint32_t *layer) {
     int ok = 0;
     EnterCriticalSection(&g_lock);
@@ -3591,6 +3794,7 @@ static int vk_diferido(void) {
     }
     return on && o_ocCmdCopyImage != NULL;
 }
+#ifdef _WIN32
 static void hook_oc_vulkan(void) {
     static HMODULE hecho;
     HMODULE m = GetModuleHandleA("vrclient_x64.dll");
@@ -3600,6 +3804,7 @@ static void hook_oc_vulkan(void) {
     void *o;
     if (patch_iat(m, "vulkan-1.dll", "vkCmdCopyImage", (void *)h_ocCmdCopyImage, &o)) { memcpy(&o_ocCmdCopyImage, &o, sizeof o); logmsg("OpenComposite: copias de imagen anotadas (Vulkan sin cuadro de atraso)"); }
 }
+#endif
 
 static void vk_readback(Session *s, const XrCompositionLayerProjection *pl, const XrCompositionLayerQuad *const *qls, int nq, XrTime displayTime, int diferido) {
     Swapchain *sc0 = (Swapchain *)pl->views[0].subImage.swapchain;
@@ -3800,6 +4005,7 @@ static void vk_defer(Session *s, const XrCompositionLayerProjection *pl, const X
     g_vkPend.on = 1;
 }
 
+#ifdef _WIN32
 /* OpenGL: lee los dos ojos lado a lado con PBO (el del cuadro anterior ya terminó en la GPU) y los pasa a la
    memoria compartida con la Mac. OpenGL guarda las filas de abajo hacia arriba: se dan vuelta al copiar. */
 static void gl_readback(Session *s, const XrCompositionLayerProjection *pl, XrTime displayTime) {
@@ -3902,6 +4108,7 @@ static void gl_readback(Session *s, const XrCompositionLayerProjection *pl, XrTi
     gl.BindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevRead);
     gl_end(&p);
 }
+#endif
 
 /* Anota en el registro las capas que manda el juego cada vez que cambian (cuántas, de qué tipo, su imagen y dónde
  * están), para ver en un reporte qué paneles llegan y cuáles no se pueden mostrar */
@@ -3972,12 +4179,14 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
                     if (vk_diferido()) vk_defer(s, pl, qls, nq, info->displayTime);   /* (se copia al empezar el cuadro siguiente) */
                     else { vk_flush_deferred(); vk_readback(s, pl, qls, nq, info->displayTime, 0); }
                 }
+#ifdef _WIN32
                 else if (s->gl) gl_readback(s, pl, info->displayTime);
                 else {
                     EnterCriticalSection(&g_gpuLock);
                     readback(s, pl, qls, nq, info->displayTime);
                     LeaveCriticalSection(&g_gpuLock);
                 }
+#endif
                 break;
             }
         }
@@ -4061,7 +4270,9 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrSuggestInteractionProfileBindings(XrInstance
     }
     LeaveCriticalSection(&g_lock);
     logmsg("Bindings sugeridos para %s (%u)", path_str(sb->interactionProfile), sb->countSuggestedBindings);
+#ifdef _WIN32
     if (sb->countSuggestedBindings >= 10) g_realBindingsAt = now_ns();   /* (OpenComposite ya armó los controles de verdad) */
+#endif
     return XR_SUCCESS;
 }
 
@@ -4250,6 +4461,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrStopHapticFeedback(XrSession s, const XrHapt
 /* --- Cuando reemplazamos openxr_loader.dll --- */
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrInitializeLoaderKHR(const void *info) { (void)info; init_once(); logmsg("xrInitializeLoaderKHR (modo loader)"); return XR_SUCCESS; }
 
+#ifdef _WIN32
 /* --- Conversión de tiempo (XR_KHR_win32_convert_performance_counter_time) --- */
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrConvertWin32PerformanceCounterToTimeKHR(XrInstance i, const LARGE_INTEGER *pc, XrTime *t) {
     (void)i; *t = qpc_to_ns(pc->QuadPart); return XR_SUCCESS;
@@ -4257,6 +4469,15 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrConvertWin32PerformanceCounterToTimeKHR(XrIn
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrConvertTimeToWin32PerformanceCounterKHR(XrInstance i, XrTime t, LARGE_INTEGER *pc) {
     (void)i; pc->QuadPart = (LONGLONG)((double)t * (double)g_qpf.QuadPart / 1e9); return XR_SUCCESS;
 }
+#else
+/* --- Conversión de tiempo (XR_KHR_convert_timespec_time: CLOCK_MONOTONIC, como now_ns) --- */
+XRAPI_ATTR XrResult XRAPI_CALL rt_xrConvertTimespecTimeToTimeKHR(XrInstance i, const struct timespec *ts, XrTime *t) {
+    (void)i; *t = (XrTime)ts->tv_sec * 1000000000LL + ts->tv_nsec; return XR_SUCCESS;
+}
+XRAPI_ATTR XrResult XRAPI_CALL rt_xrConvertTimeToTimespecTimeKHR(XrInstance i, XrTime t, struct timespec *ts) {
+    (void)i; ts->tv_sec = (time_t)(t / 1000000000LL); ts->tv_nsec = (long)(t % 1000000000LL); return XR_SUCCESS;
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Tabla de funciones                                                  */
@@ -4268,10 +4489,17 @@ static const struct { const char *name; PFN_xrVoidFunction fn; } g_fns[] = {
     FN(xrResultToString), FN(xrStructureTypeToString), FN(xrStringToPath), FN(xrPathToString),
     FN(xrGetSystem), FN(xrGetSystemProperties), FN(xrEnumerateEnvironmentBlendModes),
     FN(xrEnumerateViewConfigurations), FN(xrGetViewConfigurationProperties), FN(xrEnumerateViewConfigurationViews),
+#ifdef _WIN32
     FN(xrGetD3D11GraphicsRequirementsKHR),
+#endif
     FN(xrGetVulkanInstanceExtensionsKHR), FN(xrGetVulkanDeviceExtensionsKHR),
     FN(xrGetVulkanGraphicsDeviceKHR), FN(xrGetVulkanGraphicsRequirementsKHR),
+#ifdef _WIN32
     FN(xrGetOpenGLGraphicsRequirementsKHR),
+#else
+    FN(xrCreateVulkanInstanceKHR), FN(xrCreateVulkanDeviceKHR), FN(xrGetVulkanGraphicsDevice2KHR),
+    { "xrGetVulkanGraphicsRequirements2KHR", (PFN_xrVoidFunction)rt_xrGetVulkanGraphicsRequirementsKHR },
+#endif
     FN(xrCreateSession), FN(xrDestroySession), FN(xrBeginSession), FN(xrEndSession), FN(xrRequestExitSession),
     FN(xrEnumerateReferenceSpaces), FN(xrCreateReferenceSpace), FN(xrGetReferenceSpaceBoundsRect),
     FN(xrCreateActionSpace), FN(xrLocateSpace), FN(xrLocateSpaces), FN(xrDestroySpace),
@@ -4284,7 +4512,11 @@ static const struct { const char *name; PFN_xrVoidFunction fn; } g_fns[] = {
     FN(xrGetActionStateBoolean), FN(xrGetActionStateFloat), FN(xrGetActionStateVector2f), FN(xrGetActionStatePose),
     FN(xrSyncActions), FN(xrEnumerateBoundSourcesForAction), FN(xrGetInputSourceLocalizedName),
     FN(xrApplyHapticFeedback), FN(xrStopHapticFeedback),
+#ifdef _WIN32
     FN(xrInitializeLoaderKHR), FN(xrConvertWin32PerformanceCounterToTimeKHR), FN(xrConvertTimeToWin32PerformanceCounterKHR),
+#else
+    FN(xrInitializeLoaderKHR), FN(xrConvertTimespecTimeToTimeKHR), FN(xrConvertTimeToTimespecTimeKHR),
+#endif
 };
 
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetInstanceProcAddr(XrInstance instance, const char *name, PFN_xrVoidFunction *function) {
@@ -4298,6 +4530,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetInstanceProcAddr(XrInstance instance, con
 }
 
 
+#ifdef _WIN32   /* (hasta el punto de entrada: arreglos para juegos dentro de Wine, solo en Windows) */
 /* ------------------------------------------------------------------ */
 /* Desactivar "single-pass instanced" en el dispositivo D3D11 del juego */
 /* ------------------------------------------------------------------ */
@@ -4881,10 +5114,12 @@ static void install_d3d11_hook(void) {
     else
         logmsg("No se pudo interceptar GetProcAddress en UnityPlayer.dll (%s)", up ? "sin import" : "módulo no encontrado");
 }
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Punto de entrada del loader                                         */
 /* ------------------------------------------------------------------ */
+#ifdef _WIN32
 static char g_dir[MAX_PATH];
 static void copy_unity_logs(int current) {
     const char *up = getenv("USERPROFILE");
@@ -4919,6 +5154,7 @@ static void copy_last_crash(void) {
     snprintf(dst, sizeof dst, "%sunity_crash_player.log", g_dir);
     CopyFileA(src, dst, FALSE);
 }
+#endif
 
 static DWORD WINAPI watchdog_thread(LPVOID arg) {
     (void)arg;
@@ -4931,7 +5167,9 @@ static DWORD WINAPI watchdog_thread(LPVOID arg) {
         if (secs > 3.0 && !reported) {
             reported = 1;
             logmsg("ATENCIÓN: el juego lleva %.1f s sin entregar un cuadro. Último lugar: %s", secs, (const char *)g_inside);
+#ifdef _WIN32
             copy_unity_logs(1);   /* queda como unity_actual.log */
+#endif
         } else if (secs < 1.0 && reported) {
             reported = 0;
             logmsg("El juego volvió a entregar cuadros");
@@ -4943,6 +5181,37 @@ static DWORD WINAPI watchdog_thread(LPVOID arg) {
 }
 
 static volatile LONG g_initState = 0;   /* 0 = sin iniciar, 1 = iniciando, 2 = listo */
+#ifndef _WIN32
+static void init_once(void) {
+    if (InterlockedCompareExchange(&g_initState, 1, 0) != 0) {
+        while (g_initState != 2) Sleep(1);
+        return;
+    }
+    /* (la biblioteca nunca se descarga —se compila con -z nodelete—: el loader de OpenXR la descarga al cerrar la
+     *  instancia, y nuestros hilos siguen andando) */
+    InitializeCriticalSection(&g_lock);
+    InitializeCriticalSection(&g_sendlock);
+    /* El registro, al lado de la biblioteca (el del juego anterior queda como vrmin_openxr-previous.log) */
+    Dl_info di;
+    if (dladdr((void *)&init_once, &di) && di.dli_fname && strrchr(di.dli_fname, '/')) {
+        int dir = (int)(strrchr(di.dli_fname, '/') - di.dli_fname) + 1;
+        char path[MAX_PATH], prev[MAX_PATH];
+        snprintf(path, sizeof path, "%.*svrmin_openxr.log", dir, di.dli_fname);
+        snprintf(prev, sizeof prev, "%.*svrmin_openxr-previous.log", dir, di.dli_fname);
+        rename(path, prev);
+        g_logf = fopen(path, "w");
+    }
+    g_frameEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
+    CreateThread(NULL, 0, net_thread, NULL, 0, NULL);
+    CreateThread(NULL, 0, send_thread, NULL, 0, NULL);
+    CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
+    /* Dar un momento para conectar y recibir la configuración */
+    for (int i = 0; i < 20 && !g_connected; i++) Sleep(25);
+    logmsg("VRmin OpenXR runtime for Linux loaded (%s) · process %lu", g_connected ? "connected to VRmin Host" : "not connected to VRmin Host yet",
+           (unsigned long)GetCurrentProcessId());
+    InterlockedExchange(&g_initState, 2);
+}
+#else
 static void init_once(void) {
     /* Unity llama al runtime desde varios hilos a la vez al arrancar: esto debe correr UNA sola vez */
     if (InterlockedCompareExchange(&g_initState, 1, 0) != 0) {
@@ -4992,6 +5261,7 @@ static void init_once(void) {
     if (getenv("QVRB_AJUSTE_D3D11")) install_d3d11_hook();
     InterlockedExchange(&g_initState, 2);
 }
+#endif
 
 EXPORT XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInterface(const XrNegotiateLoaderInfo *loaderInfo, XrNegotiateRuntimeRequest *req) {
     init_once();
@@ -5010,6 +5280,7 @@ EXPORT XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInterface(const XrNegotiateLo
     return XR_SUCCESS;
 }
 
+#ifdef _WIN32
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
     (void)h;
     if (reason == DLL_PROCESS_DETACH && r == NULL && g_logf) {
@@ -5018,3 +5289,4 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
     }
     return TRUE;
 }
+#endif

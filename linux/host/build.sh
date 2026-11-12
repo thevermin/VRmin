@@ -2,6 +2,7 @@
 # Compila VRmin Host para Linux (g++ 11 o más nuevo, FFmpeg 6 o más nuevo y libpulse, con sus archivos de desarrollo:
 # en Ubuntu/Debian, «sudo apt install g++ libavcodec-dev libavutil-dev libpulse-dev libx11-dev libxext-dev libxtst-dev libxrandr-dev libxcomposite-dev»): ./build.sh  →  build/vrmin-host
 # La ventana usa WebKitGTK («sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev», o la 4.0); sin eso, queda sin ventana.
+# (el runtime de OpenXR y OpenComposite van al lado, en build/: ../runtime/build.sh y ../opencomposite/build.sh)
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p build
