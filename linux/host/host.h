@@ -115,6 +115,39 @@ void parallelRows(int rows, const std::function<void(int y0, int y1)> &fn);
 void bgraToNv12(const uint8_t *bgra, int stride, int w, int h, uint8_t *nv12, bool rgba = false);
 void warpEyes(const uint8_t *src, int ew, int eh, bool rgba, const Stream &st, std::vector<uint8_t> &out);
 
+// ---------- Escritorio, mouse y teclado (desktop.cpp, con X11) ----------
+void deskStart();
+void deskSetOn(bool on);
+bool deskOn();
+void deskRequestKey();
+std::string deskError();
+void deskMouse(float u, float v, const Json &down, float scroll);
+struct ScreenRect { int left = 0, top = 0, right = 0, bottom = 0; };   // (como el RECT de Windows: coordenadas de la pantalla)
+struct DisplayInfo { uint32_t id; std::string name; ScreenRect r; bool primary; };
+/// Una captura de monitor: la pantalla principal del Quest (main) o un monitor abierto como ventana (sid)
+struct DisplayCapture {
+    bool main = false;
+    uint32_t sid = 0;
+    VideoEncoder *enc = nullptr;
+    std::function<bool()> want;          // mandar ahora
+    std::function<bool()> stop;          // terminar (sin esto, espera a que want vuelva a ser sí)
+    std::function<uint32_t()> target;    // el monitor (0: el principal)
+};
+void displayCaptureLoop(const DisplayCapture &c);
+void mouseAt(const ScreenRect &r, float u, float v, const Json &down, float scroll);   // el mouse del Quest en ese rectángulo de la pantalla
+std::vector<DisplayInfo> displaysList();      // los monitores de la PC
+uint32_t deskDisplayId();                     // el que se ve en la pantalla principal del Quest
+void deskSetDisplay(uint32_t id);
+void typeKeys(const Json &m);
+bool typingActive();
+
+// ---------- Ventanas sueltas (windows.cpp): cada ventana o monitor de la PC en su propia pantalla del Quest ----------
+Json windowsListJson();                                  // [{id, app, title, w, h}]
+void winOpen(uint32_t sid, bool on);
+void winMouse(uint32_t sid, float u, float v, const Json &down, float scroll);
+void winResize(uint32_t sid, int qw, int qh);
+void winSwap(uint32_t sid, uint32_t to);
+
 // ---------- Juegos de Steam ----------
 struct GameEntry { std::string id, name, dir; bool vr = true; };
 std::vector<GameEntry> gamesList();

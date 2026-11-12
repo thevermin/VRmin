@@ -1,5 +1,5 @@
 // Conexión con la app del Quest: aviso en la red (UDP 9101), emparejado y conexión TCP (9100)
-// PC -> Quest: [largo u32][1 video | 2 sonido | 3 texto JSON | 7 escritorio]
+// PC -> Quest: [largo u32][1 video | 2 sonido | 3 texto JSON | 7 escritorio | 8 ventana]
 // Quest -> PC: [largo u32][JSON] (pose, key, log, menú…)
 #include "host.h"
 #include <cerrno>
@@ -52,6 +52,9 @@ void questSend(std::vector<uint8_t> &&p) {
         qNeedKey = false;
         statSent++;
     } else if (t == 2 && qPending > 1000000) {
+        return;
+    } else if ((t == 7 || t == 8) && qPending > 3000000) {
+        deskRequestKey();
         return;
     }
     qPending += p.size() + 4;

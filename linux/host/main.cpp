@@ -34,6 +34,7 @@ int main() {
     questStart();
     gameStart();
     lobbyStart();
+    deskStart();
     logmsg("%s", tr("Esperando al Quest: abrí VRmin en el visor (misma red Wi-Fi)", "Waiting for the Quest: open VRmin on the headset (same Wi-Fi)"));
     int sig = 0;
     sigwait(&quit, &sig);

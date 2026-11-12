@@ -4,7 +4,7 @@
 #include <thread>
 #include <unistd.h>
 
-static std::atomic<bool> mode2D{false}, hiddenSent{false};
+static std::atomic<bool> mode2D{false}, uiInHeadset{false}, hiddenSent{false};
 static std::string pcModel, g_gpu;
 static int pcVramMb = 0;
 
@@ -43,7 +43,8 @@ std::string gamesStatus();
 bool gamesBusy();
 Json gamesLaunchingInfo(bool active);
 
-void questOnConnect() { mode2D = false; hiddenSent = false; }
+bool lobbyShowsDesk() { return mode2D || uiInHeadset; }
+void questOnConnect() { mode2D = false; uiInHeadset = false; hiddenSent = false; deskRequestKey(); }
 void questOnDisconnect() {}
 
 static void settingsApply(const Json &m) {
@@ -77,8 +78,9 @@ void handleQuestMessage(const std::string &line) {
     else if (t == "framegen") { g_halfRate = m["on"].boolean(false); gameConfigChanged(); }
     else if (t == "hello") {
         std::string mode = m["mode"].str();
-        mode2D = mode == "2d";
-        logmsg("[quest] %s", mode2D ? "Quest window (2D): game list" : mode == "vr2" ? "VR room with menu and windows" : "VR mode");
+        mode2D = mode == "2d"; uiInHeadset = mode == "vr2";
+        if (mode2D || uiInHeadset) deskSetOn(false);   // (el escritorio arranca oculto)
+        logmsg("[quest] %s", mode2D ? "Quest window (2D): game list and desktop" : uiInHeadset ? "VR room with menu and windows" : "VR mode");
     } else if (t == "rejoin") {
         gameSendLine("{\"resetimg\":1}");
         questRequestKey();
@@ -92,6 +94,39 @@ void handleQuestMessage(const std::string &line) {
     } else if (t == "quitgame") {
         logmsg("[room] Closing the game from the headset");
         std::thread(gamesQuit).detach();
+    }
+    // Escritorio y ventanas (desktop.cpp, windows.cpp)
+    else if (t == "deskkey") deskRequestKey();
+    else if (t == "deskcfg") {
+        {
+            std::lock_guard<std::mutex> g(g_setLock);
+            Settings &s = g_set;
+            if (m.has("maxw")) s.deskMaxW = std::min(3840, std::max(960, (int)m["maxw"].num()));
+            if (m.has("fps")) s.deskFps = std::min(60, std::max(15, (int)m["fps"].num()));
+            if (m.has("mbps")) s.deskMbps = std::min(80, std::max(4, (int)m["mbps"].num()));
+            if (m.has("audio")) s.deskAudio = m["audio"].str();
+        }
+        saveSettings();
+        deskRequestKey();
+    } else if (t == "kb") {
+        typeKeys(m);
+    } else if (t == "deskdisp") {
+        deskSetDisplay((uint32_t)m["id"].num(0));   // «Cambiar de monitor» en la pantalla principal del Quest
+    } else if (t == "desk") {
+        if (m.has("on")) deskSetOn(m["on"].boolean());
+        if (m["on"].boolean()) deskRequestKey();
+    } else if (t == "mouse") {
+        deskMouse((float)m["u"].num(0.5), (float)m["v"].num(0.5), m["down"], (float)m["scroll"].num(0));
+    } else if (t == "win") {
+        winOpen((uint32_t)m["id"].num(0), m["on"].boolean(false));
+    } else if (t == "winkey") {
+        winOpen((uint32_t)m["id"].num(0), true);   // (ya abierta: manda una imagen completa)
+    } else if (t == "wmouse") {
+        winMouse((uint32_t)m["id"].num(0), (float)m["u"].num(0.5), (float)m["v"].num(0.5), m["down"], (float)m["scroll"].num(0));
+    } else if (t == "wsize") {
+        winResize((uint32_t)m["id"].num(0), (int)m["w"].num(0), (int)m["h"].num(0));
+    } else if (t == "dispswap") {
+        winSwap((uint32_t)m["id"].num(0), (uint32_t)m["to"].num(0));
     }
 }
 
@@ -110,7 +145,7 @@ static void lobbyThread() {
         bool active = gameActive();
         if (active) {
             if (!hiddenSent) { hiddenSent = true; questSendText("{\"type\":\"panels\",\"lobby\":false}"); }
-        } else hiddenSent = false;
+        } else if (hiddenSent) { hiddenSent = false; deskRequestKey(); }
         Settings s;
         { std::lock_guard<std::mutex> g(g_setLock); s = g_set; }
         Stream st = currentStream();
@@ -122,11 +157,27 @@ static void lobbyThread() {
         cfg.set("eye", s.eye).set("fps", s.fps).set("mbps", s.mbps).set("audioMac", s.audio == "both").set("fov", s.fov)
            .set("codec", s.hevc ? "hevc" : "h264").set("run", run).set("audio", s.audio).set("deskMaxW", s.deskMaxW)
            .set("deskFps", s.deskFps).set("deskMbps", s.deskMbps).set("deskAudio", s.deskAudio);
+        // Los monitores de la PC (se revisan cada 2 s): el principal y los demás
+        static uint64_t dispAt = 0;
+        static std::vector<DisplayInfo> disps;
+        if (nowNs() - dispAt > 2000000000ull) {
+            dispAt = nowNs();
+            std::vector<DisplayInfo> l = displaysList();
+            if (l.size() != disps.size()) for (auto &d : l) logmsg("[pc] Monitor %u: %s, %dx%d%s", d.id & 0xFFFF, d.name.c_str(), d.r.right - d.r.left, d.r.bottom - d.r.top, d.primary ? " (main)" : "");
+            disps = l;
+        }
+        Json mainD, others = Json::array();
+        for (auto &d : disps) {
+            Json j = Json::object().set("id", (double)d.id).set("name", d.primary ? pcModel : d.name).set("w", d.r.right - d.r.left).set("h", d.r.bottom - d.r.top);
+            if (d.primary) mainD = j; else others.push(j);
+        }
         Json o = Json::object();
         o.set("type", "lobby2d").set("launching", gamesLaunchingInfo(active)).set("game", active).set("gameName", active ? gamesRunningName() : std::string())
-         .set("macModel", pcModel).set("busy", gamesBusy()).set("status", gamesStatus()).set("desk", false).set("cfg", cfg).set("games", games)
+         .set("macModel", pcModel).set("busy", gamesBusy()).set("status", gamesStatus()).set("desk", deskOn()).set("deskErr", deskError()).set("cfg", cfg).set("games", games)
          .set("ll", Json::array()).set("perf", active ? perfSnapshot() : Json::object()).set("adv", profilesState())
-         .set("os", "linux").set("pcGpu", g_gpu).set("pcVram", pcVramMb);
+         .set("os", "linux").set("pcGpu", g_gpu).set("pcVram", pcVramMb)
+         .set("displays", others).set("deskDisplay", (double)deskDisplayId()).set("windows", windowsListJson()).set("typing", typingActive());
+        if (mainD.t == Json::Obj) o.set("mainDisplay", mainD);   // (sin X11 no hay pantallas para abrir)
         std::string sj = o.dump();
         uint64_t now = nowNs();
         if (sj != last || now - lastAt > 2000000000ull) { last = sj; lastAt = now; questSendText(sj); }
