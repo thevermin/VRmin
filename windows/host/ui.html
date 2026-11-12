@@ -94,6 +94,7 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 const call = (cmd, arg) => (window.vrmin ? window.vrmin(cmd, arg === undefined ? null : arg) : Promise.resolve(null));
 let S = null;            // último estado
 let es = navigator.language.startsWith("es");
+let lin = false;         // VRmin Host para Linux (state.os): sin lo que es solo de Windows
 const t = (a, b) => (es ? a : b);
 const h = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const I = {
@@ -155,17 +156,18 @@ let showLog = false, openMenu = null, sheet = null, logLines = [];
 function render() {
   if (!S) return;
   es = S.lang === "es";
+  lin = S.os === "linux";
   document.documentElement.lang = S.lang;
   const ready = S.setup.runtimeOk && S.setup.ocOk;
-  const falta = !S.steam.installed ? t("Falta instalar Steam", "Steam isn't installed") : !ready ? t("Falta preparar Windows", "Windows isn't set up yet") : null;
+  const falta = lin ? null : !S.steam.installed ? t("Falta instalar Steam", "Steam isn't installed") : !ready ? t("Falta preparar Windows", "Windows isn't set up yet") : null;
   const pill = falta || (S.quest.connected ? t("Quest conectado", "Quest connected") : t("Esperando al Quest", "Waiting for the Quest"));
   const header = `<header>
     <div class="logo"><span>VR<span class="thin">min</span></span><span class="host">Host</span></div>
-    <span class="small">v${h(S.version)} · Windows</span>
+    <span class="small">v${h(S.version)} · ${lin ? "Linux" : "Windows"}</span>
     <span class="grow"></span>
     ${S.busy ? `<span class="small ell">${h(S.busy)}</span>` : ""}
-    ${S.upd.host && !S.upd.busy ? `<button class="pill primary" data-act="updateHost" title="${t("Se baja, VRmin Host se cierra y se abre la versión nueva", "It downloads, VRmin Host closes and the new version opens")}">${S.upd.hostBack ? t("Volver a la estable ", "Back to stable ") : t("Actualizar a ", "Update to ")}${h(S.upd.host)}</button>` : ""}
-    ${S.upd.busy ? `<span class="small ell amber">${h(S.upd.busy)}</span>` : ""}
+    ${!lin && S.upd.host && !S.upd.busy ? `<button class="pill primary" data-act="updateHost" title="${t("Se baja, VRmin Host se cierra y se abre la versión nueva", "It downloads, VRmin Host closes and the new version opens")}">${S.upd.hostBack ? t("Volver a la estable ", "Back to stable ") : t("Actualizar a ", "Update to ")}${h(S.upd.host)}</button>` : ""}
+    ${!lin && S.upd.busy ? `<span class="small ell amber">${h(S.upd.busy)}</span>` : ""}
     <button class="status ${falta ? "fix" : ""}" data-act="fix" ${falta ? "" : "disabled"} title="${falta ? t("Tocá para hacerlo ahora", "Click to do it now") : ""}">
       ${dot(S.quest.connected && !falta, !!falta || !S.quest.connected)} ${h(pill)} ${falta ? `<span class="amber">${I.arrow}</span>` : ""}</button>
     <button class="pill primary" data-url="https://ko-fi.com/thevermin" title="${t("VRmin es gratis. Si te sirve, podés invitarme un café en Ko-fi", "VRmin is free. If it helps you, you can buy me a coffee on Ko-fi")}">${I.cup} ${t("Apoyar en Ko-fi", "Support on Ko-fi")}</button>
@@ -184,7 +186,14 @@ function render() {
 
   const steps = (n, done, title, sub, btn) => `<div class="step"><span class="num ${done ? "done" : ""}">${done ? "✓" : n}</span>
       <div class="grow"><div class="b">${title}</div><div class="small">${sub}</div></div>${btn || ""}</div>`;
-  const prep = `<div class="card"><h2>${I.steam} ${ready && S.steam.installed ? "Steam" : t("Primera vez", "First time")}</h2>
+  // (en Linux no hay que preparar nada: al abrir un juego VR desde VRmin, OpenXR y OpenComposite apuntan a VRmin)
+  const prep = lin ? `<div class="card"><h2>${I.steam} ${t("Juegos VR", "VR games")}</h2>
+      <div class="row">${dot(S.setup.runtimeOk, !S.setup.runtimeOk)}<div class="grow"><div class="b">OpenXR</div>
+        <div class="small">${S.setup.runtimeOk ? t("El runtime de VRmin está instalado", "VRmin's runtime is installed") : t("Falta instalar el runtime de VRmin para Linux", "VRmin's runtime for Linux isn't installed")}</div></div></div>
+      <div class="row">${dot(S.setup.ocOk, !S.setup.ocOk)}<div class="grow"><div class="b">OpenComposite</div>
+        <div class="small">${S.setup.ocOk ? t("Instalado: los juegos de SteamVR usan VRmin", "Installed: SteamVR games use VRmin") : t("Sin instalar: los juegos de SteamVR no usan VRmin", "Not installed: SteamVR games don't use VRmin")}</div></div></div>
+      <div class="tiny">${t("Al abrir un juego VR desde VRmin, usa VRmin en lugar de SteamVR. Al cerrar esta app, todo queda como estaba.", "When you open a VR game from VRmin, it uses VRmin instead of SteamVR. When you close this app, everything goes back as it was.")}</div>
+    </div>` : `<div class="card"><h2>${I.steam} ${ready && S.steam.installed ? "Steam" : t("Primera vez", "First time")}</h2>
     ${ready && S.steam.installed ? `
       <div class="row">${dot(S.steam.running, !S.steam.running)}<div class="grow"><div class="b">Steam</div>
         <div class="small">${S.steam.running ? t("Abierto", "Open") : t("Cerrado", "Closed")}</div></div>
@@ -210,7 +219,7 @@ function render() {
   const vrGames = S.games.filter(g => g.vr), flat = S.games.filter(g => !g.vr);
   const order = l => l.slice().sort((a, b) => (b.open - a.open) || a.name.localeCompare(b.name));
   if (!S.games.length) games += `<div class="row"><span class="small grow">${t("Todavía no hay juegos. Instalalos desde Steam y aparecen acá (y en el Quest).", "No games yet. Install them from Steam and they show up here (and on the Quest).")}</span>
-      ${S.steam.installed && !S.steam.running ? `<button class="pill primary" data-act="steamOpen">${t("Abrir Steam", "Open Steam")}</button>` : ""}</div>`;
+      ${!lin && S.steam.installed && !S.steam.running ? `<button class="pill primary" data-act="steamOpen">${t("Abrir Steam", "Open Steam")}</button>` : ""}</div>`;
   else {
     games += `<div class="games">${order(vrGames).map(gameCard).join("")}</div>`;
     if (flat.length) games += `<div class="small b" style="margin-top:6px">${t("Juegos planos · en el visor se ven en el escritorio", "Flat games · in the headset they show on the desktop")}</div><div class="games">${order(flat).map(gameCard).join("")}</div>`;
@@ -219,10 +228,10 @@ function render() {
   games += `</div>`;
 
   // El visor por cable USB-C (adb): el Modo Centinela
-  const C = S.cable, adbOk = C.adb && C.state === "device";
+  const C = S.cable || {}, adbOk = C.adb && C.state === "device";
   const cableStatus = !C.adb ? t("Sin instalar", "Not installed") : C.state === "device" ? t("Listo", "Ready")
     : C.state === "unauthorized" ? t("Tocá «Permitir» en el visor", "Tap \"Allow\" in the headset") : t("Conectá el Quest por cable USB-C", "Connect the Quest with the USB-C cable");
-  const v = C.questApp, U = S.upd;
+  const v = C.questApp, U = S.upd || {};
   const appStatus = !C.adb ? t("Para instalarla desde acá: las herramientas del Modo Centinela", "To install it from here: Sentinel Mode's tools")
     : C.state === "unauthorized" ? t("Tocá «Permitir» en el visor", "Tap \"Allow\" in the headset")
     : C.state !== "device" || v === "?" ? t("Conectá el Quest por cable USB-C para ver su versión", "Connect the Quest with the USB-C cable to see its version")
@@ -245,7 +254,7 @@ function render() {
   </div>`;
 
   // Grabar un video: una sola fila
-  const R = S.rec, mm = Math.floor(R.secs / 60), ss = String(R.secs % 60).padStart(2, "0");
+  const R = S.rec || {}, mm = Math.floor(R.secs / 60), ss = String(R.secs % 60).padStart(2, "0");
   const recRow = `<div class="card" style="padding:10px 14px"><div class="row">
     <span class="small b" style="color:var(--text2)">${I.rec}</span><span class="small b" style="color:var(--text2)">${t("Grabación", "Recording")}</span>
     <button class="pill ${R.on ? "" : "primary"}" data-act="record">${R.on ? t("Detener", "Stop") : t("Grabar", "Record")}</button>
@@ -256,7 +265,7 @@ function render() {
   </div></div>`;
 
   // Monitor virtual: una pantalla más, solo en el Quest (necesita un driver, que se instala una vez)
-  const V = S.vmon;
+  const V = S.vmon || {};
   const vmonRow = `<div class="card" style="padding:10px 14px"><div class="row">
     ${dot(V.installed, !V.installed)}<div class="grow"><div class="b">${t("Monitor virtual", "Virtual monitor")}</div>
       <div class="small">${V.on ? t("Abierto en el Quest", "Open in the Quest") : V.installed ? t("Instalado: se abre desde el visor, con «Agregar monitor»", "Installed: open it from the headset, with \"Add monitor\"")
@@ -266,14 +275,14 @@ function render() {
 
   const log = `<div class="col" style="gap:8px">
     <button class="link" data-act="log">${showLog ? I.chevD : I.chevR} ${t("Registro", "Log")} ${!showLog && S.lastLog ? `<span class="tiny ell" style="font-weight:400">${h(S.lastLog)}</span>` : ""}</button>
-    <div class="row"><button class="pill" data-act="report">${I.bubble} ${t("Algo anda mal", "Something's wrong")}</button>
-      <span class="tiny">${t("Junta los registros en un .zip en el Escritorio y abre la página para mandarlo cuando pidas ayuda. No incluye claves ni datos personales.", "Puts the logs in a .zip on the Desktop and opens the page to send it when you ask for help. It doesn't include passwords or personal data.")}</span></div>
+    ${lin ? "" : `<div class="row"><button class="pill" data-act="report">${I.bubble} ${t("Algo anda mal", "Something's wrong")}</button>
+      <span class="tiny">${t("Junta los registros en un .zip en el Escritorio y abre la página para mandarlo cuando pidas ayuda. No incluye claves ni datos personales.", "Puts the logs in a .zip on the Desktop and opens the page to send it when you ask for help. It doesn't include passwords or personal data.")}</span></div>`}
     ${showLog ? `<div class="log" id="log">${h(logLines.join("\n"))}</div><div class="row"><button class="pill" data-act="logs">${t("Carpeta de registros", "Logs folder")}</button></div>` : ""}
   </div>`;
 
   const app = document.getElementById("app");
   const y = window.scrollY;
-  app.innerHTML = header + `<div class="col"><div class="two">${conn}${prep}</div>${games}${cable}${vmonRow}${recRow}${log}</div>`;
+  app.innerHTML = header + `<div class="col"><div class="two">${conn}${prep}</div>${games}${lin ? "" : cable + vmonRow + recRow}${log}</div>`;
   window.scrollTo(0, y);
   const l = document.getElementById("log");
   if (l) l.scrollTop = l.scrollHeight;
@@ -285,15 +294,15 @@ function gameCard(g) {
   return `<div class="game">
     <div class="cover ${g.open ? "open" : ""}"><img src="https://cdn.cloudflare.steamstatic.com/steam/apps/${h(g.id)}/header.jpg" onerror="this.style.display='none'" alt="">
       ${g.open ? `<button class="pill primary" data-quit="1" title="${t("Cierra el juego aunque no responda (Steam sigue abierto)", "Closes the game even if it doesn't respond (Steam stays open)")}">${t("Forzar cierre", "Force quit")}</button>` : ""}</div>
-    <div class="row" style="gap:6px">${dot(g.status === "funciona", g.status !== "funciona")}<span class="b ell grow" style="font-size:12px" title="${h(g.name)}">${h(g.name)}</span>${g.open ? `<span class="tiny amber b">${t("Abierto", "Open")}</span>` : ""}</div>
-    <div class="tiny ell">${h(st)}${g.own ? " · " + t("ajustes propios", "own settings") : ""}</div>
+    <div class="row" style="gap:6px">${lin ? "" : dot(g.status === "funciona", g.status !== "funciona")}<span class="b ell grow" style="font-size:12px" title="${h(g.name)}">${h(g.name)}</span>${g.open ? `<span class="tiny amber b">${t("Abierto", "Open")}</span>` : ""}</div>
+    <div class="tiny ell">${lin ? (g.own ? t("Ajustes propios", "Own settings") : "") : h(st) + (g.own ? " · " + t("ajustes propios", "own settings") : "")}</div>
     <div class="row" style="gap:6px">
-      ${!g.open ? `<button class="pill primary" data-play="${h(g.id)}" ${S.steam.installed ? "" : "disabled"}>${t("Jugar", "Play")}</button>` : ""}
+      ${!g.open ? `<button class="pill primary" data-play="${h(g.id)}" ${lin || S.steam.installed ? "" : "disabled"}>${t("Jugar", "Play")}</button>` : ""}
       ${g.vr ? `<span class="menu ${openMenu === g.id ? "open" : ""}"><button class="pill icon" data-menu="${h(g.id)}" title="${t("Ajustes de este juego", "This game's settings")}">${I.dots}</button>
         <span class="list">
           <button data-gameq="${h(g.id)}">${t("Calidad y rendimiento de este juego…", "Quality and performance for this game…")}</button>
-          <span class="sep"></span>
-          ${["funciona", "con problemas", "no funciona", "sin probar"].map(e => `<button class="${(g.status || "sin probar") === e ? "sel" : ""}" data-status="${h(g.id)}" data-v="${e}">${{ "funciona": t("Funciona", "Works"), "con problemas": t("Anda con problemas", "Has problems"), "no funciona": t("No funciona", "Doesn't work"), "sin probar": t("Sin probar", "Not tried") }[e]}</button>`).join("")}
+          ${lin ? "" : `<span class="sep"></span>`}
+          ${lin ? "" : ["funciona", "con problemas", "no funciona", "sin probar"].map(e => `<button class="${(g.status || "sin probar") === e ? "sel" : ""}" data-status="${h(g.id)}" data-v="${e}">${{ "funciona": t("Funciona", "Works"), "con problemas": t("Anda con problemas", "Has problems"), "no funciona": t("No funciona", "Doesn't work"), "sin probar": t("Sin probar", "Not tried") }[e]}</button>`).join("")}
         </span></span>` : ""}
     </div></div>`;
 }
@@ -341,24 +350,24 @@ function settingsSheet() {
       <div class="b">${t("Sonido de los juegos", "Game sound")}</div>${seg("audio", [["quest", t("Visor", "Headset")], ["mac", "PC"], ["both", t("Los dos", "Both")]], c.audio)}
       <div><button class="pill" data-act="recommended">${t("Recomendado", "Recommended")}</button></div>
     </div>
-    <div class="card"><h2>${I.mic} ${t("Micrófono de los juegos", "Games microphone")}</h2>
+    ${lin ? "" : `<div class="card"><h2>${I.mic} ${t("Micrófono de los juegos", "Games microphone")}</h2>
       ${seg("mic", [["quest", t("El del visor (Quest)", "The headset's (Quest)")], ["pc", t("El de Windows", "Windows' microphone")]], S.mic.on ? "quest" : "pc")}
       ${S.mic.on ? (S.mic.cable ? `<div class="tiny">${t("VB-CABLE instalado. Mientras jugás, el micrófono de Windows es «CABLE Output» (tu voz desde el visor); al terminar, vuelve el de antes.", "VB-CABLE installed. While you play, Windows' microphone is \"CABLE Output\" (your voice from the headset); when you stop, yours comes back.")}</div>`
         : `<div class="row"><span class="tiny grow">${t("Falta instalar VB-CABLE (gratis), el micrófono virtual por donde llega tu voz desde el visor.", "Install VB-CABLE (free), the virtual microphone your voice comes through from the headset.")}</span><button class="pill primary" data-url="https://vb-audio.com/Cable/">${t("Descargar", "Download")}</button></div>`)
         : `<div class="tiny">${t("Los juegos usan el micrófono que elegiste en Windows (por ejemplo, unos auriculares con micrófono).", "Games use the microphone you picked in Windows (for example, a headset with a mic).")}</div>`}
-    </div>
+    </div>`}
     <div class="card"><h2>${I.speed} ${t("Rendimiento (todos los juegos)", "Performance (all games)")}</h2>${advanced("all", all, all)}
       <div class="tiny">${t("Para un solo juego: el botón de ajustes de su portada, en Juegos.", "For one game: the settings button on its cover, in Games.")}</div></div>
     <div class="card"><h2>${I.pc} ${t("Esta PC", "This PC")}</h2>
       <div class="row"><span class="grow">${es ? "Idioma" : "Language"}</span>${seg("lang", [["en", "English"], ["es", "Español"]], S.lang)}</div>
-      ${sw("openAtLogin", t("Abrir VRmin Host al iniciar Windows", "Open VRmin Host when Windows starts"), S.pc.openAtLogin)}
+      ${lin ? "" : `${sw("openAtLogin", t("Abrir VRmin Host al iniciar Windows", "Open VRmin Host when Windows starts"), S.pc.openAtLogin)}
       ${sw("keepAwake", t("No suspender mientras el Quest la usa", "Don't sleep while the Quest is using it"), S.pc.keepAwake)}
       ${sw("beta", t("Recibir versiones beta", "Get beta versions"), S.upd.beta, t("Las versiones de prueba, antes que todos. Apagado: solo las estables.", "Test versions, before everyone else. Off: stable versions only."))}
-      <div class="row"><button class="pill" data-act="checkUpdates">${t("Buscar actualizaciones", "Check for updates")}</button><span class="tiny grow">${h(S.upd.msg || "")}</span></div>
+      <div class="row"><button class="pill" data-act="checkUpdates">${t("Buscar actualizaciones", "Check for updates")}</button><span class="tiny grow">${h(S.upd.msg || "")}</span></div>`}
       <div class="row"><span class="tiny grow ell">${h(S.dataDir)}</span><button class="pill" data-act="data">${t("Mostrar datos", "Show data")}</button></div>
       <div class="row"><span class="grow">${t("Quest emparejados con esta PC", "Quests paired with this PC")}</span><button class="pill" data-act="forget">${t("Olvidar todos", "Forget all")}</button></div>
     </div>
-    <div class="tiny">VRmin Host ${h(S.version)} (Windows, beta) · VRmin by thevermin · github.com/thevermin/vrmin · GPL-3.0</div>
+    <div class="tiny">VRmin Host ${h(S.version)} (${lin ? "Linux" : "Windows"}, beta) · VRmin by thevermin · github.com/thevermin/vrmin · GPL-3.0</div>
   </div></div>`;
 }
 
@@ -402,7 +411,7 @@ function gameSheet(id) {
 const TUTS = [
   { es: "Bienvenido a VRmin Host", en: "Welcome to VRmin Host", steps: [
     ["VRmin Host es la parte de la PC: le pasa al Quest tu pantalla y los juegos VR de Steam.", "VRmin Host is the PC side: it sends your screen and Steam VR games to the Quest."],
-    ["La primera vez, «Preparar» hace que los juegos VR usen VRmin en lugar de SteamVR (Windows pide permiso de administrador).", "The first time, \"Set up\" makes VR games use VRmin instead of SteamVR (Windows asks for administrator permission)."],
+    ["La primera vez, «Preparar» hace que los juegos VR usen VRmin en lugar de SteamVR (Windows pide permiso de administrador).", "The first time, \"Set up\" makes VR games use VRmin instead of SteamVR (Windows asks for administrator permission).", "win"],
     ["En el Quest, abrí VRmin y elegí esta PC. No hace falta encender nada acá.", "On the Quest, open VRmin and pick this PC. Nothing to turn on here."],
     ["La primera vez aparece acá un código de 6 números: escribilo en el Quest.", "The first time, a 6-digit code shows up here: type it on the Quest."]] },
   { es: "Jugar un juego VR", en: "Playing a VR game", steps: [
@@ -412,7 +421,7 @@ const TUTS = [
   { es: "Wi-Fi o cable", en: "Wi-Fi or cable", steps: [
     ["Por Wi-Fi: el Quest y la PC en la misma red (mejor si la PC va por cable al router).", "Over Wi-Fi: the Quest and the PC on the same network (best with the PC wired to the router)."],
     ["Por cable USB-C: más estable y con menos demora. VRmin lo usa solo cuando está conectado.", "Over USB-C cable: steadier, with less delay. VRmin uses it on its own when it's plugged in."]] },
-  { id: "sentinel", es: "Modo Centinela: jugar sin ponerte el visor", en: "Sentinel Mode: play without wearing the headset", steps: [
+  { id: "sentinel", win: 1, es: "Modo Centinela: jugar sin ponerte el visor", en: "Sentinel Mode: play without wearing the headset", steps: [
     ["El visor queda apoyado en el escritorio mirándote, sigue los controles, y el juego se ve en una ventana de la PC.", "The headset rests on your desk facing you, tracks the controllers, and the game shows in a window on the PC."],
     ["Se empieza desde el Quest (en el menú, Modo Centinela) o con «Empezar», en «Visor por cable USB-C».", "Start it from the Quest (in the menu, Sentinel Mode) or with \"Start\", in \"Headset over USB-C cable\"."],
     ["Con el visor apoyado, el sensor entre las lentes cree que te lo sacaste y apaga la pantalla. Para evitarlo hace falta el modo desarrollador, una sola vez:", "With the headset resting, the sensor between the lenses thinks you took it off and turns off the display. To avoid that you need developer mode, once:"],
@@ -421,14 +430,14 @@ const TUTS = [
     ["Conectá el Quest a la PC con el cable USB-C, ponete el visor y tocá «Permitir» en el aviso de depuración USB (marcá «Permitir siempre desde esta computadora»).", "Connect the Quest to the PC with the USB-C cable, put on the headset and tap \"Allow\" on the USB debugging prompt (check \"Always allow from this computer\")."],
     ["Sin modo desarrollador también funciona: tapá el sensor con cinta o un papel doblado.", "It also works without developer mode: cover the sensor with tape or a folded piece of paper."]] },
   { es: "Si algo no anda", en: "If something isn't working", steps: [
-    ["«Algo anda mal» (abajo de todo) junta los registros en un .zip para mandarlo en un Issue.", "\"Something's wrong\" (at the very bottom) puts the logs in a .zip to send in an Issue."],
+    ["«Algo anda mal» (abajo de todo) junta los registros en un .zip para mandarlo en un Issue.", "\"Something's wrong\" (at the very bottom) puts the logs in a .zip to send in an Issue.", "win"],
     ["Sin sonido en el visor: revisá «Sonido de los juegos» en los ajustes.", "No sound in the headset: check \"Game sound\" in settings."],
-    ["«Volver a SteamVR» deja Windows como estaba antes de VRmin.", "\"Back to SteamVR\" puts Windows back the way it was before VRmin."]] },
-];
+    ["«Volver a SteamVR» deja Windows como estaba antes de VRmin.", "\"Back to SteamVR\" puts Windows back the way it was before VRmin.", "win"]] },
+];   // (win: solo en Windows)
 function helpSheet() {
   return `<div class="overlay" data-close="1"><div class="sheet">
     <div class="row"><h1 class="grow">${t("Ayuda", "Help")}</h1><button class="pill primary" data-act="close">${t("Listo", "Done")}</button></div>
-    ${TUTS.map(x => `<div class="card" ${x.id ? `id="tut-${x.id}"` : ""}><h2>${h(t(x.es, x.en))}</h2><div class="steps">${x.steps.map((s, i) => `<div class="step"><span class="num">${i + 1}</span><span>${h(t(...s))}</span></div>`).join("")}</div></div>`).join("")}
+    ${TUTS.filter(x => !lin || !x.win).map(x => `<div class="card" ${x.id ? `id="tut-${x.id}"` : ""}><h2>${h(t(x.es, x.en))}</h2><div class="steps">${x.steps.filter(s => !lin || !s[2]).map((s, i) => `<div class="step"><span class="num">${i + 1}</span><span>${h(t(...s))}</span></div>`).join("")}</div></div>`).join("")}
   </div></div>`;
 }
 

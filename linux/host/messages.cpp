@@ -7,6 +7,7 @@
 static std::atomic<bool> mode2D{false}, uiInHeadset{false}, hiddenSent{false};
 static std::string pcModel, g_gpu;
 static int pcVramMb = 0;
+static std::atomic<bool> gpuKnown{false};
 
 /// La placa de video (el Quest recomienda la calidad con eso): el nombre, de lspci; la memoria, de amdgpu o de nvidia-smi
 static void findGpu() {
@@ -37,7 +38,11 @@ static void findGpu() {
         }
     }
     logmsg("[pc] Graphics card: %s (%d MB)", g_gpu.empty() ? "?" : g_gpu.c_str(), pcVramMb);
+    gpuKnown = true;
 }
+// (para la ventana: vacío hasta que se sabe)
+std::string pcGpu() { return gpuKnown ? g_gpu : std::string(); }
+int pcVram() { return gpuKnown ? pcVramMb : 0; }
 
 std::string gamesStatus();
 bool gamesBusy();
@@ -47,7 +52,7 @@ bool lobbyShowsDesk() { return mode2D || uiInHeadset; }
 void questOnConnect() { mode2D = false; uiInHeadset = false; hiddenSent = false; deskRequestKey(); }
 void questOnDisconnect() {}
 
-static void settingsApply(const Json &m) {
+void settingsApply(const Json &m) {
     {
         std::lock_guard<std::mutex> g(g_setLock);
         Settings &s = g_set;
