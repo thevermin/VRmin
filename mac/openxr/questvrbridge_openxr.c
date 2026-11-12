@@ -567,8 +567,11 @@ static int shm_active(void) {
             return 1;
         }
         if (now_ns() - g_shmAsked > 3000000000LL) {
-            if (session_needs_shm()) {
-                /* (Vulkan y OpenGL no tienen otro camino: se vuelve a conectar y a ofrecer; la Mac pudo estar reiniciándose) */
+            /* Vulkan y OpenGL no tienen otro camino: se vuelve a conectar y a ofrecer (la Mac pudo estar reiniciándose).
+               D3D11 también lo intenta 3 veces: por la red no entran cuadros grandes (2150 por ojo se descartan todos),
+               y en juegos que abren una sesión nueva al cambiar de nivel la oferta pudo quedar en la sesión anterior. */
+            static int d3dRetries;
+            if (session_needs_shm() || d3dRetries++ < 3) {
                 closesocket(g_fsock); g_fsock = INVALID_SOCKET; g_fsockRetry = 0;
                 logmsg("La Mac no confirmó la memoria compartida: vuelvo a intentar");
                 return 0;
@@ -766,7 +769,7 @@ static int gpu_setup(ID3D11Device *dev, uint32_t ew, uint32_t eh, DXGI_FORMAT fm
     for (int i = 0; i < SHM_SLOTS; i++) { memset(p + 14 + i * 56, 0, 56); memcpy(p + 14 + i * 56, names[i], 55); }
     if (!send_all(g_fsock, (const char *)p, (int)(4 + len))) { closesocket(g_fsock); g_fsock = INVALID_SOCKET; g_shmMode = 0; gpu_release(); return 0; }
     g_gpuShmGen = g_shmGen; g_gpuState = 1; g_gpuAsked = now_ns();
-    logmsg("Copia directa: texturas compartidas ofrecidas a la Mac (%ux%u por ojo)", ew, eh);
+    logmsg("Copia directa: texturas compartidas ofrecidas a la Mac (%ux%u por ojo: %s, %s, %s)", ew, eh, names[0], names[1], names[2]);
     return 1;
 }
 
@@ -2306,6 +2309,10 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroySession(XrSession session) {
     for (int k = 0; k < STAGES; k++) for (int j = 0; j < NQ; j++) if (s->dQ[k][j]) ID3D11Texture2D_Release(s->dQ[k][j]);
     for (int j = 0; j < NQ; j++) free(s->dQc[j].px);
     EnterCriticalSection(&g_gpuLock); gpu_release(); g_gpuShmGen = -1; g_gpuCtx = NULL; LeaveCriticalSection(&g_gpuLock);
+    /* La copia directa, solo en la primera sesión que la usó: en juegos que abren otra sesión al cambiar de nivel
+       (The Lab y sus experiencias) las texturas compartidas nuevas se veían negras en el visor. Sigue la memoria
+       compartida, que funciona igual (un poco más de trabajo para la Mac). */
+    if (g_gpuState > 0) { g_gpuState = -1; logmsg("Copia directa: solo en la primera sesión; la próxima sigue con la memoria compartida"); }
     if (s->ctx) ID3D11DeviceContext_Release(s->ctx);
     if (s->dev) ID3D11Device_Release(s->dev);
     if (g_session == s) g_session = NULL;
