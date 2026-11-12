@@ -146,6 +146,8 @@ final class AppModel: ObservableObject {
     @Published var statsLine = ""
     @Published var audioOK = false
     @Published var busyTask: String?
+    /// Cuántas tareas terminaron con error (el registro se abre solo, para que se vea el motivo)
+    @Published var taskFailures = 0
     @Published var steamRunning = false
     @Published var openGames = Set<String>() {   // carpetas (en minúsculas) de los juegos abiertos ahora
         didSet {
@@ -903,6 +905,7 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.append(pr.terminationStatus == 0 ? L("✓ %@: listo", title) : L("✗ %@: terminó con un error (código %ld)", title, Int(pr.terminationStatus)))
+                if pr.terminationStatus != 0 { self.taskFailures += 1 }
                 if exclusive { self.busyTask = nil }
                 self.refresh()
                 if pr.terminationStatus == 0 { then?() }
@@ -1706,6 +1709,7 @@ struct ContentView: View {
                 }
             }
         }
+        .onChange(of: m.taskFailures) { _, _ in withAnimation(.easeOut(duration: 0.2)) { showLog = true } }
     }
 }
 

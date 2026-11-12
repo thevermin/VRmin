@@ -12,6 +12,8 @@ C="$WINEPREFIX/drive_c"
 tail -c 3000000 "$P/logs/servidor.log" > "$D/servidor.log" 2>/dev/null
 tail -c 2000000 "$P/logs/steam.log" > "$D/steam.log" 2>/dev/null
 cp "$P/logs/vigia.log" "$D/" 2>/dev/null
+tail -c 300000 "$P/logs/instalar_motor.log" > "$D/instalar_motor.log" 2>/dev/null
+tail -c 300000 "$P/logs/steam_instalacion.log" > "$D/steam_instalacion.log" 2>/dev/null
 cp "$P/logs/juegos/"*.log "$D/juegos/" 2>/dev/null
 cp "$C/questvrbridge/questvrbridge_log.txt" "$D/runtime_openxr.log" 2>/dev/null
 cp "$C/questvrbridge/questvrbridge_log_anterior.txt" "$D/runtime_openxr_anterior.log" 2>/dev/null
