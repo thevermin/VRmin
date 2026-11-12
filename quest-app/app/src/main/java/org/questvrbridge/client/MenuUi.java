@@ -920,7 +920,7 @@ final class MenuUi implements Link.Listener {
         String deskErr = st.optString("deskErr");
         content.addView(Ui.section(ctx, I18n.t("Pantalla principal")));
         LinearLayout r = Ui.row(ctx, "display", I18n.t("Pantalla principal de la Mac"),
-                !deskErr.isEmpty() ? I18n.t("Falta el permiso de grabación de pantalla en la Mac (Ajustes del Sistema → Privacidad y seguridad)")
+                !deskErr.isEmpty() ? (onPc() ? deskErr : I18n.t("Falta el permiso de grabación de pantalla en la Mac (Ajustes del Sistema → Privacidad y seguridad)"))
                         : desk ? I18n.t("Se muestra en esta ventana · el botón del menú vuelve acá") : I18n.t("Se muestra en esta misma ventana"));
         TextView b = desk ? Ui.pill(ctx, I18n.t("Ocultar")) : Ui.primary(ctx, I18n.t("Mostrar"));
         b.setOnClickListener(v -> Link.I.send("{\"type\":\"desk\",\"on\":" + !desk + "}"));
