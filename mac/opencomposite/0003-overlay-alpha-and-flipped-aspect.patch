@@ -1,0 +1,31 @@
+diff --git a/OpenOVR/Reimpl/BaseOverlay.cpp b/OpenOVR/Reimpl/BaseOverlay.cpp
+index 50a80b4..1fbf96c 100644
+--- a/OpenOVR/Reimpl/BaseOverlay.cpp
++++ b/OpenOVR/Reimpl/BaseOverlay.cpp
+@@ -120,10 +120,11 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
+ 			if (!overlay.visible || overlay.texture.handle == nullptr)
+ 				continue;
+ 
+-			// Quick hack to get around Boneworks creating overlays and setting them to an opacity of
+-			// zero to hide them. Leave 1% of margin in case of weird float issues.
+-			// if (overlay.colour.a < 0.01)
+-			//	continue;
++			// VRmin: an overlay with (almost) no opacity is hidden, like in SteamVR. Games fade overlays out
++			// with SetOverlayAlpha (The Lab's signs in the hub), and the alpha isn't applied to the layer, so
++			// they showed at full opacity. Leave 1% of margin in case of weird float issues.
++			if (overlay.colour.a < 0.01)
++				continue;
+ 
+ 			if ((uint64_t)overlay.layerQuad.subImage.swapchain == 0) {
+ 				continue;
+@@ -137,7 +138,9 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
+ 			}
+ 
+ 			// Calculate the texture's aspect ratio
+-			const float aspect = srcSize.extent.height > 0 ? (float)srcSize.extent.width / (float)srcSize.extent.height : 1.0f;
++			// VRmin: a texture flipped with its bounds has a negative height; its shape is the same (upstream fell
++			// back to a square, so wide signs showed much too tall)
++			const float aspect = srcSize.extent.height != 0 ? fabsf((float)srcSize.extent.width / (float)srcSize.extent.height) : 1.0f;
+ 			// ... and use that to set the size of the overlay, as it will appear to the user
+ 			// Note we shouldn't do this when setting the texture, as the user may change the width of
+ 			//  the overlay without changing the texture.
