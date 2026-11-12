@@ -79,7 +79,7 @@ xattr -dr com.apple.quarantine "$MOTOR" 2>/dev/null || true
 echo "Wine: $("$WINE" --version)"
 
 if [ ! -f "$DXMT_DIR/x86_64-unix/winemetal.so" ]; then
-  paso "Descargando DXMT (≈20 MB)" "Downloading DXMT (≈40 MB)"
+  paso "Descargando DXMT (≈20 MB)" "Downloading DXMT (≈20 MB)"
   bajar "$DXMT_URL" dxmt.tar.gz "$DXMT_SHA"
   mkdir -p "$DXMT_DIR" && tar -xzf dxmt.tar.gz -C "$DXMT_DIR" && rm dxmt.tar.gz
 fi
