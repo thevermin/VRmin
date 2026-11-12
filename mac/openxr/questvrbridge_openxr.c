@@ -540,9 +540,21 @@ static int shm_create(void) {
     }
     swprintf(g_shmWinPath, 64, L"C:\\questvrbridge\\cuadros_%lu.bin", GetCurrentProcessId());
     CreateDirectoryW(L"C:\\questvrbridge", NULL);
-    /* (se borra solo cuando el proceso termina; la Mac ya lo tiene abierto por su cuenta) */
-    g_shmFile = CreateFileW(g_shmWinPath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    /* Los que dejaron juegos ya cerrados se borran: si otro proceso todavía lo tiene abierto, no se puede abrir sin
+       compartir (y queda) */
+    WIN32_FIND_DATAW fd;
+    HANDLE fh = FindFirstFileW(L"C:\\questvrbridge\\cuadros*.bin", &fd);
+    if (fh != INVALID_HANDLE_VALUE) {
+        do {
+            wchar_t old[MAX_PATH];
+            swprintf(old, MAX_PATH, L"C:\\questvrbridge\\%ls", fd.cFileName);
+            HANDLE h = CreateFileW(old, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); DeleteFileW(old); }
+        } while (FindNextFileW(fh, &fd));
+        FindClose(fh);
+    }
+    g_shmFile = CreateFileW(g_shmWinPath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (g_shmFile == INVALID_HANDLE_VALUE) { logmsg("Memoria compartida: no se pudo crear el archivo (%lu)", GetLastError()); return 0; }
     g_shmMap = CreateFileMappingW(g_shmFile, NULL, PAGE_READWRITE, (DWORD)(total >> 32), (DWORD)total, NULL);
     if (!g_shmMap) { logmsg("Memoria compartida: CreateFileMapping falló (%lu)", GetLastError()); CloseHandle(g_shmFile); g_shmFile = INVALID_HANDLE_VALUE; return 0; }
@@ -2880,9 +2892,15 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrCreateSwapchain(XrSession session, const XrS
 #endif
 }
 
+#ifdef _WIN32
+static XrCompositionLayerProjectionView g_lastViews[2];   /* (los ojos del último cuadro con imagen 3D: ver d3d_black_frame) */
+static int g_haveLastViews;
+#endif
+
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrDestroySwapchain(XrSwapchain h) {
     Swapchain *sc = (Swapchain *)h;
 #ifdef _WIN32
+    if (g_lastViews[0].subImage.swapchain == h || g_lastViews[1].subImage.swapchain == h) g_haveLastViews = 0;
     if (sc->src) ID3D11Texture2D_Release(sc->src);
     for (uint32_t k = 0; k < sc->count; k++) if (sc->img[k]) ID3D11Texture2D_Release(sc->img[k]);
     if (sc->isGl && g_session && g_session->gl) {
@@ -4152,6 +4170,47 @@ static void log_layers(const XrFrameEndInfo *info) {
     }
 }
 
+#ifdef _WIN32
+/* Cuadro con paneles y sin imagen 3D (OpenXR: fondo negro con los paneles encima; por ejemplo, la pantalla de carga de
+ * The Lab). Se manda con los ojos en negro y los paneles, como cualquier cuadro: si no, el visor seguiría mostrando la
+ * última escena con los paneles pegados encima. Los ojos (ubicación, campo de visión, recorte) son los del último
+ * cuadro con imagen 3D. Solo D3D11. */
+static XrSpace g_lastProjSpace;
+static Swapchain g_black;
+static void d3d_remember_views(const XrCompositionLayerProjection *pl) {
+    memcpy(g_lastViews, pl->views, sizeof g_lastViews);
+    g_lastProjSpace = pl->space;
+    g_haveLastViews = 1;
+}
+static void d3d_black_frame(Session *s, const XrCompositionLayerQuad *const *qls, int nq, XrTime displayTime) {
+    Swapchain *sc0 = (Swapchain *)g_lastViews[0].subImage.swapchain;
+    if (!g_haveLastViews || !sc0 || !sc0->img[0]) return;
+    if (!g_black.img[0] || g_black.w != sc0->w || g_black.h != sc0->h || g_black.dxgi != sc0->dxgi || g_black.arraySize != sc0->arraySize) {
+        if (g_black.img[0]) ID3D11Texture2D_Release(g_black.img[0]);
+        memset(&g_black, 0, sizeof g_black);
+        D3D11_TEXTURE2D_DESC d; memset(&d, 0, sizeof d);
+        d.Width = sc0->w; d.Height = sc0->h; d.MipLevels = 1; d.ArraySize = sc0->arraySize ? sc0->arraySize : 1;
+        d.Format = sc0->dxgi; d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        void *zero = calloc((size_t)sc0->w * sc0->h, 4);
+        D3D11_SUBRESOURCE_DATA init[16];
+        for (UINT i = 0; i < d.ArraySize && i < 16; i++) { init[i].pSysMem = zero; init[i].SysMemPitch = sc0->w * 4; init[i].SysMemSlicePitch = 0; }
+        HRESULT hr = zero && d.ArraySize <= 16 ? ID3D11Device_CreateTexture2D(s->dev, &d, init, &g_black.img[0]) : E_OUTOFMEMORY;
+        free(zero);
+        if (FAILED(hr)) { g_black.img[0] = NULL; logmsg("Cuadro sin imagen 3D: no se pudo crear la imagen negra (0x%08lx)", (unsigned long)hr); return; }
+        g_black.format = sc0->format; g_black.dxgi = sc0->dxgi; g_black.w = sc0->w; g_black.h = sc0->h;
+        g_black.arraySize = d.ArraySize; g_black.mips = 1; g_black.count = 1;
+    }
+    XrCompositionLayerProjectionView v[2];
+    memcpy(v, g_lastViews, sizeof v);
+    v[0].subImage.swapchain = v[1].subImage.swapchain = (XrSwapchain)&g_black;
+    XrCompositionLayerProjection pl = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+    pl.space = g_lastProjSpace; pl.viewCount = 2; pl.views = v;
+    EnterCriticalSection(&g_gpuLock);
+    readback(s, &pl, qls, nq, displayTime);
+    LeaveCriticalSection(&g_gpuLock);
+}
+#endif
+
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEndInfo *info) {
     Session *s = (Session *)session;
     g_inside = "xrEndFrame";
@@ -4186,6 +4245,7 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
 #ifdef _WIN32
                 else if (s->gl) gl_readback(s, pl, info->displayTime);
                 else {
+                    d3d_remember_views(pl);
                     EnterCriticalSection(&g_gpuLock);
                     readback(s, pl, qls, nq, info->displayTime);
                     LeaveCriticalSection(&g_gpuLock);
@@ -4195,6 +4255,14 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrEndFrame(XrSession session, const XrFrameEnd
             }
         }
     }
+#ifdef _WIN32
+    if (!hadProj && !s->vk && !s->gl && s->dev) {
+        const XrCompositionLayerQuad *qls[NQ]; int nq = 0;
+        for (uint32_t j = 0; j < info->layerCount && nq < NQ; j++)
+            if (info->layers[j] && info->layers[j]->type == XR_TYPE_COMPOSITION_LAYER_QUAD) qls[nq++] = (const XrCompositionLayerQuad *)info->layers[j];
+        if (nq) d3d_black_frame(s, qls, nq, info->displayTime);
+    }
+#endif
     g_lastEndFrame = now_ns();
     if (g_waitEnd) { g_sumGame += (g_lastEndFrame - g_waitEnd) / 1e6; g_nGame++; }
     g_inside = "fuera del runtime (en el juego)";
