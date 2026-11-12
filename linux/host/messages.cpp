@@ -39,6 +39,10 @@ static void findGpu() {
     logmsg("[pc] Graphics card: %s (%d MB)", g_gpu.empty() ? "?" : g_gpu.c_str(), pcVramMb);
 }
 
+std::string gamesStatus();
+bool gamesBusy();
+Json gamesLaunchingInfo(bool active);
+
 void questOnConnect() { mode2D = false; hiddenSent = false; }
 void questOnDisconnect() {}
 
@@ -119,8 +123,8 @@ static void lobbyThread() {
            .set("codec", s.hevc ? "hevc" : "h264").set("run", run).set("audio", s.audio).set("deskMaxW", s.deskMaxW)
            .set("deskFps", s.deskFps).set("deskMbps", s.deskMbps).set("deskAudio", s.deskAudio);
         Json o = Json::object();
-        o.set("type", "lobby2d").set("game", active).set("gameName", active ? gamesRunningName() : std::string())
-         .set("macModel", pcModel).set("busy", false).set("status", "").set("desk", false).set("cfg", cfg).set("games", games)
+        o.set("type", "lobby2d").set("launching", gamesLaunchingInfo(active)).set("game", active).set("gameName", active ? gamesRunningName() : std::string())
+         .set("macModel", pcModel).set("busy", gamesBusy()).set("status", gamesStatus()).set("desk", false).set("cfg", cfg).set("games", games)
          .set("ll", Json::array()).set("perf", active ? perfSnapshot() : Json::object()).set("adv", profilesState())
          .set("os", "linux").set("pcGpu", g_gpu).set("pcVram", pcVramMb);
         std::string sj = o.dump();

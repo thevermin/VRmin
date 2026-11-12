@@ -2,13 +2,23 @@
 #include "host.h"
 #include <clocale>
 #include <csignal>
+#include <thread>
 #include <cstdlib>
 #include <sys/file.h>
 #include <fcntl.h>
 #include <unistd.h>
 
+void vrSetupOnExit();
+
 int main() {
     signal(SIGPIPE, SIG_IGN);
+    // (al cerrar con Ctrl+C o al apagar: la VR de Linux queda como estaba)
+    sigset_t quit;
+    sigemptyset(&quit);
+    sigaddset(&quit, SIGINT);
+    sigaddset(&quit, SIGTERM);
+    sigaddset(&quit, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &quit, nullptr);
     setlocale(LC_ALL, "");
     const char *lang = getenv("LANG");
     IDIOMA_ES = lang && strncmp(lang, "es", 2) == 0;
@@ -25,6 +35,9 @@ int main() {
     gameStart();
     lobbyStart();
     logmsg("%s", tr("Esperando al Quest: abrí VRmin en el visor (misma red Wi-Fi)", "Waiting for the Quest: open VRmin on the headset (same Wi-Fi)"));
-    pause();
+    int sig = 0;
+    sigwait(&quit, &sig);
+    vrSetupOnExit();
+    logmsg("VRmin Host closed");
     return 0;
 }

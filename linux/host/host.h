@@ -106,6 +106,7 @@ private:
     Out out_;
     std::atomic<bool> key_{true};
     std::atomic<int> pending_{0};
+    friend struct EncWorker;
 };
 bool encoderCanHevc(int w, int h, int fps, int bitrate);
 
