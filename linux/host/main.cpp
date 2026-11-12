@@ -40,5 +40,5 @@ int main() {
     sigwait(&quit, &sig);
     vrSetupOnExit();
     logmsg("VRmin Host closed");
-    return 0;
+    _exit(0);   // (sin esperar a los hilos: los que esperan algo para siempre trabarían la salida)
 }
