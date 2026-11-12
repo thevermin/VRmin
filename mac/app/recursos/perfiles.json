@@ -54,6 +54,10 @@
         "MVK_CONFIG_PERFORMANCE_TRACKING": "1",
         "MVK_CONFIG_PERFORMANCE_LOGGING_FRAME_COUNT": "1800"
       }
+    },
+    "108710": {
+      "runtime": "openxr",
+      "nota": "Alan Wake con el mod Alan Wake VR de fholger (alanwake.vrmods.eu): sin el mod es un juego plano. El mod trae su propio DXVK (DirectX 9 por Vulkan), mucho más rápido en la Mac que el DirectX 9 de Wine"
     }
   }
 }

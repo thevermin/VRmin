@@ -93,10 +93,12 @@ NO_JUEGOS = {"228980", "250820", "1070560", "1391110", "1628350"}   # redistribu
 
 # Archivos que delatan qué usa un juego (en minúsculas)
 SENALES = {
-    "openxr": {"openxr_loader.dll", "unityopenxr.dll"},
+    "openxr": {"openxr_loader.dll", "unityopenxr.dll", "awvr_readme.md", "uninstall_alanwakevr.exe"},
     "openvr": {"openvr_api.dll", "xrsdkopenvr.dll"},
     "oculus": {"ovrplugin.dll", "libovrrt64_1.dll", "libovrrt32_1.dll", "oculusxrplugin.dll"},
 }
+# Mods de VR para juegos planos (dejan estos archivos en la carpeta del juego): al instalarlos, el juego pasa a ser de VR
+MODS_VR = {"awvr_readme.md": "openxr", "uninstall_alanwakevr.exe": "openxr"}   # Alan Wake VR (fholger)
 EXE_DESCARTAR = re.compile(r"(crash|unins|setup|redist|vc_?redist|dxsetup|prereq|launcher_helper|easyanticheat|be?service|cefprocess|ue4prereq|ue5prereq)", re.I)
 
 
@@ -245,6 +247,14 @@ def vr_en_steam(appid):
 def deteccion(juego, forzar=False):
     ruta = os.path.join(DETECTADO, juego["id"] + ".json")
     d = leer_json(ruta, None)
+    # (un mod de VR recién instalado no cambia la versión del juego en Steam: se mira si está y se vuelve a detectar)
+    if d and not forzar:
+        try:
+            raiz = set(f.lower() for f in os.listdir(juego["carpeta"]))
+        except OSError:
+            raiz = set()
+        if any(m in raiz and api not in d.get("apis", []) for m, api in MODS_VR.items()):
+            forzar = True
     if forzar or not d or d.get("actualizado") != juego.get("actualizado", "") or d.get("idioma") != IDIOMA:
         vr = d.get("vr") if d else None
         d = detectar(juego)
