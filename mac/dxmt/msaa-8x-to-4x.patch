@@ -1,0 +1,26 @@
+diff --git a/src/d3d11/d3d11_resource_helper.cpp b/src/d3d11/d3d11_resource_helper.cpp
+index 6624ed6..98e11b7 100644
+--- a/src/d3d11/d3d11_resource_helper.cpp
++++ b/src/d3d11/d3d11_resource_helper.cpp
+@@ -432,8 +432,19 @@ CreateMTLTextureDescriptorInternal(
+       }
+     } else {
+       if (SampleCount > 1) {
+-        if (!pDevice->GetMTLDevice().supportsTextureSampleCount(SampleCount)) {
+-          ERR("CreateMTLTextureDescriptorInternal: sample count ", SampleCount,
++        // Apple GPUs have no 8x MSAA. Some games ask for it without checking
++        // CheckMultisampleQualityLevels: they get the highest count Metal has
++        // instead of a texture that can't be created (render passes and
++        // pipelines take the count from the Metal texture).
++        UINT Requested = SampleCount;
++        while (SampleCount > 1 &&
++               !pDevice->GetMTLDevice().supportsTextureSampleCount(SampleCount))
++          SampleCount >>= 1;
++        if (SampleCount != Requested)
++          WARN("CreateMTLTextureDescriptorInternal: sample count ", Requested,
++               " is not supported, using ", SampleCount);
++        if (SampleCount < 2) {
++          ERR("CreateMTLTextureDescriptorInternal: sample count ", Requested,
+               " is not supported.");
+           return E_INVALIDARG;
+         }

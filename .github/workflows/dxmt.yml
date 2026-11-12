@@ -1,7 +1,7 @@
 name: DXMT para VRmin
 
-# DXMT (DirectX 11 → Metal) compilado desde el código de 3Shain/dxmt, con el arreglo de la ventana de Metal para el
-# Wine de Gcenx (mac/dxmt/vista-metal.patch). Mismos pasos que el CI de DXMT. Deja un .tar.gz con la misma forma que el
+# DXMT (DirectX 11 → Metal) compilado desde el código de 3Shain/dxmt, con los parches de mac/dxmt: el arreglo de la
+# ventana de Metal para el Wine de Gcenx (vista-metal.patch) y MSAA 8x → 4x (msaa-8x-to-4x.patch). Mismos pasos que el CI de DXMT. Deja un .tar.gz con la misma forma que el
 # que instala instalar_motor.sh (x86_64-windows/, i386-windows/, x86_64-unix/winemetal.so).
 on:
   workflow_dispatch:
@@ -66,9 +66,9 @@ jobs:
           pip3 install meson==1.10.0 --break-system-packages >/dev/null
           sudo xcode-select -s /Applications/Xcode_16.1.app
           mkdir -p dxmt/toolchains/wine && curl -sSL "$WINE_URL" | tar -xz -C dxmt/toolchains/wine
-      - name: Arreglo de la ventana de Metal (Wine de Gcenx)
+      - name: Arreglos de VRmin (ventana de Metal del Wine de Gcenx, MSAA 8x)
         working-directory: dxmt
-        run: git apply ../vrmin/mac/dxmt/vista-metal.patch
+        run: for p in ../vrmin/mac/dxmt/*.patch; do echo "$p"; git apply "$p"; done
       - name: 64 bits (y winemetal.so)
         working-directory: dxmt
         run: |
@@ -92,7 +92,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/pkg"
           test -f x86_64-unix/winemetal.so && test -f x86_64-windows/d3d11.dll && test -f x86_64-windows/winemetal.dll
           cp "$GITHUB_WORKSPACE/dxmt/LICENSE" LICENSE-DXMT.txt
-          echo "DXMT ${DXMT_COMMIT} + VRmin mac/dxmt/vista-metal.patch" > VERSION.txt
+          echo "DXMT ${DXMT_COMMIT} + VRmin mac/dxmt: $(cd "$GITHUB_WORKSPACE/vrmin/mac/dxmt" && ls *.patch | tr '\n' ' ')" > VERSION.txt
           tar -czf "$GITHUB_WORKSPACE/dxmt-vrmin.tar.gz" .
           cd "$GITHUB_WORKSPACE" && shasum -a 256 dxmt-vrmin.tar.gz | tee dxmt-vrmin.tar.gz.sha256
       - uses: actions/upload-artifact@v4

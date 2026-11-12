@@ -18,6 +18,15 @@ cp "$C/questvrbridge/questvrbridge_log_anterior.txt" "$D/runtime_openxr_anterior
 cp "$P/perfiles_juegos.json" "$D/" 2>/dev/null
 cp "$P/perfiles/"*.json "$D/perfiles/" 2>/dev/null
 cp -R "$P/perfiles/detectado" "$D/perfiles/" 2>/dev/null
+# Lo que escribieron los juegos en las últimas 3 horas (Unity: Player.log u output_log.txt · Unreal: Saved/Logs), el final
+mkdir -p "$D/juegos/propios"
+n=0
+while IFS= read -r -d '' f; do
+  n=$((n + 1))
+  [ $n -gt 12 ] && break
+  tail -c 2000000 "$f" > "$D/juegos/propios/$(printf '%02d' $n)_$(basename "$f")" 2>/dev/null
+done < <(find "$C/users" "$C/Program Files (x86)/Steam/steamapps/common" -maxdepth 7 -type f \
+          \( -iname 'Player*.log' -o -iname 'output_log.txt' -o \( -iname '*.log' -path '*Saved/Logs*' \) \) -mmin -180 -print0 2>/dev/null)
 {
   echo "VRmin · $STAMP"
   sw_vers 2>/dev/null
