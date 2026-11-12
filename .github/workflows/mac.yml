@@ -72,11 +72,23 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: d3dshare, path: d3d }
       - name: Motor, wineboot y copia directa
+        env: { GH_TOKEN: "${{ github.token }}" }
         run: |
           softwareupdate --install-rosetta --agree-to-license > /dev/null 2>&1 || true
           export QVB_DATA="$RUNNER_TEMP/datos" VRMIN_LANG=es
           mkdir -p mac/app/recursos/openxr && cp mac/openxr/questvrbridge_openxr.dll mac/openxr/questvrbridge_openxr.json mac/openxr/questvrbridge_openxr32.json mac/app/recursos/openxr/ && cp mac/openxr/questvrbridge_openxr32.dll mac/app/recursos/openxr/ 2>/dev/null || true
           mkdir -p mac/app/recursos/opencomposite && cp mac/opencomposite/vrclient_x64.dll mac/opencomposite/vrclient.dll mac/app/recursos/opencomposite/
+          # (si el DXMT todavía no está en la versión publicada, el último compilado, si es el mismo que se espera)
+          url=$(grep -o '^DXMT_URL="[^"]*' mac/app/recursos/instalar_motor.sh | sed 's/^DXMT_URL="//')
+          if ! curl -fsIL -o /dev/null "$url"; then
+            sha=$(grep -o '^DXMT_SHA="[^"]*' mac/app/recursos/instalar_motor.sh | sed 's/^DXMT_SHA="//')
+            dir=$(grep -o '^DXMT_DIR="[^"]*' mac/app/recursos/instalar_motor.sh | sed 's/^DXMT_DIR="//; s|\$P|'"$QVB_DATA"'|')
+            dx=$(gh run list -R "$GITHUB_REPOSITORY" --workflow dxmt.yml --branch main --limit 10 --json databaseId,conclusion -q '[.[] | select(.conclusion == "success")][0].databaseId')
+            gh run download "$dx" -R "$GITHUB_REPOSITORY" -n dxmt-vrmin -D "$RUNNER_TEMP/dxmt"
+            echo "$sha  $RUNNER_TEMP/dxmt/dxmt-vrmin.tar.gz" | shasum -a 256 -c -
+            mkdir -p "$dir" && tar -xzf "$RUNNER_TEMP/dxmt/dxmt-vrmin.tar.gz" -C "$dir"
+            echo "::notice::DXMT del último compilado (todavía no está en $url)"
+          fi
           bash mac/app/recursos/instalar_motor.sh || echo "::warning::instalar_motor.sh terminó con error"
           tail -15 "$QVB_DATA/logs/instalar_motor.log" 2>/dev/null | while read -r l; do echo "::warning::im: $l"; done
           tail -8 "$QVB_DATA/logs/wineboot.log" | while read -r l; do echo "::warning::wb: $l"; done
