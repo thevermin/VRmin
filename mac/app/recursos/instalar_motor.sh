@@ -3,9 +3,10 @@
 #  - Wine 11 (compilación para Mac de Gcenx, la que distribuye WineHQ) + bibliotecas de Sikarugir (GStreamer…)
 #    (Wine 11: texturas compartidas entre programas, para la copia directa de DXMT. El Wine 11 de Sikarugir
 #     no puede abrir programas nuevos: wineboot falla con «failed to start wineboot 1», probado en CI)
-#  - DXMT (DirectX 11 -> Metal): la versión de notpop (github.com/notpop/dxmt, Wine 11 Metal view fix),
-#    compilada por ramiabih/play-windows-steam-on-mac. El DXMT oficial v0.80 no puede crear la ventana de Metal
-#    con el Wine de Gcenx («Failed to create metal view»: los juegos se cierran a los 5 segundos)
+#  - DXMT (DirectX 11 -> Metal): la versión de notpop (github.com/notpop/dxmt, Wine 11 Metal view fix) con
+#    mac/dxmt/msaa-8x-to-4x.patch, compilada por VRmin (.github/workflows/dxmt.yml) y publicada con VRmin 0.55. El
+#    DXMT oficial v0.80 no puede crear la ventana de Metal con el Wine de Gcenx («Failed to create metal view»: los
+#    juegos se cierran a los 5 segundos) y el más nuevo no dibuja algunos juegos (Aircar)
 #  - Un Windows (prefijo) con nuestro runtime OpenXR registrado
 #  - OpenComposite para juegos OpenVR/SteamVR (sin tocar archivos de los juegos)
 set -e
@@ -24,9 +25,9 @@ ENGINE_APP="Wine Devel.app"
 TPL="Template-1.0.21"
 TPL_URL="$BASE/Template/releases/download/v1.0/$TPL.tar.xz"
 TPL_SHA="bbe996e4e4375318485953d0c7818b7b4b0a4dc1f13303bcc584f99f7602f78d"
-DXMT_URL="https://github.com/ramiabih/play-windows-steam-on-mac/releases/download/dxmt-fork-v1/dxmt-fork-macos-arm64.tar.gz"
-DXMT_SHA="51043dd4cf585d52b1415c452052a0953dc01f9f9663ae0c3d6984907c25fab5"
-DXMT_DIR="$P/dxmt/fork-v1"
+DXMT_URL="https://github.com/thevermin/VRmin/releases/download/v0.55/dxmt-vrmin-1.tar.gz"
+DXMT_SHA="c840fc9d736cd65a996ae20d0a5691de46696a5f62ab6c9cf868dd0e2c91e56d"
+DXMT_DIR="$P/dxmt/vrmin-1"
 export WINEDEBUG=-all
 
 paso() { echo; say "==> $1" "==> ${2:-$1}"; }

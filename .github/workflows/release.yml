@@ -30,6 +30,16 @@ jobs:
           # VRmin para Windows (si ya hay uno compilado)
           win=$(gh run list -R "$GITHUB_REPOSITORY" --workflow windows.yml --branch main --limit 10 --json databaseId,conclusion -q '[.[] | select(.conclusion == "success")][0].databaseId')
           [ -n "$win" ] && gh run download "$win" -R "$GITHUB_REPOSITORY" -n VRmin-Windows -D out || echo "Sin VRmin para Windows"
+          # El DXMT que baja instalar_motor.sh, si lo pide de esta versión: el último compilado («DXMT para VRmin»),
+          # solo si es exactamente el que espera (su SHA-256)
+          url=$(grep -o '^DXMT_URL="[^"]*' mac/app/recursos/instalar_motor.sh | sed 's/^DXMT_URL="//')
+          if [ "${url%/*}" = "https://github.com/$GITHUB_REPOSITORY/releases/download/${{ inputs.tag }}" ]; then
+            sha=$(grep -o '^DXMT_SHA="[^"]*' mac/app/recursos/instalar_motor.sh | sed 's/^DXMT_SHA="//')
+            dx=$(gh run list -R "$GITHUB_REPOSITORY" --workflow dxmt.yml --branch main --limit 10 --json databaseId,conclusion -q '[.[] | select(.conclusion == "success")][0].databaseId')
+            gh run download "$dx" -R "$GITHUB_REPOSITORY" -n dxmt-vrmin -D dxmt
+            echo "$sha  dxmt/dxmt-vrmin.tar.gz" | sha256sum -c -
+            cp dxmt/dxmt-vrmin.tar.gz "out/${url##*/}"
+          fi
           ls -la out
       - name: Publicar
         run: |

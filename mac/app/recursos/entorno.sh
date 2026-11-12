@@ -12,7 +12,7 @@ WINE_REAL="$WINEDIR/bin/wine"
 WINE="$WINE_REAL"
 WINESERVER="$WINEDIR/bin/wineserver"
 FW="$MOTOR/Frameworks"
-MARCA_MOTOR="gcenx-11.8+dxmt-notpop1"
+MARCA_MOTOR="gcenx-11.8+dxmt-vrmin1"
 
 export WINEPREFIX="$P/prefijo"
 export DYLD_FALLBACK_LIBRARY_PATH="$WINEDIR/lib:$FW:$FW/GStreamer.framework/Versions/1.0/lib:/usr/lib"
