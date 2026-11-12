@@ -654,7 +654,8 @@ static ID3D11Texture2D *g_gpuTex[SHM_SLOTS];
 static ID3D11Query *g_gpuQ[SHM_SLOTS];
 static int g_gpuPending[SHM_SLOTS];
 static uint32_t g_gpuPose[SHM_SLOTS], g_gpuNq[SHM_SLOTS];   /* (paneles flotantes en el lugar, tipo 13) */
-static uint32_t g_gpuW, g_gpuH, g_gpuGen; static DXGI_FORMAT g_gpuFmt;
+static uint32_t g_gpuW, g_gpuH, g_gpuGen; static DXGI_FORMAT g_gpuFmt;   /* (g_gpuW/H: lo que entra en las texturas por ojo) */
+static uint32_t g_gpuEW[SHM_SLOTS], g_gpuEH[SHM_SLOTS];   /* el tamaño por ojo del cuadro que hay en cada lugar */
 static int g_gpuShmGen = -1;        /* conexión de imágenes donde se ofrecieron */
 /* La Mac se entera apenas la GPU termina la copia: se revisa mientras el juego espera su próximo cuadro
  * (xrWaitFrame, a veces en otro hilo). Antes se esperaba como mucho 3 ms en xrEndFrame y casi siempre se avisaba
@@ -666,6 +667,9 @@ static int64_t g_gpuAsked;
 
 static void gpu_release(void) {
     for (int i = 0; i < SHM_SLOTS; i++) {
+        /* un lugar que esperaba su copia queda libre: si no, quedaba tomado para siempre y a los 1,5 s se
+           rearmaba la conexión de imágenes (la imagen se trababa) */
+        if (g_gpuPending[i] && g_shm) { MemoryBarrier(); ((ShmHdr *)g_shm)->state[i] = 0; }
         if (g_gpuTex[i]) ID3D11Texture2D_Release(g_gpuTex[i]);
         if (g_gpuQ[i]) ID3D11Query_Release(g_gpuQ[i]);
         g_gpuTex[i] = NULL; g_gpuQ[i] = NULL; g_gpuPending[i] = 0;
@@ -781,8 +785,8 @@ static int gpu_done(ID3D11DeviceContext *ctx, int i) {   /* (con g_gpuLock tomad
     g_gpuPending[i] = 0;
     MemoryBarrier();
     ((ShmHdr *)g_shm)->state[i] = 1;
-    if (g_gpuNq[i]) shm_notify_quads_t(13, i, g_gpuPose[i], fmt_code(g_gpuFmt), g_gpuW, g_gpuH, g_gpuNq[i]);
-    else shm_notify_t(11, i, g_gpuPose[i], fmt_code(g_gpuFmt), g_gpuW, g_gpuH);
+    if (g_gpuNq[i]) shm_notify_quads_t(13, i, g_gpuPose[i], fmt_code(g_gpuFmt), g_gpuEW[i], g_gpuEH[i], g_gpuNq[i]);
+    else shm_notify_t(11, i, g_gpuPose[i], fmt_code(g_gpuFmt), g_gpuEW[i], g_gpuEH[i]);
     return 1;
 }
 
@@ -2904,8 +2908,20 @@ static void readback(Session *s, const XrCompositionLayerProjection *pl, const X
     /* Copia directa (la imagen no sale de la GPU): con la memoria compartida funcionando, sin Modo Centinela
        (que necesita los píxeles) y sin imagen dada vuelta */
     if (g_gpuState >= 0 && !g_vigia && !flip && shm_active() && ew <= 2560 && eh <= 2560 && (!nq || g_ovGpu || !g_ovMac)) {
-        if (g_gpuW != ew || g_gpuH != eh || g_gpuFmt != sc0->dxgi || g_gpuShmGen != g_shmGen) {
-            if (!gpu_setup(s->dev, ew, eh, sc0->dxgi)) { g_gpuState = -1; logmsg("Copia directa no disponible: sigo con la memoria compartida"); }
+        /* Las texturas se rehacen solo si el cuadro no entra: juegos como The Lab cambian el tamaño del cuadro
+           todo el tiempo según cuánto da la placa de video. Se hacen con lugar de sobra (de a 256 píxeles, y por lo
+           menos lo que mide la imagen del juego por ojo), así no hay que rehacerlas a cada rato. */
+        if (ew > g_gpuW || eh > g_gpuH || g_gpuFmt != sc0->dxgi || g_gpuShmGen != g_shmGen) {
+            Swapchain *sc1 = (Swapchain *)pl->views[1].subImage.swapchain;
+            uint32_t scw = sc0->w / (sc1 == sc0 && pl->views[1].subImage.imageArrayIndex == pl->views[0].subImage.imageArrayIndex ? 2 : 1), sch = sc0->h;
+            uint32_t cw = (ew + 255) & ~255u, ch = (eh + 255) & ~255u;
+            if (scw > cw) cw = scw;
+            if (sch > ch) ch = sch;
+            if (cw < g_gpuW && g_gpuFmt == sc0->dxgi) cw = g_gpuW;
+            if (ch < g_gpuH && g_gpuFmt == sc0->dxgi) ch = g_gpuH;
+            if (cw > 2560) cw = 2560;
+            if (ch > 2560) ch = 2560;
+            if (!gpu_setup(s->dev, cw, ch, sc0->dxgi)) { g_gpuState = -1; logmsg("Copia directa no disponible: sigo con la memoria compartida"); }
         } else if (g_gpuState == 1) {
             ShmHdr *h = (ShmHdr *)g_shm;
             if (h->reserved[0] == GPU_MAGIC && h->reserved[1] == g_gpuGen) { g_gpuState = 2; logmsg("Copia directa activa: el cuadro ya no sale de la GPU"); }
@@ -2949,7 +2965,7 @@ static void readback(Session *s, const XrCompositionLayerProjection *pl, const X
                     g_gpuNq[ss] = d3d_quads_write(s, s->stNext, g_shm + SHM_HDR + (size_t)ss * SHM_SLOT_MAX, SHM_SLOT_MAX, &used);
                 }
             }
-            g_gpuPose[ss] = pid; g_gpuPending[ss] = 1;
+            g_gpuPose[ss] = pid; g_gpuEW[ss] = ew; g_gpuEH[ss] = eh; g_gpuPending[ss] = 1;
             ID3D11DeviceContext_End(s->ctx, (ID3D11Asynchronous *)g_gpuQ[ss]);
             ID3D11DeviceContext_Flush(s->ctx);
             g_gpuCtx = s->ctx;
