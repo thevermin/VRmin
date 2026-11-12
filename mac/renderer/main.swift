@@ -1138,6 +1138,10 @@ final class GameLink {
     private var stageSince = DispatchTime.now().uptimeNanoseconds
     private var framesThisSecond = 0
     private func setStage(_ st: String) { stage = st; stageSince = DispatchTime.now().uptimeNanoseconds }
+    /// Para diagnóstico: en qué paso está el hilo que acepta las conexiones de los juegos
+    private let acceptLock = NSLock()
+    private var acceptStage = "esperando", acceptSince = DispatchTime.now().uptimeNanoseconds
+    private func setAcceptStage(_ st: String) { acceptLock.lock(); acceptStage = st; acceptSince = DispatchTime.now().uptimeNanoseconds; acceptLock.unlock() }
     private let encoder: Encoder
     private let shared: Shared
     private var pool: CVPixelBufferPool!
@@ -1237,6 +1241,10 @@ final class GameLink {
                 if fps < 20 || (stage != "leyendo cabecera" && secs > 1) {
                     print("[mac] Cuadros del juego recibidos: \(fps)/s · paso actual: \(stage) (hace \(String(format: "%.1f", secs)) s) · en codificación: \(shared.inFlightCount)")
                 }
+                acceptLock.lock(); let ast = acceptStage, asecs = Double(DispatchTime.now().uptimeNanoseconds - acceptSince) / 1e9; acceptLock.unlock()
+                if ast != "esperando" && asecs > 2 {
+                    print("[mac] Las conexiones nuevas de juegos no se están aceptando: el hilo que las acepta está «\(ast)» hace \(String(format: "%.1f", asecs)) s")
+                }
             }
         }
         Thread.detachNewThread { [self] in
@@ -1255,18 +1263,24 @@ final class GameLink {
             }
             if r != 0 || listen(ls, 8) != 0 { print("ERROR: no se pudo abrir el puerto \(port) para el juego"); return }
             while true {
+                setAcceptStage("esperando")
                 let c = accept(ls, nil, nil)
                 if c < 0 { continue }
+                setAcceptStage("ajustando la conexión")
                 setsockopt(c, Int32(IPPROTO_TCP), TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
                 var big: Int32 = 16 << 20
                 setsockopt(c, SOL_SOCKET, SO_RCVBUF, &big, socklen_t(MemoryLayout<Int32>.size))
-                // Nunca cerramos a nadie: cada conexión vive en su propio hilo hasta que el juego la corta.
+                // Nunca cerramos a nadie: cada conexión vive en su propio hilo hasta que el juego la corta. Este hilo solo
+                // acepta: lo demás va en el de la conexión, así nada demora a la siguiente (un juego puede abrir otro
+                // programa con VR mientras sigue abierto: The Lab abre Robot Repair)
+                setAcceptStage("anotando la conexión")
                 lock.lock(); clients[c] = 0; let total = clients.count; lock.unlock()
-                print("[juego] Un juego se conectó a QuestVRBridge (conexiones abiertas: \(total))")
-                sendTo(c, Data(configLine.utf8))
-                shared.requestKey()
+                setAcceptStage("abriendo su hilo")
                 Thread.detachNewThread { [self] in
                     Thread.current.qualityOfService = .userInteractive   // (la GPU de Apple atiende antes el trabajo de hilos con más prioridad)
+                    print("[juego] Un juego se conectó a QuestVRBridge (conexiones abiertas: \(total))")
+                    sendTo(c, Data(configLine.utf8))
+                    shared.requestKey()
                     readLoop(c)
                     lock.lock(); clients[c] = nil; pending[c] = nil; let left = clients.count; lock.unlock()
                     Darwin.close(c)
