@@ -13,6 +13,11 @@ export BURROW_TEST=madriguera
 corre estatico prueba-static.esperado $E ./prueba-static uno dos
 corre dinamico prueba-dynamic.esperado env -u TMPDIR $E --sysroot root root/prueba uno dos
 corre hilos hilos.esperado $E --sysroot root root/hilos
+if ! grep -q 'HILOS:' hilos.txt; then
+  # (where it hangs: again with elfuse's own log, the last 300 lines)
+  $E -v --sysroot root root/hilos > hilos-v.txt 2>&1 & p=$!; sleep 10; kill -9 $p 2>/dev/null; wait $p 2>/dev/null
+  tail -300 hilos-v.txt > hilos-v-final.txt; echo "(elfuse's log for hilos: hilos-v-final.txt)"
+fi
 corre busybox "" $E ./busybox sh -c 'echo hola desde busybox; ls / | head -3; uname -a; seq 3 | wc -l'
 echo
 [ $r = 0 ] && echo "BURROW: TODO BIEN" || echo "BURROW: ALGO FALLÓ"
