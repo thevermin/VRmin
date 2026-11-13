@@ -96,17 +96,31 @@ jobs:
           [ "$S" -gt 100000 ] || { echo "::error::wineboot no creó el Windows ($S bytes)"; exit 1; }
           echo "::notice::Windows creado ($S bytes) · $(cat "$QVB_DATA/prefijo/.wine_usado" 2>/dev/null)"
           # Actualizar el motor con un programa de Wine abierto (como Steam, que puede quedar abierto de antes): no se
-          # tiene que trabar
+          # tiene que trabar ni fallar. Y otra vez con «Reinstalar el motor» y un programa que arranca con Windows (como
+          # Steam: wineboot -u lo abre y queda abierto)
           echo "gcenx-11.8+dxmt-notpop1" > "$QVB_DATA/prefijo/.wine_usado"
           ( source mac/app/recursos/entorno.sh; unset DYLD_INSERT_LIBRARIES; "$WINE" notepad > /dev/null 2>&1 & )
           sleep 8
-          t0=$(date +%s); bash mac/app/recursos/instalar_motor.sh > upd.txt 2>&1 & up=$!
-          for i in $(seq 1 300); do kill -0 $up 2>/dev/null || break; sleep 1; done
-          if kill -0 $up 2>/dev/null; then
-            tail -20 upd.txt | while read -r l; do echo "::warning::upd: $l"; done
-            echo "::error::La actualización del motor quedó trabada con un programa de Wine abierto"; kill $up; exit 1
-          fi
-          echo "::notice::Actualización del motor con un programa de Wine abierto: $(( $(date +%s) - t0 )) s · $(cat "$QVB_DATA/prefijo/.wine_usado")"
+          for arg in "" --reinstalar; do
+            if [ -n "$arg" ]; then
+              ( source mac/app/recursos/entorno.sh; unset DYLD_INSERT_LIBRARIES
+                "$WINE" reg add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Run' /v Prueba /d 'C:\windows\notepad.exe' /f > /dev/null 2>&1 )
+            fi
+            t0=$(date +%s); bash mac/app/recursos/instalar_motor.sh $arg > upd.txt 2>&1 & up=$!
+            for i in $(seq 1 600); do kill -0 $up 2>/dev/null || break; sleep 1; done
+            if kill -0 $up 2>/dev/null; then
+              tail -20 upd.txt | while read -r l; do echo "::warning::upd: $l"; done
+              echo "::error::instalar_motor.sh $arg quedó trabado con un programa de Wine abierto"; kill $up; exit 1
+            fi
+            c=0; wait $up || c=$?
+            if [ $c -ne 0 ]; then
+              tail -20 upd.txt | while read -r l; do echo "::warning::upd: $l"; done
+              echo "::error::instalar_motor.sh $arg falló (código $c) con un programa de Wine abierto"; exit 1
+            fi
+            echo "::notice::instalar_motor.sh $arg con un programa de Wine abierto: $(( $(date +%s) - t0 )) s · $(cat "$QVB_DATA/prefijo/.wine_usado")"
+          done
+          ( source mac/app/recursos/entorno.sh; unset DYLD_INSERT_LIBRARIES
+            "$WINE" reg delete 'HKCU\Software\Microsoft\Windows\CurrentVersion\Run' /v Prueba /f > /dev/null 2>&1; "$WINESERVER" -k ) || true
           source mac/app/recursos/entorno.sh
           unset DYLD_INSERT_LIBRARIES
           "$WINE" d3d/d3dshare.exe > d3d.txt 2>&1 &

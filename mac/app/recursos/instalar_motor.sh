@@ -46,6 +46,12 @@ say "macOS y Rosetta 2: OK · datos en: $P" "macOS and Rosetta 2: OK · data in:
 
 [ -x "$WINESERVER" ] && "$WINESERVER" -k 2>/dev/null || true
 rm -rf "$P/wine-dxmt" "$P/Wine Devel.app"
+# «Reinstalar el motor» (VRmin Host): Wine y DXMT se bajan de nuevo, y el Windows se actualiza (Steam y los juegos quedan)
+if [ "$1" = --reinstalar ]; then
+  say "Reinstalando el motor (se conservan Steam y los juegos)" "Reinstalling the engine (Steam and games are kept)"
+  rm -rf "$WINEDIR" "$FW" "$DXMT_DIR"
+  [ -f "$WINEPREFIX/system.reg" ] && echo "gcenx-11-reinstalar" > "$WINEPREFIX/.wine_usado"
+fi
 # (un Windows de otro Wine 11 de Gcenx se conserva y se actualiza con wineboot -u: no hay que reinstalar Steam)
 USADO="$(cat "$WINEPREFIX/.wine_usado" 2>/dev/null || true)"
 if [ -d "$WINEPREFIX" ] && [ "$USADO" != "$MARCA_MOTOR" ] && [ "${USADO#gcenx-11}" = "$USADO" ]; then
@@ -89,7 +95,7 @@ fi
 esperar_wine() {
   "$WINESERVER" -w 2>/dev/null & local w=$!
   for _ in $(seq 1 "${1:-120}"); do kill -0 $w 2>/dev/null || return 0; sleep 1; done
-  "$WINESERVER" -k 2>/dev/null; sleep 2; kill $w 2>/dev/null; return 0
+  "$WINESERVER" -k 2>/dev/null || true; sleep 2; kill $w 2>/dev/null || true; return 0
 }
 # Lo que haya quedado abierto en este Windows con el motor de antes (Steam, un juego) se cierra antes de tocarlo
 if [ -f "$WINEPREFIX/system.reg" ] && [ -x "$WINESERVER" ]; then
@@ -118,7 +124,8 @@ if [ ! -f "$WINEPREFIX/system.reg" ]; then
 elif [ "$(cat "$WINEPREFIX/.wine_usado" 2>/dev/null)" != "$MARCA_MOTOR" ]; then
   paso "Actualizando el Windows al motor nuevo (se conservan Steam y los juegos)" "Updating the Windows to the new engine (Steam and games are kept)"
   "$WINE" wineboot -u > "$P/logs/wineboot.log" 2>&1 || true
-  esperar_wine 120
+  # (wineboot -u también abre lo que arranca con Windows, como Steam: no hace falta esperar a que lo cierren)
+  esperar_wine 30
   echo "$MARCA_MOTOR" > "$WINEPREFIX/.wine_usado"
 fi
 

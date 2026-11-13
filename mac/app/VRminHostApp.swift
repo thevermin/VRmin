@@ -1155,6 +1155,7 @@ struct ContentView: View {
     @EnvironmentObject var m: AppModel
     @State private var showSettings = false
     @State private var showLog = false
+    @State private var askReinstall = false
     @State private var showVigiaHelp = false
     @State private var tut: TutPresent? = nil   // tutorial o Ayuda en pantalla
     @State private var gameAdv: SteamGame? = nil   // ajustes de un juego (desde su menú)
@@ -1701,6 +1702,17 @@ struct ContentView: View {
                     .buttonStyle(Pill())
                 Text(L("Junta los registros (Mac, visor y juegos) en un .zip en el Escritorio, para mandarlo cuando pidas ayuda. No incluye claves ni datos personales."))
                     .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 10) {
+                Button { askReinstall = true } label: { Label(L("Reinstalar el motor"), systemImage: "arrow.clockwise") }
+                    .buttonStyle(Pill()).disabled(m.busyTask != nil)
+                Text(L("Si el motor no se instala o anda mal: lo baja e instala de nuevo. Se conservan Steam y los juegos."))
+                    .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+            }
+            .confirmationDialog(L("¿Reinstalar el motor?"), isPresented: $askReinstall) {
+                Button(L("Reinstalar")) { m.run(L("Reinstalando el motor"), "instalar_motor.sh", ["--reinstalar"]) }
+            } message: {
+                Text(L("Se cierran Steam y los juegos, y se baja el motor de nuevo (≈280 MB). Steam, los juegos y las partidas se conservan."))
             }
             if showLog {
                 ScrollViewReader { proxy in
