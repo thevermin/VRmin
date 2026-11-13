@@ -1,26 +1,26 @@
 # Burrow
 
-Burrow runs Linux ARM64 programs on Apple Silicon Macs, without a Linux virtual machine.
+Burrow runs Linux ARM64 games on Apple Silicon Macs, without a Linux virtual machine.
 
-The Linux program runs in its own memory space under macOS's Hypervisor framework, which catches every request it
-makes to the Linux kernel (a system call). Burrow answers each one with macOS. There's no Linux kernel and no disk
-image: the program's files are normal files on the Mac.
+It's built on [elfuse](https://github.com/sysprog21/elfuse) (Apache 2.0): the Linux program runs in its own memory
+space under macOS's Hypervisor framework, which catches every request it makes to the Linux kernel (a system call),
+and elfuse answers each one with macOS. Burrow adds what games need on top: the GPU (Vulkan → Metal), sound,
+controllers and VR (VRmin).
 
-It's being built for VRmin (to run the Linux ARM64 versions of SteamVR games), but it doesn't depend on VRmin.
+It's being built for VRmin, but it doesn't depend on VRmin.
 
 ## Status
 
-Step 1: static and simple dynamic programs (memory, files, time, the program's own startup). No threads, signals,
-GPU, sound or network yet.
+elfuse as is: Linux ARM64 programs (static or dynamic, with threads, signals and processes). Nothing for games yet.
 
 ## Build and run (Mac with Apple Silicon)
 
 ```
-./build.sh                          # → build/burrow (signed with the hypervisor entitlement)
-build/burrow [-r <root>] <program> [args…]
+brew install binutils
+./build.sh                                     # → build/elfuse
+build/elfuse [--sysroot <root>] <program> [args…]
 ```
 
-`-r <root>`: a folder with a Linux system (`/lib`, `/usr`…) that the program sees as `/`. Without it, the program
-sees the Mac's files.
+`--sysroot <root>`: a folder with a Linux system (`/lib`, `/usr`…) where dynamic programs find their libraries.
 
-`BURROW_LOG=1` prints every system call.
+elfuse is downloaded at the commit in `ELFUSE_COMMIT`, and Burrow's changes to it are in `patches/`.
