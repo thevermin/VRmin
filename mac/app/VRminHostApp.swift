@@ -292,6 +292,8 @@ final class AppModel: ObservableObject {
     private var steamLogSeen: UInt64 = 0
     private var steamSince = Date.distantFuture   // desde cuándo está abierto (al arrancar se traba un rato y no cuenta)
     @Published var engineReady = false
+    /// Rosetta 2 de Apple (el motor es de Intel): si falta, «Primera vez» muestra un botón para instalarla
+    @Published var rosetta = true
     @Published var openComposite = false
     @Published var steamInstalled = false
     @Published var games: [SteamGame] = []
@@ -473,6 +475,9 @@ final class AppModel: ObservableObject {
     func refresh() {
         let fm = FileManager.default
         let marca = (try? String(contentsOf: data.appendingPathComponent("prefijo/.wine_usado"), encoding: .utf8)) ?? ""
+        #if arch(arm64)
+        rosetta = fm.fileExists(atPath: "/Library/Apple/usr/share/rosetta/rosetta") || fm.fileExists(atPath: "/Library/Apple/usr/libexec/oah/libRosettaRuntime")
+        #endif
         engineReady = fm.isExecutableFile(atPath: data.appendingPathComponent("motor/wswine.bundle/bin/wine").path)
             && !marcaMotor.isEmpty && marca.trimmingCharacters(in: .whitespacesAndNewlines) == marcaMotor   // (otra versión del motor: hay que actualizarla)
         openComposite = fm.fileExists(atPath: data.appendingPathComponent("prefijo/drive_c/questvrbridge/opencomposite/bin/vrclient_x64.dll").path)
@@ -1218,9 +1223,10 @@ struct ContentView: View {
                 Text(t).font(.callout).foregroundStyle(Theme.text2).lineLimit(1)
             }
             // «Lista» solo si de verdad está todo: motor, Steam instalado y abierto. Si falta algo, tocarlo lo hace.
-            let falta = !m.engineReady ? L("Falta instalar el motor") : !m.steamInstalled ? L("Falta instalar Steam")
+            let falta = !m.rosetta && !m.engineReady ? L("Falta instalar Rosetta 2") : !m.engineReady ? L("Falta instalar el motor") : !m.steamInstalled ? L("Falta instalar Steam")
                 : !m.steamRunning ? L("Falta abrir Steam") : m.steamStuck ? L("Steam se trabó") : nil
-            let fix: (() -> Void)? = !m.engineReady || !m.openComposite ? { m.run(L("Instalando el motor"), "instalar_motor.sh") }
+            let fix: (() -> Void)? = !m.rosetta && !m.engineReady ? { m.run(L("Instalando Rosetta 2"), "instalar_rosetta.sh") }
+                : !m.engineReady || !m.openComposite ? { m.run(L("Instalando el motor"), "instalar_motor.sh") }
                 : !m.steamInstalled ? { m.run(L("Instalando Steam"), "instalar_steam.sh") }
                 : !m.steamRunning ? { m.run(L("Abriendo Steam"), "abrir_steam.sh") }
                 : m.steamStuck ? { m.restartSteam() } : nil
@@ -1325,6 +1331,18 @@ struct ContentView: View {
                 let n = [m.engineReady && m.openComposite, m.steamInstalled, m.steamRunning].filter { $0 }.count
                 ProgressView(value: Double(n), total: 3).tint(Theme.amber)
                 Text(L("Paso %ld de 3 · se hace una sola vez", min(3, n + 1))).font(.caption).foregroundStyle(Theme.text2)
+                if !m.rosetta && !m.engineReady {
+                    HStack(spacing: 10) {
+                        Image(systemName: "exclamationmark.circle.fill").foregroundStyle(Theme.amber).frame(width: 22)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(L("Rosetta 2 de Apple")).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                            Text(L("Falta: la necesita el motor (la Mac te pide tu contraseña)")).font(.caption).foregroundStyle(Theme.text2)
+                        }
+                        Spacer()
+                        Button(L("Instalar")) { m.run(L("Instalando Rosetta 2"), "instalar_rosetta.sh") }
+                            .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
+                    }
+                }
                 HStack(spacing: 10) {
                     step(1, m.engineReady && m.openComposite)
                     VStack(alignment: .leading, spacing: 1) {

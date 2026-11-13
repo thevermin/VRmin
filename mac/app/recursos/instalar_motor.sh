@@ -40,13 +40,8 @@ paso "Comprobando el sistema" "Checking the system"
 sw_vers -productVersion
 MAJ=$(sw_vers -productVersion | cut -d. -f1)
 [ "$MAJ" -ge 14 ] || { say "Hace falta macOS 14 (Sonoma) o más nuevo." "macOS 14 (Sonoma) or newer is required."; exit 1; }
-# Rosetta 2 (el motor es de Intel): si falta, se instala. macOS pide la contraseña de la Mac en su propia ventana.
-if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
-  paso "Instalando Rosetta 2 (la Mac te va a pedir tu contraseña)" "Installing Rosetta 2 (your Mac will ask for your password)"
-  PROMPT=$(say "VRmin necesita Rosetta 2 de Apple para los juegos de Windows." "VRmin needs Apple's Rosetta 2 to run Windows games.")
-  osascript -e "do shell script \"/usr/sbin/softwareupdate --install-rosetta --agree-to-license\" with prompt \"$PROMPT\" with administrator privileges" || true
-  arch -x86_64 /usr/bin/true 2>/dev/null || { say "Falta Rosetta 2. Instalala con:  softwareupdate --install-rosetta --agree-to-license" "Rosetta 2 is missing. Install it with:  softwareupdate --install-rosetta --agree-to-license"; exit 1; }
-fi
+# Rosetta 2 (el motor es de Intel): si falta, se instala (macOS pide la contraseña de la Mac en su propia ventana)
+arch -x86_64 /usr/bin/true 2>/dev/null || bash "$(dirname "$0")/instalar_rosetta.sh" || exit 1
 say "macOS y Rosetta 2: OK · datos en: $P" "macOS and Rosetta 2: OK · data in: $P"
 
 [ -x "$WINESERVER" ] && "$WINESERVER" -k 2>/dev/null || true
