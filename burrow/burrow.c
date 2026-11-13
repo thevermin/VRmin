@@ -447,7 +447,7 @@ static uint64_t make_stack(int argc, char **argv, Loaded *prog, Loaded *interp) 
   if (argc > 255) die("too many arguments");
   for (int i = argc - 1; i >= 0; i--) av[i] = push(&sp, argv[i], strlen(argv[i]) + 1);
   for (char **e = environ; *e && ne < 511; e++) {
-    if (!strncmp(*e, "DYLD_", 5) || !strncmp(*e, "BURROW_", 7)) continue;
+    if (!strncmp(*e, "DYLD_", 5)) continue;                                 // (the Mac's, not for Linux)
     ev[ne++] = push(&sp, *e, strlen(*e) + 1);
   }
   uint64_t execfn = push(&sp, exe_path, strlen(exe_path) + 1);
