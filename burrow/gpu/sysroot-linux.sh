@@ -4,7 +4,7 @@
 #   sysroot-linux.sh <folder>
 set -euo pipefail
 root=$1
-sudo apt-get install -y -qq mesa-vulkan-drivers vulkan-tools libvulkan1 > /dev/null
+sudo apt-get install -y -qq mesa-vulkan-drivers vulkan-tools libvulkan1 libdrm-dev > /dev/null
 mkdir -p "$root"
 copy() { local f; for f in "$@"; do [ -e "$f" ] || continue; mkdir -p "$root$(dirname "$f")"; cp -L "$f" "$root$f"; done; }
 venus=$(ls /usr/lib/aarch64-linux-gnu/libvulkan_virtio.so)
@@ -23,5 +23,9 @@ while [ -n "$todo" ]; do
   done
   todo=$next
 done
+# libdrm's GPU list, answered by Burrow (see drm-shim.c): loaded with LD_PRELOAD
+mkdir -p "$root/usr/lib/burrow"
+gcc -O2 -shared -fPIC -o "$root/usr/lib/burrow/libburrow_drm.so" "$(dirname "$0")/drm-shim.c" $(pkg-config --cflags libdrm)
+mkdir -p "$root/dev/dri" "$root/tmp"
 echo "$root: $(find "$root" -type f | wc -l) files, $(du -sh "$root" | cut -f1)"
 ls "$root/usr/share/vulkan/icd.d"

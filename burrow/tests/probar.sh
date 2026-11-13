@@ -21,5 +21,9 @@ fi
 corre busybox "" $E ./busybox sh -c 'echo hola desde busybox; ls / | head -3; uname -a; seq 3 | wc -l'
 corre gpu-mac "" ./virgl-prueba
 grep -q 'VIRGL: TODO BIEN' gpu-mac.txt || r=1
+# The GPU from Linux: vulkaninfo through Mesa's Venus driver → Burrow's /dev/dri/renderD128 → virglrenderer → Metal
+GPU=(--sysroot gpu-root --env LD_PRELOAD=/usr/lib/burrow/libburrow_drm.so --env VN_DEBUG=init)
+corre vulkaninfo "" $E "${GPU[@]}" gpu-root/usr/bin/vulkaninfo --summary
+grep -q 'Venus' vulkaninfo.txt && echo "(the Linux program sees the Mac's GPU)" || r=1
 echo
 [ $r = 0 ] && echo "BURROW: TODO BIEN" || echo "BURROW: ALGO FALLÓ"

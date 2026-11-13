@@ -79,7 +79,7 @@ jobs:
             install_name_tool -add_rpath @loader_path "$f" 2>/dev/null || true
             codesign -f -s - "$f"
           done
-          otool -L pkg/virgl-prueba pkg/lib/*.dylib | grep -v ':$' | sort -u && cp burrow/tests/probar.sh pkg/ && cp -R tests/. pkg/ && chmod +x pkg/elfuse pkg/probar.sh pkg/prueba-* pkg/busybox pkg/root/prueba pkg/root/hilos
+          otool -L pkg/virgl-prueba pkg/lib/*.dylib | grep -v ':$' | sort -u && cp burrow/tests/probar.sh pkg/ && cp -R tests/. pkg/ && chmod +x pkg/elfuse pkg/probar.sh pkg/prueba-* pkg/busybox pkg/root/prueba pkg/root/hilos pkg/gpu-root/usr/bin/*
           tar -czf burrow-prueba.tar.gz -C pkg .
       - uses: actions/upload-artifact@v4
         with: { name: burrow-prueba, path: burrow-prueba.tar.gz, retention-days: 30 }

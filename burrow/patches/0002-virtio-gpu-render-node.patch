@@ -1,0 +1,899 @@
+diff --git a/Makefile b/Makefile
+index 4e3b819..86c301e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -42,6 +42,7 @@ SRCS := \
+     syscall/fdtable.c \
+     syscall/translate.c \
+     syscall/mem.c \
++    syscall/virtgpu.c \
+     syscall/path.c \
+     syscall/fuse.c \
+     syscall/casefold.c \
+diff --git a/src/syscall/fs.c b/src/syscall/fs.c
+index bfa5dde..1ed8f1e 100644
+--- a/src/syscall/fs.c
++++ b/src/syscall/fs.c
+@@ -57,6 +57,7 @@ _Static_assert(NAME_MAX == DIRENT64_NAME_MAX,
+ #include "syscall/proc-pidfd.h" /* pidfd_pin */
+ #include "syscall/signal.h"
+ #include "syscall/sys.h"
++#include "syscall/virtgpu.h"
+ 
+ /* Linux dirent64 layout. */
+ typedef struct {
+@@ -890,6 +891,8 @@ int64_t sys_openat_path(guest_t *g,
+     if (path_might_use_open_intercept(tx.intercept_path)) {
+         if (!strcmp(tx.intercept_path, "/dev/fuse"))
+             return fuse_proc_open(linux_flags);
++        if (!strcmp(tx.intercept_path, "/dev/dri/renderD128"))
++            return virtgpu_open(linux_flags);
+ 
+         /* /dev/bus/usb/BBB/DDD: typed FD_USBDEV constructor (any access mode
+          * except O_PATH, which the stage-1 placeholder serves). A node named
+diff --git a/src/syscall/io.c b/src/syscall/io.c
+index 18d89be..2bcea14 100644
+--- a/src/syscall/io.c
++++ b/src/syscall/io.c
+@@ -58,6 +58,7 @@
+ #include "syscall/signal.h"
+ #include "syscall/sys.h"
+ #include "syscall/wakeup-pipe.h"
++#include "syscall/virtgpu.h"
+ 
+ #define URANDOM_CACHE_SIZE 4096
+ 
+@@ -2965,6 +2966,10 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
+         return 0;
+     }
+ 
++    /* The virtio-gpu render node answers the DRM ioctls (virtgpu.c). */
++    if (virtgpu_is_fd(fd))
++        return virtgpu_ioctl(g, fd, request, arg);
++
+     /* usbdevfs fds answer their own ioctl set; the host fd behind them is a
+      * readiness pipe, so nothing below applies. usbdev_ioctl re-snapshots the
+      * fd and pins the side-table entry by generation itself.
+diff --git a/src/syscall/mem.c b/src/syscall/mem.c
+index 5f23008..d72bde2 100644
+--- a/src/syscall/mem.c
++++ b/src/syscall/mem.c
+@@ -20,6 +20,8 @@
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <pthread.h>
++#include <mach/mach.h>
++#include <mach/mach_vm.h>
+ 
+ #include "debug/log.h"
+ #include "utils.h"
+@@ -34,6 +36,7 @@
+ #include "syscall/fuse.h"
+ #include "syscall/internal.h"
+ #include "syscall/mem.h"
++#include "syscall/virtgpu.h"
+ 
+ /* Protects mmap/brk bump allocators and page table extension. Multiple threads
+  * may call mmap/brk concurrently; without this lock they could get overlapping
+@@ -2467,6 +2470,45 @@ static int hvf_apply_file_overlay(guest_t *g,
+     return err;
+ }
+ 
++/* Like hvf_apply_file_overlay_quiesced, with host memory instead of a file:
++ * the slab pages at [ipa, ipa+len) are replaced by host_ptr's (shared, not
++ * copied), so the guest and the host see the same memory.
++ */
++static int hvf_apply_ptr_overlay_quiesced(guest_t *g,
++                                          uint64_t ipa,
++                                          uint64_t len,
++                                          void *host_ptr)
++{
++    hvf_segment_t segments[GUEST_MAX_HVF_SEGMENTS];
++    int nsegments = hvf_detach_range_segments(g, ipa, len, segments);
++    if (nsegments < 0)
++        return nsegments;
++
++    mach_vm_address_t target =
++        (mach_vm_address_t) (uintptr_t) ((uint8_t *) g->host_base + ipa);
++    vm_prot_t cur = 0, max = 0;
++    kern_return_t kr = mach_vm_remap(
++        mach_task_self(), &target, len, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
++        mach_task_self(), (mach_vm_address_t) (uintptr_t) host_ptr, FALSE, &cur,
++        &max, VM_INHERIT_SHARE);
++    if (kr != KERN_SUCCESS) {
++        log_warn("mmap_host_ptr: mach_vm_remap failed (%d)", kr);
++        hvf_remap_segments_best_effort(g, segments, nsegments);
++        return -LINUX_ENOMEM;
++    }
++
++    for (int i = 0; i < nsegments; i++) {
++        if (hv_vm_map((uint8_t *) g->host_base + segments[i].ipa,
++                      segments[i].ipa, segments[i].len,
++                      HVF_SEGMENT_FLAGS) == HV_SUCCESS)
++            continue;
++        hvf_restore_slab_backing(g, ipa, len);
++        hvf_remap_segments_best_effort(g, segments, nsegments);
++        return -LINUX_EIO;
++    }
++    return 0;
++}
++
+ static int hvf_remove_file_overlay_quiesced(guest_t *g,
+                                             uint64_t ipa,
+                                             uint64_t len)
+@@ -3474,6 +3516,10 @@ int64_t sys_mmap(guest_t *g,
+      * (CLONE_VM semantics).
+      */
+ 
++    /* GPU memory of the virtio-gpu render node (virtgpu.c) */
++    if (!is_anon && fd >= 0 && virtgpu_is_fd(fd))
++        return virtgpu_mmap(g, addr, length, prot, flags, fd, offset);
++
+     int64_t arg_err =
+         mmap_check_args(g, addr, &length, flags, fd, offset, is_anon);
+     if (arg_err < 0)
+@@ -3725,6 +3771,46 @@ int64_t sys_mmap(guest_t *g,
+     return (int64_t) guest_ipa(g, result_off);
+ }
+ 
++int64_t mmap_host_ptr(guest_t *g, void *host_ptr, uint64_t length, int prot)
++{
++    size_t hps = host_page_size_cached();
++    if (!length || ((uintptr_t) host_ptr % hps))
++        return -LINUX_EINVAL;
++    length = ALIGN_UP(length, hps);
++    mmap_fresh_t fresh;
++    mmap_fresh_init(&fresh);
++    const mmap_alloc_state_t saved = mmap_alloc_save(g);
++
++    uint64_t off = mmap_pick_gap(g, 0, length, false, BLOCK_2MIB, hps);
++    if (off == UINT64_MAX)
++        return -LINUX_ENOMEM;
++    if (!region_has_capacity_after_removes(g, NULL, 0, 1))
++        return mmap_abort_alloc(g, off, length, &saved, &fresh, -LINUX_ENOMEM);
++    if (mmap_extend_fresh(g, off, length, prot) < 0)
++        return mmap_abort_alloc(g, off, length, &saved, &fresh, -LINUX_ENOMEM);
++    if (!thread_quiesce_siblings())
++        return mmap_abort_alloc(g, off, length, &saved, &fresh, -LINUX_EINTR);
++    int err = hvf_apply_ptr_overlay_quiesced(g, off, length, host_ptr);
++    thread_resume_siblings();
++    if (err < 0)
++        return mmap_abort_alloc(g, off, length, &saved, &fresh, err);
++    if (guest_region_add_ex_owned(g, off, off + length, prot, LINUX_MAP_SHARED,
++                                  0, NULL, -1, false, 0) < 0) {
++        hvf_remove_file_overlay(g, off, length);
++        return mmap_abort_alloc(g, off, length, &saved, &fresh, -LINUX_ENOMEM);
++    }
++    /* Overlay metadata: munmap and MAP_FIXED over it restore the slab pages. */
++    int i = guest_region_first_end_above(g, off);
++    if (i < g->nregions && g->regions[i].start == off &&
++        g->regions[i].end == off + length) {
++        g->regions[i].overlay_active = true;
++        g->regions[i].overlay_start = off;
++        g->regions[i].overlay_end = off + length;
++    }
++    mmap_fresh_dispose(&fresh);
++    return (int64_t) guest_ipa(g, off);
++}
++
+ /* sys_mremap. */
+ 
+ /* Reject an mremap request the guest could not make sense of, before any region
+diff --git a/src/syscall/mem.h b/src/syscall/mem.h
+index b8e6b4b..4c50ebb 100644
+--- a/src/syscall/mem.h
++++ b/src/syscall/mem.h
+@@ -33,6 +33,13 @@ int64_t sys_mmap(guest_t *g,
+ /* munmap: unmap pages from guest address space */
+ int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length);
+ 
++/* Map host memory into the guest as a new MAP_SHARED region: the guest and the
++ * host see the same pages (GPU memory, for virtgpu.c). host_ptr must be
++ * host-page aligned and stay valid while mapped. Caller holds mmap_lock.
++ * Returns the guest address or -LINUX_*.
++ */
++int64_t mmap_host_ptr(guest_t *g, void *host_ptr, uint64_t length, int prot);
++
+ /* mprotect: change page permissions */
+ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot);
+ 
+diff --git a/src/syscall/virtgpu.c b/src/syscall/virtgpu.c
+new file mode 100644
+index 0000000..a58b8f4
+--- /dev/null
++++ b/src/syscall/virtgpu.c
+@@ -0,0 +1,649 @@
++/*
++ * virtio-gpu render node (/dev/dri/renderD128) over virglrenderer
++ *
++ * Copyright 2026 elfuse contributors
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Serves the virtio-gpu DRM uapi (include/uapi/drm/virtgpu_drm.h) the way the
++ * Linux virtio_gpu driver plus a VMM would, with virglrenderer in this process
++ * as the host renderer: one virglrenderer context per open fd, GEM handles per
++ * fd, HOST3D blobs mapped into the guest by mmap_host_ptr, and execbuffer
++ * fences as pipes the guest polls (POLLIN once the context fence signals).
++ *
++ * Only what Mesa's Venus driver uses is implemented: no GUEST blobs, no PRIME,
++ * no DRM syncobjs (Venus simulates them with execbuffer fence fds).
++ */
++
++#include <dlfcn.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/uio.h>
++#include <unistd.h>
++
++#include "debug/log.h"
++#include "syscall/internal.h"
++#include "syscall/linux-wire.h"
++#include "syscall/mem.h"
++#include "syscall/virtgpu.h"
++
++/* ---- virglrenderer, as dlopen'd (virglrenderer.h, MIT) ---- */
++struct vg_callbacks {
++    int version;
++    void (*write_fence)(void *cookie, uint32_t fence);
++    void *create_gl_context, *destroy_gl_context, *make_current;
++    int (*get_drm_fd)(void *cookie);
++    void (*write_context_fence)(void *cookie, uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id);
++    int (*get_server_fd)(void *cookie, uint32_t version);
++    void *(*get_egl_display)(void *cookie);
++};
++struct vg_blob_args {
++    uint32_t res_handle, ctx_id, blob_mem, blob_flags;
++    uint64_t blob_id, size;
++    const struct iovec *iovecs;
++    uint32_t num_iovs;
++};
++#define VG_VENUS (1 << 6)
++#define VG_NO_VIRGL (1 << 7)
++#define VG_ASYNC_FENCE_CB (1 << 8)
++
++static struct {
++    int (*init)(void *cookie, int flags, struct vg_callbacks *cb);
++    void (*get_cap_set)(uint32_t set, uint32_t *max_ver, uint32_t *max_size);
++    void (*fill_caps)(uint32_t set, uint32_t version, void *caps);
++    int (*context_create_with_flags)(uint32_t ctx_id, uint32_t flags, uint32_t nlen, const char *name);
++    void (*context_destroy)(uint32_t ctx_id);
++    int (*submit_cmd)(void *buffer, int ctx_id, int ndw);
++    int (*resource_create_blob)(const struct vg_blob_args *args);
++    void (*resource_unref)(uint32_t res);
++    int (*resource_get_map_ptr)(uint32_t res, uint64_t *ptr); /* macOS fork */
++    int (*resource_map)(uint32_t res, void **map, uint64_t *size);
++    int (*context_create_fence)(uint32_t ctx_id, uint32_t flags, uint32_t ring_idx, uint64_t fence_id);
++} vg;
++
++/* ---- the uapi (virtgpu_drm.h and drm.h, 64-bit layouts) ---- */
++#define DRM_TYPE 'd'
++#define NR_VERSION 0x00
++#define NR_GEM_CLOSE 0x09
++#define NR_GET_CAP 0x0c
++#define NR_VG_MAP 0x41
++#define NR_VG_EXECBUFFER 0x42
++#define NR_VG_GETPARAM 0x43
++#define NR_VG_RESOURCE_INFO 0x45
++#define NR_VG_TRANSFER_FROM_HOST 0x46
++#define NR_VG_TRANSFER_TO_HOST 0x47
++#define NR_VG_WAIT 0x48
++#define NR_VG_GET_CAPS 0x49
++#define NR_VG_CREATE_BLOB 0x4a
++#define NR_VG_CONTEXT_INIT 0x4b
++
++struct drm_version_w {
++    int32_t major, minor, patch, pad;
++    uint64_t name_len, name, date_len, date, desc_len, desc;
++};
++struct vg_getparam_w { uint64_t param, value; };
++struct vg_get_caps_w { uint32_t cap_set_id, cap_set_ver; uint64_t addr; uint32_t size, pad; };
++struct vg_context_init_w { uint32_t num_params, pad; uint64_t params; };
++struct vg_ctx_param_w { uint64_t param, value; };
++struct vg_create_blob_w {
++    uint32_t blob_mem, blob_flags, bo_handle, res_handle;
++    uint64_t size;
++    uint32_t pad, cmd_size;
++    uint64_t cmd, blob_id;
++};
++struct vg_resource_info_w { uint32_t bo_handle, res_handle, size, blob_mem; };
++struct vg_map_w { uint64_t offset; uint32_t handle, pad; };
++struct vg_execbuffer_w {
++    uint32_t flags, size;
++    uint64_t command, bo_handles;
++    uint32_t num_bo_handles;
++    int32_t fence_fd;
++    uint32_t ring_idx, syncobj_stride, num_in_syncobjs, num_out_syncobjs;
++    uint64_t in_syncobjs, out_syncobjs;
++};
++struct drm_gem_close_w { uint32_t handle, pad; };
++struct drm_get_cap_w { uint64_t capability, value; };
++
++#define VG_EXECBUF_FENCE_FD_OUT 0x02
++#define VG_EXECBUF_RING_IDX 0x04
++#define VG_BLOB_MEM_HOST3D 2
++#define VG_MAP_SHIFT 16 /* mmap cookie: GEM handle << 16 */
++#define VG_MAX_CMD (16u << 20)
++
++/* ---- state ---- */
++typedef struct {
++    uint32_t handle, res_id, blob_mem;
++    uint64_t size;
++} vg_bo_t;
++
++#define VG_MAX_DEVS 16
++typedef struct {
++    bool used;
++    int guest_fd;
++    uint32_t ctx_id; /* 0 until CONTEXT_INIT */
++    vg_bo_t *bos;
++    uint32_t nbos, cap, next_handle;
++} vg_dev_t;
++
++typedef struct vg_fence {
++    uint32_t ctx_id;
++    uint64_t fence_id;
++    int wr;
++    struct vg_fence *next;
++} vg_fence_t;
++
++static pthread_mutex_t vg_lock = PTHREAD_MUTEX_INITIALIZER;     /* devices + virglrenderer calls */
++static pthread_mutex_t vg_fence_lock = PTHREAD_MUTEX_INITIALIZER; /* fences (the callback can run anywhere) */
++static vg_dev_t vg_devs[VG_MAX_DEVS];
++static vg_fence_t *vg_fences;
++static uint64_t vg_next_fence = 1;
++static uint32_t vg_next_ctx = 1, vg_next_res = 1;
++static int vg_state; /* 0 not tried, 1 ready, -1 unavailable */
++
++static void vg_signal(uint32_t ctx_id, uint64_t fence_id)
++{
++    /* A fence signals every earlier fence on its timeline too; the guest only
++     * waits on fds, so close all of this context's up to fence_id.
++     */
++    pthread_mutex_lock(&vg_fence_lock);
++    vg_fence_t **pp = &vg_fences;
++    while (*pp) {
++        vg_fence_t *f = *pp;
++        if (f->ctx_id == ctx_id && f->fence_id <= fence_id) {
++            char b = 1;
++            (void) !write(f->wr, &b, 1);
++            close(f->wr);
++            *pp = f->next;
++            free(f);
++        } else {
++            pp = &f->next;
++        }
++    }
++    pthread_mutex_unlock(&vg_fence_lock);
++}
++
++static void cb_write_fence(void *cookie, uint32_t fence)
++{
++    (void) cookie;
++    (void) fence;
++}
++
++static void cb_write_context_fence(void *cookie, uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id)
++{
++    (void) cookie;
++    (void) ring_idx;
++    vg_signal(ctx_id, fence_id);
++}
++
++static struct vg_callbacks vg_cb = {
++    .version = 3,
++    .write_fence = cb_write_fence,
++    .write_context_fence = cb_write_context_fence,
++};
++
++#define VG_SYM(field, name)                                                    \
++    do {                                                                       \
++        *(void **) &vg.field = dlsym(h, name);                                 \
++        if (!vg.field && required) {                                           \
++            log_warn("virtgpu: %s missing from virglrenderer", name);          \
++            return false;                                                      \
++        }                                                                      \
++    } while (0)
++
++static bool vg_load(void)
++{
++    const char *env = getenv("ELFUSE_VIRGLRENDERER");
++    const char *names[] = {env, "@executable_path/lib/libvirglrenderer.1.dylib",
++                           "libvirglrenderer.1.dylib"};
++    void *h = NULL;
++    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !h; i++)
++        if (names[i])
++            h = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
++    if (!h) {
++        log_warn("virtgpu: no virglrenderer (%s): no GPU for the guest", dlerror());
++        return false;
++    }
++    bool required = true;
++    VG_SYM(init, "virgl_renderer_init");
++    VG_SYM(get_cap_set, "virgl_renderer_get_cap_set");
++    VG_SYM(fill_caps, "virgl_renderer_fill_caps");
++    VG_SYM(context_create_with_flags, "virgl_renderer_context_create_with_flags");
++    VG_SYM(context_destroy, "virgl_renderer_context_destroy");
++    VG_SYM(submit_cmd, "virgl_renderer_submit_cmd");
++    VG_SYM(resource_create_blob, "virgl_renderer_resource_create_blob");
++    VG_SYM(resource_unref, "virgl_renderer_resource_unref");
++    VG_SYM(context_create_fence, "virgl_renderer_context_create_fence");
++    required = false;
++    VG_SYM(resource_get_map_ptr, "virgl_renderer_resource_get_map_ptr");
++    VG_SYM(resource_map, "virgl_renderer_resource_map");
++    int r = vg.init(NULL, VG_VENUS | VG_NO_VIRGL | VG_ASYNC_FENCE_CB, &vg_cb);
++    if (r) {
++        log_warn("virtgpu: virgl_renderer_init failed (%d)", r);
++        return false;
++    }
++    log_debug("virtgpu: virglrenderer with Venus ready");
++    return true;
++}
++
++static vg_dev_t *vg_dev_locked(int guest_fd)
++{
++    for (int i = 0; i < VG_MAX_DEVS; i++)
++        if (vg_devs[i].used && vg_devs[i].guest_fd == guest_fd)
++            return &vg_devs[i];
++    return NULL;
++}
++
++static vg_bo_t *vg_bo_locked(vg_dev_t *d, uint32_t handle)
++{
++    for (uint32_t i = 0; i < d->nbos; i++)
++        if (d->bos[i].handle == handle)
++            return &d->bos[i];
++    return NULL;
++}
++
++static void virtgpu_close(int guest_fd)
++{
++    pthread_mutex_lock(&vg_lock);
++    vg_dev_t *d = vg_dev_locked(guest_fd);
++    if (d) {
++        for (uint32_t i = 0; i < d->nbos; i++)
++            vg.resource_unref(d->bos[i].res_id);
++        if (d->ctx_id)
++            vg.context_destroy(d->ctx_id);
++        free(d->bos);
++        memset(d, 0, sizeof(*d));
++    }
++    pthread_mutex_unlock(&vg_lock);
++}
++
++bool virtgpu_is_fd(int guest_fd)
++{
++    pthread_mutex_lock(&vg_lock);
++    bool r = vg_state == 1 && vg_dev_locked(guest_fd) != NULL;
++    pthread_mutex_unlock(&vg_lock);
++    return r;
++}
++
++int64_t virtgpu_open(int linux_flags)
++{
++    (void) linux_flags;
++    pthread_mutex_lock(&vg_lock);
++    if (vg_state == 0)
++        vg_state = vg_load() ? 1 : -1;
++    if (vg_state < 0) {
++        pthread_mutex_unlock(&vg_lock);
++        return -LINUX_ENOENT;
++    }
++    vg_dev_t *d = NULL;
++    for (int i = 0; i < VG_MAX_DEVS && !d; i++)
++        if (!vg_devs[i].used)
++            d = &vg_devs[i];
++    if (!d) {
++        pthread_mutex_unlock(&vg_lock);
++        return -LINUX_EMFILE;
++    }
++    /* The fd's host side is a pipe nobody writes: the node is only ioctl and
++     * mmap, and poll on it never reports anything (no DRM events).
++     */
++    int p[2];
++    if (pipe(p) < 0) {
++        pthread_mutex_unlock(&vg_lock);
++        return linux_errno();
++    }
++    close(p[1]);
++    fcntl(p[0], F_SETFD, FD_CLOEXEC);
++    int gfd = fd_alloc(FD_PIPE, p[0], virtgpu_close);
++    if (gfd < 0) {
++        close(p[0]);
++        pthread_mutex_unlock(&vg_lock);
++        return -LINUX_EMFILE;
++    }
++    memset(d, 0, sizeof(*d));
++    d->used = true;
++    d->guest_fd = gfd;
++    d->next_handle = 1;
++    pthread_mutex_unlock(&vg_lock);
++    log_debug("virtgpu: /dev/dri/renderD128 opened as fd %d", gfd);
++    return gfd;
++}
++
++/* A guest pipe fd for an execbuffer fence: readable once the fence signals. */
++static int64_t vg_fence_fd_locked(vg_dev_t *d, uint32_t ring_idx)
++{
++    int p[2];
++    if (pipe(p) < 0)
++        return linux_errno();
++    fcntl(p[0], F_SETFD, FD_CLOEXEC);
++    fcntl(p[1], F_SETFD, FD_CLOEXEC);
++    int gfd = fd_alloc(FD_PIPE, p[0], NULL);
++    if (gfd < 0) {
++        close(p[0]);
++        close(p[1]);
++        return -LINUX_EMFILE;
++    }
++    vg_fence_t *f = calloc(1, sizeof(*f));
++    if (!f) {
++        close(p[1]);
++        return -LINUX_ENOMEM; /* (the guest fd stays, never readable) */
++    }
++    pthread_mutex_lock(&vg_fence_lock);
++    f->ctx_id = d->ctx_id;
++    f->fence_id = vg_next_fence++;
++    f->wr = p[1];
++    f->next = vg_fences;
++    vg_fences = f;
++    uint64_t id = f->fence_id;
++    pthread_mutex_unlock(&vg_fence_lock);
++    int r = vg.context_create_fence(d->ctx_id, 0, ring_idx, id);
++    if (r) {
++        log_warn("virtgpu: context_create_fence(ring %u) failed (%d)", ring_idx, r);
++        vg_signal(d->ctx_id, id);
++    }
++    return gfd;
++}
++
++static int64_t vg_submit_locked(guest_t *g, vg_dev_t *d, uint64_t gva, uint32_t size)
++{
++    if (!size)
++        return 0;
++    if (size > VG_MAX_CMD || (size & 3))
++        return -LINUX_EINVAL;
++    void *buf = malloc(size);
++    if (!buf)
++        return -LINUX_ENOMEM;
++    if (guest_read(g, gva, buf, size) < 0) {
++        free(buf);
++        return -LINUX_EFAULT;
++    }
++    int r = vg.submit_cmd(buf, (int) d->ctx_id, (int) (size / 4));
++    free(buf);
++    return r ? -LINUX_EINVAL : 0;
++}
++
++static int64_t vg_version(guest_t *g, uint64_t arg)
++{
++    struct drm_version_w v;
++    if (guest_read_small(g, arg, &v, sizeof(v)) < 0)
++        return -LINUX_EFAULT;
++    static const char *strs[3] = {"virtio_gpu", "0", "virtio GPU (elfuse)"};
++    uint64_t *len[3] = {&v.name_len, &v.date_len, &v.desc_len};
++    uint64_t ptr[3] = {v.name, v.date, v.desc};
++    for (int i = 0; i < 3; i++) {
++        size_t n = strlen(strs[i]);
++        if (ptr[i] && *len[i]) {
++            size_t c = n < *len[i] ? n : *len[i];
++            if (guest_write(g, ptr[i], strs[i], c) < 0)
++                return -LINUX_EFAULT;
++        }
++        *len[i] = n;
++    }
++    v.major = 0;
++    v.minor = 1;
++    v.patch = 0;
++    return guest_write_small(g, arg, &v, sizeof(v)) < 0 ? -LINUX_EFAULT : 0;
++}
++
++static int64_t vg_getparam(guest_t *g, uint64_t arg)
++{
++    struct vg_getparam_w p;
++    if (guest_read_small(g, arg, &p, sizeof(p)) < 0)
++        return -LINUX_EFAULT;
++    int32_t v;
++    switch (p.param) {
++    case 1: /* 3D_FEATURES */
++    case 2: /* CAPSET_QUERY_FIX */
++    case 3: /* RESOURCE_BLOB */
++    case 4: /* HOST_VISIBLE */
++    case 6: /* CONTEXT_INIT */
++        v = 1;
++        break;
++    case 7: /* SUPPORTED_CAPSET_IDs */
++        v = 1 << 4; /* Venus */
++        break;
++    case 5: /* CROSS_DEVICE */
++    case 8: /* EXPLICIT_DEBUG_NAME */
++        v = 0;
++        break;
++    default:
++        return -LINUX_EINVAL;
++    }
++    return guest_write_small(g, p.value, &v, sizeof(v)) < 0 ? -LINUX_EFAULT : 0;
++}
++
++static int64_t vg_get_caps(guest_t *g, uint64_t arg)
++{
++    struct vg_get_caps_w c;
++    if (guest_read_small(g, arg, &c, sizeof(c)) < 0)
++        return -LINUX_EFAULT;
++    uint32_t max_ver = 0, max_size = 0;
++    vg.get_cap_set(c.cap_set_id, &max_ver, &max_size);
++    if (!max_size || c.cap_set_ver > max_ver)
++        return -LINUX_EINVAL;
++    void *buf = calloc(1, max_size);
++    if (!buf)
++        return -LINUX_ENOMEM;
++    vg.fill_caps(c.cap_set_id, c.cap_set_ver, buf);
++    uint32_t n = c.size < max_size ? c.size : max_size;
++    int r = guest_write(g, c.addr, buf, n);
++    free(buf);
++    return r < 0 ? -LINUX_EFAULT : 0;
++}
++
++static int64_t vg_context_init(guest_t *g, vg_dev_t *d, uint64_t arg)
++{
++    struct vg_context_init_w c;
++    if (guest_read_small(g, arg, &c, sizeof(c)) < 0)
++        return -LINUX_EFAULT;
++    if (d->ctx_id)
++        return -LINUX_EEXIST;
++    uint32_t capset = 0;
++    for (uint32_t i = 0; i < c.num_params && i < 16; i++) {
++        struct vg_ctx_param_w p;
++        if (guest_read_small(g, c.params + i * sizeof(p), &p, sizeof(p)) < 0)
++            return -LINUX_EFAULT;
++        if (p.param == 1) /* CAPSET_ID */
++            capset = (uint32_t) p.value;
++    }
++    if (capset != 4)
++        return -LINUX_EINVAL;
++    uint32_t id = vg_next_ctx++;
++    int r = vg.context_create_with_flags(id, capset, 6, "elfuse");
++    if (r) {
++        log_warn("virtgpu: context_create_with_flags failed (%d)", r);
++        return -LINUX_EINVAL;
++    }
++    d->ctx_id = id;
++    return 0;
++}
++
++static int64_t vg_create_blob(guest_t *g, vg_dev_t *d, uint64_t arg)
++{
++    struct vg_create_blob_w b;
++    if (guest_read_small(g, arg, &b, sizeof(b)) < 0)
++        return -LINUX_EFAULT;
++    if (!d->ctx_id || b.blob_mem != VG_BLOB_MEM_HOST3D || !b.size)
++        return -LINUX_EINVAL;
++    int64_t sr = vg_submit_locked(g, d, b.cmd, b.cmd_size);
++    if (sr < 0)
++        return sr;
++    if (d->nbos == d->cap) {
++        uint32_t cap = d->cap ? d->cap * 2 : 64;
++        vg_bo_t *n = realloc(d->bos, cap * sizeof(*n));
++        if (!n)
++            return -LINUX_ENOMEM;
++        d->bos = n;
++        d->cap = cap;
++    }
++    struct vg_blob_args a = {
++        .res_handle = vg_next_res++,
++        .ctx_id = d->ctx_id,
++        .blob_mem = b.blob_mem,
++        .blob_flags = b.blob_flags,
++        .blob_id = b.blob_id,
++        .size = b.size,
++    };
++    int r = vg.resource_create_blob(&a);
++    if (r) {
++        log_warn("virtgpu: resource_create_blob(id %llu, %llu bytes) failed (%d)",
++                 (unsigned long long) b.blob_id, (unsigned long long) b.size, r);
++        return -LINUX_EINVAL;
++    }
++    vg_bo_t *bo = &d->bos[d->nbos++];
++    bo->handle = d->next_handle++;
++    bo->res_id = a.res_handle;
++    bo->blob_mem = b.blob_mem;
++    bo->size = b.size;
++    b.bo_handle = bo->handle;
++    b.res_handle = bo->res_id;
++    return guest_write_small(g, arg, &b, sizeof(b)) < 0 ? -LINUX_EFAULT : 0;
++}
++
++static int64_t vg_resource_info(guest_t *g, vg_dev_t *d, uint64_t arg)
++{
++    struct vg_resource_info_w i;
++    if (guest_read_small(g, arg, &i, sizeof(i)) < 0)
++        return -LINUX_EFAULT;
++    vg_bo_t *bo = vg_bo_locked(d, i.bo_handle);
++    if (!bo)
++        return -LINUX_ENOENT;
++    i.res_handle = bo->res_id;
++    i.size = (uint32_t) bo->size;
++    i.blob_mem = bo->blob_mem;
++    return guest_write_small(g, arg, &i, sizeof(i)) < 0 ? -LINUX_EFAULT : 0;
++}
++
++static int64_t vg_map(guest_t *g, vg_dev_t *d, uint64_t arg)
++{
++    struct vg_map_w m;
++    if (guest_read_small(g, arg, &m, sizeof(m)) < 0)
++        return -LINUX_EFAULT;
++    if (!vg_bo_locked(d, m.handle))
++        return -LINUX_ENOENT;
++    m.offset = (uint64_t) m.handle << VG_MAP_SHIFT;
++    return guest_write_small(g, arg, &m, sizeof(m)) < 0 ? -LINUX_EFAULT : 0;
++}
++
++static int64_t vg_execbuffer(guest_t *g, vg_dev_t *d, uint64_t arg, uint32_t argsize)
++{
++    struct vg_execbuffer_w e;
++    memset(&e, 0, sizeof(e));
++    uint32_t n = argsize < sizeof(e) ? argsize : (uint32_t) sizeof(e);
++    if (n < 40 || guest_read_small(g, arg, &e, n) < 0)
++        return -LINUX_EFAULT;
++    if (!d->ctx_id)
++        return -LINUX_EINVAL;
++    int64_t sr = vg_submit_locked(g, d, e.command, e.size);
++    if (sr < 0)
++        return sr;
++    if (e.flags & VG_EXECBUF_FENCE_FD_OUT) {
++        int64_t fd = vg_fence_fd_locked(d, (e.flags & VG_EXECBUF_RING_IDX) ? e.ring_idx : 0);
++        if (fd < 0)
++            return fd;
++        e.fence_fd = (int32_t) fd;
++        if (guest_write_small(g, arg, &e, n) < 0)
++            return -LINUX_EFAULT;
++    }
++    return 0;
++}
++
++static int64_t vg_gem_close(guest_t *g, vg_dev_t *d, uint64_t arg)
++{
++    struct drm_gem_close_w c;
++    if (guest_read_small(g, arg, &c, sizeof(c)) < 0)
++        return -LINUX_EFAULT;
++    for (uint32_t i = 0; i < d->nbos; i++) {
++        if (d->bos[i].handle != c.handle)
++            continue;
++        vg.resource_unref(d->bos[i].res_id);
++        d->bos[i] = d->bos[--d->nbos];
++        return 0;
++    }
++    return -LINUX_EINVAL;
++}
++
++int64_t virtgpu_ioctl(guest_t *g, int guest_fd, uint64_t request, uint64_t arg)
++{
++    uint32_t nr = request & 0xff, type = (request >> 8) & 0xff;
++    uint32_t size = (request >> 16) & 0x3fff;
++    if (type != DRM_TYPE)
++        return -LINUX_ENOTTY;
++    pthread_mutex_lock(&vg_lock);
++    vg_dev_t *d = vg_dev_locked(guest_fd);
++    int64_t r;
++    if (!d) {
++        r = -LINUX_EBADF;
++    } else {
++        switch (nr) {
++        case NR_VERSION: r = vg_version(g, arg); break;
++        case NR_GEM_CLOSE: r = vg_gem_close(g, d, arg); break;
++        case NR_GET_CAP: {
++            struct drm_get_cap_w c;
++            if (guest_read_small(g, arg, &c, sizeof(c)) < 0) { r = -LINUX_EFAULT; break; }
++            c.value = 0; /* no PRIME, no syncobjs, no dumb buffers */
++            r = guest_write_small(g, arg, &c, sizeof(c)) < 0 ? -LINUX_EFAULT : 0;
++            break;
++        }
++        case NR_VG_GETPARAM: r = vg_getparam(g, arg); break;
++        case NR_VG_GET_CAPS: r = vg_get_caps(g, arg); break;
++        case NR_VG_CONTEXT_INIT: r = vg_context_init(g, d, arg); break;
++        case NR_VG_CREATE_BLOB: r = vg_create_blob(g, d, arg); break;
++        case NR_VG_RESOURCE_INFO: r = vg_resource_info(g, d, arg); break;
++        case NR_VG_MAP: r = vg_map(g, d, arg); break;
++        case NR_VG_EXECBUFFER: r = vg_execbuffer(g, d, arg, size); break;
++        case NR_VG_TRANSFER_FROM_HOST:
++        case NR_VG_TRANSFER_TO_HOST:
++        case NR_VG_WAIT: r = 0; break; /* blobs are shared memory: nothing to move or wait for */
++        default:
++            log_debug("virtgpu: ioctl nr 0x%x not handled", nr);
++            r = -LINUX_ENOTTY;
++        }
++    }
++    pthread_mutex_unlock(&vg_lock);
++    if (r < 0 && r != -LINUX_ENOTTY)
++        log_debug("virtgpu: ioctl nr 0x%x -> %lld", nr, (long long) r);
++    return r;
++}
++
++int64_t virtgpu_mmap(guest_t *g,
++                     uint64_t addr,
++                     uint64_t length,
++                     int prot,
++                     int flags,
++                     int guest_fd,
++                     int64_t offset)
++{
++    (void) addr;
++    if (flags & (LINUX_MAP_FIXED | LINUX_MAP_FIXED_NOREPLACE))
++        return -LINUX_EINVAL;
++    if (!(flags & LINUX_MAP_SHARED))
++        return -LINUX_EINVAL;
++    uint32_t handle = (uint32_t) ((uint64_t) offset >> VG_MAP_SHIFT);
++    pthread_mutex_lock(&vg_lock);
++    vg_dev_t *d = vg_dev_locked(guest_fd);
++    vg_bo_t *bo = d ? vg_bo_locked(d, handle) : NULL;
++    if (!bo || length > bo->size + (1u << 16)) {
++        pthread_mutex_unlock(&vg_lock);
++        return -LINUX_EINVAL;
++    }
++    void *ptr = NULL;
++    uint64_t p64 = 0, msize = 0;
++    if (vg.resource_get_map_ptr && vg.resource_get_map_ptr(bo->res_id, &p64) == 0)
++        ptr = (void *) (uintptr_t) p64;
++    if (!ptr && vg.resource_map)
++        vg.resource_map(bo->res_id, &ptr, &msize);
++    uint32_t res = bo->res_id;
++    pthread_mutex_unlock(&vg_lock);
++    if (!ptr) {
++        log_warn("virtgpu: resource %u has no host memory to map", res);
++        return -LINUX_EINVAL;
++    }
++    int64_t r = mmap_host_ptr(g, ptr, length, prot);
++    log_debug("virtgpu: mmap handle %u (resource %u, %llu bytes) -> 0x%llx", handle, res,
++              (unsigned long long) length, (unsigned long long) r);
++    return r;
++}
+diff --git a/src/syscall/virtgpu.h b/src/syscall/virtgpu.h
+new file mode 100644
+index 0000000..dd878b2
+--- /dev/null
++++ b/src/syscall/virtgpu.h
+@@ -0,0 +1,39 @@
++/*
++ * virtio-gpu render node (/dev/dri/renderD128) over virglrenderer
++ *
++ * Copyright 2026 elfuse contributors
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * The guest's Mesa Venus Vulkan driver talks to /dev/dri/renderD128 with the
++ * virtio-gpu DRM ioctls. Each ioctl is answered by virglrenderer with Venus
++ * running in this process (MoltenVK -> Metal on macOS), loaded with dlopen so
++ * elfuse runs without it. Blob memory reaches the guest through
++ * mmap_host_ptr (mem.c).
++ */
++
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "core/guest.h"
++
++/* open("/dev/dri/renderD128"). Returns the guest fd or -LINUX_*. */
++int64_t virtgpu_open(int linux_flags);
++
++/* True when guest_fd is an open render node. */
++bool virtgpu_is_fd(int guest_fd);
++
++/* ioctl on a render node fd. */
++int64_t virtgpu_ioctl(guest_t *g, int guest_fd, uint64_t request, uint64_t arg);
++
++/* mmap on a render node fd: offset is the cookie DRM_IOCTL_VIRTGPU_MAP gave.
++ * Caller holds mmap_lock.
++ */
++int64_t virtgpu_mmap(guest_t *g,
++                     uint64_t addr,
++                     uint64_t length,
++                     int prot,
++                     int flags,
++                     int guest_fd,
++                     int64_t offset);
