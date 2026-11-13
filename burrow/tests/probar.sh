@@ -19,5 +19,7 @@ if ! grep -q 'HILOS:' hilos.txt; then
   tail -300 hilos-v.txt > hilos-v-final.txt; echo "(elfuse's log for hilos: hilos-v-final.txt)"
 fi
 corre busybox "" $E ./busybox sh -c 'echo hola desde busybox; ls / | head -3; uname -a; seq 3 | wc -l'
+corre gpu-mac "" ./virgl-prueba
+grep -q 'VIRGL: TODO BIEN' gpu-mac.txt || r=1
 echo
 [ $r = 0 ] && echo "BURROW: TODO BIEN" || echo "BURROW: ALGO FALLÓ"

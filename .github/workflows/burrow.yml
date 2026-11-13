@@ -27,6 +27,8 @@ jobs:
           file out/prueba-static out/prueba-dynamic
           for p in out/prueba-static out/prueba-dynamic; do env -u TMPDIR BURROW_TEST=madriguera $p uno dos | tee "$p.esperado"; done
           out/root/hilos | tee out/hilos.esperado
+      - name: GPU test system (Mesa Venus, vulkaninfo, vkcube)
+        run: bash burrow/gpu/sysroot-linux.sh "$PWD/out/gpu-root"
       - uses: actions/upload-artifact@v4
         with: { name: burrow-tests, path: out, retention-days: 30 }
   mac:
@@ -39,6 +41,15 @@ jobs:
           brew install binutils > /dev/null
           bash burrow/build.sh 2> err.txt || { grep -m20 "error" err.txt | while read -r l; do echo "::error::$l"; done; cat err.txt; exit 1; }
           grep -m20 "warning" err.txt | while read -r l; do echo "::warning::$l"; done || true
+      - name: GPU, Mac side (virglrenderer with Venus + MoltenVK)
+        run: |
+          brew install meson ninja pkg-config libepoxy molten-vk > /dev/null
+          bash burrow/gpu/build-virgl.sh
+          v=burrow/build/virgl
+          clang -O2 -o "$v/virgl-prueba" burrow/gpu/virgl-prueba.c -I"$v/include/virgl" -L"$v/lib" -lvirglrenderer -Wl,-rpath,@executable_path/lib
+          DYLD_LIBRARY_PATH="$v/lib:$(brew --prefix)/lib" "$v/virgl-prueba" | tee virgl.txt || true
+          grep -q 'VIRGL: TODO BIEN' virgl.txt && echo "::notice::GPU: virglrenderer + Venus + MoltenVK start on this Mac ($(grep capset virgl.txt))" \
+            || echo "::warning::GPU: virglrenderer + Venus didn't start on this GitHub Mac (no real GPU?)"
       - uses: actions/download-artifact@v4
         with: { name: burrow-tests, path: tests }
       - name: Run (if this Mac allows the Hypervisor framework)
@@ -55,7 +66,20 @@ jobs:
           [ $r = 0 ] && echo "::notice::Burrow: the test programs run the same as on Linux" || { echo "::error::Burrow: the tests don't match Linux"; exit 1; }
       - name: Package for a real Mac
         run: |
-          mkdir -p pkg && cp burrow/build/elfuse pkg/ && cp burrow/tests/probar.sh pkg/ && cp -R tests/. pkg/ && chmod +x pkg/elfuse pkg/probar.sh pkg/prueba-* pkg/busybox pkg/root/prueba pkg/root/hilos
+          mkdir -p pkg/lib && cp burrow/build/elfuse pkg/
+          # GPU: virglrenderer and what it needs from Homebrew (MoltenVK, libepoxy), next to the test program
+          cp burrow/build/virgl/virgl-prueba pkg/ && cp -L burrow/build/virgl/lib/libvirglrenderer*.dylib pkg/lib/
+          cp -L "$(brew --prefix)/lib/libMoltenVK.dylib" "$(brew --prefix)/lib/libepoxy.0.dylib" pkg/lib/
+          # (they look for each other next to the program, not in Homebrew; then signed again)
+          for f in pkg/lib/*.dylib; do chmod u+w "$f"; install_name_tool -id "@rpath/$(basename "$f")" "$f" 2>/dev/null; done
+          for f in pkg/virgl-prueba pkg/lib/*.dylib; do
+            for dep in $(otool -L "$f" | awk 'NR>1 {print $1}' | grep -E 'virglrenderer|MoltenVK|epoxy'); do
+              install_name_tool -change "$dep" "@rpath/$(basename "$dep")" "$f" 2>/dev/null
+            done
+            install_name_tool -add_rpath @loader_path "$f" 2>/dev/null || true
+            codesign -f -s - "$f"
+          done
+          otool -L pkg/virgl-prueba pkg/lib/*.dylib | grep -v ':$' | sort -u && cp burrow/tests/probar.sh pkg/ && cp -R tests/. pkg/ && chmod +x pkg/elfuse pkg/probar.sh pkg/prueba-* pkg/busybox pkg/root/prueba pkg/root/hilos
           tar -czf burrow-prueba.tar.gz -C pkg .
       - uses: actions/upload-artifact@v4
         with: { name: burrow-prueba, path: burrow-prueba.tar.gz, retention-days: 30 }
