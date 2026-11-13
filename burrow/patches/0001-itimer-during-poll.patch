@@ -1,0 +1,33 @@
+diff --git a/src/syscall/poll.c b/src/syscall/poll.c
+index 5b6294d..8c30469 100644
+--- a/src/syscall/poll.c
++++ b/src/syscall/poll.c
+@@ -652,6 +652,12 @@ ppoll_retry:
+         if (s->unpollable_count > 0)
+             s->unpollable_ready = poll_eval_unpollable(s->unpollable, nfds);
+ 
++        /* ITIMER_REAL is virtual and only becomes a pending SIGALRM when it is
++         * checked; the syscall epilogue that would do it cannot run while the
++         * thread waits here, so alarm() followed by pause() never woke.
++         */
++        signal_check_timer_real();
++
+         /* A signal already pending when the wait starts ends it after one
+          * non-blocking pass, the way Linux do_poll() finds it on its first
+          * pass; parked instead, the wait would sit out a slice before looking.
+@@ -1447,6 +1453,7 @@ pselect_retry:
+          * see ppoll. Parked instead, the wait would sit out a slice before
+          * looking, and a finite wait has no wakeup pipe to cut that short.
+          */
++        signal_check_timer_real(); /* see ppoll */
+         int slice_ms =
+             signal_pending_interruption(NULL) ? 0 : poll_slice_ms(deadline_ms);
+         struct timespec slice_ts = {.tv_sec = slice_ms / 1000,
+@@ -3138,6 +3145,7 @@ epoll_rewait:
+          * see ppoll. Parked instead, the wait would sit out a slice before
+          * looking.
+          */
++        signal_check_timer_real(); /* see ppoll */
+         int slice_ms = (hup_ready || signal_pending_interruption(NULL))
+                            ? 0
+                            : poll_slice_ms(deadline_ms);
