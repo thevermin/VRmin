@@ -21,6 +21,8 @@ Uso:
   vrjuegos.py listar                   todos los juegos con su detección y perfil (JSON, lo usa la app)
   vrjuegos.py intento APPID RUNTIME    se abrió con ese runtime (todavía sin imagen)
   vrjuegos.py exito APPID              el juego mandó imagen: ese runtime anda
+  vrjuegos.py agregar RUTA_EXE [NOMBRE] agrega un juego de fuera de Steam (muestra su id, «p-…»)
+  vrjuegos.py quitar ID                saca de la lista un juego de fuera de Steam (sus archivos quedan)
 
 Funciona con el python3 que trae macOS (3.9): sin sintaxis nueva.
 """
@@ -38,6 +40,7 @@ PREFIJO = os.path.join(DATOS, "prefijo")
 C = os.path.join(PREFIJO, "drive_c")
 STEAMAPPS = os.path.join(C, "Program Files (x86)", "Steam", "steamapps")
 PERFILES = os.path.join(DATOS, "perfiles")
+PROPIOS = os.path.join(DATOS, "juegos_propios.json")   # juegos de fuera de Steam: [{id, nombre, exe (ruta en la Mac)}]
 DETECTADO = os.path.join(PERFILES, "detectado")
 
 RUNTIMES = ["auto", "openxr", "openvr", "steamvr", "oculus", "plano"]
@@ -52,6 +55,7 @@ NOMBRES = {
 # Idioma de los mensajes: inglés (por defecto) o español; lo pasa VRmin Host en VRMIN_LANG
 IDIOMA = "es" if os.environ.get("VRMIN_LANG") == "es" else "en"
 EN = {
+    "No es un .exe: %s": "That isn't an .exe: %s",
     "Automático": "Automatic",
     "OpenVR (OpenComposite)": "OpenVR (OpenComposite)",
     "SteamVR real": "Real SteamVR",
@@ -138,7 +142,7 @@ def juegos_instalados():
     try:
         archivos = os.listdir(STEAMAPPS)
     except Exception:
-        return out
+        archivos = []
     for f in archivos:
         if not (f.startswith("appmanifest_") and f.endswith(".acf")):
             continue
@@ -150,6 +154,18 @@ def juegos_instalados():
         if os.path.isdir(ruta):
             out[appid] = {"id": appid, "nombre": d.get("name", carpeta), "carpeta": ruta,
                           "actualizado": d.get("LastUpdated", d.get("buildid", ""))}
+    out.update(juegos_propios())
+    return out
+
+
+def juegos_propios():
+    """Los juegos de fuera de Steam que se agregaron (los que todavía existen)"""
+    out = {}
+    for j in leer_json(PROPIOS, {}).get("juegos", []):
+        exe = j.get("exe", "")
+        if j.get("id") and os.path.isfile(exe):
+            out[j["id"]] = {"id": j["id"], "nombre": j.get("nombre") or os.path.basename(exe), "carpeta": os.path.dirname(exe),
+                            "exe": os.path.basename(exe), "propio": True, "actualizado": str(int(os.path.getmtime(exe)))}
     return out
 
 
@@ -261,6 +277,8 @@ def deteccion(juego, forzar=False):
         if vr is not None:
             d["vr"] = vr
         guardar_json(ruta, d)
+    if juego.get("propio"):
+        d["vr"] = True   # (se agregó como juego de VR; no está en la tienda de Steam)
     if d.get("vr") is None:
         vr = vr_en_steam(juego["id"])
         if vr is not None:
@@ -358,6 +376,8 @@ def resolver_juego(juego, det=None):
     env.update(usr.get("env", {}))
     lanzar = usr.get("lanzar") or inc.get("lanzar") or "steam"
     exe = usr.get("exe") or inc.get("exe") or det.get("exe", "")
+    if juego.get("propio"):   # de fuera de Steam: siempre directo, con el .exe que se eligió
+        lanzar, exe = "directo", juego["exe"]
     return {
         "id": appid, "nombre": juego["nombre"], "carpeta": juego["carpeta"],
         "pedido": pedido, "runtime": runtime, "avisos": avisos,
@@ -458,6 +478,33 @@ def cmd_listar():
                       "opencomposite": opencomposite_instalado()}, ensure_ascii=False))
 
 
+def cmd_agregar(exe, nombre):
+    exe = os.path.abspath(exe)
+    if not (os.path.isfile(exe) and exe.lower().endswith(".exe")):
+        sys.exit(T("No es un .exe: %s") % exe)
+    datos = leer_json(PROPIOS, {})
+    lista = datos.get("juegos", [])
+    for j in lista:
+        if j.get("exe") == exe:
+            print(j["id"])
+            return
+    if not nombre:   # el nombre de la carpeta del juego, salvo que sea una genérica
+        carpeta = os.path.basename(os.path.dirname(exe))
+        nombre = carpeta if carpeta.lower() not in ("bin", "binaries", "win64", "x64", "game", "downloads", "descargas") \
+            else os.path.splitext(os.path.basename(exe))[0]
+    nuevo = "p-%d" % int(time.time() * 1000)
+    lista.append({"id": nuevo, "nombre": nombre, "exe": exe})
+    datos["juegos"] = lista
+    guardar_json(PROPIOS, datos)
+    print(nuevo)
+
+
+def cmd_quitar(id_):
+    datos = leer_json(PROPIOS, {})
+    datos["juegos"] = [j for j in datos.get("juegos", []) if j.get("id") != id_]
+    guardar_json(PROPIOS, datos)
+
+
 def cmd_controles_oc(carpeta, *destinos):
     """OpenComposite no entiende el modo «grab» de los controles de Touch (agarrar con el grip): ese botón quedaba sin
     nada (en Half-Life 2: VR Mod no se podía agarrar). Se arma, a partir de los controles de Touch del propio juego, una
@@ -517,6 +564,10 @@ def main(a):
         cmd_intento(a[1], a[2])
     elif len(a) >= 2 and a[0] == "exito":
         cmd_exito(a[1])
+    elif len(a) >= 2 and a[0] == "agregar":
+        cmd_agregar(a[1], a[2] if len(a) > 2 else "")
+    elif len(a) >= 2 and a[0] == "quitar":
+        cmd_quitar(a[1])
     elif len(a) >= 2 and a[0] == "controles_oc":
         cmd_controles_oc(*a[1:])
     else:
