@@ -83,6 +83,18 @@ if [ ! -f "$DXMT_DIR/x86_64-unix/winemetal.so" ]; then
   bajar "$DXMT_URL" dxmt.tar.gz "$DXMT_SHA"
   mkdir -p "$DXMT_DIR" && tar -xzf dxmt.tar.gz -C "$DXMT_DIR" && rm dxmt.tar.gz
 fi
+# Espera a que terminen los programas de este Windows, hasta $1 segundos (por defecto 120): si alguno sigue abierto
+# (Steam, por ejemplo), se cierra, así la instalación nunca queda esperando para siempre
+esperar_wine() {
+  "$WINESERVER" -w 2>/dev/null & local w=$!
+  for _ in $(seq 1 "${1:-120}"); do kill -0 $w 2>/dev/null || return 0; sleep 1; done
+  "$WINESERVER" -k 2>/dev/null; sleep 2; kill $w 2>/dev/null; return 0
+}
+# Lo que haya quedado abierto en este Windows con el motor de antes (Steam, un juego) se cierra antes de tocarlo
+if [ -f "$WINEPREFIX/system.reg" ] && [ -x "$WINESERVER" ]; then
+  "$WINESERVER" -k 2>/dev/null || true
+  esperar_wine 15
+fi
 paso "Instalando DXMT dentro del motor" "Installing DXMT into the engine"
 for f in d3d11.dll dxgi.dll d3d10core.dll winemetal.dll; do
   dst="$WINEDIR/lib/wine/x86_64-windows/$f"
@@ -94,7 +106,7 @@ cp "$DXMT_DIR/x86_64-unix/winemetal.so" "$WINEDIR/lib/wine/x86_64-unix/winemetal
 if [ ! -f "$WINEPREFIX/system.reg" ]; then
   paso "Creando el Windows de QuestVRBridge (1-2 minutos)" "Creating VRmin's Windows (1-2 minutes)"
   R=0; WINEDEBUG=err+all,warn+module "$WINE" wineboot -i > "$P/logs/wineboot.log" 2>&1 || R=$?
-  "$WINESERVER" -w || true
+  esperar_wine 180
   # Un Windows bien creado tiene un registro de varios MB: si quedó casi vacío, wineboot falló aunque no lo diga
   if [ $R -ne 0 ] || [ "$(stat -f %z "$WINEPREFIX/system.reg" 2>/dev/null || echo 0)" -lt 100000 ]; then
     say "Falló la creación del Windows (código $R). Detalle en logs/wineboot.log:" "Creating the Windows failed (code $R). Details in logs/wineboot.log:"
@@ -105,7 +117,7 @@ if [ ! -f "$WINEPREFIX/system.reg" ]; then
 elif [ "$(cat "$WINEPREFIX/.wine_usado" 2>/dev/null)" != "$MARCA_MOTOR" ]; then
   paso "Actualizando el Windows al motor nuevo (se conservan Steam y los juegos)" "Updating the Windows to the new engine (Steam and games are kept)"
   "$WINE" wineboot -u > "$P/logs/wineboot.log" 2>&1 || true
-  "$WINESERVER" -w || true
+  esperar_wine 120
   echo "$MARCA_MOTOR" > "$WINEPREFIX/.wine_usado"
 fi
 
@@ -119,7 +131,7 @@ if [ -f "$RES/openxr/questvrbridge_openxr32.dll" ]; then
   cp "$RES/openxr/questvrbridge_openxr32.dll" "$RES/openxr/questvrbridge_openxr32.json" "$Q/"
   "$WINE" reg add 'HKLM\Software\Wow6432Node\Khronos\OpenXR\1' /v ActiveRuntime /t REG_SZ /d 'C:\questvrbridge\questvrbridge_openxr32.json' /f && touch "$Q/.runtime32"
 fi
-"$WINESERVER" -w
+esperar_wine 60
 
 paso "OpenComposite (para juegos de SteamVR/OpenVR)" "OpenComposite (for SteamVR/OpenVR games)"
 # (el que viene con VRmin Host, compilado por VRmin desde el código de GameNative: ver opencomposite/README.md)

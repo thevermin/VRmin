@@ -95,6 +95,18 @@ jobs:
           S=$(stat -f %z "$QVB_DATA/prefijo/system.reg" 2>/dev/null || echo 0)
           [ "$S" -gt 100000 ] || { echo "::error::wineboot no creó el Windows ($S bytes)"; exit 1; }
           echo "::notice::Windows creado ($S bytes) · $(cat "$QVB_DATA/prefijo/.wine_usado" 2>/dev/null)"
+          # Actualizar el motor con un programa de Wine abierto (como Steam, que puede quedar abierto de antes): no se
+          # tiene que trabar
+          echo "gcenx-11.8+dxmt-notpop1" > "$QVB_DATA/prefijo/.wine_usado"
+          ( source mac/app/recursos/entorno.sh; unset DYLD_INSERT_LIBRARIES; "$WINE" notepad > /dev/null 2>&1 & )
+          sleep 8
+          t0=$(date +%s); bash mac/app/recursos/instalar_motor.sh > upd.txt 2>&1 & up=$!
+          for i in $(seq 1 300); do kill -0 $up 2>/dev/null || break; sleep 1; done
+          if kill -0 $up 2>/dev/null; then
+            tail -20 upd.txt | while read -r l; do echo "::warning::upd: $l"; done
+            echo "::error::La actualización del motor quedó trabada con un programa de Wine abierto"; kill $up; exit 1
+          fi
+          echo "::notice::Actualización del motor con un programa de Wine abierto: $(( $(date +%s) - t0 )) s · $(cat "$QVB_DATA/prefijo/.wine_usado")"
           source mac/app/recursos/entorno.sh
           unset DYLD_INSERT_LIBRARIES
           "$WINE" d3d/d3dshare.exe > d3d.txt 2>&1 &
