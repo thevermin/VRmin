@@ -1,6 +1,6 @@
 name: Publicar versión
-# Arma la versión en GitHub (como borrador) con la app del Quest que compiló «App del Quest» en main y VRmin para
-# Windows («VRmin para Windows»)
+# Arma la versión en GitHub (como borrador) con la app del Quest que compiló «App del Quest» en main, VRmin para
+# Windows («VRmin para Windows») y VRmin para Linux («VRmin para Linux»)
 # (las notas salen de docs/releases/<etiqueta>.md).
 # La app de Mac NO sale de acá: se arma en la Mac de VRmin con «bash crear_app.sh --paquete» (firmada con el
 # certificado fijo de VRmin; el actualizador de VRmin Host rechaza otra firma) y se sube a mano al borrador antes
@@ -30,6 +30,9 @@ jobs:
           # VRmin para Windows (si ya hay uno compilado)
           win=$(gh run list -R "$GITHUB_REPOSITORY" --workflow windows.yml --branch main --limit 10 --json databaseId,conclusion -q '[.[] | select(.conclusion == "success")][0].databaseId')
           [ -n "$win" ] && gh run download "$win" -R "$GITHUB_REPOSITORY" -n VRmin-Windows -D out || echo "Sin VRmin para Windows"
+          # VRmin para Linux (beta, si ya hay uno compilado)
+          lin=$(gh run list -R "$GITHUB_REPOSITORY" --workflow linux.yml --branch main --limit 10 --json databaseId,conclusion -q '[.[] | select(.conclusion == "success")][0].databaseId')
+          [ -n "$lin" ] && gh run download "$lin" -R "$GITHUB_REPOSITORY" -n VRmin-Linux -D out || echo "Sin VRmin para Linux"
           # El DXMT que baja instalar_motor.sh, si lo pide de esta versión: el último compilado («DXMT para VRmin»),
           # solo si es exactamente el que espera (su SHA-256)
           url=$(grep -o '^DXMT_URL="[^"]*' mac/app/recursos/instalar_motor.sh | sed 's/^DXMT_URL="//')

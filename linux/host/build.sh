@@ -3,6 +3,7 @@
 # en Ubuntu/Debian, «sudo apt install g++ libavcodec-dev libavutil-dev libpulse-dev libx11-dev libxext-dev libxtst-dev libxrandr-dev libxcomposite-dev»): ./build.sh  →  build/vrmin-host
 # La ventana usa WebKitGTK («sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev», o la 4.0); sin eso, queda sin ventana.
 # (el runtime de OpenXR y OpenComposite van al lado, en build/: ../runtime/build.sh y ../opencomposite/build.sh)
+# VRMIN_FFMPEG_STATIC=1 (con PKG_CONFIG_PATH en un FFmpeg estático): FFmpeg queda dentro del programa (../paquete.sh)
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p build
@@ -26,6 +27,6 @@ fi
 g++ -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -pthread -o build/vrmin-host \
   main.cpp common.cpp quest.cpp game.cpp messages.cpp convert.cpp encoder.cpp games.cpp vrsetup.cpp pendiente.cpp ui.cpp \
   desktop.cpp windows.cpp audio.cpp mic.cpp \
-  $(pkg-config --cflags --libs libavcodec libavutil libpulse-simple libpulse) \
+  $(pkg-config ${VRMIN_FFMPEG_STATIC:+--static} --cflags --libs libavcodec libavutil) $(pkg-config --cflags --libs libpulse-simple libpulse) \
   $(pkg-config --cflags --libs x11 xext xtst xrandr xcomposite) ${UI[@]+"${UI[@]}"}
 echo "build/vrmin-host"

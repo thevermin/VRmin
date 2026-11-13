@@ -1,0 +1,46 @@
+name: VRmin para Linux
+# Arma «VRmin Linux <versión>.tar.gz» (linux/paquete.sh): VRmin Host, el runtime de OpenXR y OpenComposite. Al armar
+# una versión, «Publicar versión» lo agrega solo. (Ubuntu 22.04: anda en distribuciones de 2022 en adelante)
+on:
+  push:
+    branches: [main]
+    paths: ['linux/**', 'mac/openxr/questvrbridge_openxr.c', 'mac/opencomposite/*.patch', 'mac/opencomposite/COMMIT', '.github/workflows/linux.yml']
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Herramientas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++ git cmake python3 pkg-config nasm libva-dev libx264-dev libpulse-dev \
+            libx11-dev libxext-dev libxtst-dev libxrandr-dev libxcomposite-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libvulkan-dev libgl-dev xvfb >/dev/null
+      - name: Armar el paquete
+        run: |
+          set -e
+          bash linux/paquete.sh "$RUNNER_TEMP/out"
+          f=$(ls "$RUNNER_TEMP"/out/VRmin\ Linux\ *.tar.gz)
+          echo "TGZ=$f" >> "$GITHUB_ENV"
+          ls -laR "$RUNNER_TEMP/out/VRmin Linux"
+      - name: Probar
+        run: |
+          set -e
+          d="$RUNNER_TEMP/out/VRmin Linux"
+          # FFmpeg va adentro: no tiene que pedir el del sistema
+          ldd "$d/vrmin-host" | tee ldd.txt
+          ! grep -q 'not found' ldd.txt
+          ! grep -q 'libavcodec' ldd.txt
+          ldd "$d/runtime/libvrmin_openxr.so" | grep 'not found' && exit 1 || true
+          # Que abra (con una pantalla de mentira), instale el runtime y OpenComposite, y cierre bien
+          mkdir -p ~/.steam/steam
+          xvfb-run -a timeout -s TERM 15 "$d/vrmin-host" || true
+          cat ~/.local/share/VRmin/VRmin.log
+          grep -q 'VRmin Host for Linux' ~/.local/share/VRmin/VRmin.log
+          grep -q 'VRmin Host closed' ~/.local/share/VRmin/VRmin.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VRmin-Linux
+          path: ${{ env.TGZ }}
+          retention-days: 30

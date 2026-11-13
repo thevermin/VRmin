@@ -41,4 +41,10 @@ jobs:
             unzip -q VRmin*Windows*.zip -d w
             [ -f "w/VRmin Windows/VRmin Host.exe" ] && [ -f "w/VRmin Windows/runtime/questvrbridge_openxr.dll" ] || mal "Al .zip de Windows le falta VRmin Host.exe o el runtime"
           fi
+          lins=$(ls | grep -c '^VRmin[ .]Linux.*\.tar\.gz$' || true)
+          if [ "$lins" -gt 0 ]; then
+            [ "$lins" = 1 ] || mal "Hay $lins .tar.gz de VRmin para Linux"
+            mkdir l && tar -xzf VRmin*Linux*.tar.gz -C l
+            [ -f "l/VRmin Linux/vrmin-host" ] && [ -f "l/VRmin Linux/runtime/libvrmin_openxr.so" ] && [ -f "l/VRmin Linux/OpenComposite/bin/linux64/vrclient.so" ] || mal "Al .tar.gz de Linux le falta vrmin-host, el runtime u OpenComposite"
+          fi
           echo "::notice::$TAG: app de Mac $v firmada con el certificado de VRmin, una sola app del Quest ($(ls *.apk))"
