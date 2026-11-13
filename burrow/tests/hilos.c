@@ -21,6 +21,7 @@ static volatile sig_atomic_t got;
 static void handler(int s) { got = s; }
 
 int main(void) {
+  setvbuf(stdout, NULL, _IOLBF, 0);   // (each line right away: if something hangs, the last one says where)
   pthread_t t[8];
   int ok = 1;
   for (long i = 0; i < 8; i++) ok &= pthread_create(&t[i], NULL, worker, (void *)i) == 0;

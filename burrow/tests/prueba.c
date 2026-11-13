@@ -17,6 +17,7 @@ static void check(const char *name, int ok, const char *why) {
 }
 
 int main(int argc, char **argv) {
+  setvbuf(stdout, NULL, _IOLBF, 0);
   check("args", argc == 3 && !strcmp(argv[1], "uno") && !strcmp(argv[2], "dos"), "argv");
   check("env", getenv("BURROW_TEST") && !strcmp(getenv("BURROW_TEST"), "madriguera"), "BURROW_TEST");
 
