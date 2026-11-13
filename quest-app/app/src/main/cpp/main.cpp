@@ -962,6 +962,11 @@ static float jsonNum(const std::string &t, const char *key) {
     size_t p = t.find(key);
     return p == std::string::npos ? 0.f : (float)atof(t.c_str() + p + strlen(key));
 }
+// Vibración que pide el juego (llega por la red, se aplica en el próximo cuadro). dur en ms (< 0 = la mínima),
+// amp 0..1 (0 = parar), freq en Hz (0 = la del control).
+struct Haptic { bool pending = false; float dur = 0, amp = 0, freq = 0; };
+static Haptic g_haptic[2];
+static std::mutex g_hapticLock;
 struct Vigia {
     bool calibrated = false;
     float calMid[3] = {0, 0, 0}, calHead[3] = {0, 0, 0};
@@ -1713,6 +1718,13 @@ static void networkLoop() {
                     }
                     else if (t.find("\"panels\"") != std::string::npos) receivePanels(t);
                     else if (t.find("\"exitvr\"") != std::string::npos) g_exitVR = true;
+                    else if (t.find("\"type\":\"haptic\"") != std::string::npos) {
+                        int h = (int)jsonNum(t, "\"hand\":");
+                        if (h == 0 || h == 1) {
+                            std::lock_guard<std::mutex> lk(g_hapticLock);
+                            g_haptic[h] = {true, jsonNum(t, "\"dur\":"), jsonNum(t, "\"amp\":"), jsonNum(t, "\"freq\":")};
+                        }
+                    }
                     else if (t.find("\"type\":\"mic\"") != std::string::npos) micSet(t.find("\"on\":true") != std::string::npos);
                     else if (t.find("\"config\"") != std::string::npos) {
                         size_t q = t.find("\"fps\":");
@@ -1839,7 +1851,7 @@ struct App {
 
     XrActionSet actionSet = XR_NULL_HANDLE;
     XrAction aGrip, aAim, aTrigger, aSqueeze, aStick, aStickClick, aStickTouch, aTrigTouch,
-             aA, aB, aATouch, aBTouch, aMenu;
+             aA, aB, aATouch, aBTouch, aMenu, aHaptic;
     XrPath hand[2];
     XrSpace gripSpace[2], aimSpace[2];
 
@@ -2365,6 +2377,7 @@ static bool initXR(App &app) {
     app.aATouch = makeAction(app, "touch_a", XR_ACTION_TYPE_BOOLEAN_INPUT);
     app.aBTouch = makeAction(app, "touch_b", XR_ACTION_TYPE_BOOLEAN_INPUT);
     app.aMenu = makeAction(app, "menu", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    app.aHaptic = makeAction(app, "haptic", XR_ACTION_TYPE_VIBRATION_OUTPUT);
 
     std::vector<XrActionSuggestedBinding> b;
     auto sug = [&](XrAction act, const char *pth) { b.push_back({act, path(app, pth)}); };
@@ -2378,6 +2391,7 @@ static bool initXR(App &app) {
         sug(app.aStick, (base + "/input/thumbstick").c_str());
         sug(app.aStickClick, (base + "/input/thumbstick/click").c_str());
         sug(app.aStickTouch, (base + "/input/thumbstick/touch").c_str());
+        sug(app.aHaptic, (base + "/output/haptic").c_str());
     }
     sug(app.aA, "/user/hand/left/input/x/click");
     sug(app.aB, "/user/hand/left/input/y/click");
@@ -8462,6 +8476,22 @@ static void fgUpdate(App &app, bool compensateHead) {
     g_fg.updates++;
 }
 
+static void applyHaptics(App &app) {
+    Haptic h[2];
+    { std::lock_guard<std::mutex> lk(g_hapticLock); h[0] = g_haptic[0]; h[1] = g_haptic[1]; g_haptic[0].pending = g_haptic[1].pending = false; }
+    for (int i = 0; i < 2; i++) {
+        if (!h[i].pending) continue;
+        XrHapticActionInfo hi{XR_TYPE_HAPTIC_ACTION_INFO};
+        hi.action = app.aHaptic; hi.subactionPath = app.hand[i];
+        if (h[i].amp <= 0) { xrStopHapticFeedback(app.session, &hi); continue; }
+        XrHapticVibration v{XR_TYPE_HAPTIC_VIBRATION};
+        v.duration = h[i].dur < 0 ? XR_MIN_HAPTIC_DURATION : (XrDuration)(h[i].dur * 1e6);
+        v.amplitude = h[i].amp > 1 ? 1 : h[i].amp;
+        v.frequency = h[i].freq > 0 ? h[i].freq : XR_FREQUENCY_UNSPECIFIED;
+        xrApplyHapticFeedback(app.session, &hi, (const XrHapticBaseHeader *)&v);
+    }
+}
+
 static void renderFrame(App &app) {
     XrFrameState fs{XR_TYPE_FRAME_STATE};
     if (XR_FAILED(xrWaitFrame(app.session, nullptr, &fs))) return;
@@ -8471,6 +8501,7 @@ static void renderFrame(App &app) {
     XrActionsSyncInfo si{XR_TYPE_ACTIONS_SYNC_INFO};
     si.countActiveActionSets = 1; si.activeActionSets = &aas;
     xrSyncActions(app.session, &si);
+    applyHaptics(app);
 
     // Salida de emergencia, también durante un juego: los dos joysticks apretados 1,5 segundos
     if (getBool(app, app.aStickClick, 0) && getBool(app, app.aStickClick, 1)) {

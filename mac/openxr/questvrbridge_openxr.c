@@ -363,8 +363,8 @@ static int send_all(SOCKET s, const char *p, int n) {
 
 static void send_packet(uint8_t type, const void *a, uint32_t alen, const void *b, uint32_t blen) {
     if (g_sock == INVALID_SOCKET) return;
-    if (type == 3 || type == 7) {
-        /* Los mensajes de log nunca esperan: si la conexión está ocupada, solo van al archivo */
+    if (type == 3 || type == 7 || type == 14) {
+        /* Los mensajes de log (y la vibración) nunca esperan: si la conexión está ocupada, solo van al archivo */
         if (!TryEnterCriticalSection(&g_sendlock)) return;
     } else {
         EnterCriticalSection(&g_sendlock);
@@ -4527,8 +4527,45 @@ XRAPI_ATTR XrResult XRAPI_CALL rt_xrGetInputSourceLocalizedName(XrSession s, con
     return XR_SUCCESS;
 }
 
-XRAPI_ATTR XrResult XRAPI_CALL rt_xrApplyHapticFeedback(XrSession s, const XrHapticActionInfo *i, const XrHapticBaseHeader *h) { (void)s; (void)i; (void)h; return XR_SUCCESS; }
-XRAPI_ATTR XrResult XRAPI_CALL rt_xrStopHapticFeedback(XrSession s, const XrHapticActionInfo *i) { (void)s; (void)i; return XR_SUCCESS; }
+/* Vibración: va al Quest como un mensaje (tipo 14) por cada mano que tenga la acción en el perfil actual.
+   dur en ms (-1 = la mínima), amp 0..1 (0 = parar), freq en Hz (0 = la del control). */
+static void send_haptic(Session *s, const XrHapticActionInfo *i, double durMs, float amp, float freq) {
+    Action *a = (Action *)i->action;
+    int si = sub_index(i->subactionPath);
+    if (si < 0) return;
+    int hands = 0;
+    EnterCriticalSection(&g_lock);
+    for (int j = 0; j < a->nall; j++) {
+        if (a->all[j].profile != s->profile) continue;
+        const char *b = path_str(a->all[j].binding);
+        if (!strstr(b, "/output/haptic")) continue;
+        int h = strstr(b, "/user/hand/left/") ? 1 : strstr(b, "/user/hand/right/") ? 2 : 0;
+        if (h && (si == 0 || si == h)) hands |= h;
+    }
+    LeaveCriticalSection(&g_lock);
+    for (int h = 0; h < 2; h++) {
+        if (!(hands & (1 << h))) continue;
+        char m[128];
+        int n = snprintf(m, sizeof m, "{\"type\":\"haptic\",\"hand\":%d,\"dur\":%.1f,\"amp\":%.3f,\"freq\":%.1f}", h, durMs, amp, freq);
+        send_packet(14, m, (uint32_t)n, NULL, 0);
+    }
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL rt_xrApplyHapticFeedback(XrSession s, const XrHapticActionInfo *i, const XrHapticBaseHeader *h) {
+    if (((Action *)i->action)->type != XR_ACTION_TYPE_VIBRATION_OUTPUT) return XR_ERROR_ACTION_TYPE_MISMATCH;
+    if (h->type != XR_TYPE_HAPTIC_VIBRATION) return XR_SUCCESS;
+    const XrHapticVibration *v = (const XrHapticVibration *)h;
+    double ms = v->duration <= 0 ? -1.0 : (double)v->duration / 1e6;
+    if (ms > 10000) ms = 10000;
+    float amp = v->amplitude < 0 ? 0 : v->amplitude > 1 ? 1 : v->amplitude;
+    send_haptic((Session *)s, i, ms, amp, v->frequency > 0 ? v->frequency : 0);
+    return XR_SUCCESS;
+}
+XRAPI_ATTR XrResult XRAPI_CALL rt_xrStopHapticFeedback(XrSession s, const XrHapticActionInfo *i) {
+    if (((Action *)i->action)->type != XR_ACTION_TYPE_VIBRATION_OUTPUT) return XR_ERROR_ACTION_TYPE_MISMATCH;
+    send_haptic((Session *)s, i, -1.0, 0, 0);
+    return XR_SUCCESS;
+}
 
 /* --- Cuando reemplazamos openxr_loader.dll --- */
 XRAPI_ATTR XrResult XRAPI_CALL rt_xrInitializeLoaderKHR(const void *info) { (void)info; init_once(); logmsg("xrInitializeLoaderKHR (modo loader)"); return XR_SUCCESS; }

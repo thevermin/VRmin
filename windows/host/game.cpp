@@ -154,6 +154,7 @@ static void readLoop(SOCKET s) {
         switch (b[0]) {
         case 3: logmsg("[game] %.*s", (int)n - 1, (const char *)b + 1); break;
         case 7: perfSetRuntime(std::string((const char *)b + 1, n - 1)); break;
+        case 14: questSendText(std::string((const char *)b + 1, n - 1)); break;   // vibración de un control
         case 9: {
             profilesBegin(std::string((const char *)b + 1, n - 1));
             std::lock_guard<std::mutex> g(cLock);

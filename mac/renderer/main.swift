@@ -1128,6 +1128,8 @@ final class GameLink {
         didSet { if halfRate != oldValue { sendLine(Data(configLine.utf8)); print("[juego] Generación de cuadros \(halfRate ? "activada: el juego dibuja a \(FPS / 2) cuadros/s" : "apagada: el juego dibuja a \(FPS) cuadros/s")") } }
     }
     var configLine: String { GameProfiles.shared.configLine(fps: halfRate ? FPS / 2 : FPS, hello: false) }
+    /// Mensajes para la app del Quest (la vibración de los controles)
+    var sendNative: (Data) -> Void = { _ in }
     /// Todas las conexiones de juegos abiertas (puede haber copias viejas en segundo plano).
     private var clients: [Int32: Int] = [:]      // fd -> envíos fallidos seguidos
     private let lock = NSLock()
@@ -1366,6 +1368,9 @@ final class GameLink {
             switch buf[0] {
             case 3:
                 print("[juego] " + (String(bytes: buf[1..<n], encoding: .utf8) ?? "?"))
+            case 14:
+                // Vibración de un control: el runtime ya la manda como mensaje para el Quest
+                var d = Data([3]); d.append(contentsOf: buf[1..<n]); sendNative(d)
             case 7:
                 Perf.shared.setRuntime(Data(buf[1..<n]))
                 GameProfiles.shared.autoTick(Data(buf[1..<n]))
@@ -4325,6 +4330,7 @@ Link.mirror = { native.send($0) }
 HeadCam.shared.send = { var d = Data([3]); d.append(Data($0.utf8)); native.send(d) }
 renderer.lobby?.isNative = { native.isConnected }
 renderer.lobby?.sendNative = { native.send($0) }
+game.sendNative = { native.send($0) }
 native.onConnect = { renderQueue.async { renderer.lobby?.mode2D = false; renderer.lobby?.uiInHeadset = false; renderer.lobby?.stopWindows() }; renderer.lobby?.requestResend() }
 renderer.lobby?.queue = renderQueue
 if #available(macOS 14.2, *), let a = audioTap as? AudioTap {
