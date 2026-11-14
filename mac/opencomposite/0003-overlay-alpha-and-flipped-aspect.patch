@@ -1,8 +1,19 @@
 diff --git a/OpenOVR/Reimpl/BaseOverlay.cpp b/OpenOVR/Reimpl/BaseOverlay.cpp
-index 50a80b4..1fbf96c 100644
+index 50a80b4..29931de 100644
 --- a/OpenOVR/Reimpl/BaseOverlay.cpp
 +++ b/OpenOVR/Reimpl/BaseOverlay.cpp
-@@ -120,10 +120,11 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
+@@ -23,7 +23,9 @@ class BaseOverlay::OverlayData {
+ public:
+ 	const string key;
+ 	string name;
+-	HmdColor_t colour;
++	// VRmin: white and opaque until the game changes it, like in SteamVR (it was left uninitialized, and overlays
++	// with no opacity are hidden: those of games that never set it, like HL2 VR's menu, could disappear)
++	HmdColor_t colour = { 1, 1, 1, 1 };
+ 
+ 	float widthMeters = 1; // default 1 meter
+ 
+@@ -120,10 +122,11 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
  			if (!overlay.visible || overlay.texture.handle == nullptr)
  				continue;
  
@@ -18,7 +29,7 @@ index 50a80b4..1fbf96c 100644
  
  			if ((uint64_t)overlay.layerQuad.subImage.swapchain == 0) {
  				continue;
-@@ -137,7 +138,9 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
+@@ -137,7 +140,9 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
  			}
  
  			// Calculate the texture's aspect ratio
