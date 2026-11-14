@@ -205,6 +205,7 @@ static uint32_t pose_for(const HmdMatrix34_t &m, double *dist) {
 }
 // VRmin Host's settings for the game ("config" line): size of an eye, frames per second, part of the field of view
 static std::atomic<int> g_cfgEyeW{0}, g_cfgEyeH{0}, g_cfgFps{0};
+static std::atomic<int> g_cfgNativeW{0}, g_cfgNativeH{0};   // (the Quest's own resolution per eye, from VRmin Host)
 static std::atomic<float> g_cfgFovK{1.f};
 
 static void parse_pose(const char *line) {
@@ -250,6 +251,8 @@ static void parse_config(const char *line) {
   if ((p = strstr(line, "\"eyeH\":")) && atoi(p + 7) >= 256 && atoi(p + 7) <= 4096) g_cfgEyeH = atoi(p + 7);
   if ((p = strstr(line, "\"fovk\":")) && atof(p + 7) >= 0.6 && atof(p + 7) <= 1.0) g_cfgFovK = (float)atof(p + 7);
   if ((p = strstr(line, "\"fps\":")) && atoi(p + 6) >= 30 && atoi(p + 6) <= 144) g_cfgFps = atoi(p + 6);
+  int nw = (p = strstr(line, "\"nw\":")) ? atoi(p + 5) : 0, nh = (p = strstr(line, "\"nh\":")) ? atoi(p + 5) : 0;
+  if (nw >= 256 && nw <= 8192 && nh >= 256 && nh <= 8192) { g_cfgNativeW = nw; g_cfgNativeH = nh; }
 }
 
 // The display's size, rate and field of view can't change once SteamVR has the headset: before adding it, this waits
@@ -261,7 +264,11 @@ static void wait_display() {
     if (g_cfgFps && t.valid) break;
     Sleep(20);
   }
+  // The headset's resolution is the Quest's own (as SteamVR's 100 % on Windows): SteamVR chooses how much of it the
+  // games draw (automatically, from how fast the GPU is, or with its resolution setting), and VRmin Host scales the
+  // image to the stream's size. Without the Quest's model, VRmin Host's resolution.
   if (g_cfgFps && g_cfgEyeW) { EYE_W = g_cfgEyeW; EYE_H = g_cfgEyeH; HZ = (float)g_cfgFps; }
+  if (g_cfgFps && g_cfgNativeW) { EYE_W = g_cfgNativeW; EYE_H = g_cfgNativeH; }
   if (t.valid) {
     float k = g_cfgFovK;
     for (int e = 0; e < 2; e++) {

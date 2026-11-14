@@ -968,6 +968,19 @@ final class Renderer {
 }
 
 
+/// El modelo del Quest conectado (Build.MODEL, del mensaje con que se empareja) y la resolución por ojo que recomienda
+/// su OpenXR
+enum QuestModel {
+    static var name = ""
+    static var nativeEye: (w: Int, h: Int)? {
+        let n = name.lowercased()
+        if n.contains("quest 3s") || n.contains("quest 2") { return (1832, 1920) }
+        if n.contains("quest 3") { return (2064, 2208) }
+        if n.contains("quest pro") { return (1800, 1920) }
+        return nil
+    }
+}
+
 // MARK: - Ajustes avanzados por juego
 /// Escala de render (el juego dibuja menos píxeles y MetalFX lo agranda), escala automática (se ajusta sola entre
 /// sesiones según los cuadros por segundo), campo de visión recortado y emular controles de Index. Hay unos para todos
@@ -1014,12 +1027,16 @@ final class GameProfiles {
         lock.lock(); activeK = e.fovk; lock.unlock()
         print("[juego] Ajustes de «\(key)»: escala \(Int(e.scale * 100)) %\(e.auto ? " (automática)" : ""), campo de visión \(Int(e.fovk * 100)) %\(e.index ? ", controles de Index" : "")\(e.vive ? ", controles de Vive" : "")")
     }
-    /// La línea "config" para el runtime (con «pv»: son los ajustes de este juego)
+    /// La línea "config" para el runtime (con «pv»: son los ajustes de este juego). «nw»/«nh»: la resolución de la
+    /// pantalla del Quest por ojo (la que recomienda su OpenXR), para el driver de SteamVR: con SteamVR real la resolución
+    /// del juego la elige SteamVR sobre esa base (su 100 % es el mismo que en Windows); la imagen que viaja al Quest
+    /// sigue siendo la de los ajustes del Host (el Host la escala)
     func configLine(fps: Int, hello: Bool) -> String {
         let e = effective(current)
         let eye = max(256, Int((Double(EYE) * e.scale * e.fovk / 8).rounded()) * 8)
+        let native = QuestModel.nativeEye.map { ",\"nw\":\($0.w),\"nh\":\($0.h)" } ?? ""
         // «vg»: Modo Centinela (el runtime adelanta las poses al momento en que se ve el cuadro: no hay reproyección)
-        return "{\"type\":\"config\",\"eye\":\(eye),\"fps\":\(fps),\"fovk\":\(String(format: "%.3f", e.fovk)),\"index\":\(e.index ? 1 : 0),\"vive\":\(e.vive ? 1 : 0),\"vg\":\(Vigia.shared.on ? 1 : 0)\(hello ? ",\"pv\":1" : "")}"
+        return "{\"type\":\"config\",\"eye\":\(eye),\"fps\":\(fps),\"fovk\":\(String(format: "%.3f", e.fovk)),\"index\":\(e.index ? 1 : 0),\"vive\":\(e.vive ? 1 : 0),\"vg\":\(Vigia.shared.on ? 1 : 0)\(native)\(hello ? ",\"pv\":1" : "")}"
     }
     /// Desde el Quest: cambiar lo de un juego ("game": el abierto; "key:<carpeta>": cualquiera) o lo de todos ("all"),
     /// o volver a lo de todos
@@ -3986,7 +4003,7 @@ final class NativeLink {
                     if n > 0, n < 4096, let body = readExact(c, n),
                        let o = try? JSONSerialization.jsonObject(with: body) as? [String: Any], (o["type"] as? String) == "auth" {
                         switch pairing.check(o, ip: ip) {
-                        case .ok(let t): authOK = true; newToken = t
+                        case .ok(let t): authOK = true; newToken = t; QuestModel.name = (o["device"] as? String) ?? 
                         case .needCode(let wrong):
                             var m = Data([3]); m.append(Data("{\"type\":\"auth\",\"ok\":false,\"need\":\"code\",\"wrong\":\(wrong)}".utf8))
                             var len = UInt32(m.count).bigEndian
