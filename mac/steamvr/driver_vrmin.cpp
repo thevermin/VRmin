@@ -508,6 +508,14 @@ private:
   // Draws each layer over the game's image in the slot (each eye in its half)
   void draw_overlays(ID3D11Texture2D *dst, uint32_t ew, uint32_t eh, const std::vector<Overlay> &over) {
     if (over.empty()) return;
+    static int layerShots;
+    if (copies > 600 && layerShots < 1) {   // (one look at the first layer over the game's, alone: steamvr_cuadro_3.bmp)
+      layerShots++;
+      D3D11_TEXTURE2D_DESC d;
+      over[0].tex[0]->GetDesc(&d);
+      logf("Layer over the game's image: %ux%u, format %d", d.Width, d.Height, (int)d.Format);
+      snapshot(over[0].tex[0], d, 3);
+    }
     if (!blendState) blendState = blend_init() ? 1 : -1;
     if (blendState < 0) return;
     for (const Overlay &o : over)
@@ -892,7 +900,7 @@ public:
     now.swap(prevLayers);
     prevLayers.swap(layers);
     // The game's image: the first layer from a game's textures. SteamVR's own image under it (vrcompositor.exe's) comes
-    // out a single color inside VRmin's Windows and isn't used; the game's layers after it are drawn over it
+    // out a single color inside VRmin's Windows and isn't used; the layers after it are drawn over it
     int base = -1;
     for (size_t k = 0; k < now.size() && base < 0; k++) {
       int i;
@@ -911,9 +919,7 @@ public:
         for (int e = 0; e < 2; e++) {
           int i;
           Set *st = find(now[k].eye[e].hTexture, &i);
-          // (SteamVR's own layers aren't drawn yet: inside VRmin's Windows everything vrcompositor.exe draws comes out a
-          //  single color)
-          if (!st || st->compositor) { ok = false; break; }
+          if (!st) { ok = false; break; }
           o.tex[e] = st->tex[i];
           const VRTextureBounds_t &tb = now[k].eye[e].bounds;
           o.rect[e][0] = tb.uMin; o.rect[e][1] = tb.vMin; o.rect[e][2] = tb.uMax; o.rect[e][3] = tb.vMax;
