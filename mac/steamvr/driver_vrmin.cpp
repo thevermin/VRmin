@@ -390,8 +390,8 @@ public:
   std::atomic<uint64_t> sent{0}, dropped{0};
 
 private:
-  // A look at frames 300, 2000 and 5000: their average color in the log and a picture in
-  // C:\questvrbridge\steamvr_cuadro_N.bmp (a quarter of the size), to see what SteamVR draws
+  // A look at frame 300 and then every 1500: their average color in the log and a picture in
+  // C:\questvrbridge\steamvr_cuadro_N.bmp (a quarter of the size), to see what the game draws
   void snapshot(ID3D11Texture2D *s, const D3D11_TEXTURE2D_DESC &sd, int k) {
     D3D11_TEXTURE2D_DESC d = sd;
     d.MipLevels = 1; d.ArraySize = 1; d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_STAGING;
@@ -649,10 +649,10 @@ public:
     pendingW = sd.Width / 2;
     pendingH = sd.Height;
     ++copies;
-    if (copies == 300 || copies == 2000 || copies == 5000) {
+    if (copies == 300 || copies % 1500 == 0) {   // (1: at the start; 2: the latest, every ~30 s)
       D3D11_TEXTURE2D_DESC d;
       tex[slot]->GetDesc(&d);
-      snapshot(tex[slot], d, copies == 300 ? 1 : copies == 2000 ? 2 : 3);
+      snapshot(tex[slot], d, copies == 300 ? 1 : 2);
     }
   }
 
@@ -972,6 +972,13 @@ public:
             logf("Quest pose %u: head %.3f %.3f %.3f, left hand %s %.3f %.3f %.3f, right hand %s %.3f %.3f %.3f", t.id, (t.eye[0][0] + t.eye[1][0]) / 2,
                  (t.eye[0][1] + t.eye[1][1]) / 2, (t.eye[0][2] + t.eye[1][2]) / 2, t.handValid[0] ? "yes" : "no", t.aim[0][0], t.aim[0][1], t.aim[0][2],
                  t.handValid[1] ? "yes" : "no", t.aim[1][0], t.aim[1][1], t.aim[1][2]);
+            // What SteamVR has for the three devices
+            TrackedDevicePose_t sv[3] = {};
+            VRServerDriverHost()->GetRawTrackedDevicePoses(0, sv, 3);
+            for (int i = 0; i < 3; i++)
+              logf("  SteamVR device %d: valid %d, connected %d, tracking %d, at %.3f %.3f %.3f", i, sv[i].bPoseIsValid, sv[i].bDeviceIsConnected,
+                   (int)sv[i].eTrackingResult, sv[i].mDeviceToAbsoluteTracking.m[0][3], sv[i].mDeviceToAbsoluteTracking.m[1][3],
+                   sv[i].mDeviceToAbsoluteTracking.m[2][3]);
           }
           hmd.update(t);
           leftHand.update(t);
