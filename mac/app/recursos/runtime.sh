@@ -136,12 +136,13 @@ PY
 # SteamVR en C:\questvrbridge\openvr\config (solo los usa VRmin): solo el visor de VRmin, sin pedir armar la sala
 # (el driver da el área de juego), sin las paredes del área de juego (el Quest tiene las suyas) y sin SteamVR Home.
 # El menú de SteamVR (botón de menú del control izquierdo), sin su ventana en la Mac. Sus paneles son páginas web que
-# Chromium dibuja en la placa de video y SteamVR le pasa a su compositor (DXMT con reshare-opened-textures.patch; sin
-# eso el menú quedaba negro). Dibujados sin la placa (forceCEFMode cpu) necesitan OpenGL, que vrwebhelper no puede
-# crear dentro de Wine. Steam no se conecta a SteamVR (ajustes_dll, en entorno.sh: dentro de Wine se colgaba).
-# useNewDesktop false: el menú mostraba el escritorio de Windows con la forma de Windows 10 (Graphics Capture), que
-# Wine no tiene, y se cerraba y volvía a abrir todo el tiempo. allowDisplayLockedMode: dentro de Wine, SteamVR cree
-# que la sesión de Windows está bloqueada y en vez de dibujar llenaba todo de un color verde azulado
+# Chromium dibuja en la placa de video y SteamVR le pasa a su compositor (necesita el DXMT de VRmin con
+# reshare-opened-textures, keyed-mutex, dxgi-usage y offscreen-swapchain). Dibujados sin la placa (forceCEFMode cpu)
+# necesitan OpenGL, que vrwebhelper no puede crear dentro de Wine. Steam no se conecta a SteamVR (ajustes_dll, en
+# entorno.sh: dentro de Wine se colgaba). useNewDesktop false: el menú mostraba el escritorio de Windows con la forma de
+# Windows 10 (Graphics Capture), que Wine no tiene, y se cerraba y volvía a abrir todo el tiempo. allowDisplayLockedMode:
+# dentro de Wine, SteamVR cree que la sesión de Windows está bloqueada y en vez de dibujar llenaba todo de un color
+# verde azulado
 poner_driver_steamvr() {
   local d sha
   for d in "$RES/steamvr/driver_vrmin" "$RES/../../steamvr/driver_vrmin"; do [ -f "$d/bin/win64/driver_vrmin.dll" ] && break; done
@@ -163,7 +164,6 @@ ajustes_steamvr() {
    "driver_null" : { "enable" : false },
    "dashboard" : { "useNewDesktop" : false, "showDesktop" : false },
    "collisionBounds" : { "CollisionBoundsColorGammaA" : 0, "CollisionBoundsFadeDistance" : 0 },
-   "VRWebHelper" : { "DebuggerEnabled" : true, "DebuggerPort" : 8087 },
    "steamvr" : {
       "requireHmd" : true,
       "forcedDriver" : "vrmin",
@@ -189,9 +189,7 @@ abrir_steamvr() {
   cerrar_steamvr   # (uno a medio abrir o sin el driver de VRmin)
   rm -f "$Q/driver_vrmin.log"
   say "Abriendo SteamVR…" "Opening SteamVR…"
-  # (lo que escriben SteamVR, Wine y DXMT, con los errores de cada proceso: para ver por qué se cierra el proceso de la
-  #  placa de video de los paneles del menú)
-  DXMT_VRMIN_TRACE=1 WINEDEBUG=+pid,+seh,+loaddll "$WINE" "$STEAMVR_WIN\\bin\\win64\\vrstartup.exe" >"$P/logs/steamvr_wine.log" 2>&1 < /dev/null &
+  WINEDEBUG=-all "$WINE" "$STEAMVR_WIN\\bin\\win64\\vrstartup.exe" >/dev/null 2>&1 < /dev/null &
   local i
   for i in $(seq 1 120); do
     grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null && { say "SteamVR listo" "SteamVR ready"; return 0; }
