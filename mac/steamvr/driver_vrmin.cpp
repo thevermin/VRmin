@@ -378,7 +378,7 @@ static DXGI_FORMAT typeless(DXGI_FORMAT f) {
 struct Overlay {
   ID3D11Texture2D *tex[2];
   float rect[2][4];               // the part of each eye's texture used (u, v from - to)
-  float dst[4] = {0, 0, 1, 1};    // where in the eye it goes (x, y, width, height, as fractions)
+  float dst[2][4] = {{0, 0, 1, 1}, {0, 0, 1, 1}};   // where in each eye it goes (x, y, width, height, as fractions)
 };
 
 // Draws a texture over part of another (alpha blending): what SteamVR's compositor does with the layers on Windows
@@ -491,7 +491,8 @@ private:
         ID3D11RenderTargetView *rtv = nullptr;
         ID3D11ShaderResourceView *srv = nullptr;
         if (SUCCEEDED(dev->CreateRenderTargetView(dst, &rv, &rtv)) && SUCCEEDED(dev->CreateShaderResourceView(o.tex[e], &sv, &srv))) {
-          D3D11_VIEWPORT vp = {e * ew + o.dst[0] * ew, o.dst[1] * eh, o.dst[2] * ew, o.dst[3] * eh, 0, 1};
+          const float *dd = o.dst[e];
+          D3D11_VIEWPORT vp = {e * ew + dd[0] * ew, dd[1] * eh, dd[2] * ew, dd[3] * eh, 0, 1};
           ctx->UpdateSubresource(cb, 0, nullptr, o.rect[e], 0, 0);
           ctx->OMSetRenderTargets(1, &rtv, nullptr);
           ctx->OMSetBlendState(blend, nullptr, 0xffffffff);
@@ -975,7 +976,14 @@ public:
           Overlay o;
           o.tex[0] = o.tex[1] = mt;
           for (int e = 0; e < 2; e++) { o.rect[e][0] = 0; o.rect[e][1] = 0; o.rect[e][2] = 1; o.rect[e][3] = 1; }
-          o.dst[0] = 0.15f; o.dst[1] = 0.45f; o.dst[2] = 0.7f; o.dst[3] = 0.11f;
+          // (straight ahead in each eye: the eyes' fields of view aren't centered, so the same place in both images
+          //  would be seen double; 1 x 0.16 in tangents, a little below the middle)
+          for (int e = 0; e < 2; e++) {
+            const float *f = FOV[e];   // left, right, «top» (lower edge), «bottom» (upper edge)
+            float w = 1.0f / (f[1] - f[0]), h = 0.16f / (f[3] - f[2]);
+            float cx = -f[0] / (f[1] - f[0]), cy = (f[3] + 0.15f) / (f[3] - f[2]);
+            o.dst[e][0] = cx - w / 2; o.dst[e][1] = cy - h / 2; o.dst[e][2] = w; o.dst[e][3] = h;
+          }
           over.push_back(o);
         }
       }

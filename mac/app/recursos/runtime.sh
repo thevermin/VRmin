@@ -135,8 +135,9 @@ PY
 # SteamVR real: el driver de VRmin (el que viene con VRmin Host, copiado al motor cuando cambia) y los ajustes de
 # SteamVR en C:\questvrbridge\openvr\config (solo los usa VRmin): solo el visor de VRmin, sin pedir armar la sala
 # (el driver da el área de juego), sin las paredes del área de juego (el Quest tiene las suyas) y sin SteamVR Home.
-# useNewDesktop false: el menú de SteamVR muestra el escritorio de Windows con la forma de Windows 10 (Graphics
-# Capture), que Wine no tiene, y se cerraba y volvía a abrir todo el tiempo; con la anterior arranca.
+# Sin el menú de SteamVR ni su ventana todavía: con el menú, Steam se conecta a SteamVR para mostrar sus paneles y se
+# cuelga dentro de Wine. useNewDesktop false: el menú mostraba el escritorio de Windows con la forma de Windows 10
+# (Graphics Capture), que Wine no tiene, y se cerraba y volvía a abrir todo el tiempo.
 # allowDisplayLockedMode: dentro de Wine, SteamVR cree que la sesión de Windows está bloqueada y en vez de dibujar
 # llenaba todo de un color verde azulado
 poner_driver_steamvr() {
@@ -152,7 +153,7 @@ ajustes_steamvr() {
   cat > "$Q/openvr/config/steamvr.vrsettings" <<'JSON'
 {
    "driver_null" : { "enable" : false },
-   "dashboard" : { "useNewDesktop" : false, "showDesktop" : false },
+   "dashboard" : { "enableDashboard" : false, "useNewDesktop" : false, "showDesktop" : false },
    "collisionBounds" : { "CollisionBoundsColorGammaA" : 0, "CollisionBoundsFadeDistance" : 0 },
    "steamvr" : {
       "requireHmd" : true,
@@ -160,6 +161,8 @@ ajustes_steamvr() {
       "activateMultipleDrivers" : false,
       "enableHomeApp" : false,
       "showMirrorView" : false,
+      "startMonitorFromAppLaunch" : false,
+      "startDashboardFromAppLaunch" : false,
       "startOverlayAppsFromDashboard" : false,
       "allowDisplayLockedMode" : true
    }
@@ -167,26 +170,15 @@ ajustes_steamvr() {
 JSON
 }
 
-# SteamVR real, abierto antes que el juego y con el visor y los controles de VRmin ya agregados: si el juego lo abre él
-# mismo, se conecta antes de que cargue el driver, arma sus controles sin dispositivos y se queda sin controles
-# (si ya está abierto y con los controles de VRmin, se usa el mismo: el juego nuevo se conecta en el momento)
+# SteamVR real: si quedó abierto de antes con los controles de VRmin, el juego nuevo lo usa; si no, se cierra lo que haya
+# quedado (uno a medio cerrar le daba al juego dispositivos viejos y se quedaba sin controles) y lo abre el juego.
+# (Abrirlo antes que el juego no anduvo: por fuera de Steam, Steam abría otro y se colgaba; por Steam, Steam se conecta a
+#  SteamVR para mostrar sus paneles y se cuelga dentro de Wine)
 abrir_steamvr() {
   if pgrep -f 'vrserver.exe' >/dev/null 2>&1 && grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null; then
     say "SteamVR ya está abierto" "SteamVR is already open"; return 0
   fi
-  cerrar_steamvr   # (uno a medio abrir o sin el driver de VRmin)
-  rm -f "$Q/driver_vrmin.log"
-  say "Abriendo SteamVR…" "Opening SteamVR…"
-  # (lo abre Steam, como en una PC: así Steam sabe que SteamVR está abierto y después abre el juego sin intentar abrir
-  #  otro SteamVR, que chocaba con este y colgaba a Steam. vrserver solo no sirve: no carga los drivers hasta que algún
-  #  programa se le conecta)
-  WINEDEBUG=-all "$WINE" "C:\\Program Files (x86)\\Steam\\steam.exe" -applaunch 250820 >> "$P/logs/steam.log" 2>&1 < /dev/null &
-  local i
-  for i in $(seq 1 120); do
-    grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null && { say "SteamVR listo" "SteamVR ready"; return 0; }
-    sleep 0.5
-  done
-  say "SteamVR tardó en abrir; abro el juego igual" "SteamVR took long to open; opening the game anyway"
+  cerrar_steamvr
 }
 
 # Cierra SteamVR (y deja de vigilar el juego que lo usaba)
