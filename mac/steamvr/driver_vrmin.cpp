@@ -190,7 +190,7 @@ struct ShmHdr {
 typedef UINT KMT_HANDLE;
 struct KMT_OPENADAPTERFROMLUID { LUID luid; KMT_HANDLE hAdapter; };
 struct KMT_CREATEDEVICE {
-  KMT_HANDLE hAdapter; UINT Flags; KMT_HANDLE hDevice; void *pCommandBuffer; UINT CommandBufferSize;
+  union { KMT_HANDLE hAdapter; void *pAdapter; }; UINT Flags; KMT_HANDLE hDevice; void *pCommandBuffer; UINT CommandBufferSize;
   void *pAllocationList; UINT AllocationListSize; void *pPatchLocationList; UINT PatchLocationListSize;
 };
 struct KMT_QUERYRESOURCEINFO {
