@@ -72,6 +72,7 @@ EN = {
     "el driver de VRmin para SteamVR": "the VRmin driver for SteamVR",
     "SteamVR (instalalo desde Steam) y el driver de VRmin": "SteamVR (install it from Steam) and the VRmin driver",
     "SteamVR real: falta %s. Se usa OpenVR": "Real SteamVR: missing %s. Using OpenVR",
+    "SteamVR real todavía no anda con juegos que usan Vulkan: se usa %s": "Real SteamVR doesn't work with Vulkan games yet: using %s",
     "Falta OpenComposite: reinstalá el motor desde la app": "OpenComposite is missing: reinstall the engine from the app",
     "El juego %s no está instalado en el Steam de VRmin\n": "Game %s isn't installed in VRmin's Steam\n",
     "APIs: %s · motor: %s%s": "APIs: %s · engine: %s%s",
@@ -356,6 +357,11 @@ def resolver_juego(juego, det=None):
         falta = T("el driver de VRmin para SteamVR") if steamvr_instalado() else T("SteamVR (instalalo desde Steam) y el driver de VRmin")
         avisos.append(T("SteamVR real: falta %s. Se usa OpenVR") % falta)
         runtime = "openvr"
+    # SteamVR real solo recibe imágenes de DirectX 11 dentro del Windows de VRmin: los juegos que dibujan con Vulkan
+    # (Half-Life 2: VR Mod) le mandan imágenes que no puede abrir
+    if runtime == "steamvr" and any(str(a).lower() in ("-vulkan", "-force-vulkan") for a in list(inc.get("args", [])) + list(usr.get("args", []))):
+        avisos.append(T("SteamVR real todavía no anda con juegos que usan Vulkan: se usa %s") % NOMBRES[inc.get("runtime") or "openvr"])
+        runtime = inc.get("runtime") or "openvr"
     if runtime == "openvr" and not opencomposite_instalado():
         avisos.append(T("Falta OpenComposite: reinstalá el motor desde la app"))
 

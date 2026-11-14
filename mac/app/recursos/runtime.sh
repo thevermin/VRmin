@@ -170,8 +170,12 @@ JSON
 
 # SteamVR real, abierto antes que el juego y con el visor y los controles de VRmin ya agregados: si el juego lo abre él
 # mismo, se conecta antes de que cargue el driver, arma sus controles sin dispositivos y se queda sin controles
+# (si ya está abierto y con los controles de VRmin, se usa el mismo: el juego nuevo se conecta en el momento)
 abrir_steamvr() {
-  if pgrep -f 'vrserver.exe' >/dev/null 2>&1 && grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null; then return 0; fi
+  if pgrep -f 'vrserver.exe' >/dev/null 2>&1 && grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null; then
+    say "SteamVR ya está abierto" "SteamVR is already open"; return 0
+  fi
+  cerrar_steamvr   # (uno a medio abrir o sin el driver de VRmin)
   rm -f "$Q/driver_vrmin.log"
   say "Abriendo SteamVR…" "Opening SteamVR…"
   WINEDEBUG=-all "$WINE" "$STEAMVR_WIN\\bin\\win64\\vrserver.exe" >/dev/null 2>&1 < /dev/null &
@@ -183,12 +187,23 @@ abrir_steamvr() {
   say "SteamVR tardó en abrir; abro el juego igual" "SteamVR took long to open; opening the game anyway"
 }
 
+# Cierra SteamVR (y deja de vigilar el juego que lo usaba)
+cerrar_steamvr() {
+  local v; v="$(cat "$Q/.vigia_steamvr" 2>/dev/null)"
+  [ -n "$v" ] && kill "$v" 2>/dev/null; rm -f "$Q/.vigia_steamvr"
+  pgrep -f 'vrserver.exe' >/dev/null 2>&1 || return 0
+  local p; for p in vrmonitor vrcompositor vrdashboard vrwebhelper vrserver vrstartup; do pkill -f "$p.exe" 2>/dev/null; done
+  sleep 2
+}
+
 # Cierra SteamVR cuando el juego se cierra (si no, sigue dibujando y calentando la Mac): espera a que aparezca algún
 # programa de la carpeta del juego (hasta 5 minutos) y, cuando ya no queda ninguno durante 30 segundos, cierra SteamVR.
 # (con una pausa así, un juego que abre otro, como The Lab con Robot Repair, no lo cierra)
 cerrar_steamvr_con_el_juego() {
   local carpeta="$1"
   [ -n "$carpeta" ] || return 0
+  local v; v="$(cat "$Q/.vigia_steamvr" 2>/dev/null)"
+  [ -n "$v" ] && kill "$v" 2>/dev/null   # (el que vigilaba el juego anterior: SteamVR ahora es de este)
   (
     export FILTRO="steamapps\\common\\$carpeta" FILTRO2="steamapps/common/$carpeta"
     abierto() { ps -axo command= | awk 'BEGIN { f = tolower(ENVIRON["FILTRO"]); g = tolower(ENVIRON["FILTRO2"]) } index(tolower($0), f) || index(tolower($0), g) { n++ } END { exit !n }'; }
@@ -204,7 +219,9 @@ cerrar_steamvr_con_el_juego() {
         break
       fi
     done
+    rm -f "$Q/.vigia_steamvr"
   ) > /dev/null 2>&1 < /dev/null &
+  echo $! > "$Q/.vigia_steamvr"
   disown 2>/dev/null || true
 }
 

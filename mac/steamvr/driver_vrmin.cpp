@@ -1028,13 +1028,29 @@ public:
   void *GetComponent(const char *) override { return nullptr; }
   void DebugRequest(const char *, char *buf, uint32_t size) override { if (size) buf[0] = 0; }
   DriverPose_t GetPose() override { return pose_at(left ? -0.2 : 0.2, 1.2, -0.3); }
-  // The controller where the Quest's is (its aim pose: it points where the Quest's ray does) and its buttons
+  // The controller where the Quest's is, and its buttons. SteamVR wants the controller's own origin, as Oculus's
+  // driver gives it: games find the hand from there with the render model's components. The Quest gives its grip
+  // pose, which in SteamVR's Quest 2 model is the component «openxr_grip»: 20.6° about x and (±0.007, -0.0018,
+  // 0.1019) m from the origin. So origin = grip × (that)⁻¹.
+  static void raw_from_grip(const double *g, bool left, double out[7]) {
+    const double a = -20.6 * 3.14159265358979 / 180 / 2, cx = std::sin(a), cw = std::cos(a);   // (rotation about x, inverted)
+    const double qx = g[3], qy = g[4], qz = g[5], qw = g[6];
+    // raw rotation = grip rotation × inverse(local rotation)
+    double rx = qw * cx + qx * cw, ry = qy * cw + qz * cx, rz = qz * cw - qy * cx, rw = qw * cw - qx * cx;
+    // raw position = grip position - raw rotation applied to the local offset
+    const double o[3] = {left ? 0.007 : -0.007, -0.00182941, 0.1019482};
+    double tx = 2 * (ry * o[2] - rz * o[1]), ty = 2 * (rz * o[0] - rx * o[2]), tz = 2 * (rx * o[1] - ry * o[0]);
+    double v[3] = {o[0] + rw * tx + (ry * tz - rz * ty), o[1] + rw * ty + (rz * tx - rx * tz), o[2] + rw * tz + (rx * ty - ry * tx)};
+    out[0] = g[0] - v[0]; out[1] = g[1] - v[1]; out[2] = g[2] - v[2];
+    out[3] = rx; out[4] = ry; out[5] = rz; out[6] = rw;
+  }
   void update(const Track &t) {
     if (id == k_unTrackedDeviceIndexInvalid) return;
     int h = left ? 0 : 1;
     DriverPose_t p;
+    double raw[7];
     if (!t.valid) p = GetPose();
-    else if (t.handValid[h]) p = pose_at(t.aim[h][0], t.aim[h][1], t.aim[h][2], t.aim[h] + 3);
+    else if (t.handValid[h]) { raw_from_grip(t.grip[h], left, raw); p = pose_at(raw[0], raw[1], raw[2], raw + 3); }
     else { p = GetPose(); p.poseIsValid = false; p.result = TrackingResult_Running_OutOfRange; }   // (put down or out of sight)
     VRServerDriverHost()->TrackedDevicePoseUpdated(id, p, sizeof p);
     if (!t.valid) return;
