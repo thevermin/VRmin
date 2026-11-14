@@ -1,8 +1,9 @@
 // VRmin's driver for SteamVR (Windows; on the Mac it runs inside VRmin's Windows).
 //
 // SteamVR loads it in vrserver.exe and sees a headset and two Touch controllers that follow the Quest's (poses and
-// buttons come from VRmin Host), the play area provided by the driver so SteamVR doesn't ask for room setup, and a
-// virtual display that sends the compositor's frames to VRmin Host at the headset's rate. Vibration comes next.
+// buttons come from VRmin Host), the play area provided by the driver so SteamVR doesn't ask for room setup, and
+// SteamVR's direct mode: the game's frames come to the driver (SteamVR's last drawing pass, the lens warp, doesn't run:
+// inside VRmin's Windows it drew a single color) and go to VRmin Host at the headset's rate. Vibration comes next.
 //
 // Log: C:\questvrbridge\driver_vrmin.log (and SteamVR's vrserver.txt)
 #include <winsock2.h>
@@ -19,6 +20,8 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <vector>
+#include <algorithm>
 
 using namespace vr;
 
@@ -167,6 +170,39 @@ struct Track {
 static std::mutex g_trackLock;
 static Track g_track;
 static std::atomic<uint32_t> g_poseId{0};   // (frames carry it: the Quest only shows frames whose pose it knows)
+
+// The head poses given to SteamVR, by the number of the Quest's pose: a frame says which head pose it was drawn with,
+// and VRmin Host needs the Quest's number for it
+struct HeadSent { uint32_t id; double pos[3], rot[9]; };
+static std::mutex g_sentLock;
+static HeadSent g_sent[128];
+static int g_sentNext;
+static void remember_head(uint32_t id, const DriverPose_t &p) {
+  const HmdQuaternion_t &q = p.qRotation;
+  HeadSent h = {id, {p.vecPosition[0], p.vecPosition[1], p.vecPosition[2]},
+                {1 - 2 * (q.y * q.y + q.z * q.z), 2 * (q.x * q.y - q.z * q.w), 2 * (q.x * q.z + q.y * q.w),
+                 2 * (q.x * q.y + q.z * q.w), 1 - 2 * (q.x * q.x + q.z * q.z), 2 * (q.y * q.z - q.x * q.w),
+                 2 * (q.x * q.z - q.y * q.w), 2 * (q.y * q.z + q.x * q.w), 1 - 2 * (q.x * q.x + q.y * q.y)}};
+  std::lock_guard<std::mutex> g(g_sentLock);
+  g_sent[g_sentNext] = h;
+  g_sentNext = (g_sentNext + 1) % 128;
+}
+// The Quest's pose closest to the head pose a frame was drawn with (0: none)
+static uint32_t pose_for(const HmdMatrix34_t &m) {
+  std::lock_guard<std::mutex> g(g_sentLock);
+  uint32_t best = 0;
+  double bestD = 1e9;
+  for (const HeadSent &h : g_sent) {
+    if (!h.id) continue;
+    double d = 0;
+    for (int r = 0; r < 3; r++) {
+      d += std::fabs(m.m[r][3] - h.pos[r]);
+      for (int c = 0; c < 3; c++) d += std::fabs(m.m[r][c] - h.rot[r * 3 + c]);
+    }
+    if (d < bestD) { bestD = d; best = h.id; }
+  }
+  return best;
+}
 // VRmin Host's settings for the game ("config" line): size of an eye, frames per second, part of the field of view
 static std::atomic<int> g_cfgEyeW{0}, g_cfgEyeH{0}, g_cfgFps{0};
 static std::atomic<float> g_cfgFovK{1.f};
@@ -333,9 +369,6 @@ class FrameSender {
   ID3D11Device *dev = nullptr;
   ID3D11DeviceContext *ctx = nullptr;
   bool failed = false;   // (no D3D11 or no shared textures: frames aren't sent)
-  // compositor's textures, opened once
-  SharedTextureHandle_t srcHandle[4] = {};
-  ID3D11Texture2D *src[4] = {};
   // image connection
   SOCKET fs = INVALID_SOCKET;
   double retryAt = 0, askedAt = 0;
@@ -354,7 +387,6 @@ class FrameSender {
   kmt_fn kQuery = nullptr, kOpen = nullptr, kDestroy = nullptr;
 public:
   std::atomic<uint64_t> sent{0}, dropped{0};
-  std::atomic<uint32_t> framePose{0};   // the Quest's pose when the compositor started the frame being presented
 
 private:
   // A look at frames 300, 2000 and 5000: their average color in the log and a picture in
@@ -450,23 +482,6 @@ private:
     memcpy(out, data, 54);
     out[54] = 0;
     return !strncmp(out, "DXMT_shared_resource_", 21);
-  }
-
-  ID3D11Texture2D *open_source(SharedTextureHandle_t h) {
-    for (int i = 0; i < 4; i++) if (src[i] && srcHandle[i] == h) return src[i];
-    int i = 0;
-    while (i < 4 && src[i]) i++;
-    if (i == 4) { for (auto &t : src) { t->Release(); t = nullptr; } i = 0; }   // (the compositor made new ones)
-    if (FAILED(dev->OpenSharedResource((HANDLE)(uintptr_t)h, __uuidof(ID3D11Texture2D), (void **)&src[i]))) {
-      src[i] = nullptr;
-      logf("Frames: couldn't open the compositor's texture %llu", (unsigned long long)h);
-      return nullptr;
-    }
-    srcHandle[i] = h;
-    D3D11_TEXTURE2D_DESC d;
-    src[i]->GetDesc(&d);
-    logf("Compositor's texture %llu: %ux%u, format %d", (unsigned long long)h, d.Width, d.Height, (int)d.Format);
-    return src[i];
   }
 
   void close_connection(const char *why) {
@@ -598,31 +613,43 @@ private:
   }
 
 public:
-  // From Present: copies the frame into a free shared texture (the GPU does it while the compositor goes on)
-  void copy(SharedTextureHandle_t h) {
-    std::lock_guard<std::mutex> g(lock);
-    if (failed) return;
-    if (!dev && !init_device()) { failed = true; return; }
-    ID3D11Texture2D *s = open_source(h);
-    if (!s) return;
-    D3D11_TEXTURE2D_DESC sd;
-    s->GetDesc(&sd);
+  std::mutex &mutex() { return lock; }
+  // (with mutex() held) D3D11 device of the driver, made the first time
+  ID3D11Device *device() {
+    if (!dev && !failed && !init_device()) failed = true;
+    return failed ? nullptr : dev;
+  }
+
+  // (with mutex() held) Copies each eye's part of the game's frame next to each other into a free shared texture
+  // (the GPU does it while SteamVR goes on), drawn with the Quest's pose «pose»
+  void copy(ID3D11Texture2D *src[2], const D3D11_BOX box[2], DXGI_FORMAT fmt, uint32_t pose) {
+    if (!device()) return;
+    D3D11_TEXTURE2D_DESC sd = {};
+    sd.Width = (box[0].right - box[0].left) * 2; sd.Height = box[0].bottom - box[0].top; sd.Format = fmt;
     if (!ready(sd)) return;
     if (pending >= 0) finish();
     int slot = -1;
     for (int i = 0; i < SLOTS && slot < 0; i++) if (shm->state[i] == 0) slot = i;
     if (slot < 0) { dropped++; return; }   // (VRmin Host is still busy with the 3)
     shm->state[slot] = 2;
-    ctx->CopyResource(tex[slot], s);
+    for (int e = 0; e < 2; e++) {
+      D3D11_BOX b = box[e];
+      b.right = b.left + sd.Width / 2; b.bottom = b.top + sd.Height;   // (the two eyes the same size)
+      ctx->CopySubresourceRegion(tex[slot], 0, e * sd.Width / 2, 0, 0, src[e], 0, &b);
+    }
     ctx->End(query[slot]);
     ctx->Flush();
     pending = slot;
-    pendingPose = framePose;
+    pendingPose = pose;
     ++copies;
-    if (copies == 300 || copies == 2000 || copies == 5000) snapshot(s, sd, copies == 300 ? 1 : copies == 2000 ? 2 : 3);
+    if (copies == 300 || copies == 2000 || copies == 5000) {
+      D3D11_TEXTURE2D_DESC d;
+      tex[slot]->GetDesc(&d);
+      snapshot(tex[slot], d, copies == 300 ? 1 : copies == 2000 ? 2 : 3);
+    }
   }
 
-  // From WaitForPresent: when the GPU finished the copy, VRmin Host is told
+  // (with mutex() held) When the GPU finished the copy, VRmin Host is told
   void finish() {
     if (pending < 0 || fs == INVALID_SOCKET) return;
     BOOL done = FALSE;
@@ -637,51 +664,131 @@ public:
     if (!notify(slot, pendingPose)) { shm->state[slot] = 0; close_connection("lost; trying again"); return; }
     sent++;
   }
-  void finish_locked() {
-    std::lock_guard<std::mutex> g(lock);
-    finish();
-  }
 };
 
-class VRminVirtualDisplay : public IVRVirtualDisplay {
+// SteamVR's direct mode: SteamVR asks the driver for the textures the game's frames go into (3 per set, shared with
+// SteamVR's processes), and each frame says which ones have the game's eyes (SubmitLayer) and when it's complete
+// (Present). Layers after the first (SteamVR's own panels) aren't shown yet.
+class VRminDirectMode : public IVRDriverDirectModeComponent {
   FrameSender frames;
-  std::atomic<uint64_t> presented{0};
+  struct Set { uint32_t pid; SharedTextureHandle_t handle[3]; ID3D11Texture2D *tex[3]; uint32_t next; };
+  std::vector<Set> sets;
+  bool haveLayer = false;
+  SubmitLayerPerEye_t layer[2];
+  uint64_t presented = 0, lastPresented = 0, lastSent = 0;
   double t0 = now_s(), lastLog = 0;
-  uint64_t lastPresented = 0, lastSent = 0;
+
+  ID3D11Texture2D *find(SharedTextureHandle_t h) {
+    for (Set &st : sets)
+      for (int i = 0; i < 3; i++) if (st.handle[i] == h) return st.tex[i];
+    return nullptr;
+  }
+
 public:
-  void Present(const PresentInfo_t *info, uint32_t) override {
+  void CreateSwapTextureSet(uint32_t pid, const SwapTextureSetDesc_t *desc, SwapTextureSet_t *out) override {
+    std::lock_guard<std::mutex> g(frames.mutex());
+    memset(out, 0, sizeof *out);
+    ID3D11Device *dev = frames.device();
+    if (!dev) return;
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = desc->nWidth; d.Height = desc->nHeight; d.MipLevels = 1; d.ArraySize = 1;
+    d.Format = (DXGI_FORMAT)desc->nFormat; d.SampleDesc.Count = desc->nSampleCount ? desc->nSampleCount : 1;
+    d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    Set st = {pid, {}, {}, 0};
+    for (int i = 0; i < 3; i++) {
+      IDXGIResource *r = nullptr;
+      HANDLE h = nullptr;
+      if (FAILED(dev->CreateTexture2D(&d, nullptr, &st.tex[i])) || FAILED(st.tex[i]->QueryInterface(__uuidof(IDXGIResource), (void **)&r)) ||
+          FAILED(r->GetSharedHandle(&h))) {
+        logf("Direct mode: couldn't make a texture for SteamVR (%ux%u, format %u)", d.Width, d.Height, desc->nFormat);
+        if (r) r->Release();
+        for (int j = 0; j <= i; j++) if (st.tex[j]) st.tex[j]->Release();
+        return;
+      }
+      r->Release();
+      st.handle[i] = out->rSharedTextureHandles[i] = (SharedTextureHandle_t)(uintptr_t)h;
+    }
+    sets.push_back(st);
+    logf("Direct mode: textures for process %u: %ux%u, format %u, %u samples", pid, d.Width, d.Height, desc->nFormat, d.SampleDesc.Count);
+  }
+  void DestroySwapTextureSet(SharedTextureHandle_t h) override {
+    std::lock_guard<std::mutex> g(frames.mutex());
+    for (size_t i = 0; i < sets.size(); i++)
+      for (int j = 0; j < 3; j++)
+        if (sets[i].handle[j] == h) {
+          for (ID3D11Texture2D *t : sets[i].tex) t->Release();
+          sets.erase(sets.begin() + i);
+          return;
+        }
+  }
+  void DestroyAllSwapTextureSets(uint32_t pid) override {
+    std::lock_guard<std::mutex> g(frames.mutex());
+    for (size_t i = 0; i < sets.size();)
+      if (sets[i].pid == pid) {
+        for (ID3D11Texture2D *t : sets[i].tex) t->Release();
+        sets.erase(sets.begin() + i);
+      } else i++;
+  }
+  void GetNextSwapTextureSetIndex(SharedTextureHandle_t h[2], uint32_t (*indices)[2]) override {
+    std::lock_guard<std::mutex> g(frames.mutex());
+    for (int e = 0; e < 2; e++) {
+      (*indices)[e] = 0;
+      for (Set &st : sets)
+        for (int i = 0; i < 3; i++)
+          if (st.handle[i] == h[e]) { (*indices)[e] = (i + 1) % 3; }
+    }
+  }
+  void SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2]) override {
+    std::lock_guard<std::mutex> g(frames.mutex());
+    if (haveLayer) return;   // (the first layer is the game's)
+    layer[0] = perEye[0];
+    layer[1] = perEye[1];
+    haveLayer = true;
+  }
+  void Present(SharedTextureHandle_t) override {
+    std::lock_guard<std::mutex> g(frames.mutex());
     uint64_t n = ++presented;
-    if (n == 1) logf("First frame from the compositor (texture %llu)", (unsigned long long)info->backbufferTextureHandle);
-    frames.copy(info->backbufferTextureHandle);
+    if (haveLayer) {
+      haveLayer = false;
+      ID3D11Texture2D *src[2] = {find(layer[0].hTexture), find(layer[1].hTexture)};
+      if (src[0] && src[1]) {
+        D3D11_BOX box[2];
+        D3D11_TEXTURE2D_DESC d;
+        for (int e = 0; e < 2; e++) {
+          src[e]->GetDesc(&d);
+          const VRTextureBounds_t &b = layer[e].bounds;
+          float v0 = std::min(b.vMin, b.vMax), v1 = std::max(b.vMin, b.vMax);
+          box[e] = {(UINT)(b.uMin * d.Width + 0.5f), (UINT)(v0 * d.Height + 0.5f), 0, (UINT)(b.uMax * d.Width + 0.5f), (UINT)(v1 * d.Height + 0.5f), 1};
+        }
+        if (n == 1 || presented % 2000 == 0)
+          logf("Direct mode: frame %llu, eyes %ux%u (bounds %.2f-%.2f, %.2f-%.2f), format %d", (unsigned long long)n, box[0].right - box[0].left,
+               box[0].bottom - box[0].top, layer[0].bounds.uMin, layer[0].bounds.uMax, layer[0].bounds.vMin, layer[0].bounds.vMax, (int)d.Format);
+        frames.copy(src, box, typeless(d.Format), pose_for(layer[0].mHmdPose));
+      }
+    }
     double t = now_s();
     if (t - lastLog > 5) {
       double dt = t - (lastLog ? lastLog : t0);
-      logf("Compositor: %.0f frames/s, %.0f sent to VRmin Host (%llu dropped so far)", (n - lastPresented) / dt,
+      logf("SteamVR: %.0f frames/s, %.0f sent to VRmin Host (%llu dropped so far)", (n - lastPresented) / dt,
            (frames.sent - lastSent) / dt, (unsigned long long)frames.dropped.load());
       lastLog = t;
       lastPresented = n;
       lastSent = frames.sent;
     }
   }
-  // The compositor waits here for the next vsync of the headset: VRmin Host is told about the frame, then it sleeps
-  void WaitForPresent() override {
-    frames.finish_locked();
+  // After Present: VRmin Host is told about the frame, then this waits for the headset's next vsync
+  void PostPresent(const Throttling_t *) override {
+    { std::lock_guard<std::mutex> g(frames.mutex()); frames.finish(); }
     double period = 1.0 / HZ, t = now_s() - t0;
     double next = (std::floor(t / period) + 1) * period;
     while ((t = now_s() - t0) < next) Sleep((DWORD)((next - t) * 1000 > 1 ? (next - t) * 1000 - 1 : 0));
-    frames.framePose = g_poseId.load();
-  }
-  bool GetTimeSinceLastVsync(float *since, uint64_t *counter) override {
-    double t = now_s() - t0, period = 1.0 / HZ;
-    *counter = (uint64_t)(t / period);
-    *since = (float)(t - *counter * period);
-    return true;
   }
 };
 
 class VRminHmd : public ITrackedDeviceServerDriver {
   VRminDisplay display;
-  VRminVirtualDisplay virtualDisplay;
+  VRminDirectMode directMode;
 public:
   uint32_t id = k_unTrackedDeviceIndexInvalid;
   EVRInitError Activate(uint32_t objectId) override {
@@ -699,7 +806,7 @@ public:
     VRProperties()->SetBoolProperty(c, Prop_IsOnDesktop_Bool, false);
     VRProperties()->SetBoolProperty(c, Prop_DisplayDebugMode_Bool, false);
     VRProperties()->SetBoolProperty(c, Prop_HasDisplayComponent_Bool, true);
-    VRProperties()->SetBoolProperty(c, Prop_HasVirtualDisplayComponent_Bool, true);
+    VRProperties()->SetBoolProperty(c, Prop_HasDriverDirectModeComponent_Bool, true);
     VRProperties()->SetStringProperty(c, Prop_DriverProvidedChaperoneJson_String, CHAPERONE_JSON);
     VRProperties()->SetBoolProperty(c, Prop_DriverProvidedChaperoneVisibility_Bool, false);
     VRProperties()->SetInt32Property(c, Prop_ExpectedControllerCount_Int32, 2);
@@ -710,7 +817,7 @@ public:
   void EnterStandby() override {}
   void *GetComponent(const char *name) override {
     if (!strcmp(name, IVRDisplayComponent_Version)) return &display;   // (see VRminDisplay)
-    if (!strcmp(name, IVRVirtualDisplay_Version)) return &virtualDisplay;
+    if (!strcmp(name, IVRDriverDirectModeComponent_Version)) return &directMode;
     return nullptr;
   }
   void DebugRequest(const char *, char *buf, uint32_t size) override { if (size) buf[0] = 0; }
@@ -720,6 +827,7 @@ public:
     if (id == k_unTrackedDeviceIndexInvalid) return;
     DriverPose_t p = t.valid ? pose_at((t.eye[0][0] + t.eye[1][0]) / 2, (t.eye[0][1] + t.eye[1][1]) / 2, (t.eye[0][2] + t.eye[1][2]) / 2, t.eye[0] + 3)
                              : GetPose();
+    if (t.valid) remember_head(t.id, p);
     VRServerDriverHost()->TrackedDevicePoseUpdated(id, p, sizeof p);
   }
 };
