@@ -1,0 +1,37 @@
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index 11397e0..d98aeb4 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -336,11 +336,31 @@ public:
+     return device->QueryInterface(riid, ppDevice);
+   };
+ 
++  // IDXGIResource::GetUsage from the bind flags and usage, as in Windows (it was always 0, and ANGLE takes the
++  // textures other programs share with Chromium as neither drawable into nor readable: SteamVR's web panels)
+   virtual HRESULT GetDXGIUsage(DXGI_USAGE *pUsage) {
+     if (!pUsage) {
+       return E_INVALIDARG;
+     }
+-    *pUsage = 0;
++    DXGI_USAGE usage = 0;
++    if (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
++      usage |= DXGI_USAGE_SHADER_INPUT;
++    if (desc.BindFlags & D3D11_BIND_RENDER_TARGET)
++      usage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
++    if (desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
++      usage |= DXGI_USAGE_UNORDERED_ACCESS;
++    switch (desc.Usage) {
++    case D3D11_USAGE_STAGING:
++      usage |= DXGI_CPU_ACCESS_READ_WRITE;
++      break;
++    case D3D11_USAGE_DYNAMIC:
++      usage |= DXGI_CPU_ACCESS_DYNAMIC;
++      break;
++    default:
++      usage |= DXGI_CPU_ACCESS_NONE;
++      break;
++    }
++    *pUsage = usage;
+     return S_OK;
+   }
+ 
