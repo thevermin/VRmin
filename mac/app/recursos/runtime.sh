@@ -149,6 +149,15 @@ poner_driver_steamvr() {
   rm -rf "$Q/driver_vrmin" && cp -R "$d" "$Q/driver_vrmin" && echo "$sha" > "$Q/driver_vrmin/.version"
 }
 ajustes_steamvr() {
+  # Steam no se conecta a SteamVR: Steam (de 32 bits) se conecta para mostrar sus paneles en el visor y dentro de Wine se
+  # traba entero; los juegos, al no poder hablar con Steam, se cierran. Sin vrclient.dll en steam.exe no lo intenta
+  # (los juegos usan SteamVR igual). Vale desde la próxima vez que se abre Steam.
+  if [ ! -f "$Q/.steam_sin_vrclient" ]; then
+    "$WINE" reg add 'HKCU\Software\Wine\AppDefaults\steam.exe\DllOverrides' /v vrclient /t REG_SZ /d "" /f >/dev/null 2>&1 \
+      && touch "$Q/.steam_sin_vrclient" \
+      && say "Ajusté Steam para SteamVR: si este juego no abre, cerrá Steam, abrilo de nuevo y probá otra vez." \
+             "Adjusted Steam for SteamVR: if this game doesn't open, close Steam, open it again and try once more."
+  fi
   mkdir -p "$Q/openvr/config"
   cat > "$Q/openvr/config/steamvr.vrsettings" <<'JSON'
 {
