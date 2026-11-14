@@ -21,7 +21,7 @@ DRV=""
 for d in "$RES/steamvr/driver_vrmin" "$RES/../../steamvr/driver_vrmin"; do [ -f "$d/bin/win64/driver_vrmin.dll" ] && DRV="$d" && break; done
 if [ "$CON" = vrmin ]; then
   [ -n "$DRV" ] || { say "No encontré el driver de VRmin para SteamVR." "Couldn't find VRmin's SteamVR driver."; exit 1; }
-  rm -rf "$Q/driver_vrmin" && cp -R "$DRV" "$Q/driver_vrmin" && rm -f "$Q/driver_vrmin.log"
+  rm -rf "$Q/driver_vrmin" && cp -R "$DRV" "$Q/driver_vrmin" && rm -f "$Q/driver_vrmin.log" "$Q/steamvr_cuadro.bmp"
 fi
 
 # OpenVR → SteamVR (con el driver de VRmin registrado) y OpenXR → SteamVR
@@ -83,7 +83,7 @@ say "Procesos de SteamVR que quedaron abiertos:" "SteamVR processes still open:"
 # Cerrar SteamVR y juntar sus registros
 for p in vrmonitor vrcompositor vrdashboard vrwebhelper vrserver vrstartup; do pkill -f "$p.exe" 2>/dev/null; done
 sleep 3
-cp "$Q/openvr/logs/"*.txt "$STEAM/logs/"vr*.txt "$Q/driver_vrmin.log" "$OUT/" 2>/dev/null
+cp "$Q/openvr/logs/"*.txt "$STEAM/logs/"vr*.txt "$Q/driver_vrmin.log" "$Q/steamvr_cuadro.bmp" "$OUT/" 2>/dev/null
 if [ -f "$OUT/steamvr.vrsettings.antes" ]; then cp "$OUT/steamvr.vrsettings.antes" "$CFG"; else rm -f "$CFG"; fi
 tail -c 2000000 "$OUT/wine.log" > "$OUT/wine_final.log"
 say "Listo. Registros en: $OUT" "Done. Logs in: $OUT"

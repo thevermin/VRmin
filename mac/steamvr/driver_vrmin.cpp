@@ -241,6 +241,46 @@ public:
   std::atomic<uint64_t> sent{0}, dropped{0};
 
 private:
+  // A look at frame 300: its average color in the log and a picture in C:\questvrbridge\steamvr_cuadro.bmp
+  // (a quarter of the size), to tell a black frame from SteamVR from one that arrives empty
+  void snapshot(ID3D11Texture2D *s, const D3D11_TEXTURE2D_DESC &sd) {
+    D3D11_TEXTURE2D_DESC d = sd;
+    d.MipLevels = 1; d.ArraySize = 1; d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_STAGING;
+    d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+    ID3D11Texture2D *st = nullptr;
+    if (FAILED(dev->CreateTexture2D(&d, nullptr, &st))) { logf("Snapshot: no staging texture"); return; }
+    ctx->CopyResource(st, s);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) { logf("Snapshot: Map failed"); st->Release(); return; }
+    uint32_t w = sd.Width / 4, h = sd.Height / 4;
+    uint8_t *px = (uint8_t *)malloc((size_t)w * h * 4);
+    double sum[4] = {};
+    bool bgra = typeless(sd.Format) == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    for (uint32_t y = 0; y < h; y++)
+      for (uint32_t x = 0; x < w; x++) {
+        const uint8_t *p = (const uint8_t *)m.pData + (size_t)(y * 4) * m.RowPitch + (size_t)(x * 4) * 4;
+        uint8_t *o = px + ((size_t)(h - 1 - y) * w + x) * 4;   // (BMP: bottom row first, BGRA)
+        o[0] = bgra ? p[0] : p[2]; o[1] = p[1]; o[2] = bgra ? p[2] : p[0]; o[3] = 255;
+        for (int c = 0; c < 4; c++) sum[c] += p[c];
+      }
+    ctx->Unmap(st, 0);
+    st->Release();
+    double n = (double)w * h;
+    logf("Snapshot: format %d, average of the 4 channels %.1f %.1f %.1f %.1f", (int)sd.Format, sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n);
+    FILE *f = fopen("C:\\questvrbridge\\steamvr_cuadro.bmp", "wb");
+    if (f) {
+      uint32_t size = 54 + w * h * 4;
+      uint8_t hd[54] = {'B', 'M'};
+      memcpy(hd + 2, &size, 4); hd[10] = 54; hd[14] = 40;
+      memcpy(hd + 18, &w, 4); memcpy(hd + 22, &h, 4); hd[26] = 1; hd[28] = 32;
+      fwrite(hd, 1, 54, f);
+      fwrite(px, 1, (size_t)w * h * 4, f);
+      fclose(f);
+    }
+    free(px);
+  }
+  uint64_t copies = 0;
+
   bool init_device() {
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx);
     if (FAILED(hr)) { logf("Frames: no D3D11 device (%lx)", (unsigned long)hr); return false; }
@@ -459,6 +499,7 @@ public:
     ctx->End(query[slot]);
     ctx->Flush();
     pending = slot;
+    if (++copies == 300) snapshot(s, sd);
   }
 
   // From WaitForPresent: when the GPU finished the copy, VRmin Host is told
