@@ -892,7 +892,7 @@ public:
     now.swap(prevLayers);
     prevLayers.swap(layers);
     // The game's image: the first layer from a game's textures. SteamVR's own image under it (vrcompositor.exe's) comes
-    // out a single color inside VRmin's Windows and isn't used; the layers after it are drawn over it
+    // out a single color inside VRmin's Windows and isn't used; the game's layers after it are drawn over it
     int base = -1;
     for (size_t k = 0; k < now.size() && base < 0; k++) {
       int i;
@@ -911,7 +911,9 @@ public:
         for (int e = 0; e < 2; e++) {
           int i;
           Set *st = find(now[k].eye[e].hTexture, &i);
-          if (!st) { ok = false; break; }
+          // (SteamVR's own layers aren't drawn yet: inside VRmin's Windows everything vrcompositor.exe draws comes out a
+          //  single color)
+          if (!st || st->compositor) { ok = false; break; }
           o.tex[e] = st->tex[i];
           const VRTextureBounds_t &tb = now[k].eye[e].bounds;
           o.rect[e][0] = tb.uMin; o.rect[e][1] = tb.vMin; o.rect[e][2] = tb.uMax; o.rect[e][3] = tb.vMax;
