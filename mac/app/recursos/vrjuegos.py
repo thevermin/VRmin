@@ -386,6 +386,10 @@ def resolver_juego(juego, det=None):
     exe = usr.get("exe") or inc.get("exe") or det.get("exe", "")
     if juego.get("propio"):   # de fuera de Steam: siempre directo, con el .exe que se eligió
         lanzar, exe = "directo", juego["exe"]
+    # SteamVR real: directo. Pedido a Steam con SteamVR abierto, Steam le avisa a SteamVR qué juego arranca, se queda
+    # esperando la respuesta dentro de Wine y se cuelga (y el juego, sin Steam, se cierra)
+    if runtime == "steamvr" and exe:
+        lanzar = "directo"
     return {
         "id": appid, "nombre": juego["nombre"], "carpeta": juego["carpeta"],
         "pedido": pedido, "runtime": runtime, "avisos": avisos,
