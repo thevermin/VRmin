@@ -163,6 +163,7 @@ ajustes_steamvr() {
    "driver_null" : { "enable" : false },
    "dashboard" : { "useNewDesktop" : false, "showDesktop" : false },
    "collisionBounds" : { "CollisionBoundsColorGammaA" : 0, "CollisionBoundsFadeDistance" : 0 },
+   "VRWebHelper" : { "DebuggerEnabled" : true, "DebuggerPort" : 8087 },
    "steamvr" : {
       "requireHmd" : true,
       "forcedDriver" : "vrmin",
