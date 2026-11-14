@@ -379,6 +379,7 @@ struct Overlay {
   ID3D11Texture2D *tex[2];
   float rect[2][4];               // the part of each eye's texture used (u, v from - to)
   float dst[2][4] = {{0, 0, 1, 1}, {0, 0, 1, 1}};   // where in each eye it goes (x, y, width, height, as fractions)
+  bool opaque = false;                               // (replaces what's there instead of blending: a flipped game image)
 };
 
 // Draws a texture over part of another (alpha blending): what SteamVR's compositor does with the layers on Windows
@@ -434,7 +435,7 @@ private:
   ID3D11PixelShader *ps = nullptr;
   ID3D11Buffer *cb = nullptr;
   ID3D11SamplerState *sampler = nullptr;
-  ID3D11BlendState *blend = nullptr;
+  ID3D11BlendState *blend = nullptr, *noBlend = nullptr;
   ID3D11RasterizerState *raster = nullptr;
   bool blend_init() {
     typedef HRESULT(WINAPI * compile_fn)(const void *, SIZE_T, const char *, const void *, void *, const char *, const char *, UINT, UINT, ID3DBlob **, ID3DBlob **);
@@ -467,6 +468,8 @@ private:
     rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE;
     ok = ok && SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &cb)) && SUCCEEDED(dev->CreateSamplerState(&sd, &sampler)) &&
          SUCCEEDED(dev->CreateBlendState(&bl, &blend)) && SUCCEEDED(dev->CreateRasterizerState(&rd, &raster));
+    rt.BlendEnable = FALSE;
+    ok = ok && SUCCEEDED(dev->CreateBlendState(&bl, &noBlend));
     if (!ok) logf("Layers: couldn't make the drawing objects");
     else logf("Layers: ready to draw SteamVR's layers over the game's image");
     return ok;
@@ -495,7 +498,7 @@ private:
           D3D11_VIEWPORT vp = {e * ew + dd[0] * ew, dd[1] * eh, dd[2] * ew, dd[3] * eh, 0, 1};
           ctx->UpdateSubresource(cb, 0, nullptr, o.rect[e], 0, 0);
           ctx->OMSetRenderTargets(1, &rtv, nullptr);
-          ctx->OMSetBlendState(blend, nullptr, 0xffffffff);
+          ctx->OMSetBlendState(o.opaque ? noBlend : blend, nullptr, 0xffffffff);
           ctx->RSSetState(raster);
           ctx->RSSetViewports(1, &vp);
           ctx->IASetInputLayout(nullptr);
@@ -756,7 +759,8 @@ public:
 
   // (with mutex() held) Copies each eye's part of the game's frame next to each other into a free shared texture
   // (the GPU does it while SteamVR goes on), drawn with the Quest's pose «pose»
-  void copy(ID3D11Texture2D *src[2], const D3D11_BOX box[2], DXGI_FORMAT fmt, uint32_t pose, const std::vector<Overlay> &over) {
+  void copy(ID3D11Texture2D *src[2], const D3D11_BOX box[2], DXGI_FORMAT fmt, uint32_t pose, const std::vector<Overlay> &over,
+            bool drawn = false) {   // (drawn: the game's image is the first of «over», flipped, instead of copied)
     if (!device()) return;
     D3D11_TEXTURE2D_DESC sd = {};
     sd.Width = (box[0].right - box[0].left) * 2; sd.Height = box[0].bottom - box[0].top; sd.Format = fmt;
@@ -766,7 +770,7 @@ public:
     for (int i = 0; i < SLOTS && slot < 0; i++) if (shm->state[i] == 0) slot = i;
     if (slot < 0) { dropped++; return; }   // (VRmin Host is still busy with the 3)
     shm->state[slot] = 2;
-    for (int e = 0; e < 2; e++) {
+    for (int e = 0; e < 2 && !drawn; e++) {
       D3D11_BOX b = box[e];
       b.right = b.left + sd.Width / 2; b.bottom = b.top + sd.Height;   // (the two eyes the same size)
       ctx->CopySubresourceRegion(tex[slot], 0, e * sd.Width / 2, 0, 0, src[e], 0, &b);
@@ -1004,9 +1008,23 @@ public:
         double dist;
         uint32_t pose = pose_for(use[0].mHmdPose, &dist);
         if (++gameFrames == 1)
-          logf("Game's first frame: %ux%u per eye, format %d, Quest pose %u (difference %.4f), %zu layers over it", box[0].right - box[0].left,
-               box[0].bottom - box[0].top, (int)d.Format, pose, dist, over.size());
-        frames.copy(src, box, typeless(d.Format), pose, over);
+          logf("Game's first frame: %ux%u per eye, bounds u %.2f-%.2f v %.2f-%.2f, format %d, Quest pose %u (difference %.4f), %zu layers over it",
+               box[0].right - box[0].left, box[0].bottom - box[0].top, use[0].bounds.uMin, use[0].bounds.uMax, use[0].bounds.vMin,
+               use[0].bounds.vMax, (int)d.Format, pose, dist, over.size());
+        // A game image upside down (its bounds go from bottom to top, like Secret Shop's): drawn flipped by the shader
+        // instead of copied
+        bool flipped = use[0].bounds.vMin > use[0].bounds.vMax || use[0].bounds.uMin > use[0].bounds.uMax;
+        if (flipped) {
+          Overlay b;
+          b.opaque = true;
+          for (int e = 0; e < 2; e++) {
+            b.tex[e] = src[e];
+            const VRTextureBounds_t &tb = use[e].bounds;
+            b.rect[e][0] = tb.uMin; b.rect[e][1] = tb.vMin; b.rect[e][2] = tb.uMax; b.rect[e][3] = tb.vMax;
+          }
+          over.insert(over.begin(), b);
+        }
+        frames.copy(src, box, typeless(d.Format), pose, over, flipped);
       }
     }
     double t = now_s();

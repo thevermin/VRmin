@@ -218,7 +218,10 @@ def detectar(juego):
     exe = ""
     if exes:
         ship = [e for e in exes if e[0].lower().endswith("-win64-shipping.exe")]
-        elegido = ship[0] if ship else sorted(exes, key=lambda e: (e[2] > 1, -e[1]))[0]
+        # (uno que se llame como la carpeta del juego: en The Lab, TheLab.exe y no SecretShop.exe, que es más grande)
+        clave = lambda n: re.sub(r"[^a-z0-9]", "", n.lower())
+        mismo = [e for e in exes if clave(os.path.basename(e[0])[:-4]) == clave(os.path.basename(raiz))]
+        elegido = ship[0] if ship else mismo[0] if mismo else sorted(exes, key=lambda e: (e[2] > 1, -e[1]))[0]
         exe = os.path.relpath(elegido[0], raiz)
 
     # Recomendación: lo más directo que el juego entienda
