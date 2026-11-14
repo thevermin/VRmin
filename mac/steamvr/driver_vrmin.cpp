@@ -45,7 +45,9 @@ static double now_s() {
 // ---- what the headset is like (Quest 3 defaults, until VRmin Host and the Quest's first pose say: wait_display) ----
 static uint32_t EYE_W = 1832, EYE_H = 1920;
 static float HZ = 72.f, IPD = 0.063f;
-static float FOV[2][4] = {{-1, 1, -1, 1}, {-1, 1, -1, 1}};   // per eye: left, right, top, bottom, as GetProjectionRaw wants
+// Per eye: left, right, top, bottom, as GetProjectionRaw wants them: tangents where «top» is the lower edge (negative) and
+// «bottom» the upper one (Valve's projection matrix uses y downwards: m[1][2] = (bottom + top) / (bottom - top))
+static float FOV[2][4] = {{-1, 1, -1, 1}, {-1, 1, -1, 1}};
 static const uint64_t UNIVERSE = 0x56526d696e;                                 // "VRmin"
 
 // Play area: 2 x 2 m, standing at the origin
@@ -267,7 +269,7 @@ static void wait_display() {
     float k = g_cfgFovK;
     for (int e = 0; e < 2; e++) {
       FOV[e][0] = (float)t.fov[e][0] * k; FOV[e][1] = (float)t.fov[e][1] * k;
-      FOV[e][2] = -(float)t.fov[e][3] * k; FOV[e][3] = -(float)t.fov[e][2] * k;
+      FOV[e][2] = (float)t.fov[e][2] * k; FOV[e][3] = (float)t.fov[e][3] * k;   // (the Quest's down and up)
     }
     double d[3] = {t.eye[1][0] - t.eye[0][0], t.eye[1][1] - t.eye[0][1], t.eye[1][2] - t.eye[0][2]};
     IPD = (float)std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
