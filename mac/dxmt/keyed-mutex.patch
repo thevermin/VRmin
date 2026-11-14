@@ -1,5 +1,5 @@
 diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
-index 82914a5..7b25cca 100644
+index 82914a5..11397e0 100644
 --- a/src/d3d11/d3d11_resource.hpp
 +++ b/src/d3d11/d3d11_resource.hpp
 @@ -12,6 +12,7 @@
@@ -10,15 +10,16 @@ index 82914a5..7b25cca 100644
  #include <memory>
  #include <type_traits>
  #include <random>
-@@ -26,6 +27,68 @@ DEFINE_COM_INTERFACE("9a6f6549-d4b1-45ea-8794-8503d190d3d1",
+@@ -26,6 +27,69 @@ DEFINE_COM_INTERFACE("9a6f6549-d4b1-45ea-8794-8503d190d3d1",
  
  namespace dxmt {
  
-+/* IDXGIKeyedMutex for resources created SHARED_KEYEDMUTEX (Chromium's GPU
-+ * process shares its images that way, and stops if they have none). The
-+ * acquire and release don't wait: within one Metal device the GPU work of
-+ * the processes sharing the resource isn't reordered by the key. Resources
-+ * created only SHARED still have none, as in Windows.
++/* IDXGIKeyedMutex for resources created SHARED_KEYEDMUTEX or SHARED_NTHANDLE
++ * (Chromium's GPU process asks for it on the images it shares, and crashes
++ * without it). The acquire and release don't wait: within one Metal device
++ * the GPU work of the processes sharing the resource isn't reordered by the
++ * key. Resources created only SHARED (SteamVR's compositor and drivers) still
++ * have none.
 + */
 +class MTLDXGIKeyedMutex final : public IDXGIKeyedMutex {
 +  std::atomic<ULONG> refs_{1};
@@ -79,11 +80,12 @@ index 82914a5..7b25cca 100644
  template <typename RESOURCE_DESC>
  void UpgradeResourceDescription(const RESOURCE_DESC *pSrc, RESOURCE_DESC &dst) {
    dst = *pSrc;
-@@ -238,6 +301,12 @@ public:
+@@ -238,6 +302,13 @@ public:
        return S_OK;
      }
  
-+    if (riid == __uuidof(IDXGIKeyedMutex) && (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) {
++    if (riid == __uuidof(IDXGIKeyedMutex) &&
++        (desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE))) {
 +      *ppvObject = static_cast<IDXGIKeyedMutex *>(new MTLDXGIKeyedMutex(ref_and_cast<D3D11ResourceCommon>(this)));
 +      static_cast<D3D11ResourceCommon *>(this)->Release();   // (the mutex object holds its own reference)
 +      return S_OK;
