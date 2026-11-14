@@ -152,14 +152,16 @@ ajustes_steamvr() {
   # Steam no se conecta a SteamVR: cuando SteamVR arranca, Steam (de 32 bits) carga vrclient.dll para mostrar sus paneles
   # en el visor y dentro de Wine se traba entero; los juegos, al no poder hablar con Steam, se cierran. vrclient.dll
   # necesita d3d11.dll: sin d3d11 en steam.exe (Steam no la necesita para nada más; la carga solo si está) no se puede
-  # cargar y Steam no lo intenta. Los juegos usan SteamVR igual. Vale desde la próxima vez que se abre Steam.
+  # cargar y Steam no lo intenta. Los juegos usan SteamVR igual. Vale desde la próxima vez que se abre Steam (abrir_steam.sh
+  # le saca d3d11 a WINEDLLOVERRIDES; los demás programas la toman incorporada de los ajustes de Wine).
   # (una prueba anterior desactivaba vrclient.dll directamente; Wine lo ignora porque Steam la carga con su ruta)
   if [ -f "$Q/.steam_sin_vrclient" ]; then
     "$WINE" reg delete 'HKCU\Software\Wine\AppDefaults\steam.exe\DllOverrides' /v vrclient /f >/dev/null 2>&1
     rm -f "$Q/.steam_sin_vrclient"
   fi
   if [ ! -f "$Q/.steam_sin_d3d11" ]; then
-    "$WINE" reg add 'HKCU\Software\Wine\AppDefaults\steam.exe\DllOverrides' /v d3d11 /t REG_SZ /d "" /f >/dev/null 2>&1 \
+    "$WINE" reg add 'HKCU\Software\Wine\DllOverrides' /v d3d11 /t REG_SZ /d builtin /f >/dev/null 2>&1 \
+      && "$WINE" reg add 'HKCU\Software\Wine\AppDefaults\steam.exe\DllOverrides' /v d3d11 /t REG_SZ /d "" /f >/dev/null 2>&1 \
       && touch "$Q/.steam_sin_d3d11" \
       && say "Ajusté Steam para SteamVR: si este juego no abre, cerrá Steam, abrilo de nuevo y probá otra vez." \
              "Adjusted Steam for SteamVR: if this game doesn't open, close Steam, open it again and try once more."

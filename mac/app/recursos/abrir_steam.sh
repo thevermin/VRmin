@@ -30,6 +30,10 @@ EXTRA="-nofriendsui -nochatui"
 # -noverifyfiles: si Steam verifica sus archivos al arrancar, vuelve a poner su steamwebhelper.exe y la ventana
 # queda negra otra vez. -cef-single-process: el navegador de Steam en un solo proceso (igual que el arreglo).
 EXTRA="$EXTRA -noverifyfiles -cef-single-process"
+# Con SteamVR real (runtime.sh, ajustes_steamvr): Steam sin d3d11, así no carga vrclient.dll ni se conecta a SteamVR
+# (dentro de Wine se traba). Las variables de entorno le ganan a los ajustes de cada programa, así que d3d11 sale de
+# WINEDLLOVERRIDES para Steam; los juegos que abre la toman de los ajustes de Wine (incorporada, como siempre).
+[ -f "$WINEPREFIX/drive_c/questvrbridge/.steam_sin_d3d11" ] && export WINEDLLOVERRIDES="${WINEDLLOVERRIDES/d3d11,/}"
 "$WINE" "C:\\Program Files (x86)\\Steam\\steam.exe" -cef-disable-gpu -cef-disable-gpu-compositing -no-cef-sandbox $EXTRA \
   > "$P/logs/steam.log" 2>&1 < /dev/null &
 disown
