@@ -4003,7 +4003,7 @@ final class NativeLink {
                     if n > 0, n < 4096, let body = readExact(c, n),
                        let o = try? JSONSerialization.jsonObject(with: body) as? [String: Any], (o["type"] as? String) == "auth" {
                         switch pairing.check(o, ip: ip) {
-                        case .ok(let t): authOK = true; newToken = t; QuestModel.name = (o["device"] as? String) ?? 
+                        case .ok(let t): authOK = true; newToken = t; QuestModel.name = (o["device"] as? String) ?? ""
                         case .needCode(let wrong):
                             var m = Data([3]); m.append(Data("{\"type\":\"auth\",\"ok\":false,\"need\":\"code\",\"wrong\":\(wrong)}".utf8))
                             var len = UInt32(m.count).bigEndian
