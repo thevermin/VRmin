@@ -140,8 +140,11 @@ static SOCKET host_connect() {
   return s;
 }
 
-// Control connection: tells VRmin Host a game is running (type 9, its name). What VRmin Host sends back (the Quest's
-// poses, settings) is read and, for now, not used.
+// The number of the Quest's latest pose: each frame carries it, and the Quest only shows frames whose pose it knows
+static std::atomic<uint32_t> g_poseId{0};
+
+// Control connection: tells VRmin Host a game is running (type 9, its name) and receives the Quest's poses, one JSON
+// line each ("id":N … "xr":[…]). For now only their number is used.
 class HostControl {
   std::atomic<bool> running{false};
   std::atomic<SOCKET> sock{INVALID_SOCKET};
@@ -150,14 +153,28 @@ public:
   void start() {
     running = true;
     th = std::thread([this] {
-      char buf[65536];
+      static char buf[65536];
       while (running) {
         SOCKET s = host_connect();
         if (s == INVALID_SOCKET) { Sleep(1000); continue; }
         sock = s;
         logf("Connected to VRmin Host");
         send_packet(s, 9, "SteamVR", 7);
-        while (running && recv(s, buf, sizeof buf, 0) > 0) {}
+        int used = 0, r;
+        while (running && (r = recv(s, buf + used, (int)sizeof buf - 1 - used, 0)) > 0) {
+          used += r;
+          buf[used] = 0;
+          char *start = buf, *nl;
+          while ((nl = strchr(start, '\n'))) {
+            *nl = 0;
+            const char *id = strstr(start, "\"id\":");
+            if (id && strstr(start, "\"xr\":")) g_poseId = (uint32_t)strtoul(id + 5, nullptr, 10);
+            start = nl + 1;
+          }
+          used = (int)(buf + used - start);
+          memmove(buf, start, used);
+          if (used >= (int)sizeof buf - 1) used = 0;
+        }
         sock = INVALID_SOCKET;
         closesocket(s);
         if (running) { logf("VRmin Host disconnected"); Sleep(1000); }
@@ -233,6 +250,7 @@ class FrameSender {
   ID3D11Texture2D *tex[SLOTS] = {};
   ID3D11Query *query[SLOTS] = {};
   int pending = -1;   // slot copied, waiting for the GPU
+  uint32_t pendingPose = 0;
   uint32_t texW = 0, texH = 0, gen = 0;
   DXGI_FORMAT texFmt = DXGI_FORMAT_UNKNOWN;
   KMT_HANDLE kdev = 0;
@@ -430,8 +448,8 @@ private:
   }
 
   // [11][slot][pose id u32][format][width of an eye u16][height u16]
-  bool notify(int slot) {
-    uint8_t p[10] = {(uint8_t)slot, 0, 0, 0, 0, (uint8_t)(texFmt == DXGI_FORMAT_B8G8R8A8_TYPELESS ? 0 : 1),
+  bool notify(int slot, uint32_t pose) {
+    uint8_t p[10] = {(uint8_t)slot, (uint8_t)(pose >> 24), (uint8_t)(pose >> 16), (uint8_t)(pose >> 8), (uint8_t)pose, (uint8_t)(texFmt == DXGI_FORMAT_B8G8R8A8_TYPELESS ? 0 : 1),
                      (uint8_t)(texW / 2 >> 8), (uint8_t)(texW / 2), (uint8_t)(texH >> 8), (uint8_t)texH};
     return send_packet(fs, 11, p, sizeof p);
   }
@@ -499,6 +517,7 @@ public:
     ctx->End(query[slot]);
     ctx->Flush();
     pending = slot;
+    pendingPose = g_poseId;
     if (++copies == 300) snapshot(s, sd);
   }
 
@@ -514,7 +533,7 @@ public:
     pending = -1;
     MemoryBarrier();
     shm->state[slot] = 1;
-    if (!notify(slot)) { shm->state[slot] = 0; close_connection("lost; trying again"); return; }
+    if (!notify(slot, pendingPose)) { shm->state[slot] = 0; close_connection("lost; trying again"); return; }
     sent++;
   }
   void finish_locked() {
