@@ -1,0 +1,56 @@
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index f8e16ea..c8b3f36 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -188,6 +188,18 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    VkExportMemoryAllocateInfo local_export_info;
+    VkExportMemoryAllocateInfo *export_info =
+       vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
++#ifdef __APPLE__
++   /* The guest asks for opaque fd export because VK_KHR_external_memory_fd is
++    * advertised (vkr_physical_device_init_extensions); MoltenVK can't, and mappable
++    * memory is exported through its host pointer instead.
++    */
++   if (export_info) {
++      VkBaseInStructure *prev_of_export_info = vkr_find_prev_struct(
++         alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
++      prev_of_export_info->pNext = export_info->pNext;
++      export_info = NULL;
++   }
++#endif
+    if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
+       /* An implementation can support dma_buf import along with opaque fd export/import.
+        * If the client driver is using external memory and requesting dma_buf, without
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index 5792337..9ea0728 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -253,6 +253,28 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev,
+          physical_dev->KHR_external_fence_fd = false;
+    }
+ 
++#ifdef __APPLE__
++   /* Guest Venus drivers (Mesa 25.1+) skip a renderer device without
++    * VK_KHR_external_memory_fd, which they need for mapping memory. MoltenVK has
++    * no fd export, but here mappable memory reaches the guest through its host
++    * pointer (vkr_device_memory_export_blob), so the extension is advertised to
++    * the guest without being used on the host.
++    */
++   if (!physical_dev->KHR_external_memory_fd) {
++      const uint32_t fd_spec = vkr_extension_get_spec_version("VK_KHR_external_memory_fd");
++      VkExtensionProperties *more = realloc(exts, sizeof(*exts) * (advertised_count + 1));
++      if (fd_spec && more) {
++         exts = more;
++         memset(&exts[advertised_count], 0, sizeof(*exts));
++         strcpy(exts[advertised_count].extensionName, "VK_KHR_external_memory_fd");
++         exts[advertised_count].specVersion = fd_spec;
++         advertised_count++;
++      } else if (more) {
++         exts = more;
++      }
++   }
++#endif
++
+    physical_dev->extensions = exts;
+    physical_dev->extension_count = advertised_count;
+ }
