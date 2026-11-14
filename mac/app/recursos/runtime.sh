@@ -135,9 +135,9 @@ PY
 # SteamVR real: el driver de VRmin (el que viene con VRmin Host, copiado al motor cuando cambia) y los ajustes de
 # SteamVR en C:\questvrbridge\openvr\config (solo los usa VRmin): solo el visor de VRmin, sin pedir armar la sala
 # (el driver da el área de juego), sin las paredes del área de juego (el Quest tiene las suyas) y sin SteamVR Home.
-# Sin el menú de SteamVR ni su ventana todavía: con el menú, Steam se conecta a SteamVR para mostrar sus paneles y se
-# cuelga dentro de Wine. useNewDesktop false: el menú mostraba el escritorio de Windows con la forma de Windows 10
-# (Graphics Capture), que Wine no tiene, y se cerraba y volvía a abrir todo el tiempo.
+# El menú de SteamVR (botón de menú del control izquierdo), sin su ventana en la Mac. Steam no se conecta a SteamVR
+# (ajustes_dll, en entorno.sh: dentro de Wine se colgaba). useNewDesktop false: el menú mostraba el escritorio de Windows
+# con la forma de Windows 10 (Graphics Capture), que Wine no tiene, y se cerraba y volvía a abrir todo el tiempo.
 # allowDisplayLockedMode: dentro de Wine, SteamVR cree que la sesión de Windows está bloqueada y en vez de dibujar
 # llenaba todo de un color verde azulado
 poner_driver_steamvr() {
@@ -159,7 +159,7 @@ ajustes_steamvr() {
   cat > "$Q/openvr/config/steamvr.vrsettings" <<'JSON'
 {
    "driver_null" : { "enable" : false },
-   "dashboard" : { "enableDashboard" : false, "useNewDesktop" : false, "showDesktop" : false },
+   "dashboard" : { "useNewDesktop" : false, "showDesktop" : false },
    "collisionBounds" : { "CollisionBoundsColorGammaA" : 0, "CollisionBoundsFadeDistance" : 0 },
    "steamvr" : {
       "requireHmd" : true,
@@ -168,7 +168,6 @@ ajustes_steamvr() {
       "enableHomeApp" : false,
       "showMirrorView" : false,
       "startMonitorFromAppLaunch" : false,
-      "startDashboardFromAppLaunch" : false,
       "startOverlayAppsFromDashboard" : false,
       "allowDisplayLockedMode" : true
    }
