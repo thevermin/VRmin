@@ -1,9 +1,8 @@
 // VRmin's driver for SteamVR (Windows; on the Mac it runs inside VRmin's Windows).
 //
-// SteamVR loads it in vrserver.exe and sees a headset and two Touch controllers: their properties and a fixed pose
-// (standing, looking ahead), the play area provided by the driver so SteamVR doesn't ask for room setup, and a
-// virtual display that sends the compositor's frames to VRmin Host at the headset's rate. The Quest's poses and
-// buttons and vibration come next.
+// SteamVR loads it in vrserver.exe and sees a headset and two Touch controllers that follow the Quest's (poses and
+// buttons come from VRmin Host), the play area provided by the driver so SteamVR doesn't ask for room setup, and a
+// virtual display that sends the compositor's frames to VRmin Host at the headset's rate. Vibration comes next.
 //
 // Log: C:\questvrbridge\driver_vrmin.log (and SteamVR's vrserver.txt)
 #include <winsock2.h>
@@ -40,10 +39,10 @@ static double now_s() {
   return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
-// ---- what the headset is like (Quest 3 defaults; VRmin Host will send the real ones) ----
-static const uint32_t EYE_W = 1832, EYE_H = 1920;
-static const float HZ = 72.f, IPD = 0.063f;
-static const float FOV_L = 1.0f, FOV_R = 1.0f, FOV_U = 1.0f, FOV_D = 1.0f;   // tan of the half angles (90°)
+// ---- what the headset is like (Quest 3 defaults, until VRmin Host and the Quest's first pose say: wait_display) ----
+static uint32_t EYE_W = 1832, EYE_H = 1920;
+static float HZ = 72.f, IPD = 0.063f;
+static float FOV[2][4] = {{-1, 1, -1, 1}, {-1, 1, -1, 1}};   // per eye: left, right, top, bottom, as GetProjectionRaw wants
 static const uint64_t UNIVERSE = 0x56526d696e;                                 // "VRmin"
 
 // Play area: 2 x 2 m, standing at the origin
@@ -62,7 +61,8 @@ static const char *CHAPERONE_JSON = R"({
   "version" : 5
 })";
 
-static DriverPose_t pose_at(double x, double y, double z) {
+// A pose for SteamVR from a position and a rotation (x y z w); without one, looking ahead
+static DriverPose_t pose_at(double x, double y, double z, const double *q = nullptr) {
   DriverPose_t p = {};
   p.poseIsValid = true;
   p.result = TrackingResult_Running_OK;
@@ -70,6 +70,10 @@ static DriverPose_t pose_at(double x, double y, double z) {
   p.qWorldFromDriverRotation.w = 1;
   p.qDriverFromHeadRotation.w = 1;
   p.qRotation.w = 1;
+  if (q) {
+    double m = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    if (m > 1e-4) { p.qRotation.x = q[0] / m; p.qRotation.y = q[1] / m; p.qRotation.z = q[2] / m; p.qRotation.w = q[3] / m; }
+  }
   p.vecPosition[0] = x;
   p.vecPosition[1] = y;
   p.vecPosition[2] = z;
@@ -89,7 +93,10 @@ struct VRminDisplay {
   virtual void GetEyeOutputViewport(EVREye eye, uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h) {
     *x = eye == Eye_Left ? 0 : EYE_W; *y = 0; *w = EYE_W; *h = EYE_H;
   }
-  virtual void GetProjectionRaw(EVREye, float *l, float *r, float *t, float *b) { *l = -FOV_L; *r = FOV_R; *t = -FOV_U; *b = FOV_D; }
+  virtual void GetProjectionRaw(EVREye eye, float *l, float *r, float *t, float *b) {
+    const float *f = FOV[eye == Eye_Left ? 0 : 1];
+    *l = f[0]; *r = f[1]; *t = f[2]; *b = f[3];
+  }
   // (no lens: the Quest corrects its own)
   virtual DistortionCoordinates_t *ComputeDistortion(DistortionCoordinates_t *c, EVREye, float u, float v) {
     c->rfRed[0] = c->rfGreen[0] = c->rfBlue[0] = u;
@@ -140,11 +147,95 @@ static SOCKET host_connect() {
   return s;
 }
 
-// The number of the Quest's latest pose: each frame carries it, and the Quest only shows frames whose pose it knows
-static std::atomic<uint32_t> g_poseId{0};
+// ---- what the Quest sends ----
+// A pose line from VRmin Host: "id":N … "xr":[77 numbers]: valid, then per eye its position, rotation (x y z w) and the
+// tangents of its field of view (left, right, down, up), then per hand: valid, grip pose, aim pose and 12 inputs.
+// Positions are in meters from the Quest's floor, with the same axes SteamVR uses.
+enum { IN_TRIGGER, IN_SQUEEZE, IN_TX, IN_TY, IN_TCLICK, IN_A, IN_B, IN_TTOUCH, IN_THTOUCH, IN_ATOUCH, IN_BTOUCH, IN_MENU, IN_COUNT };
+struct Track {
+  uint32_t id = 0;
+  bool valid = false, handValid[2] = {};
+  double eye[2][7] = {}, fov[2][4] = {}, grip[2][7] = {}, aim[2][7] = {};
+  float in[2][IN_COUNT] = {};
+};
+static std::mutex g_trackLock;
+static Track g_track;
+static std::atomic<uint32_t> g_poseId{0};   // (frames carry it: the Quest only shows frames whose pose it knows)
+// VRmin Host's settings for the game ("config" line): size of an eye, frames per second, part of the field of view
+static std::atomic<int> g_cfgEyeW{0}, g_cfgEyeH{0}, g_cfgFps{0};
+static std::atomic<float> g_cfgFovK{1.f};
 
-// Control connection: tells VRmin Host a game is running (type 9, its name) and receives the Quest's poses, one JSON
-// line each ("id":N … "xr":[…]). For now only their number is used.
+static void parse_pose(const char *line) {
+  const char *p = strstr(line, "\"xr\":");
+  const char *idp = strstr(line, "\"id\":");
+  if (!p || !idp || !(p = strchr(p, '['))) return;
+  p++;
+  double v[77];
+  int n = 0;
+  while (n < 77 && *p && *p != ']') {
+    char *end;
+    double d = strtod(p, &end);
+    if (end == p) { p++; continue; }
+    v[n++] = d;
+    p = end;
+  }
+  if (n < 77) return;
+  for (double d : v) if (!std::isfinite(d) || std::fabs(d) > 1000) return;
+  Track t;
+  int k = 0;
+  t.id = (uint32_t)strtoul(idp + 5, nullptr, 10);
+  t.valid = v[k++] > 0.5;
+  for (int e = 0; e < 2; e++) {
+    for (int i = 0; i < 7; i++) t.eye[e][i] = v[k++];
+    for (int i = 0; i < 4; i++) t.fov[e][i] = v[k++];
+  }
+  for (int h = 0; h < 2; h++) {
+    t.handValid[h] = v[k++] > 0.5;
+    for (int i = 0; i < 7; i++) t.grip[h][i] = v[k++];
+    for (int i = 0; i < 7; i++) t.aim[h][i] = v[k++];
+    for (int i = 0; i < IN_COUNT; i++) t.in[h][i] = (float)v[k++];
+  }
+  std::lock_guard<std::mutex> g(g_trackLock);
+  g_track = t;
+  g_poseId = t.id;
+}
+
+static void parse_config(const char *line) {
+  const char *p;
+  int eye = 0;
+  if ((p = strstr(line, "\"eye\":"))) eye = atoi(p + 6);
+  if (eye >= 256 && eye <= 4096) { g_cfgEyeW = eye; g_cfgEyeH = eye; }
+  if ((p = strstr(line, "\"eyeH\":")) && atoi(p + 7) >= 256 && atoi(p + 7) <= 4096) g_cfgEyeH = atoi(p + 7);
+  if ((p = strstr(line, "\"fovk\":")) && atof(p + 7) >= 0.6 && atof(p + 7) <= 1.0) g_cfgFovK = (float)atof(p + 7);
+  if ((p = strstr(line, "\"fps\":")) && atoi(p + 6) >= 30 && atoi(p + 6) <= 144) g_cfgFps = atoi(p + 6);
+}
+
+// The display's size, rate and field of view can't change once SteamVR has the headset: before adding it, this waits
+// (a little) for VRmin Host's settings and the Quest's first pose. Without them the defaults stay.
+static void wait_display() {
+  Track t;
+  for (int i = 0; i < 150; i++) {
+    { std::lock_guard<std::mutex> g(g_trackLock); t = g_track; }
+    if (g_cfgFps && t.valid) break;
+    Sleep(20);
+  }
+  if (g_cfgFps && g_cfgEyeW) { EYE_W = g_cfgEyeW; EYE_H = g_cfgEyeH; HZ = (float)g_cfgFps; }
+  if (t.valid) {
+    float k = g_cfgFovK;
+    for (int e = 0; e < 2; e++) {
+      FOV[e][0] = (float)t.fov[e][0] * k; FOV[e][1] = (float)t.fov[e][1] * k;
+      FOV[e][2] = -(float)t.fov[e][3] * k; FOV[e][3] = -(float)t.fov[e][2] * k;
+    }
+    double d[3] = {t.eye[1][0] - t.eye[0][0], t.eye[1][1] - t.eye[0][1], t.eye[1][2] - t.eye[0][2]};
+    IPD = (float)std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+  }
+  logf("Display: %ux%u per eye, %.0f Hz, eyes %.1f mm apart, field of view %.2f %.2f %.2f %.2f / %.2f %.2f %.2f %.2f (%s)", EYE_W, EYE_H, HZ,
+       IPD * 1000, FOV[0][0], FOV[0][1], FOV[0][2], FOV[0][3], FOV[1][0], FOV[1][1], FOV[1][2], FOV[1][3],
+       g_cfgFps && t.valid ? "from VRmin Host and the Quest" : g_cfgFps ? "no pose from the Quest: default field of view" : "VRmin Host didn't answer: defaults");
+}
+
+// Control connection: tells VRmin Host a game is running (type 9, its name) and receives its settings and the
+// Quest's poses, one JSON line each.
 class HostControl {
   std::atomic<bool> running{false};
   std::atomic<SOCKET> sock{INVALID_SOCKET};
@@ -167,8 +258,8 @@ public:
           char *start = buf, *nl;
           while ((nl = strchr(start, '\n'))) {
             *nl = 0;
-            const char *id = strstr(start, "\"id\":");
-            if (id && strstr(start, "\"xr\":")) g_poseId = (uint32_t)strtoul(id + 5, nullptr, 10);
+            if (strstr(start, "\"xr\":")) parse_pose(start);
+            else if (strstr(start, "\"config\"")) parse_config(start);
             start = nl + 1;
           }
           used = (int)(buf + used - start);
@@ -257,6 +348,7 @@ class FrameSender {
   kmt_fn kQuery = nullptr, kOpen = nullptr, kDestroy = nullptr;
 public:
   std::atomic<uint64_t> sent{0}, dropped{0};
+  std::atomic<uint32_t> framePose{0};   // the Quest's pose when the compositor started the frame being presented
 
 private:
   // A look at frame 300: its average color in the log and a picture in C:\questvrbridge\steamvr_cuadro.bmp
@@ -517,7 +609,7 @@ public:
     ctx->End(query[slot]);
     ctx->Flush();
     pending = slot;
-    pendingPose = g_poseId;
+    pendingPose = framePose;
     if (++copies == 300) snapshot(s, sd);
   }
 
@@ -568,6 +660,7 @@ public:
     double period = 1.0 / HZ, t = now_s() - t0;
     double next = (std::floor(t / period) + 1) * period;
     while ((t = now_s() - t0) < next) Sleep((DWORD)((next - t) * 1000 > 1 ? (next - t) * 1000 - 1 : 0));
+    frames.framePose = g_poseId.load();
   }
   bool GetTimeSinceLastVsync(float *since, uint64_t *counter) override {
     double t = now_s() - t0, period = 1.0 / HZ;
@@ -613,11 +706,20 @@ public:
   }
   void DebugRequest(const char *, char *buf, uint32_t size) override { if (size) buf[0] = 0; }
   DriverPose_t GetPose() override { return pose_at(0, 1.6, 0); }
+  // The head: between the two eyes, turned like them
+  void update(const Track &t) {
+    if (id == k_unTrackedDeviceIndexInvalid) return;
+    DriverPose_t p = t.valid ? pose_at((t.eye[0][0] + t.eye[1][0]) / 2, (t.eye[0][1] + t.eye[1][1]) / 2, (t.eye[0][2] + t.eye[1][2]) / 2, t.eye[0] + 3)
+                             : GetPose();
+    VRServerDriverHost()->TrackedDevicePoseUpdated(id, p, sizeof p);
+  }
 };
 
 // ---- controllers (Touch, so SteamVR uses Valve's Touch bindings for each game) ----
 class VRminController : public ITrackedDeviceServerDriver {
   bool left;
+  VRInputComponentHandle_t joyX = 0, joyY = 0, joyClick = 0, joyTouch = 0, trigger = 0, triggerClick = 0, triggerTouch = 0,
+                           grip = 0, gripTouch = 0, lower = 0, lowerTouch = 0, upper = 0, upperTouch = 0, system = 0;
 public:
   uint32_t id = k_unTrackedDeviceIndexInvalid;
   explicit VRminController(bool l) : left(l) {}
@@ -633,6 +735,22 @@ public:
     VRProperties()->SetInt32Property(c, Prop_ControllerRoleHint_Int32, left ? TrackedControllerRole_LeftHand : TrackedControllerRole_RightHand);
     VRProperties()->SetInt32Property(c, Prop_DeviceClass_Int32, TrackedDeviceClass_Controller);
     VRProperties()->SetUint64Property(c, Prop_CurrentUniverseId_Uint64, UNIVERSE);
+    // The inputs of {oculus}/input/touch_profile.json (A and B on the right, X and Y on the left)
+    IVRDriverInput *in = VRDriverInput();
+    in->CreateScalarComponent(c, "/input/joystick/x", &joyX, VRScalarType_Absolute, VRScalarUnits_NormalizedTwoSided);
+    in->CreateScalarComponent(c, "/input/joystick/y", &joyY, VRScalarType_Absolute, VRScalarUnits_NormalizedTwoSided);
+    in->CreateBooleanComponent(c, "/input/joystick/click", &joyClick);
+    in->CreateBooleanComponent(c, "/input/joystick/touch", &joyTouch);
+    in->CreateScalarComponent(c, "/input/trigger/value", &trigger, VRScalarType_Absolute, VRScalarUnits_NormalizedOneSided);
+    in->CreateBooleanComponent(c, "/input/trigger/click", &triggerClick);
+    in->CreateBooleanComponent(c, "/input/trigger/touch", &triggerTouch);
+    in->CreateScalarComponent(c, "/input/grip/value", &grip, VRScalarType_Absolute, VRScalarUnits_NormalizedOneSided);
+    in->CreateBooleanComponent(c, "/input/grip/touch", &gripTouch);
+    in->CreateBooleanComponent(c, left ? "/input/x/click" : "/input/a/click", &lower);
+    in->CreateBooleanComponent(c, left ? "/input/x/touch" : "/input/a/touch", &lowerTouch);
+    in->CreateBooleanComponent(c, left ? "/input/y/click" : "/input/b/click", &upper);
+    in->CreateBooleanComponent(c, left ? "/input/y/touch" : "/input/b/touch", &upperTouch);
+    if (left) in->CreateBooleanComponent(c, "/input/system/click", &system);   // (the Quest's menu button)
     logf("%s controller activated (device %u)", left ? "Left" : "Right", id);
     return VRInitError_None;
   }
@@ -641,6 +759,33 @@ public:
   void *GetComponent(const char *) override { return nullptr; }
   void DebugRequest(const char *, char *buf, uint32_t size) override { if (size) buf[0] = 0; }
   DriverPose_t GetPose() override { return pose_at(left ? -0.2 : 0.2, 1.2, -0.3); }
+  // The controller where the Quest's is (its aim pose: it points where the Quest's ray does) and its buttons
+  void update(const Track &t) {
+    if (id == k_unTrackedDeviceIndexInvalid) return;
+    int h = left ? 0 : 1;
+    DriverPose_t p;
+    if (!t.valid) p = GetPose();
+    else if (t.handValid[h]) p = pose_at(t.aim[h][0], t.aim[h][1], t.aim[h][2], t.aim[h] + 3);
+    else { p = GetPose(); p.poseIsValid = false; p.result = TrackingResult_Running_OutOfRange; }   // (put down or out of sight)
+    VRServerDriverHost()->TrackedDevicePoseUpdated(id, p, sizeof p);
+    if (!t.valid) return;
+    const float *v = t.in[h];
+    IVRDriverInput *in = VRDriverInput();
+    in->UpdateScalarComponent(joyX, v[IN_TX], 0);
+    in->UpdateScalarComponent(joyY, v[IN_TY], 0);
+    in->UpdateBooleanComponent(joyClick, v[IN_TCLICK] > 0.5f, 0);
+    in->UpdateBooleanComponent(joyTouch, v[IN_THTOUCH] > 0.5f, 0);
+    in->UpdateScalarComponent(trigger, v[IN_TRIGGER], 0);
+    in->UpdateBooleanComponent(triggerClick, v[IN_TRIGGER] > 0.9f, 0);
+    in->UpdateBooleanComponent(triggerTouch, v[IN_TTOUCH] > 0.5f || v[IN_TRIGGER] > 0.05f, 0);
+    in->UpdateScalarComponent(grip, v[IN_SQUEEZE], 0);
+    in->UpdateBooleanComponent(gripTouch, v[IN_SQUEEZE] > 0.05f, 0);
+    in->UpdateBooleanComponent(lower, v[IN_A] > 0.5f, 0);
+    in->UpdateBooleanComponent(lowerTouch, v[IN_ATOUCH] > 0.5f || v[IN_A] > 0.5f, 0);
+    in->UpdateBooleanComponent(upper, v[IN_B] > 0.5f, 0);
+    in->UpdateBooleanComponent(upperTouch, v[IN_BTOUCH] > 0.5f || v[IN_B] > 0.5f, 0);
+    if (left) in->UpdateBooleanComponent(system, v[IN_MENU] > 0.5f, 0);
+  }
 };
 
 // ---- the driver ----
@@ -657,22 +802,31 @@ public:
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     host.start();
+    wait_display();
     if (!VRServerDriverHost()->TrackedDeviceAdded("VRMIN-HMD", TrackedDeviceClass_HMD, &hmd)) logf("SteamVR didn't take the headset");
     VRServerDriverHost()->TrackedDeviceAdded("VRMIN-LEFT", TrackedDeviceClass_Controller, &leftHand);
     VRServerDriverHost()->TrackedDeviceAdded("VRMIN-RIGHT", TrackedDeviceClass_Controller, &rightHand);
     running = true;
+    // Each new pose from the Quest goes to SteamVR (without the Quest: every 11 ms, the fixed ones)
     poses = std::thread([this] {
+      uint32_t last = 0;
+      double sentAt = 0, newAt = 0;
       while (running) {
-        if (hmd.id != k_unTrackedDeviceIndexInvalid) {
-          DriverPose_t p = hmd.GetPose();
-          VRServerDriverHost()->TrackedDevicePoseUpdated(hmd.id, p, sizeof p);
+        Track t;
+        { std::lock_guard<std::mutex> g(g_trackLock); t = g_track; }
+        double now = now_s();
+        if (t.id != last || now - sentAt > 0.011) {
+          if (t.id != last) {
+            if (!last) logf("First pose from the Quest (%u)", t.id);
+            last = t.id;
+            newAt = now;
+          } else if (now - newAt > 0.5) t.valid = false;   // (no poses: the Quest isn't there)
+          sentAt = now;
+          hmd.update(t);
+          leftHand.update(t);
+          rightHand.update(t);
         }
-        for (VRminController *c : {&leftHand, &rightHand})
-          if (c->id != k_unTrackedDeviceIndexInvalid) {
-            DriverPose_t p = c->GetPose();
-            VRServerDriverHost()->TrackedDevicePoseUpdated(c->id, p, sizeof p);
-          }
-        std::this_thread::sleep_for(std::chrono::milliseconds(11));
+        Sleep(1);
       }
     });
     return VRInitError_None;
