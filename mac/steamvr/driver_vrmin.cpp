@@ -785,7 +785,15 @@ public:
         double dist;
         uint32_t pose = pose_for(layer[0].mHmdPose, &dist);
         if (++gameFrames == 1 || gameFrames % 500 == 0) {
+          // The projection the game drew each eye with, as tangents (left, right, top, bottom: GetProjectionRaw's)
+          for (int e = 0; e < 2; e++) {
+            const HmdMatrix44_t &P = layer[e].mProjection;
+            float l = (P.m[0][2] - 1) / P.m[0][0], r = (P.m[0][2] + 1) / P.m[0][0];
+            float tp = (P.m[1][2] - 1) / P.m[1][1], bt = (P.m[1][2] + 1) / P.m[1][1];
+            logf("  eye %d drawn with %.3f %.3f %.3f %.3f (projection %.3f %.3f %.3f %.3f)", e, l, r, tp, bt, P.m[0][0], P.m[0][2], P.m[1][1], P.m[1][2]);
+          }
           const HmdMatrix34_t &m = layer[0].mHmdPose;
+          logf("  head looking towards %.2f %.2f %.2f", -m.m[0][2], -m.m[1][2], -m.m[2][2]);
           logf("Direct mode: game frame %llu, eyes %ux%u (bounds %.2f-%.2f, %.2f-%.2f), format %d; drawn at %.3f %.3f %.3f: Quest pose %u "
                "(the latest is %u), difference %.4f", (unsigned long long)gameFrames, box[0].right - box[0].left, box[0].bottom - box[0].top,
                layer[0].bounds.uMin, layer[0].bounds.uMax, layer[0].bounds.vMin, layer[0].bounds.vMax, (int)d.Format, m.m[0][3], m.m[1][3], m.m[2][3],
