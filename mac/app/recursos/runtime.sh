@@ -135,13 +135,13 @@ PY
 # SteamVR real: el driver de VRmin (el que viene con VRmin Host, copiado al motor cuando cambia) y los ajustes de
 # SteamVR en C:\questvrbridge\openvr\config (solo los usa VRmin): solo el visor de VRmin, sin pedir armar la sala
 # (el driver da el área de juego), sin las paredes del área de juego (el Quest tiene las suyas) y sin SteamVR Home.
-# El menú de SteamVR (botón de menú del control izquierdo), sin su ventana en la Mac. Steam no se conecta a SteamVR
-# (ajustes_dll, en entorno.sh: dentro de Wine se colgaba). useNewDesktop false: el menú mostraba el escritorio de Windows
-# con la forma de Windows 10 (Graphics Capture), que Wine no tiene, y se cerraba y volvía a abrir todo el tiempo.
-# allowDisplayLockedMode: dentro de Wine, SteamVR cree que la sesión de Windows está bloqueada y en vez de dibujar
-# llenaba todo de un color verde azulado. forceCEFMode cpu: los paneles del menú (páginas web) se dibujan sin la placa
-# de video y se le pasan a SteamVR como imagen; dibujados en la placa, SteamVR no podía abrir sus texturas y el menú
-# quedaba negro
+# Sin el menú de SteamVR todavía: sus paneles son páginas web que dentro de Wine no se ven. Dibujados en la placa de
+# video, SteamVR no puede abrir sus texturas (menú negro); dibujados sin ella (forceCEFMode cpu) necesitan OpenGL, que
+# vrwebhelper no puede crear, y se cierra (menú negro delante del juego, sin poder cerrarlo). Steam no se conecta a
+# SteamVR (ajustes_dll, en entorno.sh: dentro de Wine se colgaba). useNewDesktop false: el menú mostraba el escritorio
+# de Windows con la forma de Windows 10 (Graphics Capture), que Wine no tiene, y se cerraba y volvía a abrir todo el
+# tiempo. allowDisplayLockedMode: dentro de Wine, SteamVR cree que la sesión de Windows está bloqueada y en vez de
+# dibujar llenaba todo de un color verde azulado
 poner_driver_steamvr() {
   local d sha
   for d in "$RES/steamvr/driver_vrmin" "$RES/../../steamvr/driver_vrmin"; do [ -f "$d/bin/win64/driver_vrmin.dll" ] && break; done
@@ -161,7 +161,7 @@ ajustes_steamvr() {
   cat > "$Q/openvr/config/steamvr.vrsettings" <<'JSON'
 {
    "driver_null" : { "enable" : false },
-   "dashboard" : { "useNewDesktop" : false, "showDesktop" : false },
+   "dashboard" : { "enableDashboard" : false, "useNewDesktop" : false, "showDesktop" : false },
    "collisionBounds" : { "CollisionBoundsColorGammaA" : 0, "CollisionBoundsFadeDistance" : 0 },
    "steamvr" : {
       "requireHmd" : true,
@@ -170,9 +170,9 @@ ajustes_steamvr() {
       "enableHomeApp" : false,
       "showMirrorView" : false,
       "startMonitorFromAppLaunch" : false,
+      "startDashboardFromAppLaunch" : false,
       "startOverlayAppsFromDashboard" : false,
-      "allowDisplayLockedMode" : true,
-      "forceCEFMode" : "cpu"
+      "allowDisplayLockedMode" : true
    }
 }
 JSON
