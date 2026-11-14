@@ -1,0 +1,95 @@
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index 82914a5..7ed2282 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -12,6 +12,7 @@
+ #include "../d3d10/d3d10_buffer.hpp"
+ #include "../d3d10/d3d10_texture.hpp"
+ #include "../d3d10/d3d10_view.hpp"
++#include <atomic>
+ #include <memory>
+ #include <type_traits>
+ #include <random>
+@@ -26,6 +27,68 @@ DEFINE_COM_INTERFACE("9a6f6549-d4b1-45ea-8794-8503d190d3d1",
+ 
+ namespace dxmt {
+ 
++/* IDXGIKeyedMutex for resources created SHARED or SHARED_KEYEDMUTEX. The
++ * acquire and release don't wait: within one Metal device the GPU work of
++ * the processes sharing the resource isn't reordered by the key. Without the
++ * interface, SteamVR's compositor (which takes the mutex of every texture it
++ * shares with games and drivers) draws nothing usable.
++ */
++class MTLDXGIKeyedMutex final : public IDXGIKeyedMutex {
++  std::atomic<ULONG> refs_{1};
++  ID3D11Resource *resource_;
++
++public:
++  MTLDXGIKeyedMutex(ID3D11Resource *resource) : resource_(resource) { resource_->AddRef(); }
++  ~MTLDXGIKeyedMutex() { resource_->Release(); }
++
++  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
++    if (!ppvObject)
++      return E_POINTER;
++    if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIDeviceSubObject) ||
++        riid == __uuidof(IDXGIKeyedMutex)) {
++      AddRef();
++      *ppvObject = this;
++      return S_OK;
++    }
++    return resource_->QueryInterface(riid, ppvObject);
++  }
++  ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
++  ULONG STDMETHODCALLTYPE Release() override {
++    ULONG r = --refs_;
++    if (!r)
++      delete this;
++    return r;
++  }
++  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID Name, UINT DataSize, const void *pData) override {
++    return resource_->SetPrivateData(Name, DataSize, pData);
++  }
++  HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID Name, const IUnknown *pUnknown) override {
++    return resource_->SetPrivateDataInterface(Name, pUnknown);
++  }
++  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID Name, UINT *pDataSize, void *pData) override {
++    return resource_->GetPrivateData(Name, pDataSize, pData);
++  }
++  HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void **ppParent) override {
++    IDXGIResource *r = nullptr;
++    if (FAILED(resource_->QueryInterface(__uuidof(IDXGIResource), (void **)&r)))
++      return E_NOINTERFACE;
++    HRESULT hr = r->GetParent(riid, ppParent);
++    r->Release();
++    return hr;
++  }
++  HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **ppDevice) override {
++    ID3D11Device *d = nullptr;
++    resource_->GetDevice(&d);
++    if (!d)
++      return E_FAIL;
++    HRESULT hr = d->QueryInterface(riid, ppDevice);
++    d->Release();
++    return hr;
++  }
++  HRESULT STDMETHODCALLTYPE AcquireSync(UINT64 Key, DWORD dwMilliseconds) override { return S_OK; }
++  HRESULT STDMETHODCALLTYPE ReleaseSync(UINT64 Key) override { return S_OK; }
++};
++
+ template <typename RESOURCE_DESC>
+ void UpgradeResourceDescription(const RESOURCE_DESC *pSrc, RESOURCE_DESC &dst) {
+   dst = *pSrc;
+@@ -238,6 +301,13 @@ public:
+       return S_OK;
+     }
+ 
++    if (riid == __uuidof(IDXGIKeyedMutex) &&
++        (desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))) {
++      *ppvObject = static_cast<IDXGIKeyedMutex *>(new MTLDXGIKeyedMutex(ref_and_cast<D3D11ResourceCommon>(this)));
++      static_cast<D3D11ResourceCommon *>(this)->Release();   // (the mutex object holds its own reference)
++      return S_OK;
++    }
++
+     if (logQueryInterfaceError(__uuidof(typename tag::COM), riid)) {
+       WARN("D3D11Resource(", tag::debug_name ,"): Unknown interface query ", str::format(riid));
+     }
