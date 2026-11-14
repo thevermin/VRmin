@@ -89,7 +89,12 @@ public:
     c.rfRed[1] = c.rfGreen[1] = c.rfBlue[1] = v;
     return c;
   }
-  bool ComputeInverseDistortion(HmdVector2_t *, EVREye, uint32_t, float, float) override { return false; }
+  // (no lens: the Quest corrects its own; SteamVR's compositor needs the inverse too, or it doesn't start)
+  bool ComputeInverseDistortion(HmdVector2_t *r, EVREye, uint32_t, float u, float v) override {
+    r->v[0] = u;
+    r->v[1] = v;
+    return true;
+  }
 };
 
 class VRminVirtualDisplay : public IVRVirtualDisplay {
