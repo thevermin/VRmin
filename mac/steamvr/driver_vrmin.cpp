@@ -10,6 +10,7 @@
 #include <openvr_driver.h>
 #include <windows.h>
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <dxgi.h>
 
 #include <atomic>
@@ -20,6 +21,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <string>
 #include <vector>
 #include <algorithm>
 
@@ -369,6 +371,30 @@ static DXGI_FORMAT typeless(DXGI_FORMAT f) {
   }
 }
 
+// A layer drawn over the game's image (SteamVR's own objects and panels): each eye's texture and the part of it used
+struct Overlay { ID3D11Texture2D *tex[2]; float rect[2][4]; };
+
+// Draws a texture over part of another (alpha blending): what SteamVR's compositor does with the layers on Windows
+static const char *BLEND_HLSL = R"(
+cbuffer C : register(b0) { float4 r; };
+Texture2D t : register(t0);
+SamplerState s : register(s0);
+void vs(uint id : SV_VertexID, out float4 p : SV_Position, out float2 uv : TEXCOORD0) {
+  float2 q = float2((id << 1) & 2, id & 2);
+  p = float4(q * float2(2, -2) + float2(-1, 1), 0, 1);
+  uv = r.xy + (r.zw - r.xy) * q;
+}
+float4 ps(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return t.Sample(s, uv); }
+)";
+
+static DXGI_FORMAT srgb_of(DXGI_FORMAT f) {
+  return f == DXGI_FORMAT_R8G8B8A8_TYPELESS ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : f == DXGI_FORMAT_B8G8R8A8_TYPELESS ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : f;
+}
+static DXGI_FORMAT unorm_of(DXGI_FORMAT f) {
+  return f == DXGI_FORMAT_R8G8B8A8_TYPELESS ? DXGI_FORMAT_R8G8B8A8_UNORM : f == DXGI_FORMAT_B8G8R8A8_TYPELESS ? DXGI_FORMAT_B8G8R8A8_UNORM : f;
+}
+static bool is_srgb(DXGI_FORMAT f) { return f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB; }
+
 class FrameSender {
   std::mutex lock;
   ID3D11Device *dev = nullptr;
@@ -435,6 +461,92 @@ private:
     free(px);
   }
   uint64_t copies = 0, lastShot = 0;
+
+  // Layer blending (made the first time a frame has layers; if it can't be made, the layers aren't drawn)
+  int blendState = 0;   // 0 not made · 1 ready · -1 not available
+  ID3D11VertexShader *vs = nullptr;
+  ID3D11PixelShader *ps = nullptr;
+  ID3D11Buffer *cb = nullptr;
+  ID3D11SamplerState *sampler = nullptr;
+  ID3D11BlendState *blend = nullptr;
+  ID3D11RasterizerState *raster = nullptr;
+  bool blend_init() {
+    typedef HRESULT(WINAPI * compile_fn)(const void *, SIZE_T, const char *, const void *, void *, const char *, const char *, UINT, UINT, ID3DBlob **, ID3DBlob **);
+    HMODULE m = LoadLibraryA("d3dcompiler_47.dll");
+    if (!m) m = LoadLibraryA("d3dcompiler_43.dll");
+    compile_fn compile = m ? (compile_fn)GetProcAddress(m, "D3DCompile") : nullptr;
+    if (!compile) { logf("Layers: no shader compiler (d3dcompiler_47)"); return false; }
+    ID3DBlob *bv = nullptr, *bp = nullptr, *err = nullptr;
+    if (FAILED(compile(BLEND_HLSL, strlen(BLEND_HLSL), "blend", nullptr, nullptr, "vs", "vs_4_0", 0, 0, &bv, &err)) ||
+        FAILED(compile(BLEND_HLSL, strlen(BLEND_HLSL), "blend", nullptr, nullptr, "ps", "ps_4_0", 0, 0, &bp, &err))) {
+      logf("Layers: the shader didn't compile: %s", err ? (const char *)err->GetBufferPointer() : "?");
+      return false;
+    }
+    bool ok = SUCCEEDED(dev->CreateVertexShader(bv->GetBufferPointer(), bv->GetBufferSize(), nullptr, &vs)) &&
+              SUCCEEDED(dev->CreatePixelShader(bp->GetBufferPointer(), bp->GetBufferSize(), nullptr, &ps));
+    bv->Release();
+    bp->Release();
+    D3D11_BUFFER_DESC bd = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+    D3D11_SAMPLER_DESC sd = {};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    D3D11_BLEND_DESC bl = {};
+    D3D11_RENDER_TARGET_BLEND_DESC &rt = bl.RenderTarget[0];
+    rt.BlendEnable = TRUE;
+    rt.SrcBlend = D3D11_BLEND_SRC_ALPHA; rt.DestBlend = D3D11_BLEND_INV_SRC_ALPHA; rt.BlendOp = D3D11_BLEND_OP_ADD;
+    rt.SrcBlendAlpha = D3D11_BLEND_ONE; rt.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    D3D11_RASTERIZER_DESC rd = {};
+    rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE;
+    ok = ok && SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &cb)) && SUCCEEDED(dev->CreateSamplerState(&sd, &sampler)) &&
+         SUCCEEDED(dev->CreateBlendState(&bl, &blend)) && SUCCEEDED(dev->CreateRasterizerState(&rd, &raster));
+    if (!ok) logf("Layers: couldn't make the drawing objects");
+    else logf("Layers: ready to draw SteamVR's layers over the game's image");
+    return ok;
+  }
+  // Draws each layer over the game's image in the slot (each eye in its half)
+  void draw_overlays(ID3D11Texture2D *dst, uint32_t ew, uint32_t eh, const std::vector<Overlay> &over) {
+    if (over.empty()) return;
+    if (!blendState) blendState = blend_init() ? 1 : -1;
+    if (blendState < 0) return;
+    for (const Overlay &o : over)
+      for (int e = 0; e < 2; e++) {
+        D3D11_TEXTURE2D_DESC sdsc;
+        o.tex[e]->GetDesc(&sdsc);
+        // (an sRGB layer is read as linear and written back as sRGB: blending in linear light, as the compositor does)
+        D3D11_RENDER_TARGET_VIEW_DESC rv = {};
+        rv.Format = is_srgb(sdsc.Format) ? srgb_of(texFmt) : unorm_of(texFmt);
+        rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+        sv.Format = sdsc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS || sdsc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ? unorm_of(sdsc.Format) : sdsc.Format;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+        ID3D11RenderTargetView *rtv = nullptr;
+        ID3D11ShaderResourceView *srv = nullptr;
+        if (SUCCEEDED(dev->CreateRenderTargetView(dst, &rv, &rtv)) && SUCCEEDED(dev->CreateShaderResourceView(o.tex[e], &sv, &srv))) {
+          D3D11_VIEWPORT vp = {(float)(e * ew), 0, (float)ew, (float)eh, 0, 1};
+          ctx->UpdateSubresource(cb, 0, nullptr, o.rect[e], 0, 0);
+          ctx->OMSetRenderTargets(1, &rtv, nullptr);
+          ctx->OMSetBlendState(blend, nullptr, 0xffffffff);
+          ctx->RSSetState(raster);
+          ctx->RSSetViewports(1, &vp);
+          ctx->IASetInputLayout(nullptr);
+          ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+          ctx->VSSetShader(vs, nullptr, 0);
+          ctx->VSSetConstantBuffers(0, 1, &cb);
+          ctx->PSSetShader(ps, nullptr, 0);
+          ctx->PSSetShaderResources(0, 1, &srv);
+          ctx->PSSetSamplers(0, 1, &sampler);
+          ctx->Draw(3, 0);
+          ID3D11ShaderResourceView *none = nullptr;
+          ctx->PSSetShaderResources(0, 1, &none);
+          ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        }
+        if (rtv) rtv->Release();
+        if (srv) srv->Release();
+      }
+  }
 
   bool init_device() {
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx);
@@ -550,7 +662,7 @@ private:
     D3D11_TEXTURE2D_DESC d = {};
     d.Width = w * 2; d.Height = h; d.MipLevels = 1; d.ArraySize = 1;
     d.Format = typeless(sd.Format); d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT;
-    d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET; d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
     uint8_t p[9 + SLOTS * 56] = {};
     D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
     for (int i = 0; i < SLOTS; i++) {
@@ -631,7 +743,7 @@ public:
 
   // (with mutex() held) Copies each eye's part of the game's frame next to each other into a free shared texture
   // (the GPU does it while SteamVR goes on), drawn with the Quest's pose «pose»
-  void copy(ID3D11Texture2D *src[2], const D3D11_BOX box[2], DXGI_FORMAT fmt, uint32_t pose) {
+  void copy(ID3D11Texture2D *src[2], const D3D11_BOX box[2], DXGI_FORMAT fmt, uint32_t pose, const std::vector<Overlay> &over) {
     if (!device()) return;
     D3D11_TEXTURE2D_DESC sd = {};
     sd.Width = (box[0].right - box[0].left) * 2; sd.Height = box[0].bottom - box[0].top; sd.Format = fmt;
@@ -646,6 +758,7 @@ public:
       b.right = b.left + sd.Width / 2; b.bottom = b.top + sd.Height;   // (the two eyes the same size)
       ctx->CopySubresourceRegion(tex[slot], 0, e * sd.Width / 2, 0, 0, src[e], 0, &b);
     }
+    draw_overlays(tex[slot], sd.Width / 2, sd.Height, over);
     ctx->End(query[slot]);
     ctx->Flush();
     pending = slot;
@@ -685,8 +798,10 @@ class VRminDirectMode : public IVRDriverDirectModeComponent {
   FrameSender frames;
   struct Set { uint32_t pid; SharedTextureHandle_t handle[3]; ID3D11Texture2D *tex[3]; bool compositor; };
   std::vector<Set> sets;
-  bool haveLayer = false, havePrev = false;
-  SubmitLayerPerEye_t layer[2], prev[2];
+  // The layers of the frame being submitted and of the previous one: the game's image (the first layer from a game's
+  // textures) and the ones after it
+  struct Layer { SubmitLayerPerEye_t eye[2]; };
+  std::vector<Layer> layers, prevLayers;
   uint64_t presented = 0, lastPresented = 0, lastSent = 0, gameFrames = 0;
   double t0 = now_s(), lastLog = 0;
 
@@ -736,7 +851,7 @@ public:
   }
   void DestroySwapTextureSet(SharedTextureHandle_t h) override {
     std::lock_guard<std::mutex> g(frames.mutex());
-    havePrev = false;
+    prevLayers.clear();
     for (size_t i = 0; i < sets.size(); i++)
       for (int j = 0; j < 3; j++)
         if (sets[i].handle[j] == h) {
@@ -747,7 +862,7 @@ public:
   }
   void DestroyAllSwapTextureSets(uint32_t pid) override {
     std::lock_guard<std::mutex> g(frames.mutex());
-    havePrev = false;
+    prevLayers.clear();
     for (size_t i = 0; i < sets.size();)
       if (sets[i].pid == pid) {
         for (ID3D11Texture2D *t : sets[i].tex) t->Release();
@@ -765,12 +880,7 @@ public:
   }
   void SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2]) override {
     std::lock_guard<std::mutex> g(frames.mutex());
-    int i;
-    Set *st = find(perEye[0].hTexture, &i);
-    if (haveLayer || !st || st->compositor) return;   // (the first layer of the game is its image)
-    layer[0] = perEye[0];
-    layer[1] = perEye[1];
-    haveLayer = true;
+    if (layers.size() < 16) layers.push_back({{perEye[0], perEye[1]}});
   }
   void Present(SharedTextureHandle_t) override {
     std::lock_guard<std::mutex> g(frames.mutex());
@@ -778,14 +888,36 @@ public:
     // The game's frame is copied one frame later: nothing tells this process when the game's GPU finished drawing it
     // (in Windows SteamVR's sync texture does; in VRmin's Windows it doesn't), and copied right away it sometimes
     // still had the image from 3 frames before
-    bool go = false;
+    std::vector<Layer> now;
+    now.swap(prevLayers);
+    prevLayers.swap(layers);
+    // The game's image: the first layer from a game's textures. SteamVR's own image under it (vrcompositor.exe's) comes
+    // out a single color inside VRmin's Windows and isn't used; the layers after it are drawn over it
+    int base = -1;
+    for (size_t k = 0; k < now.size() && base < 0; k++) {
+      int i;
+      Set *st = find(now[k].eye[0].hTexture, &i);
+      if (st && !st->compositor) base = (int)k;
+    }
+    bool go = base >= 0;
     SubmitLayerPerEye_t use[2];
-    if (haveLayer) {
-      haveLayer = false;
-      go = havePrev;
-      use[0] = prev[0]; use[1] = prev[1];
-      prev[0] = layer[0]; prev[1] = layer[1];
-      havePrev = true;
+    std::vector<Overlay> over;
+    if (go) {
+      use[0] = now[base].eye[0];
+      use[1] = now[base].eye[1];
+      for (size_t k = base + 1; k < now.size(); k++) {
+        Overlay o;
+        bool ok = true;
+        for (int e = 0; e < 2; e++) {
+          int i;
+          Set *st = find(now[k].eye[e].hTexture, &i);
+          if (!st) { ok = false; break; }
+          o.tex[e] = st->tex[i];
+          const VRTextureBounds_t &tb = now[k].eye[e].bounds;
+          o.rect[e][0] = tb.uMin; o.rect[e][1] = tb.vMin; o.rect[e][2] = tb.uMax; o.rect[e][3] = tb.vMax;
+        }
+        if (ok) over.push_back(o);
+      }
     }
     if (go) {
       int i0, i1;
@@ -817,7 +949,16 @@ public:
                use[0].bounds.uMin, use[0].bounds.uMax, use[0].bounds.vMin, use[0].bounds.vMax, (int)d.Format, m.m[0][3], m.m[1][3], m.m[2][3],
                pose, g_poseId.load(), dist);
         }
-        frames.copy(src, box, typeless(d.Format), pose);
+        if (gameFrames == 1 || gameFrames % 500 == 0) {
+          std::string who;
+          for (size_t k = 0; k < now.size(); k++) {
+            int i;
+            Set *st = find(now[k].eye[0].hTexture, &i);
+            who += !st ? " ?" : st->compositor ? " SteamVR" : " game";
+          }
+          logf("  layers:%s (drawing %zu over the game's)", who.c_str(), over.size());
+        }
+        frames.copy(src, box, typeless(d.Format), pose, over);
       }
     }
     double t = now_s();
