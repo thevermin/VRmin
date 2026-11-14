@@ -1,0 +1,100 @@
+diff --git a/src/d3d11/d3d11_texture_device.cpp b/src/d3d11/d3d11_texture_device.cpp
+index 55ee999..ac893d9 100644
+--- a/src/d3d11/d3d11_texture_device.cpp
++++ b/src/d3d11/d3d11_texture_device.cpp
+@@ -19,6 +19,9 @@ private:
+   float min_lod = 0.0;
+   D3DKMT_HANDLE local_kmt_ = 0;
+   D3DKMT_HANDLE global_kmt_ = 0;
++  // An opened shared texture can be shared again, as in Windows: the handle it was opened with (SteamVR passes
++  // textures other programs shared with it on to its compositor)
++  HANDLE imported_nt_ = nullptr;
+ 
+   using SRVBase =
+       TResourceViewBase<tag_shader_resource_view<DeviceTexture<tag_texture>>>;
+@@ -126,7 +129,14 @@ public:
+         this->texture_ = std::move(u_texture);
+       }
+ 
++  void SetImportedHandles(D3DKMT_HANDLE globalHandle, HANDLE ntHandle) {
++    global_kmt_ = globalHandle;
++    imported_nt_ = ntHandle;
++  }
++
+   ~DeviceTexture() {
++    if (imported_nt_)
++      CloseHandle(imported_nt_);
+     if (local_kmt_) {
+       D3DKMT_DESTROYALLOCATION destroy = {};
+       destroy.hDevice = this->m_parent->GetLocalD3DKMT();
+@@ -278,6 +288,12 @@ public:
+   CreateSharedHandle(const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName, HANDLE *pNTHandle)
+       override {
+     InitReturnPtr(pNTHandle);
++    if (!local_kmt_ && imported_nt_ && !pName) {
++      if (!DuplicateHandle(GetCurrentProcess(), imported_nt_, GetCurrentProcess(), pNTHandle, 0, FALSE,
++                           DUPLICATE_SAME_ACCESS))
++        return E_FAIL;
++      return S_OK;
++    }
+     if (!local_kmt_)
+       return E_INVALIDARG;
+ 
+@@ -471,7 +487,7 @@ template <typename tag>
+ HRESULT
+ ImportSharedTextureInternal(
+     MTLD3D11Device *pDevice, const typename tag::DESC1 *pDescUnchecked, mach_port_t MachPort, REFIID riid,
+-    void **ppTexture
++    void **ppTexture, D3DKMT_HANDLE GlobalHandle = 0, HANDLE NtHandle = nullptr
+ ) {
+   WMTTextureInfo info;
+   typename tag::DESC1 finalDesc;
+@@ -485,6 +501,10 @@ ImportSharedTextureInternal(
+   texture->rename(std::move(allocation));
+ 
+   Com<DeviceTexture<tag>> device_texture = (ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), pDevice)));
++  HANDLE nt = nullptr;
++  if (NtHandle)
++    DuplicateHandle(GetCurrentProcess(), NtHandle, GetCurrentProcess(), &nt, 0, FALSE, DUPLICATE_SAME_ACCESS);
++  device_texture->SetImportedHandles(GlobalHandle, nt);
+   return device_texture->QueryInterface(riid, ppTexture);
+ }
+ 
+@@ -547,15 +567,15 @@ ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
+   {
+   case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+     return ImportSharedTextureInternal<tag_texture_1d>(
+-        pDevice, &runtimeData.desc.desc1d, mach_port, riid, ppTexture
++        pDevice, &runtimeData.desc.desc1d, mach_port, riid, ppTexture, (D3DKMT_HANDLE)reinterpret_cast<uintptr_t>(hResource)
+     );
+   case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+     return ImportSharedTextureInternal<tag_texture_2d>(
+-        pDevice, &runtimeData.desc.desc2d, mach_port, riid, ppTexture
++        pDevice, &runtimeData.desc.desc2d, mach_port, riid, ppTexture, (D3DKMT_HANDLE)reinterpret_cast<uintptr_t>(hResource)
+     );
+   case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+     return ImportSharedTextureInternal<tag_texture_3d>(
+-        pDevice, &runtimeData.desc.desc3d, mach_port, riid, ppTexture
++        pDevice, &runtimeData.desc.desc3d, mach_port, riid, ppTexture, (D3DKMT_HANDLE)reinterpret_cast<uintptr_t>(hResource)
+     );
+   default:
+     ERR("ImportSharedTexture: Unsupported resource dimension");
+@@ -639,15 +659,15 @@ ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFII
+   {
+   case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+     return ImportSharedTextureInternal<tag_texture_1d>(
+-        pDevice, &runtimeData.desc.desc1d, mach_port, riid, ppTexture
++        pDevice, &runtimeData.desc.desc1d, mach_port, riid, ppTexture, 0, hResource
+     );
+   case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+     return ImportSharedTextureInternal<tag_texture_2d>(
+-        pDevice, &runtimeData.desc.desc2d, mach_port, riid, ppTexture
++        pDevice, &runtimeData.desc.desc2d, mach_port, riid, ppTexture, 0, hResource
+     );
+   case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+     return ImportSharedTextureInternal<tag_texture_3d>(
+-        pDevice, &runtimeData.desc.desc3d, mach_port, riid, ppTexture
++        pDevice, &runtimeData.desc.desc3d, mach_port, riid, ppTexture, 0, hResource
+     );
+   default:
+     ERR("ImportSharedTexture: Unsupported resource dimension");
