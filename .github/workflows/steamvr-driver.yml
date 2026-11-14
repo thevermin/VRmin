@@ -29,7 +29,7 @@ jobs:
       - name: Keep the DLL in the repository
         if: github.event_name == 'push'
         run: |
-          cp "$RUNNER_TEMP/driver_vrmin.dll" mac/steamvr/driver_vrmin/bin/win64/driver_vrmin.dll
+          mkdir -p mac/steamvr/driver_vrmin/bin/win64 && cp "$RUNNER_TEMP/driver_vrmin.dll" mac/steamvr/driver_vrmin/bin/win64/driver_vrmin.dll
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add mac/steamvr/driver_vrmin/bin/win64/driver_vrmin.dll
