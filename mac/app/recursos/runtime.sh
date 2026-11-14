@@ -189,7 +189,9 @@ abrir_steamvr() {
   cerrar_steamvr   # (uno a medio abrir o sin el driver de VRmin)
   rm -f "$Q/driver_vrmin.log"
   say "Abriendo SteamVR…" "Opening SteamVR…"
-  WINEDEBUG=-all "$WINE" "$STEAMVR_WIN\\bin\\win64\\vrstartup.exe" >/dev/null 2>&1 < /dev/null &
+  # (lo que escriben SteamVR, Wine y DXMT, con los errores de cada proceso: para ver por qué se cierra el proceso de la
+  #  placa de video de los paneles del menú)
+  WINEDEBUG=+pid,+seh "$WINE" "$STEAMVR_WIN\\bin\\win64\\vrstartup.exe" >"$P/logs/steamvr_wine.log" 2>&1 < /dev/null &
   local i
   for i in $(seq 1 120); do
     grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null && { say "SteamVR listo" "SteamVR ready"; return 0; }
