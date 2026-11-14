@@ -179,15 +179,24 @@ ajustes_steamvr() {
 JSON
 }
 
-# SteamVR real: si quedó abierto de antes con los controles de VRmin, el juego nuevo lo usa; si no, se cierra lo que haya
-# quedado (uno a medio cerrar le daba al juego dispositivos viejos y se quedaba sin controles) y lo abre el juego.
-# (Abrirlo antes que el juego no anduvo: por fuera de Steam, Steam abría otro y se colgaba; por Steam, Steam se conecta a
-#  SteamVR para mostrar sus paneles y se cuelga dentro de Wine)
+# SteamVR real, abierto antes que el juego y con el visor y los controles de VRmin ya agregados: si lo abre el juego,
+# se conecta antes de que cargue el driver y se queda sin controles (OpenVR), o no encuentra el visor (OpenXR).
+# Se abre con vrstartup (su ventana se conecta y hace cargar los drivers; vrserver solo no carga ninguno hasta que algún
+# programa se le conecta). Si ya está abierto con los controles de VRmin, el juego nuevo lo usa.
 abrir_steamvr() {
   if pgrep -f 'vrserver.exe' >/dev/null 2>&1 && grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null; then
     say "SteamVR ya está abierto" "SteamVR is already open"; return 0
   fi
-  cerrar_steamvr
+  cerrar_steamvr   # (uno a medio abrir o sin el driver de VRmin)
+  rm -f "$Q/driver_vrmin.log"
+  say "Abriendo SteamVR…" "Opening SteamVR…"
+  WINEDEBUG=-all "$WINE" "$STEAMVR_WIN\\bin\\win64\\vrstartup.exe" >/dev/null 2>&1 < /dev/null &
+  local i
+  for i in $(seq 1 120); do
+    grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null && { say "SteamVR listo" "SteamVR ready"; return 0; }
+    sleep 0.5
+  done
+  say "SteamVR tardó en abrir; abro el juego igual" "SteamVR took long to open; opening the game anyway"
 }
 
 # Cierra SteamVR (y deja de vigilar el juego que lo usaba)
