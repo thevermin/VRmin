@@ -1,13 +1,14 @@
 #!/bin/bash
-# Prueba si el SteamVR de Windows arranca dentro del Windows de VRmin, antes de hacerle un driver:
-# lo abre con su visor de prueba («null»: dibuja en una ventana común) durante un rato y junta sus registros.
-#   probar_steamvr.sh [segundos]   (por defecto 90)
+# Prueba el SteamVR de Windows dentro del Windows de VRmin: lo abre durante un rato con el driver de VRmin
+# (mac/steamvr) o con su visor de prueba («null», dibuja en una ventana común) y junta sus registros.
+#   probar_steamvr.sh [segundos] [vrmin|null]   (por defecto 90 y vrmin)
 # Hace falta SteamVR instalado en el Steam de VRmin y Steam abierto. Deja todo como estaba: los ajustes de SteamVR
 # vuelven a los de antes y el próximo juego vuelve a elegir su runtime.
 source "$(dirname "$0")/entorno.sh"
 source "$RES/runtime.sh"
 cd "$P"
 SEG="${1:-90}"
+CON="${2:-vrmin}"
 STEAM="$WINEPREFIX/drive_c/Program Files (x86)/Steam"
 SVR="$STEAM/steamapps/common/SteamVR"
 OUT="$P/logs/steamvr_prueba"
@@ -15,8 +16,16 @@ OUT="$P/logs/steamvr_prueba"
 steam_abierto || { say "Steam no está abierto. Abrilo y esperá a ver tu biblioteca." "Steam isn't open. Open it and wait until you see your library."; exit 1; }
 rm -rf "$OUT"; mkdir -p "$OUT"
 
-# OpenVR → SteamVR (sin drivers externos) y OpenXR → SteamVR
-escribir_vrpath "$STEAMVR_WIN"
+# El driver de VRmin (el de la app; si no, el de la carpeta del código)
+DRV=""
+for d in "$RES/steamvr/driver_vrmin" "$RES/../../steamvr/driver_vrmin"; do [ -f "$d/bin/win64/driver_vrmin.dll" ] && DRV="$d" && break; done
+if [ "$CON" = vrmin ]; then
+  [ -n "$DRV" ] || { say "No encontré el driver de VRmin para SteamVR." "Couldn't find VRmin's SteamVR driver."; exit 1; }
+  rm -rf "$Q/driver_vrmin" && cp -R "$DRV" "$Q/driver_vrmin" && rm -f "$Q/driver_vrmin.log"
+fi
+
+# OpenVR → SteamVR (con el driver de VRmin registrado) y OpenXR → SteamVR
+if [ "$CON" = vrmin ]; then escribir_vrpath "$STEAMVR_WIN" 'C:\questvrbridge\driver_vrmin'; else escribir_vrpath "$STEAMVR_WIN"; fi
 openxr_activo "$STEAMVR_WIN\\steamxr_win64.json" > /dev/null 2>&1
 rm -f "$Q/.runtime"   # (el próximo juego vuelve a poner su runtime)
 
@@ -25,6 +34,21 @@ rm -f "$Q/.runtime"   # (el próximo juego vuelve a poner su runtime)
 mkdir -p "$Q/openvr/config" "$Q/openvr/logs"
 CFG="$Q/openvr/config/steamvr.vrsettings"
 [ -f "$CFG" ] && cp "$CFG" "$OUT/steamvr.vrsettings.antes"
+if [ "$CON" = vrmin ]; then
+cat > "$CFG" <<'JSON'
+{
+   "driver_null" : { "enable" : false },
+   "steamvr" : {
+      "requireHmd" : true,
+      "forcedDriver" : "vrmin",
+      "activateMultipleDrivers" : false,
+      "enableHomeApp" : false,
+      "showMirrorView" : false,
+      "startMonitorFromAppLaunch" : true
+   }
+}
+JSON
+else
 cat > "$CFG" <<'JSON'
 {
    "driver_null" : {
@@ -45,6 +69,7 @@ cat > "$CFG" <<'JSON'
    }
 }
 JSON
+fi
 
 say "Abriendo SteamVR ($SEG segundos)…" "Opening SteamVR ($SEG seconds)…"
 export WINEDEBUG=err+all,warn+module
@@ -57,8 +82,9 @@ say "Procesos de SteamVR que quedaron abiertos:" "SteamVR processes still open:"
 # Cerrar SteamVR y juntar sus registros
 for p in vrmonitor vrcompositor vrdashboard vrwebhelper vrserver vrstartup; do pkill -f "$p.exe" 2>/dev/null; done
 sleep 3
-cp "$Q/openvr/logs/"*.txt "$STEAM/logs/"vr*.txt "$OUT/" 2>/dev/null
+cp "$Q/openvr/logs/"*.txt "$STEAM/logs/"vr*.txt "$Q/driver_vrmin.log" "$OUT/" 2>/dev/null
 if [ -f "$OUT/steamvr.vrsettings.antes" ]; then cp "$OUT/steamvr.vrsettings.antes" "$CFG"; else rm -f "$CFG"; fi
 tail -c 2000000 "$OUT/wine.log" > "$OUT/wine_final.log"
 say "Listo. Registros en: $OUT" "Done. Logs in: $OUT"
 grep -h -i 'compositor\|error\|failed\|fatal' "$OUT"/vrserver.txt "$OUT"/vrcompositor.txt 2>/dev/null | tail -20
+[ -f "$OUT/driver_vrmin.log" ] && { say "Driver de VRmin:" "VRmin driver:"; tail -15 "$OUT/driver_vrmin.log"; }
