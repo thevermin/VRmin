@@ -38,6 +38,7 @@ if [ "$CON" = vrmin ]; then
 cat > "$CFG" <<'JSON'
 {
    "driver_null" : { "enable" : false },
+   "dashboard" : { "showDesktop" : false },
    "steamvr" : {
       "requireHmd" : true,
       "forcedDriver" : "vrmin",
