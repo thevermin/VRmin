@@ -65,9 +65,9 @@ if [ "$LANZAR" = "directo" ] && [ -n "$EXE" ] && [ -f "$CARPETA/$EXE" ]; then
     export WINEDEBUG=-all,err+module,err+loaddll
   fi
   export DXMT_LOG_PATH="$P/logs"
-  # (lo que Steam les pasa a los juegos que abre: así el juego sabe que es de Steam y no pide volver a abrirse por
-  #  Steam, y SteamVR lo reconoce y le da sus controles)
-  export SteamAppId="$APPID" SteamGameId="$APPID"
+  # (SteamVR real: lo que Steam les pasa a los juegos que abre; así el juego sabe que es de Steam y no pide volver a
+  #  abrirse por Steam, y SteamVR lo reconoce y le da sus controles. Con los otros runtimes, como antes)
+  [ "$RUNTIME" = "steamvr" ] && export SteamAppId="$APPID" SteamGameId="$APPID"
   for e in "${ENVS[@]}"; do export "$e"; echo "Variable: $e" >> "$LOG"; done
   cd "$CARPETA/$(dirname "$EXE")"
   "$WINE" "$CARPETA/$EXE" "${ARGS[@]}" "$@" >> "$LOG" 2>&1 < /dev/null &
