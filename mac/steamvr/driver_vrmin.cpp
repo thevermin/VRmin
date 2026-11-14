@@ -765,8 +765,7 @@ class VRminDirectMode : public IVRDriverDirectModeComponent {
       for (*i = 0; *i < 3; (*i)++) if (st.handle[*i] == h) return &st;
     return nullptr;
   }
-  // SteamVR's own frames (vrcompositor.exe, while a game loads or misses a frame) come out a single color inside VRmin's
-  // Windows (its drawing doesn't work there): they aren't sent, and the Quest keeps showing the game's last one
+  // SteamVR's own textures (vrcompositor.exe's: its room, menu and panels)
   static bool is_compositor(uint32_t pid) {
     char path[MAX_PATH] = "";
     DWORD n = MAX_PATH;
@@ -846,13 +845,17 @@ public:
     std::vector<Layer> now;
     now.swap(prevLayers);
     prevLayers.swap(layers);
-    // The game's image: the first layer from a game's textures. SteamVR's own image under it (vrcompositor.exe's) comes
-    // out a single color inside VRmin's Windows and isn't used; the layers after it are drawn over it
+    // The image: the first layer from a game's textures (SteamVR's own image under it is its background, hidden by the
+    // game's), or without a game, SteamVR's own (its room and menu); the layers after it are drawn over it
     int base = -1;
     for (size_t k = 0; k < now.size() && base < 0; k++) {
       int i;
       Set *st = find(now[k].eye[0].hTexture, &i);
       if (st && !st->compositor) base = (int)k;
+    }
+    if (base < 0 && !now.empty()) {
+      int i;
+      if (find(now[0].eye[0].hTexture, &i)) base = 0;
     }
     bool go = base >= 0;
     SubmitLayerPerEye_t use[2];

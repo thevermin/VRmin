@@ -134,8 +134,9 @@ PY
 
 # SteamVR real: el driver de VRmin (el que viene con VRmin Host, copiado al motor cuando cambia) y los ajustes de
 # SteamVR en C:\questvrbridge\openvr\config (solo los usa VRmin): solo el visor de VRmin, sin pedir armar la sala
-# (el driver da el área de juego), sin las paredes del área de juego (el Quest tiene las suyas), sin SteamVR Home y sin
-# el menú de SteamVR ni su ventana (en la Mac se cerraban y abrían todo el tiempo y la ponían muy lenta).
+# (el driver da el área de juego), sin las paredes del área de juego (el Quest tiene las suyas) y sin SteamVR Home.
+# useNewDesktop false: el menú de SteamVR muestra el escritorio de Windows con la forma de Windows 10 (Graphics
+# Capture), que Wine no tiene, y se cerraba y volvía a abrir todo el tiempo; con la anterior arranca.
 # allowDisplayLockedMode: dentro de Wine, SteamVR cree que la sesión de Windows está bloqueada y en vez de dibujar
 # llenaba todo de un color verde azulado
 poner_driver_steamvr() {
@@ -151,7 +152,7 @@ ajustes_steamvr() {
   cat > "$Q/openvr/config/steamvr.vrsettings" <<'JSON'
 {
    "driver_null" : { "enable" : false },
-   "dashboard" : { "enableDashboard" : false, "showDesktop" : false },
+   "dashboard" : { "useNewDesktop" : false, "showDesktop" : false },
    "collisionBounds" : { "CollisionBoundsColorGammaA" : 0, "CollisionBoundsFadeDistance" : 0 },
    "steamvr" : {
       "requireHmd" : true,
@@ -159,8 +160,6 @@ ajustes_steamvr() {
       "activateMultipleDrivers" : false,
       "enableHomeApp" : false,
       "showMirrorView" : false,
-      "startMonitorFromAppLaunch" : false,
-      "startDashboardFromAppLaunch" : false,
       "startOverlayAppsFromDashboard" : false,
       "allowDisplayLockedMode" : true
    }
@@ -178,9 +177,11 @@ abrir_steamvr() {
   cerrar_steamvr   # (uno a medio abrir o sin el driver de VRmin)
   rm -f "$Q/driver_vrmin.log"
   say "Abriendo SteamVR…" "Opening SteamVR…"
-  WINEDEBUG=-all "$WINE" "$STEAMVR_WIN\\bin\\win64\\vrserver.exe" >/dev/null 2>&1 < /dev/null &
+  # (como lo abre Steam: vrstartup abre la ventana de SteamVR, que se conecta y hace cargar los drivers; vrserver solo
+  #  no carga ninguno hasta que algún programa se le conecta)
+  WINEDEBUG=-all "$WINE" "$STEAMVR_WIN\\bin\\win64\\vrstartup.exe" >/dev/null 2>&1 < /dev/null &
   local i
-  for i in $(seq 1 60); do
+  for i in $(seq 1 120); do
     grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null && { say "SteamVR listo" "SteamVR ready"; return 0; }
     sleep 0.5
   done
