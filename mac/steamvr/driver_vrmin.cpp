@@ -991,6 +991,7 @@ public:
 class VRminHmd : public ITrackedDeviceServerDriver {
   VRminDisplay display;
   VRminDirectMode directMode;
+  VRInputComponentHandle_t proximity = 0;
 public:
   uint32_t id = k_unTrackedDeviceIndexInvalid;
   EVRInitError Activate(uint32_t objectId) override {
@@ -1012,6 +1013,10 @@ public:
     VRProperties()->SetStringProperty(c, Prop_DriverProvidedChaperoneJson_String, CHAPERONE_JSON);
     VRProperties()->SetBoolProperty(c, Prop_DriverProvidedChaperoneVisibility_Bool, false);
     VRProperties()->SetInt32Property(c, Prop_ExpectedControllerCount_Int32, 2);
+    // The headset is on (the Quest only sends poses while it's worn): SteamVR looks for /proximity
+    VRProperties()->SetBoolProperty(c, Prop_ContainsProximitySensor_Bool, true);
+    VRDriverInput()->CreateBooleanComponent(c, "/proximity", &proximity);
+    VRDriverInput()->UpdateBooleanComponent(proximity, true, 0);
     logf("Headset activated (device %u): %ux%u per eye, %.0f Hz", id, EYE_W, EYE_H, HZ);
     return VRInitError_None;
   }
