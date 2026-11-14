@@ -168,6 +168,21 @@ ajustes_steamvr() {
 JSON
 }
 
+# SteamVR real, abierto antes que el juego y con el visor y los controles de VRmin ya agregados: si el juego lo abre él
+# mismo, se conecta antes de que cargue el driver, arma sus controles sin dispositivos y se queda sin controles
+abrir_steamvr() {
+  if pgrep -f 'vrserver.exe' >/dev/null 2>&1 && grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null; then return 0; fi
+  rm -f "$Q/driver_vrmin.log"
+  say "Abriendo SteamVR…" "Opening SteamVR…"
+  WINEDEBUG=-all "$WINE" "$STEAMVR_WIN\\bin\\win64\\vrserver.exe" >/dev/null 2>&1 < /dev/null &
+  local i
+  for i in $(seq 1 60); do
+    grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null && { say "SteamVR listo" "SteamVR ready"; return 0; }
+    sleep 0.5
+  done
+  say "SteamVR tardó en abrir; abro el juego igual" "SteamVR took long to open; opening the game anyway"
+}
+
 preparar_runtime() {
   local modo="$1" antes
   antes="$(cat "$Q/.runtime" 2>/dev/null)"
