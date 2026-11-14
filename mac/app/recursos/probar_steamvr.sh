@@ -17,11 +17,9 @@ steam_abierto || { say "Steam no está abierto. Abrilo y esperá a ver tu biblio
 rm -rf "$OUT"; mkdir -p "$OUT"
 
 # El driver de VRmin (el de la app; si no, el de la carpeta del código)
-DRV=""
-for d in "$RES/steamvr/driver_vrmin" "$RES/../../steamvr/driver_vrmin"; do [ -f "$d/bin/win64/driver_vrmin.dll" ] && DRV="$d" && break; done
 if [ "$CON" = vrmin ]; then
-  [ -n "$DRV" ] || { say "No encontré el driver de VRmin para SteamVR." "Couldn't find VRmin's SteamVR driver."; exit 1; }
-  rm -rf "$Q/driver_vrmin" && cp -R "$DRV" "$Q/driver_vrmin" && rm -f "$Q/driver_vrmin.log" "$Q/steamvr_cuadro.bmp"
+  poner_driver_steamvr || exit 1
+  rm -f "$Q/driver_vrmin.log" "$Q/steamvr_cuadro.bmp"
 fi
 
 # OpenVR → SteamVR (con el driver de VRmin registrado) y OpenXR → SteamVR
@@ -35,20 +33,7 @@ mkdir -p "$Q/openvr/config" "$Q/openvr/logs"
 CFG="$Q/openvr/config/steamvr.vrsettings"
 [ -f "$CFG" ] && cp "$CFG" "$OUT/steamvr.vrsettings.antes"
 if [ "$CON" = vrmin ]; then
-cat > "$CFG" <<'JSON'
-{
-   "driver_null" : { "enable" : false },
-   "dashboard" : { "showDesktop" : false },
-   "steamvr" : {
-      "requireHmd" : true,
-      "forcedDriver" : "vrmin",
-      "activateMultipleDrivers" : false,
-      "enableHomeApp" : false,
-      "showMirrorView" : false,
-      "startMonitorFromAppLaunch" : true
-   }
-}
-JSON
+ajustes_steamvr
 else
 cat > "$CFG" <<'JSON'
 {

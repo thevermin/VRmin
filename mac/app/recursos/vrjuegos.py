@@ -5,7 +5,7 @@ VRmin Host · juegos VR: detección, perfiles y elección del runtime de cada ju
 Cada juego de PC VR habla con el visor a través de una "API" de VR. Las que existen:
   - OpenXR   : la estándar. Va directo a nuestro runtime (C:\\questvrbridge\\questvrbridge_openxr.dll).
   - OpenVR   : la de SteamVR. La traduce OpenComposite a OpenXR (sin SteamVR real y sin tocar el juego).
-  - SteamVR  : el SteamVR real de Valve con un driver nuestro (experimental: el driver todavía no existe).
+  - SteamVR  : el SteamVR real de Valve con el driver de VRmin (mac/steamvr; experimental).
   - Oculus   : el SDK de Oculus (LibOVR). Haría falta ReVive (todavía no está incluido).
   - Sin VR   : abrir el juego en una pantalla plana (útil para probar o para juegos con modo plano).
 
@@ -302,7 +302,9 @@ def perfil_usuario(appid):
 
 
 def driver_steamvr_listo():
-    return os.path.isfile(os.path.join(C, "questvrbridge", "driver_vrmin", "bin", "win64", "driver_vrmin.dll"))
+    # (el que viene con VRmin Host; se copia al motor al abrir el juego)
+    return any(os.path.isfile(os.path.join(d, "steamvr", "driver_vrmin", "bin", "win64", "driver_vrmin.dll"))
+               for d in (RES, os.path.join(RES, "..", "..")))
 
 
 def steamvr_instalado():

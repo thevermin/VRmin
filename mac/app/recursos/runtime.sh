@@ -132,6 +132,38 @@ PY
   fi
 }
 
+# SteamVR real: el driver de VRmin (el que viene con VRmin Host, copiado al motor cuando cambia) y los ajustes de
+# SteamVR en C:\questvrbridge\openvr\config (solo los usa VRmin): solo el visor de VRmin, sin pedir armar la sala
+# (el driver da el área de juego), sin SteamVR Home y sin el menú de SteamVR ni su ventana (en la Mac se cerraban y
+# abrían todo el tiempo y la ponían muy lenta)
+poner_driver_steamvr() {
+  local d sha
+  for d in "$RES/steamvr/driver_vrmin" "$RES/../../steamvr/driver_vrmin"; do [ -f "$d/bin/win64/driver_vrmin.dll" ] && break; done
+  [ -f "$d/bin/win64/driver_vrmin.dll" ] || { say "Falta el driver de VRmin para SteamVR" "VRmin's SteamVR driver is missing"; return 1; }
+  sha="$(shasum -a 256 "$d/bin/win64/driver_vrmin.dll" | cut -d' ' -f1)"
+  [ "$(cat "$Q/driver_vrmin/.version" 2>/dev/null)" = "$sha" ] && return 0
+  rm -rf "$Q/driver_vrmin" && cp -R "$d" "$Q/driver_vrmin" && echo "$sha" > "$Q/driver_vrmin/.version"
+}
+ajustes_steamvr() {
+  mkdir -p "$Q/openvr/config"
+  cat > "$Q/openvr/config/steamvr.vrsettings" <<'JSON'
+{
+   "driver_null" : { "enable" : false },
+   "dashboard" : { "enableDashboard" : false, "showDesktop" : false },
+   "steamvr" : {
+      "requireHmd" : true,
+      "forcedDriver" : "vrmin",
+      "activateMultipleDrivers" : false,
+      "enableHomeApp" : false,
+      "showMirrorView" : false,
+      "startMonitorFromAppLaunch" : false,
+      "startDashboardFromAppLaunch" : false,
+      "startOverlayAppsFromDashboard" : false
+   }
+}
+JSON
+}
+
 preparar_runtime() {
   local modo="$1" antes
   antes="$(cat "$Q/.runtime" 2>/dev/null)"
@@ -146,6 +178,8 @@ preparar_runtime() {
       echo "Runtime: OpenXR → VRmin · OpenVR → OpenComposite → VRmin"
       ;;
     steamvr)
+      poner_driver_steamvr || return 1
+      ajustes_steamvr
       escribir_vrpath "$STEAMVR_WIN" 'C:\questvrbridge\driver_vrmin'
       [ "$antes" = "steamvr" ] || openxr_activo "$STEAMVR_WIN\\steamxr_win64.json"
       echo "steamvr" > "$Q/.runtime"
