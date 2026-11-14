@@ -76,6 +76,7 @@ jobs:
         working-directory: dxmt
         run: |
           git apply ../vrmin/mac/dxmt/msaa-8x-to-4x.patch
+          git apply ../vrmin/mac/dxmt/shared-buffer-handle.patch   # (SteamVR's compositor)
           if [ "$DXMT_REPO" = 3Shain/dxmt ]; then git apply ../vrmin/mac/dxmt/vista-metal.patch
           else git apply ../vrmin/mac/dxmt/fork-iomanip.patch; fi   # (el fork no compila con el mingw de ahora sin esto)
       - name: 64 bits (y winemetal.so)
@@ -101,7 +102,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/pkg"
           test -f x86_64-unix/winemetal.so && test -f x86_64-windows/d3d11.dll && test -f x86_64-windows/winemetal.dll
           cp "$GITHUB_WORKSPACE/dxmt/LICENSE" LICENSE-DXMT.txt
-          echo "DXMT ${DXMT_REPO}@${DXMT_COMMIT} + VRmin mac/dxmt/msaa-8x-to-4x.patch$( [ "$DXMT_REPO" = 3Shain/dxmt ] && echo ' + vista-metal.patch')" > VERSION.txt
+          echo "DXMT ${DXMT_REPO}@${DXMT_COMMIT} + VRmin mac/dxmt/msaa-8x-to-4x.patch + shared-buffer-handle.patch$( [ "$DXMT_REPO" = 3Shain/dxmt ] && echo ' + vista-metal.patch')" > VERSION.txt
           tar -czf "$GITHUB_WORKSPACE/dxmt-vrmin.tar.gz" .
           cd "$GITHUB_WORKSPACE" && shasum -a 256 dxmt-vrmin.tar.gz | tee dxmt-vrmin.tar.gz.sha256
       - uses: actions/upload-artifact@v4
