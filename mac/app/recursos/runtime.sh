@@ -177,9 +177,10 @@ abrir_steamvr() {
   cerrar_steamvr   # (uno a medio abrir o sin el driver de VRmin)
   rm -f "$Q/driver_vrmin.log"
   say "Abriendo SteamVR…" "Opening SteamVR…"
-  # (como lo abre Steam: vrstartup abre la ventana de SteamVR, que se conecta y hace cargar los drivers; vrserver solo
-  #  no carga ninguno hasta que algún programa se le conecta)
-  WINEDEBUG=-all "$WINE" "$STEAMVR_WIN\\bin\\win64\\vrstartup.exe" >/dev/null 2>&1 < /dev/null &
+  # (lo abre Steam, como en una PC: así Steam sabe que SteamVR está abierto y después abre el juego sin intentar abrir
+  #  otro SteamVR, que chocaba con este y colgaba a Steam. vrserver solo no sirve: no carga los drivers hasta que algún
+  #  programa se le conecta)
+  WINEDEBUG=-all "$WINE" "C:\\Program Files (x86)\\Steam\\steam.exe" -applaunch 250820 >> "$P/logs/steam.log" 2>&1 < /dev/null &
   local i
   for i in $(seq 1 120); do
     grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null && { say "SteamVR listo" "SteamVR ready"; return 0; }

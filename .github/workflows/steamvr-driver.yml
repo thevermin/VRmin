@@ -20,7 +20,7 @@ jobs:
       - name: Build
         run: |
           x86_64-w64-mingw32-g++-posix -std=c++17 -O2 -Wall -shared -o "$RUNNER_TEMP/driver_vrmin.dll" mac/steamvr/driver_vrmin.cpp \
-            -I"$RUNNER_TEMP/openvr/headers" -static -static-libgcc -static-libstdc++ -ld3d11 -ldxgi -lws2_32 -ldxguid > build.log 2>&1 || true
+            -I"$RUNNER_TEMP/openvr/headers" -static -static-libgcc -static-libstdc++ -ld3d11 -ldxgi -lws2_32 -ldxguid -lgdi32 > build.log 2>&1 || true
           grep -E "error|warning" build.log | head -20 | while IFS= read -r l; do echo "::warning::$l"; done
           test -f "$RUNNER_TEMP/driver_vrmin.dll"
           x86_64-w64-mingw32-objdump -p "$RUNNER_TEMP/driver_vrmin.dll" | grep -q HmdDriverFactory

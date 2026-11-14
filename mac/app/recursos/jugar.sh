@@ -41,7 +41,9 @@ cp "$RES/openxr/questvrbridge_openxr.dll" "$RES/openxr/questvrbridge_openxr.json
 preparar_runtime "$RUNTIME" 2>&1 | tee -a "$LOG"
 # (SteamVR real: abierto antes que el juego y cerrado cuando el juego se cierra; con otro runtime, si quedó abierto de
 #  un juego anterior, se cierra)
-if [ "$RUNTIME" = "steamvr" ]; then abrir_steamvr 2>&1 | tee -a "$LOG"; cerrar_steamvr_con_el_juego "$(basename "$CARPETA")"
+if [ "$RUNTIME" = "steamvr" ]; then
+  say "Abriendo $NOMBRE…" "Opening $NOMBRE…" > "$Q/steamvr_abriendo.txt"   # (el cartel que muestra el visor mientras tanto)
+  abrir_steamvr 2>&1 | tee -a "$LOG"; cerrar_steamvr_con_el_juego "$(basename "$CARPETA")"
 else cerrar_steamvr; fi
 # (OpenComposite: el grip de Touch como botón donde el juego lo usa para agarrar; OpenComposite busca esos controles en
 #  la carpeta desde donde se abre el juego)
