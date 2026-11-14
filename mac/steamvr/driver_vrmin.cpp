@@ -3,7 +3,8 @@
 // SteamVR loads it in vrserver.exe and sees a headset and two Touch controllers that follow the Quest's (poses and
 // buttons come from VRmin Host), the play area provided by the driver so SteamVR doesn't ask for room setup, and
 // SteamVR's direct mode: the game's frames come to the driver (SteamVR's last drawing pass, the lens warp, doesn't run:
-// inside VRmin's Windows it drew a single color) and go to VRmin Host at the headset's rate. Vibration comes next.
+// inside VRmin's Windows it drew a single color) and go to VRmin Host at the headset's rate, and the games'
+// vibration goes to the Quest's controllers.
 //
 // Log: C:\questvrbridge\driver_vrmin.log (and SteamVR's vrserver.txt)
 #include <winsock2.h>
@@ -37,29 +38,6 @@ static void logf(const char *fmt, ...) {
   if (!g_log) g_log = fopen("C:\\questvrbridge\\driver_vrmin.log", "w");
   if (g_log) { fprintf(g_log, "%s\n", b); fflush(g_log); }
   if (VRDriverLog()) { strncat(b, "\n", sizeof b - strlen(b) - 1); VRDriverLog()->Log(b); }
-}
-
-// The name of a SteamVR event (the ones about focus, standby and the dashboard; the rest by number)
-static const char *VRSystemEventName(uint32_t t) {
-  switch (t) {
-  case VREvent_InputFocusCaptured: return "InputFocusCaptured";
-  case VREvent_InputFocusReleased: return "InputFocusReleased";
-  case VREvent_SceneApplicationChanged: return "SceneApplicationChanged";
-  case VREvent_InputFocusChanged: return "InputFocusChanged";
-  case VREvent_DashboardActivated: return "DashboardActivated";
-  case VREvent_DashboardDeactivated: return "DashboardDeactivated";
-  case VREvent_EnterStandbyMode: return "EnterStandbyMode";
-  case VREvent_LeaveStandbyMode: return "LeaveStandbyMode";
-  case VREvent_TrackedDeviceUserInteractionStarted: return "UserInteractionStarted";
-  case VREvent_TrackedDeviceUserInteractionEnded: return "UserInteractionEnded";
-  case VREvent_ButtonPress: return "ButtonPress";
-  case VREvent_ButtonUnpress: return "ButtonUnpress";
-  case VREvent_ProcessConnected: return "ProcessConnected";
-  case VREvent_ProcessDisconnected: return "ProcessDisconnected";
-  case VREvent_HideRenderModels: return "HideRenderModels";
-  case VREvent_ShowRenderModels: return "ShowRenderModels";
-  default: return "?";
-  }
 }
 
 static double now_s() {
@@ -128,20 +106,14 @@ struct VRminDisplay {
     *l = f[0]; *r = f[1]; *t = f[2]; *b = f[3];
   }
   // (no lens: the Quest corrects its own)
-  virtual DistortionCoordinates_t *ComputeDistortion(DistortionCoordinates_t *c, EVREye eye, float u, float v) {
+  virtual DistortionCoordinates_t *ComputeDistortion(DistortionCoordinates_t *c, EVREye, float u, float v) {
     c->rfRed[0] = c->rfGreen[0] = c->rfBlue[0] = u;
     c->rfRed[1] = c->rfGreen[1] = c->rfBlue[1] = v;
-    static std::atomic<int> n{0};
-    int i = ++n;
-    if (i <= 4 || i % 1000 == 0) logf("ComputeDistortion #%d: eye %d, u %.3f, v %.3f", i, (int)eye, u, v);
     return c;
   }
-  virtual bool ComputeInverseDistortion(HmdVector2_t *r, EVREye eye, uint32_t ch, float u, float v) {
+  virtual bool ComputeInverseDistortion(HmdVector2_t *r, EVREye, uint32_t, float u, float v) {
     r->v[0] = u;
     r->v[1] = v;
-    static std::atomic<int> n{0};
-    int i = ++n;
-    if (i <= 4 || i % 1000 == 0) logf("ComputeInverseDistortion #%d: eye %d, channel %u, u %.3f, v %.3f", i, (int)eye, ch, u, v);
     return true;
   }
 };
@@ -197,7 +169,6 @@ struct Track {
 static std::mutex g_trackLock;
 static Track g_track;
 static std::atomic<uint32_t> g_poseId{0};   // (frames carry it: the Quest only shows frames whose pose it knows)
-static std::atomic<bool> g_handsValid{false};   // (the Quest sees both controllers)
 
 // The head poses given to SteamVR, by the number of the Quest's pose: a frame says which head pose it was drawn with,
 // and VRmin Host needs the Quest's number for it
@@ -269,7 +240,6 @@ static void parse_pose(const char *line) {
   std::lock_guard<std::mutex> g(g_trackLock);
   g_track = t;
   g_poseId = t.id;
-  g_handsValid = t.valid && t.handValid[0] && t.handValid[1];
 }
 
 static void parse_config(const char *line) {
@@ -309,6 +279,7 @@ static void wait_display() {
 // Control connection: tells VRmin Host a game is running (type 9, its name) and receives its settings and the
 // Quest's poses, one JSON line each.
 class HostControl {
+  std::mutex sendLock;
   std::atomic<bool> running{false};
   std::atomic<SOCKET> sock{INVALID_SOCKET};
   std::thread th;
@@ -320,9 +291,12 @@ public:
       while (running) {
         SOCKET s = host_connect();
         if (s == INVALID_SOCKET) { Sleep(1000); continue; }
-        sock = s;
+        {
+          std::lock_guard<std::mutex> g(sendLock);
+          sock = s;
+          send_packet(s, 9, "SteamVR", 7);
+        }
         logf("Connected to VRmin Host");
-        send_packet(s, 9, "SteamVR", 7);
         int used = 0, r;
         while (running && (r = recv(s, buf + used, (int)sizeof buf - 1 - used, 0)) > 0) {
           used += r;
@@ -338,11 +312,17 @@ public:
           memmove(buf, start, used);
           if (used >= (int)sizeof buf - 1) used = 0;
         }
-        sock = INVALID_SOCKET;
+        { std::lock_guard<std::mutex> g(sendLock); sock = INVALID_SOCKET; }
         closesocket(s);
         if (running) { logf("VRmin Host disconnected"); Sleep(1000); }
       }
     });
+  }
+  // Sends a packet on the control connection (if VRmin Host is connected)
+  void send(uint8_t type, const void *data, uint32_t n) {
+    std::lock_guard<std::mutex> g(sendLock);
+    SOCKET s = sock;
+    if (s != INVALID_SOCKET) send_packet(s, type, data, n);
   }
   void stop() {
     running = false;
@@ -443,47 +423,6 @@ public:
   std::atomic<uint64_t> sent{0}, dropped{0};
 
 private:
-  // A look at frame 300 and then every 1500: their average color in the log and a picture in
-  // C:\questvrbridge\steamvr_cuadro_N.bmp (a quarter of the size), to see what the game draws
-  void snapshot(ID3D11Texture2D *s, const D3D11_TEXTURE2D_DESC &sd, int k) {
-    D3D11_TEXTURE2D_DESC d = sd;
-    d.MipLevels = 1; d.ArraySize = 1; d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_STAGING;
-    d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
-    ID3D11Texture2D *st = nullptr;
-    if (FAILED(dev->CreateTexture2D(&d, nullptr, &st))) { logf("Snapshot: no staging texture"); return; }
-    ctx->CopyResource(st, s);
-    D3D11_MAPPED_SUBRESOURCE m;
-    if (FAILED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) { logf("Snapshot: Map failed"); st->Release(); return; }
-    uint32_t w = sd.Width / 4, h = sd.Height / 4;
-    uint8_t *px = (uint8_t *)malloc((size_t)w * h * 4);
-    double sum[4] = {};
-    bool bgra = typeless(sd.Format) == DXGI_FORMAT_B8G8R8A8_TYPELESS;
-    for (uint32_t y = 0; y < h; y++)
-      for (uint32_t x = 0; x < w; x++) {
-        const uint8_t *p = (const uint8_t *)m.pData + (size_t)(y * 4) * m.RowPitch + (size_t)(x * 4) * 4;
-        uint8_t *o = px + ((size_t)(h - 1 - y) * w + x) * 4;   // (BMP: bottom row first, BGRA)
-        o[0] = bgra ? p[0] : p[2]; o[1] = p[1]; o[2] = bgra ? p[2] : p[0]; o[3] = 255;
-        for (int c = 0; c < 4; c++) sum[c] += p[c];
-      }
-    ctx->Unmap(st, 0);
-    st->Release();
-    double n = (double)w * h;
-    logf("Snapshot: format %d, average of the 4 channels %.1f %.1f %.1f %.1f", (int)sd.Format, sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n);
-    char name[64];
-    snprintf(name, sizeof name, "C:\\questvrbridge\\steamvr_cuadro_%d.bmp", k);
-    FILE *f = fopen(name, "wb");
-    if (f) {
-      uint32_t size = 54 + w * h * 4;
-      uint8_t hd[54] = {'B', 'M'};
-      memcpy(hd + 2, &size, 4); hd[10] = 54; hd[14] = 40;
-      memcpy(hd + 18, &w, 4); memcpy(hd + 22, &h, 4); hd[26] = 1; hd[28] = 32;
-      fwrite(hd, 1, 54, f);
-      fwrite(px, 1, (size_t)w * h * 4, f);
-      fclose(f);
-    }
-    free(px);
-  }
-  uint64_t copies = 0, lastShot = 0;
 
   // Layer blending (made the first time a frame has layers; if it can't be made, the layers aren't drawn)
   int blendState = 0;   // 0 not made · 1 ready · -1 not available
@@ -531,14 +470,6 @@ private:
   // Draws each layer over the game's image in the slot (each eye in its half)
   void draw_overlays(ID3D11Texture2D *dst, uint32_t ew, uint32_t eh, const std::vector<Overlay> &over) {
     if (over.empty()) return;
-    static int layerShots;
-    if (copies > 600 && layerShots < 1) {   // (one look at the first layer over the game's, alone: steamvr_cuadro_3.bmp)
-      layerShots++;
-      D3D11_TEXTURE2D_DESC d;
-      over[0].tex[0]->GetDesc(&d);
-      logf("Layer over the game's image: %ux%u, format %d", d.Width, d.Height, (int)d.Format);
-      snapshot(over[0].tex[0], d, 3);
-    }
     if (!blendState) blendState = blend_init() ? 1 : -1;
     if (blendState < 0) return;
     for (const Overlay &o : over)
@@ -796,13 +727,6 @@ public:
     pendingPose = pose;
     pendingW = sd.Width / 2;
     pendingH = sd.Height;
-    ++copies;
-    if (copies == 300 || (copies > 1500 && copies - lastShot >= 1500 && g_handsValid)) {   // (1: at the start; 2: every ~30 s, with the controllers seen)
-      if (copies != 300) lastShot = copies;
-      D3D11_TEXTURE2D_DESC d;
-      tex[slot]->GetDesc(&d);
-      snapshot(tex[slot], d, copies == 300 ? 1 : 2);
-    }
   }
 
   // (with mutex() held) When the GPU finished the copy, VRmin Host is told
@@ -965,30 +889,9 @@ public:
         }
         double dist;
         uint32_t pose = pose_for(use[0].mHmdPose, &dist);
-        if (++gameFrames == 1 || gameFrames % 500 == 0) {
-          // The projection the game drew each eye with, as tangents (left, right, top, bottom: GetProjectionRaw's)
-          for (int e = 0; e < 2; e++) {
-            const HmdMatrix44_t &P = use[e].mProjection;
-            float l = (P.m[0][2] - 1) / P.m[0][0], r = (P.m[0][2] + 1) / P.m[0][0];
-            float tp = (P.m[1][2] - 1) / P.m[1][1], bt = (P.m[1][2] + 1) / P.m[1][1];
-            logf("  eye %d drawn with %.3f %.3f %.3f %.3f (projection %.3f %.3f %.3f %.3f)", e, l, r, tp, bt, P.m[0][0], P.m[0][2], P.m[1][1], P.m[1][2]);
-          }
-          const HmdMatrix34_t &m = use[0].mHmdPose;
-          logf("  head looking towards %.2f %.2f %.2f", -m.m[0][2], -m.m[1][2], -m.m[2][2]);
-          logf("Direct mode: game frame %llu, eyes %ux%u (bounds %.2f-%.2f, %.2f-%.2f), format %d; drawn at %.3f %.3f %.3f: Quest pose %u "
-               "(the latest is %u), difference %.4f", (unsigned long long)gameFrames, box[0].right - box[0].left, box[0].bottom - box[0].top,
-               use[0].bounds.uMin, use[0].bounds.uMax, use[0].bounds.vMin, use[0].bounds.vMax, (int)d.Format, m.m[0][3], m.m[1][3], m.m[2][3],
-               pose, g_poseId.load(), dist);
-        }
-        if (gameFrames == 1 || gameFrames % 500 == 0) {
-          std::string who;
-          for (size_t k = 0; k < now.size(); k++) {
-            int i;
-            Set *st = find(now[k].eye[0].hTexture, &i);
-            who += !st ? " ?" : st->compositor ? " SteamVR" : " game";
-          }
-          logf("  layers:%s (drawing %zu over the game's)", who.c_str(), over.size());
-        }
+        if (++gameFrames == 1)
+          logf("Game's first frame: %ux%u per eye, format %d, Quest pose %u (difference %.4f), %zu layers over it", box[0].right - box[0].left,
+               box[0].bottom - box[0].top, (int)d.Format, pose, dist, over.size());
         frames.copy(src, box, typeless(d.Format), pose, over);
       }
     }
@@ -1071,6 +974,8 @@ class VRminController : public ITrackedDeviceServerDriver {
   VRInputComponentHandle_t joyX = 0, joyY = 0, joyClick = 0, joyTouch = 0, trigger = 0, triggerClick = 0, triggerTouch = 0,
                            grip = 0, gripTouch = 0, lower = 0, lowerTouch = 0, upper = 0, upperTouch = 0, system = 0;
 public:
+  VRInputComponentHandle_t haptic = 0;
+  bool isLeft() const { return left; }
   uint32_t id = k_unTrackedDeviceIndexInvalid;
   explicit VRminController(bool l) : left(l) {}
   EVRInitError Activate(uint32_t objectId) override {
@@ -1113,6 +1018,7 @@ public:
     in->CreateBooleanComponent(c, left ? "/input/y/click" : "/input/b/click", &upper);
     in->CreateBooleanComponent(c, left ? "/input/y/touch" : "/input/b/touch", &upperTouch);
     if (left) in->CreateBooleanComponent(c, "/input/system/click", &system);   // (the Quest's menu button)
+    in->CreateHapticComponent(c, "/output/haptic", &haptic);
     id = objectId;   // (after its inputs: from here on the pose thread updates it)
     logf("%s controller activated (device %u)", left ? "Left" : "Right", id);
     return VRInitError_None;
@@ -1185,25 +1091,6 @@ public:
             newAt = now;
           } else if (now - newAt > 0.5) t.valid = false;   // (no poses: the Quest isn't there)
           sentAt = now;
-          static double logAt;
-          if (t.valid && now - logAt > 5) {
-            logAt = now;
-            logf("Quest pose %u: head %.3f %.3f %.3f, left hand %s %.3f %.3f %.3f, right hand %s %.3f %.3f %.3f", t.id, (t.eye[0][0] + t.eye[1][0]) / 2,
-                 (t.eye[0][1] + t.eye[1][1]) / 2, (t.eye[0][2] + t.eye[1][2]) / 2, t.handValid[0] ? "yes" : "no", t.aim[0][0], t.aim[0][1], t.aim[0][2],
-                 t.handValid[1] ? "yes" : "no", t.aim[1][0], t.aim[1][1], t.aim[1][2]);
-            for (int h = 0; h < 2; h++) {
-              const float *v = t.in[h];
-              logf("  %s inputs: trigger %.2f grip %.2f stick %.2f %.2f click %.0f, %s %.0f %s %.0f, menu %.0f", h ? "right" : "left",
-                   v[IN_TRIGGER], v[IN_SQUEEZE], v[IN_TX], v[IN_TY], v[IN_TCLICK], h ? "A" : "X", v[IN_A], h ? "B" : "Y", v[IN_B], v[IN_MENU]);
-            }
-            // What SteamVR has for the three devices
-            TrackedDevicePose_t sv[3] = {};
-            VRServerDriverHost()->GetRawTrackedDevicePoses(0, sv, 3);
-            for (int i = 0; i < 3; i++)
-              logf("  SteamVR device %d: valid %d, connected %d, tracking %d, at %.3f %.3f %.3f", i, sv[i].bPoseIsValid, sv[i].bDeviceIsConnected,
-                   (int)sv[i].eTrackingResult, sv[i].mDeviceToAbsoluteTracking.m[0][3], sv[i].mDeviceToAbsoluteTracking.m[1][3],
-                   sv[i].mDeviceToAbsoluteTracking.m[2][3]);
-          }
           hmd.update(t);
           leftHand.update(t);
           rightHand.update(t);
@@ -1224,10 +1111,18 @@ public:
   void RunFrame() override {
     VREvent_t e;
     while (VRServerDriverHost()->PollNextEvent(&e, sizeof e)) {
-      // (the first 300 events SteamVR sends to drivers, to see what it thinks is going on: focus, standby, dashboard…)
-      static int n;
-      if (n++ < 300)
-        logf("SteamVR event %s (%d), device %u", VRSystemEventName(e.eventType), (int)e.eventType, e.trackedDeviceIndex);
+      // A game's vibration: to the Quest's controller, through VRmin Host (the same message as VRmin's OpenXR runtime)
+      if (e.eventType == VREvent_Input_HapticVibration) {
+        const VREvent_HapticVibration_t &h = e.data.hapticVibration;
+        for (VRminController *c : {&leftHand, &rightHand})
+          if (c->haptic && h.componentHandle == c->haptic) {
+            char m[128];
+            int n = snprintf(m, sizeof m, "{\"type\":\"haptic\",\"hand\":%d,\"dur\":%.1f,\"amp\":%.3f,\"freq\":%.1f}", c->isLeft() ? 0 : 1,
+                             h.fDurationSeconds * 1000.0, h.fAmplitude, h.fFrequency);
+            host.send(14, m, (uint32_t)n);
+          }
+        continue;
+      }
     }
   }
   bool ShouldBlockStandbyMode() override { return false; }

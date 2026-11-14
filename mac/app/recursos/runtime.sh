@@ -183,6 +183,31 @@ abrir_steamvr() {
   say "SteamVR tardó en abrir; abro el juego igual" "SteamVR took long to open; opening the game anyway"
 }
 
+# Cierra SteamVR cuando el juego se cierra (si no, sigue dibujando y calentando la Mac): espera a que aparezca algún
+# programa de la carpeta del juego (hasta 5 minutos) y, cuando ya no queda ninguno durante 30 segundos, cierra SteamVR.
+# (con una pausa así, un juego que abre otro, como The Lab con Robot Repair, no lo cierra)
+cerrar_steamvr_con_el_juego() {
+  local carpeta="$1"
+  [ -n "$carpeta" ] || return 0
+  (
+    export FILTRO="steamapps\\common\\$carpeta" FILTRO2="steamapps/common/$carpeta"
+    abierto() { ps -axo command= | awk 'BEGIN { f = tolower(ENVIRON["FILTRO"]); g = tolower(ENVIRON["FILTRO2"]) } index(tolower($0), f) || index(tolower($0), g) { n++ } END { exit !n }'; }
+    visto=0; desde=$(date +%s); sin=0
+    while pgrep -f 'vrserver.exe' >/dev/null 2>&1; do
+      sleep 5
+      if abierto; then visto=1; sin=0
+      elif [ $visto = 1 ]; then sin=$((sin + 5))
+      elif [ $(( $(date +%s) - desde )) -gt 300 ]; then sin=999
+      fi
+      if [ $sin -ge 30 ]; then
+        for p in vrmonitor vrcompositor vrdashboard vrwebhelper vrserver vrstartup; do pkill -f "$p.exe" 2>/dev/null; done
+        break
+      fi
+    done
+  ) > /dev/null 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+}
+
 preparar_runtime() {
   local modo="$1" antes
   antes="$(cat "$Q/.runtime" 2>/dev/null)"
