@@ -172,6 +172,7 @@ struct Track {
 static std::mutex g_trackLock;
 static Track g_track;
 static std::atomic<uint32_t> g_poseId{0};   // (frames carry it: the Quest only shows frames whose pose it knows)
+static std::atomic<bool> g_handsValid{false};   // (the Quest sees both controllers)
 
 // The head poses given to SteamVR, by the number of the Quest's pose: a frame says which head pose it was drawn with,
 // and VRmin Host needs the Quest's number for it
@@ -243,6 +244,7 @@ static void parse_pose(const char *line) {
   std::lock_guard<std::mutex> g(g_trackLock);
   g_track = t;
   g_poseId = t.id;
+  g_handsValid = t.valid && t.handValid[0] && t.handValid[1];
 }
 
 static void parse_config(const char *line) {
@@ -432,7 +434,7 @@ private:
     }
     free(px);
   }
-  uint64_t copies = 0;
+  uint64_t copies = 0, lastShot = 0;
 
   bool init_device() {
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx);
@@ -651,7 +653,8 @@ public:
     pendingW = sd.Width / 2;
     pendingH = sd.Height;
     ++copies;
-    if (copies == 300 || copies % 1500 == 0) {   // (1: at the start; 2: the latest, every ~30 s)
+    if (copies == 300 || (copies > 1500 && copies - lastShot >= 1500 && g_handsValid)) {   // (1: at the start; 2: every ~30 s, with the controllers seen)
+      if (copies != 300) lastShot = copies;
       D3D11_TEXTURE2D_DESC d;
       tex[slot]->GetDesc(&d);
       snapshot(tex[slot], d, copies == 300 ? 1 : 2);
@@ -682,8 +685,8 @@ class VRminDirectMode : public IVRDriverDirectModeComponent {
   FrameSender frames;
   struct Set { uint32_t pid; SharedTextureHandle_t handle[3]; ID3D11Texture2D *tex[3]; bool compositor; };
   std::vector<Set> sets;
-  bool haveLayer = false;
-  SubmitLayerPerEye_t layer[2];
+  bool haveLayer = false, havePrev = false;
+  SubmitLayerPerEye_t layer[2], prev[2];
   uint64_t presented = 0, lastPresented = 0, lastSent = 0, gameFrames = 0;
   double t0 = now_s(), lastLog = 0;
 
@@ -733,6 +736,7 @@ public:
   }
   void DestroySwapTextureSet(SharedTextureHandle_t h) override {
     std::lock_guard<std::mutex> g(frames.mutex());
+    havePrev = false;
     for (size_t i = 0; i < sets.size(); i++)
       for (int j = 0; j < 3; j++)
         if (sets[i].handle[j] == h) {
@@ -743,6 +747,7 @@ public:
   }
   void DestroyAllSwapTextureSets(uint32_t pid) override {
     std::lock_guard<std::mutex> g(frames.mutex());
+    havePrev = false;
     for (size_t i = 0; i < sets.size();)
       if (sets[i].pid == pid) {
         for (ID3D11Texture2D *t : sets[i].tex) t->Release();
@@ -770,35 +775,46 @@ public:
   void Present(SharedTextureHandle_t) override {
     std::lock_guard<std::mutex> g(frames.mutex());
     uint64_t n = ++presented;
+    // The game's frame is copied one frame later: nothing tells this process when the game's GPU finished drawing it
+    // (in Windows SteamVR's sync texture does; in VRmin's Windows it doesn't), and copied right away it sometimes
+    // still had the image from 3 frames before
+    bool go = false;
+    SubmitLayerPerEye_t use[2];
     if (haveLayer) {
       haveLayer = false;
+      go = havePrev;
+      use[0] = prev[0]; use[1] = prev[1];
+      prev[0] = layer[0]; prev[1] = layer[1];
+      havePrev = true;
+    }
+    if (go) {
       int i0, i1;
-      Set *s0 = find(layer[0].hTexture, &i0), *s1 = find(layer[1].hTexture, &i1);
+      Set *s0 = find(use[0].hTexture, &i0), *s1 = find(use[1].hTexture, &i1);
       ID3D11Texture2D *src[2] = {s0 ? s0->tex[i0] : nullptr, s1 ? s1->tex[i1] : nullptr};
       if (src[0] && src[1]) {
         D3D11_BOX box[2];
         D3D11_TEXTURE2D_DESC d;
         for (int e = 0; e < 2; e++) {
           src[e]->GetDesc(&d);
-          const VRTextureBounds_t &b = layer[e].bounds;
+          const VRTextureBounds_t &b = use[e].bounds;
           float v0 = std::min(b.vMin, b.vMax), v1 = std::max(b.vMin, b.vMax);
           box[e] = {(UINT)(b.uMin * d.Width + 0.5f), (UINT)(v0 * d.Height + 0.5f), 0, (UINT)(b.uMax * d.Width + 0.5f), (UINT)(v1 * d.Height + 0.5f), 1};
         }
         double dist;
-        uint32_t pose = pose_for(layer[0].mHmdPose, &dist);
+        uint32_t pose = pose_for(use[0].mHmdPose, &dist);
         if (++gameFrames == 1 || gameFrames % 500 == 0) {
           // The projection the game drew each eye with, as tangents (left, right, top, bottom: GetProjectionRaw's)
           for (int e = 0; e < 2; e++) {
-            const HmdMatrix44_t &P = layer[e].mProjection;
+            const HmdMatrix44_t &P = use[e].mProjection;
             float l = (P.m[0][2] - 1) / P.m[0][0], r = (P.m[0][2] + 1) / P.m[0][0];
             float tp = (P.m[1][2] - 1) / P.m[1][1], bt = (P.m[1][2] + 1) / P.m[1][1];
             logf("  eye %d drawn with %.3f %.3f %.3f %.3f (projection %.3f %.3f %.3f %.3f)", e, l, r, tp, bt, P.m[0][0], P.m[0][2], P.m[1][1], P.m[1][2]);
           }
-          const HmdMatrix34_t &m = layer[0].mHmdPose;
+          const HmdMatrix34_t &m = use[0].mHmdPose;
           logf("  head looking towards %.2f %.2f %.2f", -m.m[0][2], -m.m[1][2], -m.m[2][2]);
           logf("Direct mode: game frame %llu, eyes %ux%u (bounds %.2f-%.2f, %.2f-%.2f), format %d; drawn at %.3f %.3f %.3f: Quest pose %u "
                "(the latest is %u), difference %.4f", (unsigned long long)gameFrames, box[0].right - box[0].left, box[0].bottom - box[0].top,
-               layer[0].bounds.uMin, layer[0].bounds.uMax, layer[0].bounds.vMin, layer[0].bounds.vMax, (int)d.Format, m.m[0][3], m.m[1][3], m.m[2][3],
+               use[0].bounds.uMin, use[0].bounds.uMax, use[0].bounds.vMin, use[0].bounds.vMax, (int)d.Format, m.m[0][3], m.m[1][3], m.m[2][3],
                pose, g_poseId.load(), dist);
         }
         frames.copy(src, box, typeless(d.Format), pose);
@@ -879,7 +895,20 @@ public:
   explicit VRminController(bool l) : left(l) {}
   EVRInitError Activate(uint32_t objectId) override {
     PropertyContainerHandle_t c = VRProperties()->TrackedDeviceToPropertyContainer(objectId);
-    VRProperties()->SetStringProperty(c, Prop_ModelNumber_String, left ? "Oculus Quest3 (Left Controller)" : "Oculus Quest3 (Right Controller)");
+    // (like SteamVR's own Touch for Quest 2: {oculus}/input/touch_profile.json's simulation_settings, which older games
+    //  that use SteamVR's legacy input read: buttons, axes, model)
+    VRProperties()->SetStringProperty(c, Prop_ModelNumber_String, left ? "Oculus Quest2 (Left Controller)" : "Oculus Quest2 (Right Controller)");
+    VRProperties()->SetStringProperty(c, Prop_SerialNumber_String, left ? "VRMIN-LEFT" : "VRMIN-RIGHT");
+    VRProperties()->SetStringProperty(c, Prop_RegisteredDeviceType_String, left ? "oculus/VRMIN_Controller_Left" : "oculus/VRMIN_Controller_Right");
+    VRProperties()->SetStringProperty(c, Prop_AttachedDeviceId_String, left ? "VRMIN-LEFT" : "VRMIN-RIGHT");
+    VRProperties()->SetUint64Property(c, Prop_SupportedButtons_Uint64, (1ull << k_EButton_System) | (1ull << k_EButton_ApplicationMenu) | (1ull << k_EButton_Grip) |
+                                                                         (1ull << k_EButton_A) | (1ull << k_EButton_SteamVR_Touchpad) | (1ull << k_EButton_SteamVR_Trigger) |
+                                                                         (1ull << k_EButton_Axis2));
+    VRProperties()->SetInt32Property(c, Prop_Axis0Type_Int32, k_eControllerAxis_Joystick);
+    VRProperties()->SetInt32Property(c, Prop_Axis1Type_Int32, k_eControllerAxis_Trigger);
+    VRProperties()->SetInt32Property(c, Prop_Axis2Type_Int32, k_eControllerAxis_Trigger);
+    VRProperties()->SetBoolProperty(c, Prop_DeviceIsWireless_Bool, true);
+    VRProperties()->SetBoolProperty(c, Prop_DeviceProvidesBatteryStatus_Bool, false);
     VRProperties()->SetStringProperty(c, Prop_ManufacturerName_String, "Oculus");
     VRProperties()->SetStringProperty(c, Prop_TrackingSystemName_String, "oculus");
     VRProperties()->SetStringProperty(c, Prop_RenderModelName_String, left ? "oculus_quest2_controller_left" : "oculus_quest2_controller_right");
