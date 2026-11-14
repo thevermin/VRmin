@@ -142,7 +142,9 @@ PY
 # entorno.sh: dentro de Wine se colgaba). useNewDesktop false: el menú mostraba el escritorio de Windows con la forma de
 # Windows 10 (Graphics Capture), que Wine no tiene, y se cerraba y volvía a abrir todo el tiempo. allowDisplayLockedMode:
 # dentro de Wine, SteamVR cree que la sesión de Windows está bloqueada y en vez de dibujar llenaba todo de un color
-# verde azulado
+# verde azulado. allowDashboardAutoLaunchWithSteamVRHome false: el menú no se abre solo al abrir SteamVR sin juego (se
+# quedaba delante del juego con los controles de SteamVR a la vista). cefMaxFrameRate 30: los paneles del menú se
+# dibujan a 30 cuadros por segundo como máximo (120 por defecto), para dejarle la placa de video al juego
 poner_driver_steamvr() {
   local d sha
   for d in "$RES/steamvr/driver_vrmin" "$RES/../../steamvr/driver_vrmin"; do [ -f "$d/bin/win64/driver_vrmin.dll" ] && break; done
@@ -162,7 +164,7 @@ ajustes_steamvr() {
   cat > "$Q/openvr/config/steamvr.vrsettings" <<'JSON'
 {
    "driver_null" : { "enable" : false },
-   "dashboard" : { "useNewDesktop" : false, "showDesktop" : false },
+   "dashboard" : { "useNewDesktop" : false, "showDesktop" : false, "allowDashboardAutoLaunchWithSteamVRHome" : false, "cefMaxFrameRate" : 30 },
    "collisionBounds" : { "CollisionBoundsColorGammaA" : 0, "CollisionBoundsFadeDistance" : 0 },
    "steamvr" : {
       "requireHmd" : true,
@@ -172,7 +174,8 @@ ajustes_steamvr() {
       "showMirrorView" : false,
       "startMonitorFromAppLaunch" : false,
       "startOverlayAppsFromDashboard" : false,
-      "allowDisplayLockedMode" : true
+      "allowDisplayLockedMode" : true,
+      "allowDashboardAutoLaunchWithSteamVRHome" : false
    }
 }
 JSON
