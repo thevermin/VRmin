@@ -1104,7 +1104,8 @@ public:
 class VRminController : public ITrackedDeviceServerDriver {
   bool left;
   VRInputComponentHandle_t joyX = 0, joyY = 0, joyClick = 0, joyTouch = 0, trigger = 0, triggerClick = 0, triggerTouch = 0,
-                           grip = 0, gripTouch = 0, lower = 0, lowerTouch = 0, upper = 0, upperTouch = 0, system = 0;
+                           grip = 0, gripTouch = 0, lower = 0, lowerTouch = 0, upper = 0, upperTouch = 0, system = 0,
+                           tsX = 0, tsY = 0, tsClick = 0, tsTouch = 0;
 public:
   VRInputComponentHandle_t haptic = 0;
   bool isLeft() const { return left; }
@@ -1140,6 +1141,11 @@ public:
     in->CreateScalarComponent(c, "/input/joystick/y", &joyY, VRScalarType_Absolute, VRScalarUnits_NormalizedTwoSided);
     in->CreateBooleanComponent(c, "/input/joystick/click", &joyClick);
     in->CreateBooleanComponent(c, "/input/joystick/touch", &joyTouch);
+    // (the same stick as «thumbstick»: some games' Touch bindings use that name, like Aircar's, and their stick did nothing)
+    in->CreateScalarComponent(c, "/input/thumbstick/x", &tsX, VRScalarType_Absolute, VRScalarUnits_NormalizedTwoSided);
+    in->CreateScalarComponent(c, "/input/thumbstick/y", &tsY, VRScalarType_Absolute, VRScalarUnits_NormalizedTwoSided);
+    in->CreateBooleanComponent(c, "/input/thumbstick/click", &tsClick);
+    in->CreateBooleanComponent(c, "/input/thumbstick/touch", &tsTouch);
     in->CreateScalarComponent(c, "/input/trigger/value", &trigger, VRScalarType_Absolute, VRScalarUnits_NormalizedOneSided);
     in->CreateBooleanComponent(c, "/input/trigger/click", &triggerClick);
     in->CreateBooleanComponent(c, "/input/trigger/touch", &triggerTouch);
@@ -1192,6 +1198,10 @@ public:
     in->UpdateScalarComponent(joyY, v[IN_TY], 0);
     in->UpdateBooleanComponent(joyClick, v[IN_TCLICK] > 0.5f, 0);
     in->UpdateBooleanComponent(joyTouch, v[IN_THTOUCH] > 0.5f, 0);
+    in->UpdateScalarComponent(tsX, v[IN_TX], 0);
+    in->UpdateScalarComponent(tsY, v[IN_TY], 0);
+    in->UpdateBooleanComponent(tsClick, v[IN_TCLICK] > 0.5f, 0);
+    in->UpdateBooleanComponent(tsTouch, v[IN_THTOUCH] > 0.5f, 0);
     in->UpdateScalarComponent(trigger, v[IN_TRIGGER], 0);
     in->UpdateBooleanComponent(triggerClick, v[IN_TRIGGER] > 0.9f, 0);
     in->UpdateBooleanComponent(triggerTouch, v[IN_TTOUCH] > 0.5f || v[IN_TRIGGER] > 0.05f, 0);
