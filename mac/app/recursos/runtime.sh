@@ -135,7 +135,9 @@ PY
 # SteamVR real: el driver de VRmin (el que viene con VRmin Host, copiado al motor cuando cambia) y los ajustes de
 # SteamVR en C:\questvrbridge\openvr\config (solo los usa VRmin): solo el visor de VRmin, sin pedir armar la sala
 # (el driver da el área de juego), sin las paredes del área de juego (el Quest tiene las suyas), sin SteamVR Home y sin
-# el menú de SteamVR ni su ventana (en la Mac se cerraban y abrían todo el tiempo y la ponían muy lenta)
+# el menú de SteamVR ni su ventana (en la Mac se cerraban y abrían todo el tiempo y la ponían muy lenta).
+# allowDisplayLockedMode: dentro de Wine, SteamVR cree que la sesión de Windows está bloqueada y en vez de dibujar
+# llenaba todo de un color verde azulado
 poner_driver_steamvr() {
   local d sha
   for d in "$RES/steamvr/driver_vrmin" "$RES/../../steamvr/driver_vrmin"; do [ -f "$d/bin/win64/driver_vrmin.dll" ] && break; done
@@ -159,7 +161,8 @@ ajustes_steamvr() {
       "showMirrorView" : false,
       "startMonitorFromAppLaunch" : false,
       "startDashboardFromAppLaunch" : false,
-      "startOverlayAppsFromDashboard" : false
+      "startOverlayAppsFromDashboard" : false,
+      "allowDisplayLockedMode" : true
    }
 }
 JSON
