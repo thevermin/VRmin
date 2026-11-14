@@ -39,6 +39,29 @@ static void logf(const char *fmt, ...) {
   if (VRDriverLog()) { strncat(b, "\n", sizeof b - strlen(b) - 1); VRDriverLog()->Log(b); }
 }
 
+// The name of a SteamVR event (the ones about focus, standby and the dashboard; the rest by number)
+static const char *VRSystemEventName(uint32_t t) {
+  switch (t) {
+  case VREvent_InputFocusCaptured: return "InputFocusCaptured";
+  case VREvent_InputFocusReleased: return "InputFocusReleased";
+  case VREvent_SceneApplicationChanged: return "SceneApplicationChanged";
+  case VREvent_InputFocusChanged: return "InputFocusChanged";
+  case VREvent_DashboardActivated: return "DashboardActivated";
+  case VREvent_DashboardDeactivated: return "DashboardDeactivated";
+  case VREvent_EnterStandbyMode: return "EnterStandbyMode";
+  case VREvent_LeaveStandbyMode: return "LeaveStandbyMode";
+  case VREvent_TrackedDeviceUserInteractionStarted: return "UserInteractionStarted";
+  case VREvent_TrackedDeviceUserInteractionEnded: return "UserInteractionEnded";
+  case VREvent_ButtonPress: return "ButtonPress";
+  case VREvent_ButtonUnpress: return "ButtonUnpress";
+  case VREvent_ProcessConnected: return "ProcessConnected";
+  case VREvent_ProcessDisconnected: return "ProcessDisconnected";
+  case VREvent_HideRenderModels: return "HideRenderModels";
+  case VREvent_ShowRenderModels: return "ShowRenderModels";
+  default: return "?";
+  }
+}
+
 static double now_s() {
   using namespace std::chrono;
   return duration<double>(steady_clock::now().time_since_epoch()).count();
@@ -1165,6 +1188,11 @@ public:
             logf("Quest pose %u: head %.3f %.3f %.3f, left hand %s %.3f %.3f %.3f, right hand %s %.3f %.3f %.3f", t.id, (t.eye[0][0] + t.eye[1][0]) / 2,
                  (t.eye[0][1] + t.eye[1][1]) / 2, (t.eye[0][2] + t.eye[1][2]) / 2, t.handValid[0] ? "yes" : "no", t.aim[0][0], t.aim[0][1], t.aim[0][2],
                  t.handValid[1] ? "yes" : "no", t.aim[1][0], t.aim[1][1], t.aim[1][2]);
+            for (int h = 0; h < 2; h++) {
+              const float *v = t.in[h];
+              logf("  %s inputs: trigger %.2f grip %.2f stick %.2f %.2f click %.0f, %s %.0f %s %.0f, menu %.0f", h ? "right" : "left",
+                   v[IN_TRIGGER], v[IN_SQUEEZE], v[IN_TX], v[IN_TY], v[IN_TCLICK], h ? "A" : "X", v[IN_A], h ? "B" : "Y", v[IN_B], v[IN_MENU]);
+            }
             // What SteamVR has for the three devices
             TrackedDevicePose_t sv[3] = {};
             VRServerDriverHost()->GetRawTrackedDevicePoses(0, sv, 3);
@@ -1192,7 +1220,12 @@ public:
   const char *const *GetInterfaceVersions() override { return k_InterfaceVersions; }
   void RunFrame() override {
     VREvent_t e;
-    while (VRServerDriverHost()->PollNextEvent(&e, sizeof e)) {}
+    while (VRServerDriverHost()->PollNextEvent(&e, sizeof e)) {
+      // (the first 300 events SteamVR sends to drivers, to see what it thinks is going on: focus, standby, dashboard…)
+      static int n;
+      if (n++ < 300)
+        logf("SteamVR event %s (%d), device %u", VRSystemEventName(e.eventType), (int)e.eventType, e.trackedDeviceIndex);
+    }
   }
   bool ShouldBlockStandbyMode() override { return false; }
   void EnterStandby() override {}
