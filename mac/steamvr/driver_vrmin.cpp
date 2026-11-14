@@ -1036,6 +1036,9 @@ public:
     VRProperties()->SetStringProperty(c, Prop_DriverProvidedChaperoneJson_String, CHAPERONE_JSON);
     VRProperties()->SetBoolProperty(c, Prop_DriverProvidedChaperoneVisibility_Bool, false);
     VRProperties()->SetInt32Property(c, Prop_ExpectedControllerCount_Int32, 2);
+    // Its inputs, like a Rift's (SteamVR's own Oculus profile): without a profile the games' input didn't load (they
+    // waited for the headset's inputs and gave up, and the controllers didn't work or show)
+    VRProperties()->SetStringProperty(c, Prop_InputProfilePath_String, "{oculus}/input/rift_profile.json");
     // The headset is on (the Quest only sends poses while it's worn): SteamVR looks for /proximity
     VRProperties()->SetBoolProperty(c, Prop_ContainsProximitySensor_Bool, true);
     VRDriverInput()->CreateBooleanComponent(c, "/proximity", &proximity);
