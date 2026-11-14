@@ -48,6 +48,7 @@ else cerrar_steamvr; fi
 # (OpenComposite: el grip de Touch como botón donde el juego lo usa para agarrar; OpenComposite busca esos controles en
 #  la carpeta desde donde se abre el juego)
 [ "$RUNTIME" = "openvr" ] && /usr/bin/python3 "$RES/vrjuegos.py" controles_oc "$CARPETA" "$CARPETA/$(dirname "${EXE:-.}")" 2>&1 | tee -a "$LOG"
+ajustes_dll
 gpu_luid_dxmt 2>&1 | tee -a "$LOG"
 microfono_wine 2>&1 | tee -a "$LOG"
 

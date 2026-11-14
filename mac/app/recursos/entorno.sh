@@ -21,8 +21,14 @@ export GST_PLUGIN_SYSTEM_PATH="$GST_PLUGIN_PATH"
 export WINEMSYNC=1
 # (MoltenVK, para juegos Vulkan: traduce los shaders en varios núcleos a la vez, menos tirones al aparecer cosas nuevas)
 export MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION=1
-# La capa de Steam dentro de los juegos (gameoverlayrenderer) traba juegos y a Steam en Wine: desactivada
-export WINEDLLOVERRIDES="dxgi,d3d11,d3d10core=b;winemenubuilder.exe=d;gameoverlayrenderer,gameoverlayrenderer64=d"
+# La capa de Steam dentro de los juegos (gameoverlayrenderer) traba juegos y a Steam en Wine: desactivada.
+# d3d11 incorporada (DXMT) va en los ajustes de Wine y no acá (ajustes_dll): las variables de entorno les ganan a los
+# ajustes de cada programa, y Steam necesita uno propio.
+if [ -f "$WINEPREFIX/.dll_d3d11" ]; then
+  export WINEDLLOVERRIDES="dxgi,d3d10core=b;winemenubuilder.exe=d;gameoverlayrenderer,gameoverlayrenderer64=d"
+else
+  export WINEDLLOVERRIDES="dxgi,d3d11,d3d10core=b;winemenubuilder.exe=d;gameoverlayrenderer,gameoverlayrenderer64=d"
+fi
 # Juegos Unity: Mono lee mal el último error de Windows en hilos nuevos (archivos que no existen "existen").
 # Este arreglo se carga en Wine y lo corrige sin tocar los juegos (ver arreglo_errores.c). Solo en Wine (por wine.sh):
 # puesto para todo, macOS no abría sus propios programas de arm64e (curl, python…) en algunas Mac y el motor no se instalaba
@@ -36,3 +42,16 @@ STEAMLIB="$STEAMDIR/steamapps"
 motor_listo() { [ -x "$WINE_REAL" ] && [ -f "$WINEDIR/lib/wine/x86_64-unix/winemetal.so" ] && [ -d "$FW" ] \
   && [ "$(cat "$WINEPREFIX/.wine_usado" 2>/dev/null)" = "$MARCA_MOTOR" ]; }
 steam_abierto() { pgrep -if "steam\.exe" >/dev/null; }
+# Ajustes de DLLs de Wine (una vez por Windows de VRmin): d3d11 incorporada (DXMT) para todos los programas, y sin d3d11
+# para Steam. Con SteamVR abierto, Steam (de 32 bits) carga vrclient.dll para mostrar sus paneles en el visor y dentro
+# de Wine se traba entero, y los juegos que le piden la cuenta a Steam al arrancar se cierran. vrclient.dll necesita
+# d3d11: sin ella Steam no la puede cargar (Steam no usa d3d11 para nada más; la carga solo si está).
+# Vale desde la próxima vez que se abre Steam.
+ajustes_dll() {
+  [ -f "$WINEPREFIX/.dll_d3d11" ] && return 0
+  [ -f "$WINEPREFIX/system.reg" ] || return 0
+  "$WINE" reg add 'HKCU\Software\Wine\DllOverrides' /v d3d11 /t REG_SZ /d builtin /f >/dev/null 2>&1 \
+    && "$WINE" reg add 'HKCU\Software\Wine\AppDefaults\steam.exe\DllOverrides' /v d3d11 /t REG_SZ /d "" /f >/dev/null 2>&1 \
+    && touch "$WINEPREFIX/.dll_d3d11" \
+    && export WINEDLLOVERRIDES="dxgi,d3d10core=b;winemenubuilder.exe=d;gameoverlayrenderer,gameoverlayrenderer64=d"
+}
