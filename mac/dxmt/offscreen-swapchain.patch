@@ -1,0 +1,40 @@
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index 73c4203..5f80a20 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -1099,8 +1099,33 @@ CreateSwapChain(
+   DWORD window_process_id;
+   GetWindowThreadProcessId(hWnd, &window_process_id);
+   if (GetProcessId(GetCurrentProcess()) != window_process_id) {
+-    ERR("CreateSwapChain: cross-process swapchain not supported yet");
+-    return E_FAIL;
++    // VRmin: a window of another process (Chromium's GPU process draws for the browser's windows) gets a window of
++    // this process, off screen, instead of failing: its images aren't shown, but the process can draw (SteamVR's
++    // web panels only use the images it shares, not the window)
++    RECT rect = {};
++    GetClientRect(hWnd, &rect);
++    int width = pDesc->Width ? (int)pDesc->Width : std::max<int>(rect.right - rect.left, 1);
++    int height = pDesc->Height ? (int)pDesc->Height : std::max<int>(rect.bottom - rect.top, 1);
++    static ATOM window_class = 0;
++    if (!window_class) {
++      WNDCLASSW wc = {};
++      wc.lpfnWndProc = DefWindowProcW;
++      wc.hInstance = GetModuleHandleW(nullptr);
++      wc.lpszClassName = L"DXMTOffscreenSwapChain";
++      window_class = RegisterClassW(&wc);
++    }
++    HWND own = CreateWindowExW(
++        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"DXMTOffscreenSwapChain", L"", WS_POPUP, -32000, -32000, width, height,
++        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr
++    );
++    if (!own) {
++      ERR("CreateSwapChain: cross-process swapchain not supported yet");
++      return E_FAIL;
++    }
++    ShowWindow(own, SW_SHOWNOACTIVATE);
++    WARN("CreateSwapChain: window of another process; using an off-screen window of this one (", width, "x", height,
++         ")");
++    hWnd = own;
+   }
+ 
+   Com<IMTLDXGIDevice> layer_factory;
