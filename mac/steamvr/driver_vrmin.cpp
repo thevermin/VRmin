@@ -21,7 +21,6 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
-#include <set>
 #include <thread>
 #include <string>
 #include <vector>
@@ -205,10 +204,6 @@ static uint32_t pose_for(const HmdMatrix34_t &m, double *dist) {
   return best;
 }
 // VRmin Host's settings for the game ("config" line): size of an eye, frames per second, part of the field of view
-// SteamVR's menu (the dashboard): open or closed, when the game's image was last seen, and until when the menu
-// button is pressed by the driver (to close the menu that SteamVR leaves open when the game starts)
-static std::atomic<bool> g_dashboard{false};
-static std::atomic<double> g_gameSeenAt{0}, g_systemPressUntil{0};
 static std::atomic<int> g_cfgEyeW{0}, g_cfgEyeH{0}, g_cfgFps{0};
 static std::atomic<float> g_cfgFovK{1.f};
 
@@ -860,7 +855,6 @@ class VRminDirectMode : public IVRDriverDirectModeComponent {
       for (*i = 0; *i < 3; (*i)++) if (st.handle[*i] == h) return &st;
     return nullptr;
   }
-public:
   // SteamVR's own textures (vrcompositor.exe's: its room, menu and panels)
   static bool is_compositor(uint32_t pid) {
     char path[MAX_PATH] = "";
@@ -962,7 +956,6 @@ public:
       Set *st = find(now[base].eye[0].hTexture, &i);
       gameShown = st && !st->compositor;
     }
-    if (gameShown) g_gameSeenAt = now_s();
     if (go) {
       use[0] = now[base].eye[0];
       use[1] = now[base].eye[1];
@@ -1218,7 +1211,7 @@ public:
     in->UpdateBooleanComponent(lowerTouch, v[IN_ATOUCH] > 0.5f || v[IN_A] > 0.5f, 0);
     in->UpdateBooleanComponent(upper, v[IN_B] > 0.5f, 0);
     in->UpdateBooleanComponent(upperTouch, v[IN_BTOUCH] > 0.5f || v[IN_B] > 0.5f, 0);
-    if (left) in->UpdateBooleanComponent(system, v[IN_MENU] > 0.5f || now_s() < g_systemPressUntil, 0);
+    if (left) in->UpdateBooleanComponent(system, v[IN_MENU] > 0.5f, 0);
   }
 };
 
@@ -1229,8 +1222,6 @@ class VRminProvider : public IServerTrackedDeviceProvider {
   HostControl host;
   std::atomic<bool> running{false};
   std::thread poses;
-  std::set<uint32_t> seenTypes;
-  double gameStartAt = 0, lastGameSeen = 0, closedFor = 0;
 public:
   EVRInitError Init(IVRDriverContext *ctx) override {
     VR_INIT_SERVER_DRIVER_CONTEXT(ctx);
@@ -1290,29 +1281,6 @@ public:
           }
         continue;
       }
-      if (e.eventType == VREvent_DashboardActivated || e.eventType == VREvent_DashboardDeactivated) {
-        g_dashboard = e.eventType == VREvent_DashboardActivated;
-        logf("SteamVR menu %s", g_dashboard ? "open" : "closed");
-      } else if (e.eventType == VREvent_SceneApplicationChanged) {
-        logf("Scene application: process %u", e.data.process.pid);
-        if (e.data.process.pid && !VRminDirectMode::is_compositor(e.data.process.pid)) gameStartAt = now_s();
-      } else if (seenTypes.insert(e.eventType).second && seenTypes.size() < 64) {
-        logf("SteamVR event %u", e.eventType);
-      }
-    }
-    // A game starting: its image appears (or SteamVR says it's the one drawing) after a while without one
-    double now = now_s(), seen = g_gameSeenAt;
-    if (seen > 0 && seen > lastGameSeen + 5) gameStartAt = now;
-    if (seen > 0) lastGameSeen = seen;
-    if (gameStartAt > closedFor) {
-      // SteamVR opens its menu when it starts without a game and leaves it in front of the game when the game comes:
-      // in the first seconds of the game it's closed, once, with the menu button (opened later, by the user, it stays)
-      double since = now - gameStartAt;
-      if (g_dashboard && since > 1.0 && since < 20.0) {
-        logf("Closing SteamVR's menu, which was in front of the game");
-        g_systemPressUntil = now + 0.2;
-        closedFor = gameStartAt;
-      } else if (since >= 20.0) closedFor = gameStartAt;
     }
   }
   bool ShouldBlockStandbyMode() override { return false; }
