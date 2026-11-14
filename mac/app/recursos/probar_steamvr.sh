@@ -19,7 +19,7 @@ rm -rf "$OUT"; mkdir -p "$OUT"
 # El driver de VRmin (el de la app; si no, el de la carpeta del código)
 if [ "$CON" = vrmin ]; then
   poner_driver_steamvr || exit 1
-  rm -f "$Q/driver_vrmin.log" "$Q/steamvr_cuadro.bmp"
+  rm -f "$Q/driver_vrmin.log" "$Q"/steamvr_cuadro*.bmp
 fi
 
 # OpenVR → SteamVR (con el driver de VRmin registrado) y OpenXR → SteamVR
@@ -68,7 +68,7 @@ say "Procesos de SteamVR que quedaron abiertos:" "SteamVR processes still open:"
 # Cerrar SteamVR y juntar sus registros
 for p in vrmonitor vrcompositor vrdashboard vrwebhelper vrserver vrstartup; do pkill -f "$p.exe" 2>/dev/null; done
 sleep 3
-cp "$Q/openvr/logs/"*.txt "$STEAM/logs/"vr*.txt "$Q/driver_vrmin.log" "$Q/steamvr_cuadro.bmp" "$OUT/" 2>/dev/null
+cp "$Q/openvr/logs/"*.txt "$STEAM/logs/"vr*.txt "$Q/driver_vrmin.log" "$Q"/steamvr_cuadro*.bmp "$OUT/" 2>/dev/null
 if [ -f "$OUT/steamvr.vrsettings.antes" ]; then cp "$OUT/steamvr.vrsettings.antes" "$CFG"; else rm -f "$CFG"; fi
 tail -c 2000000 "$OUT/wine.log" > "$OUT/wine_final.log"
 say "Listo. Registros en: $OUT" "Done. Logs in: $OUT"

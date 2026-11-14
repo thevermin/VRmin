@@ -98,14 +98,20 @@ struct VRminDisplay {
     *l = f[0]; *r = f[1]; *t = f[2]; *b = f[3];
   }
   // (no lens: the Quest corrects its own)
-  virtual DistortionCoordinates_t *ComputeDistortion(DistortionCoordinates_t *c, EVREye, float u, float v) {
+  virtual DistortionCoordinates_t *ComputeDistortion(DistortionCoordinates_t *c, EVREye eye, float u, float v) {
     c->rfRed[0] = c->rfGreen[0] = c->rfBlue[0] = u;
     c->rfRed[1] = c->rfGreen[1] = c->rfBlue[1] = v;
+    static std::atomic<int> n{0};
+    int i = ++n;
+    if (i <= 4 || i % 1000 == 0) logf("ComputeDistortion #%d: eye %d, u %.3f, v %.3f", i, (int)eye, u, v);
     return c;
   }
-  virtual bool ComputeInverseDistortion(HmdVector2_t *r, EVREye, uint32_t, float u, float v) {
+  virtual bool ComputeInverseDistortion(HmdVector2_t *r, EVREye eye, uint32_t ch, float u, float v) {
     r->v[0] = u;
     r->v[1] = v;
+    static std::atomic<int> n{0};
+    int i = ++n;
+    if (i <= 4 || i % 1000 == 0) logf("ComputeInverseDistortion #%d: eye %d, channel %u, u %.3f, v %.3f", i, (int)eye, ch, u, v);
     return true;
   }
 };
@@ -351,9 +357,9 @@ public:
   std::atomic<uint32_t> framePose{0};   // the Quest's pose when the compositor started the frame being presented
 
 private:
-  // A look at frame 300: its average color in the log and a picture in C:\questvrbridge\steamvr_cuadro.bmp
-  // (a quarter of the size), to tell a black frame from SteamVR from one that arrives empty
-  void snapshot(ID3D11Texture2D *s, const D3D11_TEXTURE2D_DESC &sd) {
+  // A look at frames 300, 2000 and 5000: their average color in the log and a picture in
+  // C:\questvrbridge\steamvr_cuadro_N.bmp (a quarter of the size), to see what SteamVR draws
+  void snapshot(ID3D11Texture2D *s, const D3D11_TEXTURE2D_DESC &sd, int k) {
     D3D11_TEXTURE2D_DESC d = sd;
     d.MipLevels = 1; d.ArraySize = 1; d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_STAGING;
     d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
@@ -377,7 +383,9 @@ private:
     st->Release();
     double n = (double)w * h;
     logf("Snapshot: format %d, average of the 4 channels %.1f %.1f %.1f %.1f", (int)sd.Format, sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n);
-    FILE *f = fopen("C:\\questvrbridge\\steamvr_cuadro.bmp", "wb");
+    char name[64];
+    snprintf(name, sizeof name, "C:\\questvrbridge\\steamvr_cuadro_%d.bmp", k);
+    FILE *f = fopen(name, "wb");
     if (f) {
       uint32_t size = 54 + w * h * 4;
       uint8_t hd[54] = {'B', 'M'};
@@ -610,7 +618,8 @@ public:
     ctx->Flush();
     pending = slot;
     pendingPose = framePose;
-    if (++copies == 300) snapshot(s, sd);
+    ++copies;
+    if (copies == 300 || copies == 2000 || copies == 5000) snapshot(s, sd, copies == 300 ? 1 : copies == 2000 ? 2 : 3);
   }
 
   // From WaitForPresent: when the GPU finished the copy, VRmin Host is told
