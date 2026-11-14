@@ -73,24 +73,26 @@ static DriverPose_t pose_at(double x, double y, double z) {
 }
 
 // ---- headset ----
-class VRminDisplay : public IVRDisplayComponent {
-public:
-  void GetWindowBounds(int32_t *x, int32_t *y, uint32_t *w, uint32_t *h) override { *x = 0; *y = 0; *w = EYE_W * 2; *h = EYE_H; }
-  bool IsDisplayOnDesktop() override { return false; }
-  bool IsDisplayRealDisplay() override { return false; }
-  void GetRecommendedRenderTargetSize(uint32_t *w, uint32_t *h) override { *w = EYE_W; *h = EYE_H; }
-  void GetEyeOutputViewport(EVREye eye, uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h) override {
+// Methods that return a struct (ComputeDistortion; GetPose too, but SteamVR never calls it) can't be written the normal way: SteamVR is built with
+// MSVC, which passes the address for the result after «this», and mingw's g++ passes it before (vrserver crashed
+// in SteamVR's distortion call). So the display component is an MSVC-shaped vtable written by hand: the same methods
+// in the same order as IVRDisplayComponent, with the result address as an explicit argument after «this».
+struct VRminDisplay {
+  virtual void GetWindowBounds(int32_t *x, int32_t *y, uint32_t *w, uint32_t *h) { *x = 0; *y = 0; *w = EYE_W * 2; *h = EYE_H; }
+  virtual bool IsDisplayOnDesktop() { return false; }
+  virtual bool IsDisplayRealDisplay() { return false; }
+  virtual void GetRecommendedRenderTargetSize(uint32_t *w, uint32_t *h) { *w = EYE_W; *h = EYE_H; }
+  virtual void GetEyeOutputViewport(EVREye eye, uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h) {
     *x = eye == Eye_Left ? 0 : EYE_W; *y = 0; *w = EYE_W; *h = EYE_H;
   }
-  void GetProjectionRaw(EVREye, float *l, float *r, float *t, float *b) override { *l = -FOV_L; *r = FOV_R; *t = -FOV_U; *b = FOV_D; }
-  DistortionCoordinates_t ComputeDistortion(EVREye, float u, float v) override {
-    DistortionCoordinates_t c;
-    c.rfRed[0] = c.rfGreen[0] = c.rfBlue[0] = u;
-    c.rfRed[1] = c.rfGreen[1] = c.rfBlue[1] = v;
+  virtual void GetProjectionRaw(EVREye, float *l, float *r, float *t, float *b) { *l = -FOV_L; *r = FOV_R; *t = -FOV_U; *b = FOV_D; }
+  // (no lens: the Quest corrects its own)
+  virtual DistortionCoordinates_t *ComputeDistortion(DistortionCoordinates_t *c, EVREye, float u, float v) {
+    c->rfRed[0] = c->rfGreen[0] = c->rfBlue[0] = u;
+    c->rfRed[1] = c->rfGreen[1] = c->rfBlue[1] = v;
     return c;
   }
-  // (no lens: the Quest corrects its own; SteamVR's compositor needs the inverse too, or it doesn't start)
-  bool ComputeInverseDistortion(HmdVector2_t *r, EVREye, uint32_t, float u, float v) override {
+  virtual bool ComputeInverseDistortion(HmdVector2_t *r, EVREye, uint32_t, float u, float v) {
     r->v[0] = u;
     r->v[1] = v;
     return true;
@@ -151,7 +153,7 @@ public:
   void Deactivate() override { id = k_unTrackedDeviceIndexInvalid; }
   void EnterStandby() override {}
   void *GetComponent(const char *name) override {
-    if (!strcmp(name, IVRDisplayComponent_Version)) return &display;
+    if (!strcmp(name, IVRDisplayComponent_Version)) return &display;   // (see VRminDisplay)
     if (!strcmp(name, IVRVirtualDisplay_Version)) return &virtualDisplay;
     return nullptr;
   }
