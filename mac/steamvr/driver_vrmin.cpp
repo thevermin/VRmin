@@ -206,6 +206,10 @@ static uint32_t pose_for(const HmdMatrix34_t &m, double *dist) {
 // VRmin Host's settings for the game ("config" line): size of an eye, frames per second, part of the field of view
 static std::atomic<int> g_cfgEyeW{0}, g_cfgEyeH{0}, g_cfgFps{0};
 static std::atomic<int> g_cfgNativeW{0}, g_cfgNativeH{0};   // (the Quest's own resolution per eye, from VRmin Host)
+// SteamVR's menu: open when SteamVR starts (there's no game yet) and left in front of the game when it comes; it's
+// closed once with the menu button, a moment after the game makes its textures (the game is about to draw)
+static std::atomic<uint32_t> g_gamePid{0};
+static std::atomic<double> g_gameTexturesAt{0}, g_systemPressUntil{0};
 static std::atomic<float> g_cfgFovK{1.f};
 
 static void parse_pose(const char *line) {
@@ -897,6 +901,7 @@ public:
       st.handle[i] = out->rSharedTextureHandles[i] = (SharedTextureHandle_t)(uintptr_t)h;
     }
     sets.push_back(st);
+    if (!st.compositor && pid != g_gamePid) { g_gamePid = pid; g_gameTexturesAt = now_s(); }
     logf("Direct mode: textures for process %u%s: %ux%u, format %u, %u samples", pid, st.compositor ? " (SteamVR's)" : "", d.Width, d.Height,
          desc->nFormat, d.SampleDesc.Count);
   }
@@ -1218,7 +1223,7 @@ public:
     in->UpdateBooleanComponent(lowerTouch, v[IN_ATOUCH] > 0.5f || v[IN_A] > 0.5f, 0);
     in->UpdateBooleanComponent(upper, v[IN_B] > 0.5f, 0);
     in->UpdateBooleanComponent(upperTouch, v[IN_BTOUCH] > 0.5f || v[IN_B] > 0.5f, 0);
-    if (left) in->UpdateBooleanComponent(system, v[IN_MENU] > 0.5f, 0);
+    if (left) in->UpdateBooleanComponent(system, v[IN_MENU] > 0.5f || now_s() < g_systemPressUntil, 0);
   }
 };
 
@@ -1288,6 +1293,12 @@ public:
           }
         continue;
       }
+    }
+    double t = g_gameTexturesAt;
+    if (t > 0 && now_s() - t > 2.0) {
+      g_gameTexturesAt = 0;
+      g_systemPressUntil = now_s() + 0.2;
+      logf("Closing SteamVR's menu for the game (process %u)", (unsigned)g_gamePid);
     }
   }
   bool ShouldBlockStandbyMode() override { return false; }

@@ -142,9 +142,8 @@ PY
 # entorno.sh: dentro de Wine se colgaba). useNewDesktop false: el menú mostraba el escritorio de Windows con la forma de
 # Windows 10 (Graphics Capture), que Wine no tiene, y se cerraba y volvía a abrir todo el tiempo. allowDisplayLockedMode:
 # dentro de Wine, SteamVR cree que la sesión de Windows está bloqueada y en vez de dibujar llenaba todo de un color
-# verde azulado. allowDashboardAutoLaunchWithSteamVRHome false: el menú no se abre solo al abrir SteamVR sin juego (se
-# quedaba delante del juego con los controles de SteamVR a la vista). cefMaxFrameRate 30: los paneles del menú se
-# dibujan a 30 cuadros por segundo como máximo (120 por defecto), para dejarle la placa de video al juego
+# verde azulado. cefMaxFrameRate 30: los paneles del menú se dibujan a 30 cuadros por segundo como máximo (120 por
+# defecto), para dejarle la placa de video al juego
 poner_driver_steamvr() {
   local d sha
   for d in "$RES/steamvr/driver_vrmin" "$RES/../../steamvr/driver_vrmin"; do [ -f "$d/bin/win64/driver_vrmin.dll" ] && break; done
@@ -161,24 +160,35 @@ ajustes_steamvr() {
   fi
   rm -f "$Q/.steam_sin_d3d11"
   mkdir -p "$Q/openvr/config"
-  cat > "$Q/openvr/config/steamvr.vrsettings" <<'JSON'
-{
-   "driver_null" : { "enable" : false },
-   "dashboard" : { "useNewDesktop" : false, "showDesktop" : false, "allowDashboardAutoLaunchWithSteamVRHome" : false, "cefMaxFrameRate" : 30 },
-   "collisionBounds" : { "CollisionBoundsColorGammaA" : 0, "CollisionBoundsFadeDistance" : 0 },
-   "steamvr" : {
-      "requireHmd" : true,
-      "forcedDriver" : "vrmin",
-      "activateMultipleDrivers" : false,
-      "enableHomeApp" : false,
-      "showMirrorView" : false,
-      "startMonitorFromAppLaunch" : false,
-      "startOverlayAppsFromDashboard" : false,
-      "allowDisplayLockedMode" : true,
-      "allowDashboardAutoLaunchWithSteamVRHome" : false
-   }
+  # Lo nuestro se escribe siempre; lo demás que guarda SteamVR (como la resolución, en general o por juego) se conserva.
+  # La resolución arranca en 25 % (SteamVR, en automático, elige casi el doble: no baja de lo de los primeros visores)
+  /usr/bin/python3 - "$Q/openvr/config/steamvr.vrsettings" <<'PY'
+import json, sys
+f = sys.argv[1]
+try:
+    s = json.load(open(f))
+except Exception:
+    s = {}
+fijo = {
+    "driver_null": {"enable": False},
+    "dashboard": {"useNewDesktop": False, "showDesktop": False, "cefMaxFrameRate": 30},
+    "collisionBounds": {"CollisionBoundsColorGammaA": 0, "CollisionBoundsFadeDistance": 0},
+    "steamvr": {"requireHmd": True, "forcedDriver": "vrmin", "activateMultipleDrivers": False, "enableHomeApp": False,
+                "showMirrorView": False, "startMonitorFromAppLaunch": False, "startOverlayAppsFromDashboard": False,
+                "allowDisplayLockedMode": True},
 }
-JSON
+# (de versiones anteriores de VRmin)
+s.get("dashboard", {}).pop("enableDashboard", None)
+s.get("dashboard", {}).pop("allowDashboardAutoLaunchWithSteamVRHome", None)
+s.get("steamvr", {}).pop("forceCEFMode", None)
+s.get("steamvr", {}).pop("allowDashboardAutoLaunchWithSteamVRHome", None)
+s.pop("VRWebHelper", None)
+for sec, v in fijo.items():
+    s.setdefault(sec, {}).update(v)
+for k, v in {"supersampleManualOverride": True, "supersampleScale": 0.25}.items():
+    s["steamvr"].setdefault(k, v)
+json.dump(s, open(f, "w"), indent=3)
+PY
 }
 
 # SteamVR real, abierto antes que el juego y con el visor y los controles de VRmin ya agregados: si lo abre el juego,
