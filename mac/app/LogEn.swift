@@ -4,6 +4,7 @@ import Foundation
 
 enum LogEn {
     private static let pairs: [(String, String)] = [
+        ("Demasiados códigos equivocados: emparejar en pausa", "Too many wrong codes: pairing paused for"),
         ("No encontré «VRmin Mic»", "Couldn't find “VRmin Mic”"),
         (": instalalo en VRmin Host › Ajustes › Micrófono", ": install it in VRmin Host › Settings › Microphone"),
         ("Pidiendo el micrófono del visor (hay un juego abierto)", "Asking for the headset microphone (a game is open)"),

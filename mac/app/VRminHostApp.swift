@@ -762,11 +762,18 @@ final class AppModel: ObservableObject {
             if r != 0 { DispatchQueue.main.async { self?.append(L("Aviso: no pude escuchar los pedidos del Quest (puerto 9102)")) }; return }
             var buf = [UInt8](repeating: 0, count: 256)
             while true {
-                let n = recv(s, &buf, buf.count, 0)
+                var from = sockaddr_in6()
+                var fl = socklen_t(MemoryLayout<sockaddr_in6>.size)
+                let n = withUnsafeMutablePointer(to: &from) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(s, &buf, buf.count, 0, $0, &fl) } }
                 guard n > 0 else { continue }
                 let txt = String(decoding: buf.prefix(n), as: UTF8.self)
+                // Ajustes y «playgame» los manda el renderizador desde esta Mac (127.0.0.1): de la red solo se acepta
+                // «start» (el Quest enciende el servidor). Si no, cualquiera en la red podía cambiar ajustes o abrir juegos
+                let a = withUnsafeBytes(of: from.sin6_addr) { Array($0) }
+                let local = a == [UInt8](repeating: 0, count: 15) + [1]   // ::1
+                    || (a.prefix(10).allSatisfy { $0 == 0 } && a[10] == 0xff && a[11] == 0xff && a[12] == 127)   // ::ffff:127.x.x.x
                 // Ajustes de juegos VR elegidos en el Quest: guardarlos y reiniciar el servidor para aplicarlos
-                if txt.contains("\"settings\""), let o = try? JSONSerialization.jsonObject(with: Data(txt.utf8)) as? [String: Any] {
+                if txt.contains("\"settings\""), local, let o = try? JSONSerialization.jsonObject(with: Data(txt.utf8)) as? [String: Any] {
                     DispatchQueue.main.async {
                         guard let self else { return }
                         if let v = o["eye"] as? Int, (512...2560).contains(v) { self.eye = v }
@@ -782,7 +789,7 @@ final class AppModel: ObservableObject {
                     continue
                 }
                 // Un juego con calidad propia (o que vuelve a la general): reiniciar con esa y después abrirlo
-                if txt.contains("\"playgame\""), let o = try? JSONSerialization.jsonObject(with: Data(txt.utf8)) as? [String: Any],
+                if txt.contains("\"playgame\""), local, let o = try? JSONSerialization.jsonObject(with: Data(txt.utf8)) as? [String: Any],
                    let e = o["eye"] as? Int, let f = o["fps"] as? Int, let mb = o["mbps"] as? Int, let fv = o["fov"] as? String {
                     let id = (o["id"] as? String).flatMap { $0.allSatisfy(\.isNumber) && !$0.isEmpty ? $0 : nil }   // sin id: el juego ya está abierto
                     DispatchQueue.main.async { self?.playWith(id: id, name: o["name"] as? String ?? "", eye: e, fps: f, mbps: mb, fov: fv) }
