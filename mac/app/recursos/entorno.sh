@@ -41,7 +41,9 @@ STEAMLIB="$STEAMDIR/steamapps"
 
 motor_listo() { [ -x "$WINE_REAL" ] && [ -f "$WINEDIR/lib/wine/x86_64-unix/winemetal.so" ] && [ -d "$FW" ] \
   && [ "$(cat "$WINEPREFIX/.wine_usado" 2>/dev/null)" = "$MARCA_MOTOR" ]; }
-steam_abierto() { pgrep -if "steam\.exe" >/dev/null; }
+# (solo el steam.exe de verdad: el «start.exe /exec …\steam.exe» con que Wine lo abrió puede quedar vivo después de
+#  que Steam se reinicia al actualizarse, y con «steam\.exe» a secas Steam parecía abierto para siempre)
+steam_abierto() { pgrep -if '^c:\\program files \(x86\)\\steam\\steam\.exe' >/dev/null; }
 # Ajustes de DLLs de Wine (una vez por Windows de VRmin): d3d11 incorporada (DXMT) para todos los programas, Steam
 # incluido. Steam (de 32 bits) carga vrclient.dll con SteamVR abierto (para sus paneles en el visor); antes eso lo
 # trababa dentro de Wine y se le sacaba d3d11 (sin ella no puede cargar vrclient.dll), pero entonces avisaba

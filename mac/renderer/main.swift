@@ -2323,6 +2323,8 @@ final class AudioTap {
 // opcionalmente, una pantalla con el escritorio de la Mac que se puede usar con el control.
 
 let LOBBY_NOT_GAMES: Set<String> = ["228980", "250820", "1070560", "1391110", "1628350"]
+/// SteamVR (su número de Steam): no es un juego, pero va primero en la lista para abrirlo solo (abrir_steamvr.sh)
+let STEAMVR_APPID = "250820"
 
 struct LobbyQuad { var corners: [SIMD4<Float>]; let texture: MTLTexture }
 
@@ -3343,6 +3345,10 @@ final class Lobby {
             out.append(GameEntry(id: id, name: d["name"] ?? dir, vr: vr, dir: dir))
         }
         out.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        // SteamVR primero: abierto solo es como ponerse un Valve Index (su sala y su menú, con la biblioteca de Steam)
+        if FileManager.default.fileExists(atPath: lib.appendingPathComponent("common/SteamVR/bin/win64/vrstartup.exe").path) {
+            out.insert(GameEntry(id: STEAMVR_APPID, name: "SteamVR", vr: true, dir: ""), at: 0)
+        }
         games = out
     }
 
@@ -3351,7 +3357,7 @@ final class Lobby {
     private func steamRunning() -> Bool {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        p.arguments = ["-if", "steam\\.exe"]
+        p.arguments = ["-if", "^c:\\\\program files \\(x86\\)\\\\steam\\\\steam\\.exe"]   // (el steam.exe de verdad: ver steam_abierto en entorno.sh)
         p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
         guard (try? p.run()) != nil else { return false }
         p.waitUntilExit()
@@ -3403,6 +3409,15 @@ final class Lobby {
                 var waited = 0
                 while !steamRunning() && waited < 150 { sleep(2); waited += 2 }
                 if steamRunning() { setStatus(tr("Steam abierto, esperando que termine de cargar…", "Steam is open, waiting for it to finish loading…")); sleep(25) }
+            }
+            if g.id == STEAMVR_APPID {   // SteamVR solo: queda abierto, y los juegos se abren desde su menú
+                setStatus(tr("Abriendo SteamVR…", "Opening SteamVR…"))
+                if !runScript("abrir_steamvr.sh", []) {
+                    setStatus(tr("No se pudo abrir SteamVR. Mirá el registro en la Mac.", "Couldn't open SteamVR. Check the log on the Mac."))
+                }
+                sleep(10)
+                lock.lock(); busy = false; launchingQ = nil; if status.hasPrefix("Abriendo") || status.hasPrefix("Opening") { status = "" }; lock.unlock()
+                return
             }
             setStatus(g.vr ? tr("Abriendo \(g.name)… (si Steam pregunta, elegí VR en la Mac)", "Opening \(g.name)… (if Steam asks, choose VR on the Mac)")
                            : tr("Abriendo \(g.name)… aparece como una ventana de la Mac", "Opening \(g.name)… it shows up as a Mac window"))

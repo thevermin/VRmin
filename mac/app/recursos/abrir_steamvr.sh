@@ -1,0 +1,30 @@
+#!/bin/bash
+# Abre el SteamVR real en el visor, sin juego, como al ponerse un Valve Index: su sala y su menú (con la biblioteca de
+# Steam, desde donde se instalan y se abren los juegos). Queda abierto hasta cerrarlo (los juegos que se abren desde su
+# menú lo usan y, al cerrarse, se vuelve a su sala).
+#   abrir_steamvr.sh            lo abre (o, si ya está abierto, lo deja así)
+#   abrir_steamvr.sh --cerrar   lo cierra
+source "$(dirname "$0")/entorno.sh"
+source "$RES/runtime.sh"
+cd "$P"
+if [ "$1" = "--cerrar" ]; then
+  cerrar_steamvr
+  say "SteamVR cerrado" "SteamVR closed"
+  exit 0
+fi
+motor_listo || { say "Primero instalá el motor." "Install the engine first."; exit 1; }
+steam_abierto || { say "Steam no está abierto. Abrilo y esperá a ver tu biblioteca." "Steam isn't open. Open it and wait until you see your library."; exit 1; }
+[ -f "$STEAMLIB/common/SteamVR/bin/win64/vrstartup.exe" ] || {
+  say "SteamVR no está instalado en el Steam de VRmin: buscalo en la biblioteca de Steam (en Herramientas) e instalalo." \
+      "SteamVR isn't installed in VRmin's Steam: find it in Steam's library (under Tools) and install it."; exit 1; }
+
+# Los juegos que se abran desde el menú de SteamVR lo usan a él (OpenVR y OpenXR → SteamVR, con el driver de VRmin)
+preparar_runtime steamvr || exit 1
+ajustes_dll
+gpu_luid_dxmt
+microfono_wine
+# (sin el cartel «Abriendo…» de jugar.sh: acá no hay un juego que esperar)
+rm -f "$Q/steamvr_abriendo.txt"
+# (si quedó abierto por un juego, el vigía de ese juego lo cerraría cuando el juego se cierre: ahora queda abierto)
+v="$(cat "$Q/.vigia_steamvr" 2>/dev/null)"; [ -n "$v" ] && kill "$v" 2>/dev/null; rm -f "$Q/.vigia_steamvr"
+abrir_steamvr
