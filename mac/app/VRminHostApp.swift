@@ -1055,8 +1055,7 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in if self?.serverRunning == true { self?.openSteamVR() } }
             return
         }
-        if !steamRunning { append(L("Primero abrí Steam y esperá a ver tu biblioteca.")); return }
-        run(L("Abriendo SteamVR"), "abrir_steamvr.sh", exclusive: false)
+        run(L("Abriendo SteamVR"), "abrir_steamvr.sh", exclusive: false)   // (si Steam está cerrado, lo abre primero)
     }
     func closeSteamVR() { run(L("Cerrando SteamVR"), "abrir_steamvr.sh", ["--cerrar"], exclusive: false) }
 

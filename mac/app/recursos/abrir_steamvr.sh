@@ -13,10 +13,19 @@ if [ "$1" = "--cerrar" ]; then
   exit 0
 fi
 motor_listo || { say "Primero instalá el motor." "Install the engine first."; exit 1; }
-steam_abierto || { say "Steam no está abierto. Abrilo y esperá a ver tu biblioteca." "Steam isn't open. Open it and wait until you see your library."; exit 1; }
 [ -f "$STEAMLIB/common/SteamVR/bin/win64/vrstartup.exe" ] || {
   say "SteamVR no está instalado en el Steam de VRmin: buscalo en la biblioteca de Steam (en Herramientas) e instalalo." \
       "SteamVR isn't installed in VRmin's Steam: find it in Steam's library (under Tools) and install it."; exit 1; }
+# Steam cerrado: se abre primero (SteamVR toma de él tu biblioteca) y se espera a que cargue, como al elegir un juego
+# en el Quest. Tarda alrededor de un minuto
+if ! steam_abierto; then
+  bash "$RES/abrir_steam.sh" || exit 1
+  for i in $(seq 1 75); do steam_abierto && break; sleep 2; done
+  steam_abierto || { say "Steam no terminó de abrir: probá de nuevo en un momento." "Steam didn't finish opening: try again in a moment."; exit 1; }
+  for i in $(seq 1 45); do pgrep -f 'steamwebhelper' >/dev/null && break; sleep 2; done
+  say "Steam abierto, esperando que termine de cargar…" "Steam is open, waiting for it to finish loading…"
+  sleep 25
+fi
 
 # Los juegos que se abran desde el menú de SteamVR lo usan a él (OpenVR y OpenXR → SteamVR, con el driver de VRmin)
 preparar_runtime steamvr || exit 1
