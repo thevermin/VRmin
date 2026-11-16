@@ -3731,6 +3731,7 @@ final class Pairing {
     private var tries = 0
     private var lockedUntil = Date.distantPast   // pausa después de 5 códigos equivocados
     private var lockouts = 0                     // pausas seguidas (cada una dura el doble, hasta 1 hora)
+    private var failures: [Date] = []            // códigos equivocados de los últimos 10 minutos, de cualquier Quest
 
     private func load() -> [String: [String: String]] {
         guard let d = try? Data(contentsOf: file), let o = try? JSONSerialization.jsonObject(with: d) as? [String: [String: String]] else { return [:] }
@@ -3772,15 +3773,19 @@ final class Pairing {
                 let f = ISO8601DateFormatter()
                 all[id] = ["token": tok, "name": name, "since": f.string(from: Date())]
                 save(all)
-                code = nil; lockouts = 0
+                code = nil; lockouts = 0; failures = []
                 print("[emparejar] LISTO \(name) (\(ip))")
                 return .ok(token: tok)
             }
             tries += 1
-            if tries >= 5 {
+            // (cuentan todos los equivocados, no solo los de este código: pidiendo un código para otro Quest, el contador
+            //  de este volvía a 0 y se podía seguir probando sin llegar nunca a la pausa)
+            let now = Date()
+            failures = failures.filter { now.timeIntervalSince($0) < 600 } + [now]
+            if tries >= 5 || failures.count >= 5 {
                 // Demasiados intentos: pausa antes de dar otro código (si no, se podía probar código tras código
                 // desde la red hasta acertar). 1 minuto, 2, 4… hasta 1 hora
-                code = nil; lockouts += 1
+                code = nil; lockouts += 1; failures = []
                 let s = min(60 << min(lockouts - 1, 6), 3600)
                 lockedUntil = Date().addingTimeInterval(TimeInterval(s))
                 print("[emparejar] VENCIDO")

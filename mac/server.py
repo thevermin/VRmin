@@ -170,6 +170,8 @@ def on_quest_message(writer, text):
         data = json.loads(text)
     except ValueError:
         return
+    if not isinstance(data, dict):   # (otra cosa que un objeto JSON cortaba la conexión con un error)
+        return
     kind = data.get("type")
     if kind == "pose":
         send_text(writer, json.dumps({"type": "echo", "t": data.get("t")}))
