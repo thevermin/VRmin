@@ -201,14 +201,25 @@ abrir_steamvr() {
   fi
   cerrar_steamvr   # (uno a medio abrir o sin el driver de VRmin)
   rm -f "$Q/driver_vrmin.log"
+  # (el menú de SteamVR está listo cuando su página crea sus paneles: lo dice su registro, que empieza de nuevo)
+  local menu="$Q/openvr/logs/vrwebhelper_systemui.txt"
+  rm -f "$menu"
   say "Abriendo SteamVR…" "Opening SteamVR…"
   WINEDEBUG=-all "$WINE" "$STEAMVR_WIN\\bin\\win64\\vrstartup.exe" >/dev/null 2>&1 < /dev/null &
   local i
   for i in $(seq 1 120); do
-    grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null && { say "SteamVR listo" "SteamVR ready"; return 0; }
+    grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null && break
     sleep 0.5
   done
-  say "SteamVR tardó en abrir; abro el juego igual" "SteamVR took long to open; opening the game anyway"
+  grep -q "Right controller activated" "$Q/driver_vrmin.log" 2>/dev/null \
+    || { say "SteamVR tardó en abrir; abro el juego igual" "SteamVR took long to open; opening the game anyway"; return 0; }
+  # El juego se abre cuando el menú ya cargó: cargando a la vez, el menú (páginas web que sirve SteamVR) tardaba casi
+  # un minuto en aparecer y el juego ya había empezado
+  for i in $(seq 1 120); do
+    grep -q 'Created: system.HeadsetView' "$menu" 2>/dev/null && break
+    sleep 0.5
+  done
+  say "SteamVR listo" "SteamVR ready"
 }
 
 # Cierra SteamVR (y deja de vigilar el juego que lo usaba)

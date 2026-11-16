@@ -1799,6 +1799,7 @@ struct PresetPicker: View {
 struct AdvancedBlock: View {
     @EnvironmentObject var m: AppModel
     let key: String
+    var steamvr = false   // (el juego se abre con SteamVR real: sus controles los maneja SteamVR)
     private func group<C: View>(_ title: String, _ hint: String? = nil, @ViewBuilder _ c: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(.system(size: 13, weight: .semibold))
@@ -1822,10 +1823,15 @@ struct AdvancedBlock: View {
                 }.pickerStyle(.segmented).labelsHidden()
             }
             Toggle(L("Escala automática"), isOn: Binding(get: { auto }, set: { v in m.setAdv(key) { $0.auto = v } })).toggleStyle(.switch)
-            Toggle(L("Emular controles de Valve Index"), isOn: Binding(get: { index }, set: { v in m.setAdv(key) { $0.index = v; if v { $0.vive = false } } })).toggleStyle(.switch)
+            Toggle(L("Emular controles de Valve Index"), isOn: Binding(get: { index && !steamvr }, set: { v in m.setAdv(key) { $0.index = v; if v { $0.vive = false } } })).toggleStyle(.switch)
+                .disabled(steamvr)
             // (para juegos hechos para los controles de Vive, como DOOM VFR: el stick hace de trackpad)
-            Toggle(L("Emular controles de HTC Vive"), isOn: Binding(get: { vive }, set: { v in m.setAdv(key) { $0.vive = v; if v { $0.index = false } } })).toggleStyle(.switch)
+            Toggle(L("Emular controles de HTC Vive"), isOn: Binding(get: { vive && !steamvr }, set: { v in m.setAdv(key) { $0.vive = v; if v { $0.index = false } } })).toggleStyle(.switch)
                 .help(L("Para juegos hechos para los controles de Vive: el stick hace de trackpad (moverlo es deslizar el dedo, hundirlo es hacer clic)"))
+                .disabled(steamvr)
+            if steamvr {
+                Text(L("Con SteamVR real los controles los maneja SteamVR (sus perfiles de controles, en su menú).")).font(.caption).foregroundStyle(Theme.text2)
+            }
             Text(L("Hay que volver a abrir el juego para que se aplique.")).font(.caption).foregroundStyle(Theme.text2)
         }
     }
@@ -1871,7 +1877,7 @@ struct GameSettingsSheet: View {
                         }
                     }
                 }
-                Card(title: L("Rendimiento"), icon: "speedometer") { AdvancedBlock(key: key) }
+                Card(title: L("Rendimiento"), icon: "speedometer") { AdvancedBlock(key: key, steamvr: m.vr[game.id]?.perfil.runtime == "steamvr") }
                 if own != nil {
                     Button(L("Usar los de todos los juegos")) { m.resetAdv(key); custom = false }.buttonStyle(Pill())
                 }
