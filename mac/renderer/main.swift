@@ -3842,6 +3842,7 @@ final class NativeLink {
     private let lock = NSLock()
     private var pending = 0
     private var needKey = true
+    private var keyAsked = false   // (ya se pidió el cuadro completo para cuando la cola baje)
     private let sendQueue = DispatchQueue(label: "native-send", qos: .userInteractive)
     private let shared: Shared
     private var statSent = 0, statDropped = 0, statWaitKey = 0
@@ -3875,8 +3876,11 @@ final class NativeLink {
         if t == 1 {
             let key = p.count > 5 && p[p.startIndex + 5] == 1
             if needKey && !key { statWaitKey += 1; lock.unlock(); return }
-            if pending > 4_000_000 { statDropped += 1; needKey = true; lock.unlock(); shared.requestKey(); return }
-            needKey = false
+            // (cola llena: se descarta, y el cuadro completo se pide recién cuando la cola baje, abajo. Pedido acá, con
+            //  cada cuadro descartado, la Mac hacía solo cuadros completos, los más caros, mientras nadie los recibía:
+            //  con el Quest apagado, hasta que se diera por perdida la conexión)
+            if pending > 4_000_000 { statDropped += 1; needKey = true; keyAsked = false; lock.unlock(); return }
+            needKey = false; keyAsked = false
             statSent += 1
         } else if t == 2 && pending > 1_000_000 {
             lock.unlock(); return
@@ -3900,7 +3904,11 @@ final class NativeLink {
                 }
                 return true
             }
-            lock.lock(); pending -= size; lock.unlock()
+            lock.lock(); pending -= size
+            let ask = needKey && !keyAsked && pending < 1_000_000 && fd == f
+            if ask { keyAsked = true }
+            lock.unlock()
+            if ask { shared.requestKey() }   // (se descartó video y la cola ya bajó: un cuadro completo para seguir)
             if !ok { Darwin.shutdown(f, SHUT_RDWR) }
         }
     }
@@ -3998,6 +4006,16 @@ final class NativeLink {
                 setsockopt(c, Int32(IPPROTO_TCP), TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
                 var big: Int32 = 4 << 20
                 setsockopt(c, SOL_SOCKET, SO_SNDBUF, &big, socklen_t(MemoryLayout<Int32>.size))
+                // Quest apagado o fuera de alcance: sin respuesta, macOS seguía reintentando más de medio minuto antes de
+                // dar la conexión por perdida. Ahora se corta a los 8 s sin que conteste lo enviado (TCP_RXT_CONNDROPTIME)
+                // o, sin nada que enviar, a los ~11 s (keepalive)
+                var dropAfter: Int32 = 8
+                setsockopt(c, Int32(IPPROTO_TCP), TCP_RXT_CONNDROPTIME, &dropAfter, socklen_t(MemoryLayout<Int32>.size))
+                setsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &one, socklen_t(MemoryLayout<Int32>.size))
+                var kaIdle: Int32 = 5, kaIntvl: Int32 = 2, kaCnt: Int32 = 3
+                setsockopt(c, Int32(IPPROTO_TCP), TCP_KEEPALIVE, &kaIdle, socklen_t(MemoryLayout<Int32>.size))
+                setsockopt(c, Int32(IPPROTO_TCP), TCP_KEEPINTVL, &kaIntvl, socklen_t(MemoryLayout<Int32>.size))
+                setsockopt(c, Int32(IPPROTO_TCP), TCP_KEEPCNT, &kaCnt, socklen_t(MemoryLayout<Int32>.size))
                 var ipBuf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
                 var a6 = peer.sin6_addr
                 inet_ntop(AF_INET6, &a6, &ipBuf, socklen_t(ipBuf.count))
@@ -4033,7 +4051,7 @@ final class NativeLink {
                 // Una sola app a la vez: la nueva reemplaza a la anterior
                 lock.lock()
                 if fd >= 0 { Darwin.shutdown(fd, SHUT_RDWR) }
-                fd = c; needKey = true; pending = 0
+                fd = c; needKey = true; keyAsked = false; pending = 0
                 lock.unlock()
                 print("[quest] App del Quest conectada desde \(ip)")
                 var okMsg = Data([3])
