@@ -967,6 +967,13 @@ static float jsonNum(const std::string &t, const char *key) {
 struct Haptic { bool pending = false; float dur = 0, amp = 0, freq = 0; };
 static Haptic g_haptic[2];
 static std::mutex g_hapticLock;
+// Un toque suave al usar los menús de VRmin (sin pisar una vibración del juego que todavía no salió)
+static std::atomic<int> g_uiHand{1};   // la mano que apunta a los menús
+static void uiPulse(int h, float amp, float dur) {
+    if (h < 0 || h > 1) return;
+    std::lock_guard<std::mutex> lk(g_hapticLock);
+    if (!g_haptic[h].pending) g_haptic[h] = {true, dur, amp, 0};
+}
 struct Vigia {
     bool calibrated = false;
     float calMid[3] = {0, 0, 0}, calHead[3] = {0, 0, 0};
@@ -1326,6 +1333,8 @@ Java_org_questvrbridge_client_VrActivity_nativeSetWristFollow(JNIEnv *, jclass, 
 /// El láser está sobre algo que se puede tocar (el punto crece un poco)
 extern "C" JNIEXPORT void JNICALL
 Java_org_questvrbridge_client_VrActivity_nativeSetPointClickable(JNIEnv *, jclass, jboolean on) { g_pointClickable = on; }
+extern "C" JNIEXPORT void JNICALL
+Java_org_questvrbridge_client_VrActivity_nativeUiTick(JNIEnv *, jclass) { uiPulse(g_uiHand.load(), 0.12f, -1); }
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_questvrbridge_client_VrActivity_nativeSetLaser(JNIEnv *, jclass, jint color, jfloat gain) {
@@ -7502,6 +7511,7 @@ static int uiInput(App &app, XrTime time, const XrView &head, Ray rays[2], std::
         if (hp.down < 0 && portalInput(h, byHand, r.o, pressed, released, hitPanel[h] >= 0 || noTouchT < 1e8f)) { hp.hover = -1; continue; }
         // Agarrar la barrita para mover
         if (pressed && hitKind[h] == 2 && hp.down < 0) {
+            uiPulse(h, 0.2f, 10);
             for (UiPanel *p : g_ui) if (p->id == hitPanel[h]) {
                 hp.grab = p->id; hp.grabT = best;
                 hp.off[0] = p->pose.position.x - (r.o[0] + r.d[0] * best);
@@ -7526,6 +7536,7 @@ static int uiInput(App &app, XrTime time, const XrView &head, Ray rays[2], std::
             hp.down = hitPanel[h];
             app.pressAt[h] = nowMs();
             javaPointer(hp.down, 1, hu[h], hv[h], 0);
+            uiPulse(h, 0.25f, 12);
         }
         hp.hover = hitKind[h] == 1 ? hitPanel[h] : -1;
         // Rueda: joystick arriba/abajo sobre un panel
@@ -7535,7 +7546,7 @@ static int uiInput(App &app, XrTime time, const XrView &head, Ray rays[2], std::
     // Hover de la mano con el láser (y avisar al panel anterior que el puntero se fue)
     int hov = active >= 0 && app.hp[active].down < 0 && hitKind[active] == 1 ? hitPanel[active] : -1;
     if (app.lastHover >= 0 && app.lastHover != hov) javaPointer(app.lastHover, 5, 0, 0, 0);
-    if (hov >= 0) javaPointer(hov, 0, hu[active], hv[active], 0);
+    if (hov >= 0) { g_uiHand = active; javaPointer(hov, 0, hu[active], hv[active], 0); }
     app.lastHover = hov;
     // Barritas de las ventanas
     static double lastBarT = 0;

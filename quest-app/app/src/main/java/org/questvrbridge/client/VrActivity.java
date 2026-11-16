@@ -41,6 +41,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
     static native void nativeSetTimeZone(int minutes);
     static native void nativeSetWristFollow(boolean follow);
     static native void nativeSetPointClickable(boolean on);
+    static native void nativeUiTick();
     static native void nativeSetRealHands(boolean on);
     static native void nativeSetCameraAllowed(boolean on);
     static native void nativeSetHandSat(float sat);
@@ -610,6 +611,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
         View target = null;
         if (!macScreen && action != 5 && p.root instanceof ViewGroup) target = clickableAt((ViewGroup) p.root, x, y, p.root.getWidth(), p.root.getHeight());
         if (action == 2) target = p.lifted;   // (mientras se arrastra, sigue el mismo)
+        if (action == 0 && target != null && target != p.lifted) nativeUiTick();   // un toquecito al pasar a otro botón
         p.lifted = target;
         if (target != null && action == 1) Ui.liftPress(target);
         boolean c = target != null;
