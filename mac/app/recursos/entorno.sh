@@ -54,6 +54,12 @@ ajustes_dll() {
       && touch "$WINEPREFIX/.dll_d3d11" \
       && export WINEDLLOVERRIDES="dxgi,d3d10core=b;winemenubuilder.exe=d;gameoverlayrenderer,gameoverlayrenderer64=d"
   fi
+  # (lo que le falta a Wine para el servicio de Steam: ver agregar_export.py; también después de reinstalar el motor)
+  local a
+  for a in i386 x86_64; do
+    /usr/bin/python3 "$RES/agregar_export.py" "$WINEDIR/lib/wine/$a-windows/gdi32.dll" \
+      D3DKMTSetProcessSchedulingPriorityClass=8 >/dev/null 2>&1
+  done
   if [ ! -f "$WINEPREFIX/.steam_con_d3d11" ]; then
     "$WINE" reg delete 'HKCU\Software\Wine\AppDefaults\steam.exe\DllOverrides' /v d3d11 /f >/dev/null 2>&1
     touch "$WINEPREFIX/.steam_con_d3d11"
