@@ -4,6 +4,9 @@ import Foundation
 
 enum LogEn {
     private static let pairs: [(String, String)] = [
+        ("SteamVR abierto sin el Quest: se cierra en", "SteamVR is open without the Quest: it closes in"),
+        ("minutos si no se conecta", "minutes unless it connects"),
+        ("Sin el Quest conectado: cerrando SteamVR", "No Quest connected: closing SteamVR"),
         ("No encontré «VRmin Mic»", "Couldn't find “VRmin Mic”"),
         (": instalalo en VRmin Host › Ajustes › Micrófono", ": install it in VRmin Host › Settings › Microphone"),
         ("Pidiendo el micrófono del visor (hay un juego abierto)", "Asking for the headset microphone (a game is open)"),

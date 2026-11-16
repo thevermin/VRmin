@@ -4398,6 +4398,36 @@ micTimer.setEventHandler {
 }
 micTimer.resume()
 
+// SteamVR abierto solo (abrir_steamvr.sh: sin el vigía de un juego, .vigia_steamvr) y sin el Quest conectado: a los
+// 5 minutos se cierra, para que no siga dibujando a 90 cuadros por segundo para nadie. VRMIN_STEAMVR_IDLE: los segundos
+let steamVRIdleLimit = Double(env["VRMIN_STEAMVR_IDLE"] ?? "") ?? 300
+var steamVRIdleSince: Date?
+let steamVRIdleTimer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "steamvr.solo", qos: .utility))
+steamVRIdleTimer.schedule(deadline: .now() + 15, repeating: 15)
+steamVRIdleTimer.setEventHandler {
+    let data = env["QVB_DATA"] ?? ""
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep"); p.arguments = ["-f", "vrserver\\.exe"]
+    p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+    var open = false
+    if (try? p.run()) != nil { p.waitUntilExit(); open = p.terminationStatus == 0 }
+    let solo = open && !data.isEmpty && !FileManager.default.fileExists(atPath: data + "/prefijo/drive_c/questvrbridge/.vigia_steamvr")
+    if !solo || native.isConnected { steamVRIdleSince = nil; return }
+    if steamVRIdleSince == nil {
+        steamVRIdleSince = Date()
+        print("[steamvr] SteamVR abierto sin el Quest: se cierra en \(Int(steamVRIdleLimit / 60)) minutos si no se conecta")
+    }
+    if let s = steamVRIdleSince, Date().timeIntervalSince(s) >= steamVRIdleLimit {
+        steamVRIdleSince = nil
+        print("[steamvr] Sin el Quest conectado: cerrando SteamVR")
+        let c = Process()
+        c.executableURL = URL(fileURLWithPath: "/bin/bash")
+        c.arguments = [URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("abrir_steamvr.sh").path, "--cerrar"]
+        if (try? c.run()) != nil { c.waitUntilExit() }
+    }
+}
+steamVRIdleTimer.resume()
+
 let t0 = DispatchTime.now().uptimeNanoseconds
 let timer = DispatchSource.makeTimerSource(flags: .strict, queue: renderQueue)
 timer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / FPS), leeway: .microseconds(500))
