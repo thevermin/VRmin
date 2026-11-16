@@ -1294,8 +1294,11 @@ public:
             // (no duration: the shortest vibration the controller can do, as OpenXR's XR_MIN_HAPTIC_DURATION, which
             //  the Quest gets as -1; with 0 ms nothing vibrated)
             double ms = h.fDurationSeconds > 0 ? h.fDurationSeconds * 1000.0 : -1.0;
+            // (SteamVR passes 1 Hz when the game doesn't say which frequency: as the Quest's own, 0 = unspecified;
+            //  1 Hz is a vibration too slow to feel)
+            float freq = h.fFrequency >= 40.f ? h.fFrequency : 0.f;
             int n = snprintf(m, sizeof m, "{\"type\":\"haptic\",\"hand\":%d,\"dur\":%.1f,\"amp\":%.3f,\"freq\":%.1f}", c->isLeft() ? 0 : 1,
-                             ms, h.fAmplitude, h.fFrequency);
+                             ms, h.fAmplitude, freq);
             host.send(14, m, (uint32_t)n);
             if (g_haptics++ == 0 && !hapticLogged) {
               hapticLogged = true;

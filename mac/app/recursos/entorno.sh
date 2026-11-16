@@ -42,16 +42,21 @@ STEAMLIB="$STEAMDIR/steamapps"
 motor_listo() { [ -x "$WINE_REAL" ] && [ -f "$WINEDIR/lib/wine/x86_64-unix/winemetal.so" ] && [ -d "$FW" ] \
   && [ "$(cat "$WINEPREFIX/.wine_usado" 2>/dev/null)" = "$MARCA_MOTOR" ]; }
 steam_abierto() { pgrep -if "steam\.exe" >/dev/null; }
-# Ajustes de DLLs de Wine (una vez por Windows de VRmin): d3d11 incorporada (DXMT) para todos los programas, y sin d3d11
-# para Steam. Con SteamVR abierto, Steam (de 32 bits) carga vrclient.dll para mostrar sus paneles en el visor y dentro
-# de Wine se traba entero, y los juegos que le piden la cuenta a Steam al arrancar se cierran. vrclient.dll necesita
-# d3d11: sin ella Steam no la puede cargar (Steam no usa d3d11 para nada más; la carga solo si está).
+# Ajustes de DLLs de Wine (una vez por Windows de VRmin): d3d11 incorporada (DXMT) para todos los programas, Steam
+# incluido. Steam (de 32 bits) carga vrclient.dll con SteamVR abierto (para sus paneles en el visor); antes eso lo
+# trababa dentro de Wine y se le sacaba d3d11 (sin ella no puede cargar vrclient.dll), pero entonces avisaba
+# «Shared lib not found (102)» cada vez que buscaba SteamVR. Con el DXMT de VRmin de ahora se le devuelve.
 # Vale desde la próxima vez que se abre Steam.
 ajustes_dll() {
-  [ -f "$WINEPREFIX/.dll_d3d11" ] && return 0
   [ -f "$WINEPREFIX/system.reg" ] || return 0
-  "$WINE" reg add 'HKCU\Software\Wine\DllOverrides' /v d3d11 /t REG_SZ /d builtin /f >/dev/null 2>&1 \
-    && "$WINE" reg add 'HKCU\Software\Wine\AppDefaults\steam.exe\DllOverrides' /v d3d11 /t REG_SZ /d "" /f >/dev/null 2>&1 \
-    && touch "$WINEPREFIX/.dll_d3d11" \
-    && export WINEDLLOVERRIDES="dxgi,d3d10core=b;winemenubuilder.exe=d;gameoverlayrenderer,gameoverlayrenderer64=d"
+  if [ ! -f "$WINEPREFIX/.dll_d3d11" ]; then
+    "$WINE" reg add 'HKCU\Software\Wine\DllOverrides' /v d3d11 /t REG_SZ /d builtin /f >/dev/null 2>&1 \
+      && touch "$WINEPREFIX/.dll_d3d11" \
+      && export WINEDLLOVERRIDES="dxgi,d3d10core=b;winemenubuilder.exe=d;gameoverlayrenderer,gameoverlayrenderer64=d"
+  fi
+  if [ ! -f "$WINEPREFIX/.steam_con_d3d11" ]; then
+    "$WINE" reg delete 'HKCU\Software\Wine\AppDefaults\steam.exe\DllOverrides' /v d3d11 /f >/dev/null 2>&1
+    touch "$WINEPREFIX/.steam_con_d3d11"
+  fi
+  return 0
 }
