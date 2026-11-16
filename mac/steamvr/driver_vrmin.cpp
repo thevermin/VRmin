@@ -207,6 +207,7 @@ static uint32_t pose_for(const HmdMatrix34_t &m, double *dist) {
 static std::atomic<int> g_cfgEyeW{0}, g_cfgEyeH{0}, g_cfgFps{0};
 static std::atomic<int> g_cfgNativeW{0}, g_cfgNativeH{0};   // (the Quest's own resolution per eye, from VRmin Host)
 static std::atomic<float> g_cfgFovK{1.f};
+static std::atomic<unsigned> g_haptics{0};   // (vibrations sent to the Quest, for the log)
 
 static void parse_pose(const char *line) {
   const char *p = strstr(line, "\"xr\":");
@@ -820,7 +821,7 @@ class VRminDirectMode : public IVRDriverDirectModeComponent {
   struct Layer { SubmitLayerPerEye_t eye[2]; };
   std::vector<Layer> layers, prevLayers;
   uint64_t presented = 0, lastPresented = 0, lastSent = 0, gameFrames = 0;
-  double t0 = now_s(), lastLog = 0;
+  double t0 = now_s(), lastLog = 0, presentSum = 0, overSum = 0;
 
   // The text of C:\questvrbridge\steamvr_abriendo.txt (written by VRmin Host when it opens a game with SteamVR), read
   // once a second, while it's less than 5 minutes old; once the game's image arrives it's removed
@@ -935,6 +936,7 @@ public:
   }
   void Present(SharedTextureHandle_t) override {
     std::lock_guard<std::mutex> g(frames.mutex());
+    double presentStart = now_s();
     uint64_t n = ++presented;
     // The game's frame is copied one frame later: nothing tells this process when the game's GPU finished drawing it
     // (in Windows SteamVR's sync texture does; in VRmin's Windows it doesn't), and copied right away it sometimes
@@ -1032,16 +1034,22 @@ public:
           over.insert(over.begin(), b);
         }
         frames.copy(src, box, typeless(d.Format), pose, over, flipped);
+        overSum += over.size();
       }
     }
     double t = now_s();
+    presentSum += t - presentStart;
     if (t - lastLog > 5) {
-      double dt = t - (lastLog ? lastLog : t0);
-      logf("SteamVR: %.0f frames/s, %.0f sent to VRmin Host (%llu dropped so far)", (n - lastPresented) / dt,
-           (frames.sent - lastSent) / dt, (unsigned long long)frames.dropped.load());
+      double dt = t - (lastLog ? lastLog : t0), frames_n = (double)(n - lastPresented);
+      logf("SteamVR: %.0f frames/s, %.0f sent to VRmin Host (%llu dropped so far) · driver %.2f ms per frame, %.1f layers "
+           "over the game · vibrations %u", frames_n / dt, (frames.sent - lastSent) / dt,
+           (unsigned long long)frames.dropped.load(), frames_n ? presentSum * 1000 / frames_n : 0.0,
+           frames_n ? overSum / frames_n : 0.0, g_haptics.exchange(0));
       lastLog = t;
       lastPresented = n;
       lastSent = frames.sent;
+      presentSum = 0;
+      overSum = 0;
     }
   }
   // After Present: VRmin Host is told about the frame, then this waits for the headset's next vsync
@@ -1229,6 +1237,7 @@ class VRminProvider : public IServerTrackedDeviceProvider {
   HostControl host;
   std::atomic<bool> running{false};
   std::thread poses;
+  bool hapticLogged = false;
 public:
   EVRInitError Init(IVRDriverContext *ctx) override {
     VR_INIT_SERVER_DRIVER_CONTEXT(ctx);
@@ -1282,9 +1291,16 @@ public:
         for (VRminController *c : {&leftHand, &rightHand})
           if (c->haptic && h.componentHandle == c->haptic) {
             char m[128];
+            // (no duration: the shortest vibration the controller can do, as OpenXR's XR_MIN_HAPTIC_DURATION, which
+            //  the Quest gets as -1; with 0 ms nothing vibrated)
+            double ms = h.fDurationSeconds > 0 ? h.fDurationSeconds * 1000.0 : -1.0;
             int n = snprintf(m, sizeof m, "{\"type\":\"haptic\",\"hand\":%d,\"dur\":%.1f,\"amp\":%.3f,\"freq\":%.1f}", c->isLeft() ? 0 : 1,
-                             h.fDurationSeconds * 1000.0, h.fAmplitude, h.fFrequency);
+                             ms, h.fAmplitude, h.fFrequency);
             host.send(14, m, (uint32_t)n);
+            if (g_haptics++ == 0 && !hapticLogged) {
+              hapticLogged = true;
+              logf("First vibration: %s", m);
+            }
           }
         continue;
       }
