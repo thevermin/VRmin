@@ -364,6 +364,19 @@ final class AppModel: ObservableObject {
         let uid = micSource == "quest" ? "VRminMic_UID" : micSource
         try? uid.write(to: data.appendingPathComponent("microfono"), atomically: true, encoding: .utf8)
     }
+    /// Amigos y chat de Steam (también en el visor, con SteamVR). La interfaz de Steam en Wine se dibuja sin la GPU: con
+    /// ellos usa casi un núcleo de la CPU todo el tiempo, por eso vienen apagados. abrir_steam.sh lo lee del archivo
+    /// «steam_amigos»; vale la próxima vez que se abre Steam (steamFriendsPending: Steam está abierto con lo de antes)
+    @Published var steamFriends: Bool = UserDefaults.standard.bool(forKey: "steamFriends") {
+        didSet {
+            UserDefaults.standard.set(steamFriends, forKey: "steamFriends"); writeSteamFriendsFile()
+            if steamRunning { steamFriendsPending.toggle() }
+        } }
+    @Published var steamFriendsPending = false
+    func writeSteamFriendsFile() {
+        let f = data.appendingPathComponent("steam_amigos")
+        if steamFriends { try? "1".write(to: f, atomically: true, encoding: .utf8) } else { try? FileManager.default.removeItem(at: f) }
+    }
     var micDriverInstalled: Bool { FileManager.default.fileExists(atPath: "/Library/Audio/Plug-Ins/HAL/VRminMic.driver") }
     /// Instala (o quita) «VRmin Mic»: macOS pide la contraseña de administrador
     func installMic(remove: Bool = false) {
@@ -456,6 +469,7 @@ final class AppModel: ObservableObject {
         }
         try? fm.createDirectory(at: data, withIntermediateDirectories: true)
         UserDefaults.standard.set(data.path, forKey: "dataDir")
+        writeSteamFriendsFile()
         if !fm.fileExists(atPath: res.appendingPathComponent("servidor.sh").path) {
             append(L("ATENCIÓN: faltan archivos dentro de la app (%@). Volvé a crearla con crear_app.sh", res.path))
         }
@@ -562,7 +576,7 @@ final class AppModel: ObservableObject {
                 guard let self else { return }
                 if running && !self.steamRunning { self.steamSince = Date() }
                 self.steamRunning = running
-                if !running { self.steamStuck = false; self.steamSince = .distantFuture }
+                if !running { self.steamStuck = false; self.steamSince = .distantFuture; self.steamFriendsPending = false }
                 else if stuck && !self.steamStuck && Date().timeIntervalSince(self.steamSince) > 120 {
                     self.steamStuck = true
                     self.append(L("⚠︎ Steam se trabó. Tocá «Reiniciar Steam» (cierra Steam y el juego, y lo vuelve a abrir)."))
@@ -2083,6 +2097,17 @@ struct SettingsView: View {
                 Toggle(L("No dormir mientras el Quest la usa"), isOn: $m.keepAwake).toggleStyle(.switch)
                 Toggle(L("Recibir versiones beta"), isOn: $m.beta).toggleStyle(.switch)
                     .help(L("Las betas traen lo nuevo antes, pero pueden fallar. Si lo apagás, VRmin Host te ofrece volver a la versión estable."))
+                Toggle(L("Amigos y chat de Steam"), isOn: $m.steamFriends).toggleStyle(.switch)
+                Text(L("También en el visor, con SteamVR. Usan casi un núcleo de la CPU mientras Steam está abierto, así que los juegos pueden andar más lento."))
+                    .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+                if m.steamFriendsPending {
+                    HStack {
+                        Text(L("Se aplica al reiniciar Steam (si hay un juego abierto, también se cierra)."))
+                            .font(.caption).foregroundStyle(Theme.amberText).fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        Button(L("Reiniciar Steam")) { m.restartSteam() }.buttonStyle(Pill()).disabled(m.busyTask != nil)
+                    }
+                }
                 HStack {
                     Text(m.data.path).font(.caption).foregroundStyle(Theme.text2).lineLimit(1).truncationMode(.middle)
                     Spacer()

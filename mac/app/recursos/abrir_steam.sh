@@ -42,8 +42,9 @@ done
 say "Abriendo Steam (tarda ~1 minuto en aparecer; la primera vez se actualiza y pide iniciar sesión)" "Opening Steam (takes ~1 minute to appear; the first time it updates and asks you to sign in)"
 # Ojo: sin "nohup" ni "env": son programas protegidos de macOS y borran DYLD_FALLBACK_LIBRARY_PATH,
 # que Wine necesita para encontrar sus bibliotecas.
-# Menos carga para Steam (su interfaz es un navegador que en Wine dibuja sin GPU): sin amigos ni chat
-EXTRA="-nofriendsui -nochatui"
+# Menos carga para Steam (su interfaz es un navegador que en Wine dibuja sin GPU): sin amigos ni chat, salvo que se
+# pidan en VRmin Host › Ajustes (archivo «steam_amigos»: con ellos, Steam usa casi un núcleo de la CPU todo el tiempo)
+EXTRA=""; [ -f "$P/steam_amigos" ] || EXTRA="-nofriendsui -nochatui"
 # -noverifyfiles: si Steam verifica sus archivos al arrancar, vuelve a poner su steamwebhelper.exe y la ventana
 # queda negra otra vez. -cef-single-process: el navegador de Steam en un solo proceso (igual que el arreglo).
 EXTRA="$EXTRA -noverifyfiles -cef-single-process"
