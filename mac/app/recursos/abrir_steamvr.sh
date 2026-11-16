@@ -27,4 +27,20 @@ microfono_wine
 rm -f "$Q/steamvr_abriendo.txt"
 # (si quedó abierto por un juego, el vigía de ese juego lo cerraría cuando el juego se cierre: ahora queda abierto)
 v="$(cat "$Q/.vigia_steamvr" 2>/dev/null)"; [ -n "$v" ] && kill "$v" 2>/dev/null; rm -f "$Q/.vigia_steamvr"
+ya=0; pgrep -f 'vrserver\.exe' >/dev/null && ya=1
 abrir_steamvr
+[ $ya = 1 ] && exit 0
+# ¿Llega la imagen de SteamVR? Su pantalla (vrcompositor) necesita el DXMT de VRmin con búferes y texturas compartidos
+# (shared-buffer-handle, keyed-mutex…): con uno anterior se cierra al arrancar, una y otra vez, y en el visor no se ve
+# nada. Entonces se cierra SteamVR y se avisa por qué
+LOGC="$Q/openvr/logs/vrcompositor.txt"
+for i in $(seq 1 40); do
+  sleep 1
+  grep -q 'Frames: sending to VRmin Host' "$Q/driver_vrmin.log" 2>/dev/null && exit 0
+  if [ "$LOGC" -nt "$Q/driver_vrmin.log" ] && grep -q 'CreateSharedFrameInfoConstantBuffer' "$LOGC"; then
+    cerrar_steamvr
+    say "La pantalla de SteamVR no arrancó: necesita un motor de DirectX (DXMT) más nuevo que el instalado, que llega con una versión nueva de VRmin. SteamVR cerrado." \
+        "SteamVR's display couldn't start: it needs a newer DirectX engine (DXMT) than the one installed, which comes with a newer VRmin version. SteamVR closed."
+    exit 1
+  fi
+done
