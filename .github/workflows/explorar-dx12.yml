@@ -1,22 +1,53 @@
-name: Explorar DX12 (KosmicKrisp + vkd3d-proton)
+name: Explorar DX12 (KosmicKrisp x86_64)
 on:
   push:
     branches: [explorar-dx12]
 jobs:
-  sdk:
-    runs-on: macos-15
+  kk:
+    runs-on: macos-26
     steps:
-      - name: Vulkan SDK de LunarG (KosmicKrisp, cargador)
+      - name: Herramientas
         run: |
-          curl -sSL -o sdk.zip "https://sdk.lunarg.com/sdk/download/latest/mac/vulkan-sdk.zip"
-          ls -la sdk.zip; unzip -q sdk.zip -d sdk; find sdk -maxdepth 2 | head
-          app=$(find sdk -maxdepth 2 -name '*.app' | head -1); echo "app: $app"
-          "$app/Contents/MacOS/$(basename "$app" .app)" --root "$PWD/vk" --accept-licenses --default-answer --confirm-command install >/dev/null 2>&1 || true
-          find vk -iname '*kosmic*' -o -iname 'libvulkan*.dylib' -o -iname 'libMoltenVK.dylib' | while read f; do echo "== $f"; [ -f "$f" ] && ! [ -L "$f" ] && lipo -info "$f"; done
-          find vk -name '*.json' -path '*icd*' -exec sh -c 'echo "== $1"; cat "$1"' _ {} \;
-          cat vk/*/macOS/share/vulkan/icd.d/*.json 2>/dev/null || true
-      - name: vkd3d-proton
+          sw_vers; xcodebuild -version; xcrun --show-sdk-version
+          brew install meson ninja pkg-config llvm libclc spirv-llvm-translator spirv-tools bison flex >/dev/null
+          python3 -m venv venv && venv/bin/pip -q install mako packaging pyyaml meson
+      - name: Mesa
         run: |
-          u=$(curl -sSL https://api.github.com/repos/HansKristian-Work/vkd3d-proton/releases/latest | grep -o 'https://[^"]*\.tar\.zst' | head -1)
-          echo "$u"; curl -sSL -o v.tar.zst "$u"; brew install zstd >/dev/null 2>&1 || true; tar --zstd -xf v.tar.zst || unzstd -c v.tar.zst | tar -x
-          find . -maxdepth 3 -path '*vkd3d-proton*' -name '*.dll' | head
+          t=$(git ls-remote --tags https://gitlab.freedesktop.org/mesa/mesa.git 'mesa-26.*' | grep -v '\^{}' | grep -v -- '-rc' | awk -F/ '{print $3}' | sort -V | tail -1)
+          echo "tag: $t"; git clone -q --depth 1 -b "$t" https://gitlab.freedesktop.org/mesa/mesa.git mesa
+      - name: Nativo (arm64, y las herramientas de compilación)
+        working-directory: mesa
+        run: |
+          export PATH="$PWD/../venv/bin:$(brew --prefix llvm)/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          meson setup nat --prefix="$PWD/../nat" -Dbuildtype=release -Dplatforms=macos -Dvulkan-drivers=kosmickrisp \
+            -Dgallium-drivers= -Dopengl=false -Dzstd=disabled -Dmesa-clc=enabled -Dinstall-mesa-clc=true \
+            -Dprecomp-compiler=enabled -Dinstall-precomp-compiler=true > ../nat.log 2>&1 || { tail -40 ../nat.log; exit 1; }
+          ninja -C nat install > ../natb.log 2>&1 || { grep -B2 -A8 "error" ../natb.log | head -60; exit 1; }
+          ls ../nat/bin ../nat/lib
+      - name: x86_64 (para el Wine de Rosetta)
+        working-directory: mesa
+        run: |
+          export PATH="$PWD/../nat/bin:$PWD/../venv/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          cat > x86.txt <<'X'
+          [binaries]
+          c = ['clang', '-arch', 'x86_64']
+          cpp = ['clang++', '-arch', 'x86_64']
+          objc = ['clang', '-arch', 'x86_64']
+          objcpp = ['clang++', '-arch', 'x86_64']
+          ar = 'ar'
+          strip = 'strip'
+          pkg-config = 'false'
+          [host_machine]
+          system = 'darwin'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          X
+          meson setup x86 --cross-file x86.txt --prefix="$PWD/../x86" -Dbuildtype=release -Dplatforms=macos \
+            -Dvulkan-drivers=kosmickrisp -Dgallium-drivers= -Dopengl=false -Dzstd=disabled -Dmesa-clc=system \
+            -Dprecomp-compiler=system -Dllvm=disabled -Dexpat=disabled > ../x86.log 2>&1 || { tail -60 ../x86.log; exit 1; }
+          ninja -C x86 install > ../x86b.log 2>&1 || { grep -B2 -A10 "error" ../x86b.log | head -80; exit 1; }
+          find ../x86 -name '*.dylib' -exec lipo -info {} \; ; find ../x86 -name '*.json' -exec cat {} \;
+          otool -L ../x86/lib/libvulkan_kosmickrisp.dylib
+      - uses: actions/upload-artifact@v4
+        with: { name: kosmickrisp-x86_64, path: x86, retention-days: 7 }
