@@ -171,6 +171,10 @@ except Exception:
     s = {}
 fijo = {
     "driver_null": {"enable": False},
+    # (drivers de otros visores: SteamVR los carga igual aunque use solo el de VRmin, y el de Lighthouse le agrega una
+    #  ventana oculta para emparejar controles de Valve, con su propio proceso de navegador de ~400 MB)
+    "driver_lighthouse": {"enable": False}, "driver_oculus": {"enable": False},
+    "driver_oculus_legacy": {"enable": False}, "driver_vrlink": {"enable": False},
     "dashboard": {"useNewDesktop": False, "showDesktop": False, "cefMaxFrameRate": 30},
     "collisionBounds": {"CollisionBoundsColorGammaA": 0, "CollisionBoundsFadeDistance": 0},
     "steamvr": {"requireHmd": True, "forcedDriver": "vrmin", "activateMultipleDrivers": False, "enableHomeApp": False,
@@ -188,6 +192,21 @@ for sec, v in fijo.items():
 for k, v in {"supersampleManualOverride": True, "supersampleScale": 0.25}.items():
     s["steamvr"].setdefault(k, v)
 json.dump(s, open(f, "w"), indent=3)
+PY
+  # La ventana de ajustes de SteamVR en el escritorio (que en VRmin no se usa) se crea al abrirla y no al arrancar,
+  # oculta: es otro proceso de navegador de ~400 MB. Se revisa cada vez porque las actualizaciones de SteamVR lo vuelven
+  # a poner
+  /usr/bin/python3 - "$STEAMLIB/common/SteamVR/resources/webhelperoverlays.json" <<'PY'
+import json, sys
+f = sys.argv[1]
+try:
+    s = json.load(open(f))
+except Exception:
+    sys.exit(0)
+w = s.get("settings_desktop", {})
+if w.get("preload"):
+    w["preload"] = False
+    json.dump(s, open(f, "w"), indent="\t")
 PY
 }
 
