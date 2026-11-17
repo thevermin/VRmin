@@ -3729,6 +3729,9 @@ final class Pairing {
     private var codeFor = ""           // para qué Quest
     private var codeUntil = Date.distantPast
     private var tries = 0
+    private var lockedUntil = Date.distantPast   // pausa después de 5 códigos equivocados
+    private var lockouts = 0                     // pausas seguidas (cada una dura el doble, hasta 1 hora)
+    private var failures: [Date] = []            // códigos equivocados de los últimos 10 minutos, de cualquier Quest
 
     private func load() -> [String: [String: String]] {
         guard let d = try? Data(contentsOf: file), let o = try? JSONSerialization.jsonObject(with: d) as? [String: [String: String]] else { return [:] }
@@ -3762,19 +3765,33 @@ final class Pairing {
         let name = (msg["device"] as? String) ?? "Quest"
         var all = load()
         if let tok = msg["token"] as? String, let saved = all[id]?["token"], eq(tok, saved) { return .ok(token: nil) }
+        // En pausa: ni se revisan códigos ni se dan nuevos (los Quest ya emparejados entran igual, por su clave)
+        if Date() < lockedUntil { return .needCode(wrong: msg["code"] != nil) }
         if let c = msg["code"] as? String, let cur = code, Date() < codeUntil, codeFor == id {
             if eq(c, cur) {
                 let tok = random(32).map { String(format: "%02x", $0) }.joined()
                 let f = ISO8601DateFormatter()
                 all[id] = ["token": tok, "name": name, "since": f.string(from: Date())]
                 save(all)
-                code = nil
+                code = nil; lockouts = 0; failures = []
                 print("[emparejar] LISTO \(name) (\(ip))")
                 return .ok(token: tok)
             }
             tries += 1
-            if tries >= 5 { code = nil; print("[emparejar] VENCIDO") }   // demasiados intentos: código nuevo
-            else { return .needCode(wrong: true) }
+            // (cuentan todos los equivocados, no solo los de este código: pidiendo un código para otro Quest, el contador
+            //  de este volvía a 0 y se podía seguir probando sin llegar nunca a la pausa)
+            let now = Date()
+            failures = failures.filter { now.timeIntervalSince($0) < 600 } + [now]
+            if tries >= 5 || failures.count >= 5 {
+                // Demasiados intentos: pausa antes de dar otro código (si no, se podía probar código tras código
+                // desde la red hasta acertar). 1 minuto, 2, 4… hasta 1 hora
+                code = nil; lockouts += 1; failures = []
+                let s = min(60 << min(lockouts - 1, 6), 3600)
+                lockedUntil = Date().addingTimeInterval(TimeInterval(s))
+                print("[emparejar] VENCIDO")
+                print("[quest] Demasiados códigos equivocados: emparejar en pausa \(s) s")
+            }
+            return .needCode(wrong: true)
         }
         // Código nuevo (o el mismo, si sigue vigente para este Quest)
         if code == nil || Date() >= codeUntil || codeFor != id {
@@ -4284,10 +4301,13 @@ do {
 let renderQueue = DispatchQueue(label: "render", qos: .userInteractive)
 let questDecoder = JSONDecoder()
 let questLock = NSLock()
-func handleQuestMessage(_ line: Data) {
-    if line.first == 0x0B { MicOut.shared.push(line.dropFirst()); return }   // micrófono del visor (PCM)
+/// fromWeb: llegó por server.py (la página web del navegador del Quest, sin emparejar): de ahí solo se aceptan poses y
+/// pedidos de cuadro completo (lo único que server.py manda)
+func handleQuestMessage(_ line: Data, fromWeb: Bool = false) {
+    if line.first == 0x0B { if !fromWeb { MicOut.shared.push(line.dropFirst()) }; return }   // micrófono del visor (PCM)
     questLock.lock(); defer { questLock.unlock() }
     guard let m = try? questDecoder.decode(InMsg.self, from: line) else { return }
+    if fromWeb && m.type != "pose" && m.type != "key" { return }
     if m.type == "key" {
         shared.requestKey()
     } else if m.type == "deskkey" {
@@ -4363,7 +4383,7 @@ native.onDeskDrop = { p in
         renderQueue.async { renderer.lobby?.requestWinKey(id) }
     } else { renderer.lobby?.requestDeskKey() }
 }
-native.start(handler: handleQuestMessage)
+native.start(handler: { handleQuestMessage($0) })
 
 // Micrófono del visor: el Quest graba solo mientras hay un juego abierto (y se le vuelve a avisar si se reconecta)
 let micQueue = DispatchQueue(label: "mic.estado")
@@ -4412,7 +4432,7 @@ Thread.detachNewThread {
             print("Renderizador conectado al servidor. Esperando poses del Quest…")
             warned = false
             shared.requestKey()
-            link.readLines { line in handleQuestMessage(line) }
+            link.readLines { line in handleQuestMessage(line, fromWeb: true) }
             print("Se cortó la conexión con el servidor; reintentando…")
         } else if !warned {
             print("Esperando a que arranque server.py…")

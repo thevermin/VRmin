@@ -158,6 +158,7 @@ enum LogEn {
         ("Escala de render: el juego dibuja", "Render scale: the game draws"),
         ("Memoria compartida: no pude abrir", "Shared memory: couldn't open"),
         ("Mostrando en el Quest la pantalla", "Showing on the Quest the display"),
+        ("Demasiados códigos equivocados: emparejar en pausa", "Too many wrong codes: pairing paused for"),
         ("sin emparejar: se pidió el código", "not paired: code requested"),
         ("Renderizador de la Mac conectado", "Mac renderer connected"),
         ("Juego VR cerrado: vuelve la sala", "VR game closed: back to the room"),

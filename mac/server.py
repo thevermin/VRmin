@@ -170,6 +170,8 @@ def on_quest_message(writer, text):
         data = json.loads(text)
     except ValueError:
         return
+    if not isinstance(data, dict):   # (otra cosa que un objeto JSON cortaba la conexión con un error)
+        return
     kind = data.get("type")
     if kind == "pose":
         send_text(writer, json.dumps({"type": "echo", "t": data.get("t")}))
@@ -179,7 +181,10 @@ def on_quest_message(writer, text):
             S["rtts"].append(data["rtt"])
         w = renderer["w"]
         if w is not None and data.get("views"):
-            w.write(text.encode() + b"\n")
+            # Se reenvía la pose ya interpretada, no el texto que llegó: con una clave repetida («type» dos veces)
+            # Python se queda con la última y el renderizador (Swift) con la primera, así que un mensaje que acá es
+            # una pose podía llegar allá como otro tipo de mensaje (teclado, mouse…) sin pasar por el emparejado.
+            w.write(json.dumps(data, separators=(",", ":")).encode() + b"\n")
     elif kind == "log":
         print("  [visor]", str(data.get("msg", ""))[:300], flush=True)
     elif kind == "key":
