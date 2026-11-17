@@ -10,13 +10,21 @@ jobs:
       - uses: actions/checkout@v4
         with: { path: vrmin }
       - name: Compilar
+        env: { GH_TOKEN: "${{ github.token }}" }
         run: |
-          sudo apt-get -qq update && sudo apt-get -qq install -y mingw-w64 mingw-w64-tools glslang-tools ninja-build >/dev/null
+          sudo apt-get -qq update && sudo apt-get -qq install -y glslang-tools ninja-build >/dev/null
           pip install -q --break-system-packages meson
+          # (el MinGW de Ubuntu es viejo para vkd3d-proton: llvm-mingw, el mismo de wine.yml)
+          url=$(gh api repos/mstorsjo/llvm-mingw/releases/latest --jq '.assets[]|select(.name|test("ucrt-ubuntu-[0-9.]+-x86_64.tar.xz$"))|.browser_download_url' | head -1)
+          mkdir lm && curl -sSL "$url" | tar -xJ -C lm --strip-components 1
+          export PATH="$PWD/lm/bin:$PATH"
+          printf "%s\n" "[binaries]" "c = 'x86_64-w64-mingw32-clang'" "cpp = 'x86_64-w64-mingw32-clang++'" "ar = 'x86_64-w64-mingw32-ar'" \
+            "strip = 'x86_64-w64-mingw32-strip'" "widl = 'x86_64-w64-mingw32-widl'" "windres = 'x86_64-w64-mingw32-windres'" \
+            "[host_machine]" "system = 'windows'" "cpu_family = 'x86_64'" "cpu = 'x86_64'" "endian = 'little'" > $PWD/lm.txt
           git clone -q --recursive https://github.com/HansKristian-Work/vkd3d-proton.git v && cd v
           git checkout -q bfdb811c6d7ccd8c6151f19532654b063a6631f2 && git submodule -q update --init --recursive
           git apply ../vrmin/mac/dx12/vkd3d-proton.patch
-          meson setup --cross-file build-win64.txt --buildtype release -Denable_tests=false b64 > ../m.log 2>&1 || { tail -40 ../m.log; exit 1; }
+          meson setup --cross-file ../lm.txt --buildtype release -Denable_tests=false b64 > ../m.log 2>&1 || { tail -40 ../m.log; exit 1; }
           ninja -C b64 > ../n.log 2>&1 || { grep -B2 -A6 error ../n.log | head -50; exit 1; }
           mkdir -p ../out && cp $(find b64 -name 'd3d12.dll' -o -name 'd3d12core.dll') ../out/ && ls -la ../out
       - uses: actions/upload-artifact@v4
