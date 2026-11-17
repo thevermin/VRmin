@@ -1,0 +1,22 @@
+name: Explorar DX12 (KosmicKrisp + vkd3d-proton)
+on:
+  push:
+    branches: [explorar-dx12]
+jobs:
+  sdk:
+    runs-on: macos-15
+    steps:
+      - name: Vulkan SDK de LunarG (KosmicKrisp, cargador)
+        run: |
+          curl -sSL -o sdk.zip "https://sdk.lunarg.com/sdk/download/latest/mac/vulkan-sdk.zip"
+          ls -la sdk.zip; unzip -q sdk.zip -d sdk; find sdk -maxdepth 2 | head
+          app=$(find sdk -maxdepth 2 -name '*.app' | head -1); echo "app: $app"
+          "$app/Contents/MacOS/$(basename "$app" .app)" --root "$PWD/vk" --accept-licenses --default-answer --confirm-command install >/dev/null 2>&1 || true
+          find vk -iname '*kosmic*' -o -iname 'libvulkan*.dylib' -o -iname 'libMoltenVK.dylib' | while read f; do echo "== $f"; [ -f "$f" ] && ! [ -L "$f" ] && lipo -info "$f"; done
+          find vk -name '*.json' -path '*icd*' -exec sh -c 'echo "== $1"; cat "$1"' _ {} \;
+          cat vk/*/macOS/share/vulkan/icd.d/*.json 2>/dev/null || true
+      - name: vkd3d-proton
+        run: |
+          u=$(curl -sSL https://api.github.com/repos/HansKristian-Work/vkd3d-proton/releases/latest | grep -o 'https://[^"]*\.tar\.zst' | head -1)
+          echo "$u"; curl -sSL -o v.tar.zst "$u"; brew install zstd >/dev/null 2>&1 || true; tar --zstd -xf v.tar.zst || unzstd -c v.tar.zst | tar -x
+          find . -maxdepth 3 -path '*vkd3d-proton*' -name '*.dll' | head
