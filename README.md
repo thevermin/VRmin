@@ -6,7 +6,7 @@
 
 **Play your SteamVR games on a Mac. Streamed to your Meta Quest.**
 
-Free and open source · Apple Silicon Mac + Meta Quest + Steam · Windows PC (beta)
+Free and open source · Apple Silicon Mac + Meta Quest + Steam · Windows and Linux PC (beta)
 
 [**Download**](../../releases/latest) · [How it works](#how-it-works) · [Install](#install) · [FAQ](#faq) · [☕ Support on Ko-fi](https://ko-fi.com/thevermin)
 
@@ -26,8 +26,8 @@ Macs can't run SteamVR games. VRmin makes it happen: it runs the **Windows versi
 Mac (using Wine and a Metal translation layer), and streams the picture to your **Meta Quest** over Wi‑Fi, with your
 head and hand movements going back the other way.
 
-There's also an early **Windows** version (beta) that streams the Steam VR games on your Windows PC to the Quest in the
-same way: see [Windows (beta)](#windows-beta).
+There are also early **Windows** and **Linux** versions (beta) that stream the Steam VR games on your PC to the Quest
+in the same way: see [Windows and Linux (beta)](#windows-and-linux-beta).
 
 It is two apps that work together:
 
@@ -40,7 +40,9 @@ It is two apps that work together:
 
 ### 🎮 SteamVR games on your Mac
 Your SteamVR library, running on Apple Silicon. Tested with games like **SUPERHOT VR**, **Beat Saber**, **Aircar** and **Kayak VR: Mirage** ([full list](../../discussions/6)).
-VRmin picks the right VR runtime for each game automatically (OpenXR directly, or OpenVR through OpenComposite).
+VRmin picks the right way to run each game automatically: OpenXR straight to VRmin, OpenVR through OpenComposite
+(lighter), or the **real SteamVR** (beta), with its menu in the headset and its controller profiles, like on a Windows
+PC. Games made for other controllers (like The Lab or DOOM VFR) open with SteamVR when it's installed.
 
 <img src="docs/media/library.jpg" alt="Your SteamVR library inside VRmin" width="640">
 
@@ -79,6 +81,7 @@ Put the Quest on your monitor: it tracks you with its cameras while the game sho
 - **Flat games** on a giant screen, and **side‑by‑side 3D videos** that pop with one tap
 - **Direct GPU copy**: game frames go from the game to the video encoder without leaving the GPU
 - **Foveated encoding**: sharper in the center, where you look
+- **Controller vibration** in your games, and soft taps in VRmin's own menus
 - **Your Mac's sound** in the headset, and the **headset keyboard** types on your Mac
 - **Your microphone in games**: the Quest's own, or any microphone on your Mac
 - **Simple quality settings**: Low, Medium, High or Ultra, with the right one for your Mac marked
@@ -92,6 +95,7 @@ Put the Quest on your monitor: it tracks you with its cameras while the game sho
    Wine + DXMT ── DirectX 11 → Metal                                    │ H.265 / H.264 video + sound (Wi‑Fi)
         │                                                               │
  VRmin OpenXR runtime ── frames (shared GPU textures) ──► VRmin renderer (Mac) ── encoder
+ (or SteamVR + VRmin's driver)                                          │
         ▲                                                               │
         └──────────────── head & hand tracking ◄────────────────────────┘
 ```
@@ -105,6 +109,9 @@ Put the Quest on your monitor: it tracks you with its cameras while the game sho
 - A Steam account with your VR games, and space for them (VRmin installs its own Steam for Windows: games are
   downloaded again there)
 - **Windows PC (beta):** 64-bit Windows 10 or 11, an NVIDIA, AMD or Intel graphics card, and Steam with your VR games
+- **Linux PC (beta):** Steam with your VR games (with Proton), X11, PulseAudio or PipeWire, WebKitGTK 4.1, and a
+  graphics card that can encode video (VA-API on AMD and Intel, or NVENC on NVIDIA with driver 520 or newer)
+- **Real SteamVR on the Mac (optional, beta):** install SteamVR from VRmin's Steam (Library › Tools)
 
 ### Older headsets
 VRmin runs on Quest 1, Quest 2 and Quest Pro. Quest 2 has been confirmed working by testers; Quest 1 and Pro haven't been
@@ -153,17 +160,22 @@ Choose a game from the **Games** tab, and play.
 VRmin Host checks for new versions by itself: when there's one, click **Update** at the top. The Quest app updates
 from VRmin Host too, over the USB-C cable.
 
-### Windows (beta)
-There's also an early version for Windows PCs: download **VRmin Windows** from the
-[Releases](https://github.com/thevermin/VRmin/releases), unzip it and open **VRmin Host.exe**. It plays your Steam VR
-games on the Quest and shows the Windows desktop in the headset. The steps are in the `README.txt` file inside.
+### Windows and Linux (beta)
+There are also early versions for PCs, from the [Releases](../../releases/latest):
+- **Windows:** download **VRmin Windows**, unzip it and open **VRmin Host.exe**. It plays your Steam VR games on the
+  Quest and shows the Windows desktop in the headset.
+- **Linux:** download **VRmin Linux**, extract it and open `vrmin-host`. Your Steam VR games (with Proton) use VRmin
+  while VRmin Host is open; when you close it, your VR settings go back to how they were.
+
+The steps are in the `README.txt` file inside each one.
 
 ## FAQ
 
 **Which games work?**
 Many SteamVR games that use DirectX 11 work, but not all of them. VRmin Host shows what it detected for each game and
-lets you try another VR runtime. Games with anti‑cheat or DirectX 12 usually don't work yet. Support for Vulkan games
-(like DOOM VFR) is experimental.
+lets you try another way to run it (its menu › **VR system**). If a game doesn't work well with OpenComposite, try the
+real SteamVR: it's usually the most stable. If the real SteamVR is slow or won't open, try OpenComposite, which uses
+less memory. Games with anti‑cheat or DirectX 12 usually don't work yet. Support for Vulkan games is experimental.
 
 **How much latency is there?**
 Around 50–60 ms from your head moving to the picture changing, on a good 5 GHz Wi‑Fi network. The first minutes
@@ -177,9 +189,10 @@ installer on your Mac, and it doesn't collect any data.
 Click **"Something's wrong"** in VRmin Host (it collects the logs into a .zip on your Desktop) and open an
 [Issue](../../issues/new/choose) with it.
 
-**Does it work on Windows?**
-Yes, in beta: download **VRmin Windows** from the [Releases](../../releases/latest) (see [Windows (beta)](#windows-beta)).
-It hasn't been tested much yet, so please tell us how it goes. The Mac version is still the main one.
+**Does it work on Windows or Linux?**
+Yes, in beta: download **VRmin Windows** or **VRmin Linux** from the [Releases](../../releases/latest) (see
+[Windows and Linux (beta)](#windows-and-linux-beta)). They haven't been tested much yet, so please tell us how it goes.
+The Mac version is still the main one.
 
 **Where can I ask questions, share ideas or tell you which games work?**
 In [Discussions](../../discussions). Compatibility reports (even "it works great!") are very welcome as

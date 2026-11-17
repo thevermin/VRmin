@@ -37,6 +37,35 @@ x86_64-w64-mingw32-gcc -O2 -shared -o mac/openxr/questvrbridge_openxr.dll \
   -ld3d11 -ldxgi -ldxguid -luuid -lws2_32 -lwinmm -static-libgcc -Wl,--kill-at
 ```
 
+## SteamVR driver (Windows DLL)
+
+`mac/steamvr/driver_vrmin/bin/win64/driver_vrmin.dll` is committed, and rebuilt by the `steamvr-driver` workflow when
+`mac/steamvr/driver_vrmin.cpp` changes (mingw-w64 and [OpenVR](https://github.com/ValveSoftware/openvr)'s headers; the
+command is in `.github/workflows/steamvr-driver.yml`).
+
+## Engine parts (Wine with msync, DXMT)
+
+VRmin Host installs Gcenx's Wine for macOS and puts two things built by VRmin on top, published with the releases:
+- **Wine with msync** (`.github/workflows/wine.yml`): `wineserver` and `ntdll.so` from Wine 11.8 with
+  `mac/wine/msync.patch`.
+- **DXMT** (`.github/workflows/dxmt.yml`): DirectX 11 → Metal, with VRmin's patches in `mac/dxmt/`.
+
+## VRmin for Windows (beta)
+
+On Linux with mingw-w64 (`g++-mingw-w64-x86-64`, `gcc-mingw-w64-i686`):
+
+```bash
+bash windows/host/build.sh "<output folder>"
+```
+
+## VRmin for Linux (beta)
+
+On Ubuntu 22.04 or newer, with the packages listed in `.github/workflows/linux.yml`:
+
+```bash
+bash linux/paquete.sh "<output folder>"   # → "VRmin Linux <version>.tar.gz"
+```
+
 ## Project layout
 
 | Folder | What it is |
@@ -44,8 +73,13 @@ x86_64-w64-mingw32-gcc -O2 -shared -o mac/openxr/questvrbridge_openxr.dll \
 | `mac/app` | VRmin Host (SwiftUI) and the scripts it runs (`recursos/`: engine install, Steam, games) |
 | `mac/renderer` | Renderer and video encoder (Swift + Metal) |
 | `mac/openxr` | The Windows OpenXR runtime that games load inside Wine |
+| `mac/steamvr` | VRmin's SteamVR driver (for the real SteamVR) |
+| `mac/dxmt`, `mac/wine`, `mac/opencomposite` | VRmin's patches to DXMT, Wine and OpenComposite |
 | `mac/server.py`, `mac/web` | Stream server and its web panel |
 | `quest-app` | The Quest app (Java + OpenXR) |
+| `windows` | VRmin for Windows (beta) |
+| `linux` | VRmin for Linux (beta) |
+| `burrow` | Burrow: running Linux ARM64 games on Apple Silicon Macs (in development) |
 
 Code comments and script messages are mostly in Spanish; the apps themselves are in English and Spanish.
 
