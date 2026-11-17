@@ -49,6 +49,7 @@ final class MenuUi implements Link.Listener {
         default void set3DStrength(float s) { }
         /** Ajustes de imagen: brillo, contraste, saturación, nitidez, calidez. */
         default void setImage(float b, float c, float s, float sharp, float warm) { }
+        default void setSgsr(boolean on) { }
         default void setHud(boolean on) { }
         /** Qué objeto se ve en las manos: 0 control remoto, 1 celular, 2 banana, 3 lápiz. */
         default void setHandModel(int m) { }
@@ -667,6 +668,7 @@ final class MenuUi implements Link.Listener {
         int k = prefs().getInt("imgPreset", 0);
         float[] v = k < IMG_PRESETS.length ? IMG_PRESETS[k] : customImage();
         host.setImage(v[0], v[1], v[2], v[3], v[4]);
+        host.setSgsr(prefs().getBoolean("gameSgsr", false));
     }
 
     private void setMode(boolean monitors) {
@@ -1649,6 +1651,10 @@ final class MenuUi implements Link.Listener {
 
             case "image": {
                 pageHeader(I18n.t("Imagen"), I18n.t("Para el escritorio, las ventanas y los juegos (los menús no cambian)."));
+                toggle(content, null, I18n.t("SGSR para juegos VR"),
+                        I18n.t("Mejora la imagen al ampliarla en el visor. Requiere desactivar la codificación foveada."),
+                        prefs().getBoolean("gameSgsr", false),
+                        on -> { prefs().edit().putBoolean("gameSgsr", on).apply(); host.setSgsr(on); });
                 int k = prefs().getInt("imgPreset", 0);
                 option(content, I18n.t("Filtro"), null, new String[]{I18n.t("Normal"), I18n.t("Vívido\nColores fuertes"), I18n.t("Cine\nCálido"), I18n.t("Nítido\nMás detalle"), I18n.t("Noche\nCansa menos la vista"), I18n.t("Personal\nA tu gusto")}, k,
                         i -> { prefs().edit().putInt("imgPreset", i).apply(); applyImage(); });

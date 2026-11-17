@@ -1272,6 +1272,7 @@ static std::atomic<float> g_laserGain{1.f};    // intensidad del láser (0,15 a 
 static std::mutex g_imgLock;
 static float g_img[5] = {1, 1, 1, 0, 0};
 static std::atomic<uint32_t> g_imgVer{0};
+static std::atomic<bool> g_sgsr{false};
 static std::atomic<float> g_3dStrength{0.008f};
 static std::atomic<bool> g_leds{true};
 static std::atomic<float> g_lightGain{1.0f};   // brillo de la pantalla y de las luces de atrás
@@ -1348,6 +1349,9 @@ Java_org_questvrbridge_client_VrActivity_nativeSetImage(JNIEnv *, jclass, jfloat
     g_img[0] = b; g_img[1] = c; g_img[2] = sat; g_img[3] = sh; g_img[4] = w;
     g_imgVer++;
 }
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_questvrbridge_client_VrActivity_nativeSetSgsr(JNIEnv *, jclass, jboolean on) { g_sgsr = on; }
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_questvrbridge_client_VrActivity_nativeDeskRect(JNIEnv *, jclass, jboolean vis, jfloat x0, jfloat y0, jfloat x1, jfloat y1) {
@@ -1872,6 +1876,8 @@ struct App {
     GLuint prog = 0, vao = 0, tex = 0;
     GLint uOff = -1, uSrgb = -1, uTex = -1, uFlow = -1, uFlowK = -1, uFovLut = -1, uFovOn = -1, uFovRow = -1;
     GLuint fovTex = 0; int fovVer = -1; bool fovOn = false;
+    GLint uSgsrSize = -1;
+    int32_t sgsrEyeWidth = 0, sgsrHeight = 0;
     PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC getClientBuffer = nullptr;
     PFNEGLCREATEIMAGEKHRPROC createImage = nullptr;
     PFNEGLDESTROYIMAGEKHRPROC destroyImage = nullptr;
@@ -2047,7 +2053,7 @@ uniform vec2 flowK;             // x: activado, y: cuánto adelantar (fracción 
 uniform highp sampler2D fovLut; // foveated encoding: de la imagen del juego a la codificada (fila 0/1: x de cada ojo, 2: y)
 uniform float fovOn;
 uniform float fovRow;
-in vec2 uv;
+in highp vec2 uv;
 out vec4 color;
 highp float fl(highp float s, int row) {
     highp float f = clamp(s, 0.0, 1.0) * 1023.0;
@@ -2063,15 +2069,23 @@ vec4 videoSample(highp vec2 tc) {
     }
     return texture(tex, tc);
 }
+)"
+#include "sgsr1_glsl.inc"
+R"(
 void main() {
     highp vec2 u2 = uv;
     if (fovOn > 0.5) u2 = vec2(fl(uv.x, int(fovRow)), fl(uv.y, 2));
     if (flowK.x > 0.5) { vec2 m = texture(flow, u2).xy; u2 = clamp(u2 - vec2(m.x, -m.y) * flowK.y, 0.0, 1.0); }
+    bool sgsr = sgsrSize.x > 0.0 && fovOn < 0.5;
     highp vec2 tc = vec2(off + u2.x * sx, u2.y * sy);
+    if (sgsr) {
+        highp vec2 halfTexel = vec2(0.25, 0.5) / sgsrSize;
+        tc = clamp(tc, vec2(off, 0.0) + halfTexel, vec2(off + sx, sy) - halfTexel);
+    }
     vec4 t4 = videoSample(tc);
-    vec3 c = t4.rgb;
+    vec3 c = sgsr ? sgsrFilter(u2, t4.rgb) : t4.rgb;
     if (filt > 0.5 && uv.x >= rect.x && uv.x <= rect.z && uv.y >= rect.y && uv.y <= rect.w) {
-        if (adj.w > 0.0) {
+        if (!sgsr && adj.w > 0.0) {
             vec3 b = (videoSample(tc + vec2(texel.x, 0.0)).rgb + videoSample(tc - vec2(texel.x, 0.0)).rgb
                     + videoSample(tc + vec2(0.0, texel.y)).rgb + videoSample(tc - vec2(0.0, texel.y)).rgb) * 0.25;
             c += (c - b) * adj.w;
@@ -2102,6 +2116,7 @@ void main() {
     app.uWarm = glGetUniformLocation(app.prog, "warm");
     app.uTexel = glGetUniformLocation(app.prog, "texel");
     app.uStereo = glGetUniformLocation(app.prog, "stereo");
+    app.uSgsrSize = glGetUniformLocation(app.prog, "sgsrSize");
     app.uFlow = glGetUniformLocation(app.prog, "flow");
     app.uFlowK = glGetUniformLocation(app.prog, "flowK");
     app.uFovLut = glGetUniformLocation(app.prog, "fovLut"); app.uFovOn = glGetUniformLocation(app.prog, "fovOn"); app.uFovRow = glGetUniformLocation(app.prog, "fovRow");
@@ -3956,6 +3971,15 @@ static void latchFrame(App &app) {
     if (egl == EGL_NO_IMAGE_KHR) { AImage_delete(img); return; }
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, app.tex);
     app.imageTarget(GL_TEXTURE_EXTERNAL_OES, (GLeglImageOES)egl);
+    // Keep the SGSR grid tied to the latched decoder image during resolution switches.
+    int32_t width = 0, height = 0;
+    AImageCropRect crop{};
+    const bool fullStereoImage = g_sgsr.load() && AImage_getWidth(img, &width) == AMEDIA_OK &&
+        AImage_getHeight(img, &height) == AMEDIA_OK && width >= 2 && width % 2 == 0 && height > 0 &&
+        AImage_getCropRect(img, &crop) == AMEDIA_OK && crop.left == 0 && crop.top == 0 &&
+        crop.right == width && crop.bottom == height;
+    app.sgsrEyeWidth = fullStereoImage ? width / 2 : 0;
+    app.sgsrHeight = fullStereoImage ? height : 0;
     app.held.push_back({img, egl});
     while (app.held.size() > 3) {   // la GPU ya terminó con las de hace varios cuadros
         app.destroyImage(app.display, app.held.front().egl);
@@ -8712,6 +8736,7 @@ static void renderFrame(App &app) {
         }
     }
     double roomT0 = 0;
+    const bool wantSgsr = g_sgsr.load() && app.sgsrEyeWidth > 0;
     for (int e = 0; e < 2; e++) {
         Swapchain &s = app.sc[e];
         uint32_t idx = 0;
@@ -8736,6 +8761,9 @@ static void renderFrame(App &app) {
             glUniform1f(app.uKeepA, 0.0f);
             { const float full[4] = {0, 0, 1, 1}; setFilter(app, true, full, 1.f / std::max(1, g_vw), 1.f / std::max(1, g_vh)); }
             glUniform1i(app.uStereo, g_vw >= 2 ? 1 : 0);
+            const bool upscale = wantSgsr && s.w >= app.sgsrEyeWidth && s.h >= app.sgsrHeight &&
+                (s.w > app.sgsrEyeWidth || s.h > app.sgsrHeight);
+            if (upscale) glUniform2f(app.uSgsrSize, app.sgsrEyeWidth, app.sgsrHeight);
             // Completar cuadros: adelantar la imagen según cómo se viene moviendo, hasta que llegue el próximo cuadro
             if (fgFill && g_fg.havePrev) {
                 float k = (float)std::min(1.0, std::max(0.0, (nowMs() - g_fg.lastArrival) / std::max(4.0, g_fg.interval)));
@@ -8774,6 +8802,7 @@ static void renderFrame(App &app) {
             glBindVertexArray(app.vao);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             glUniform1i(app.uStereo, 0);
+            if (upscale) glUniform2f(app.uSgsrSize, 0.f, 0.f);
             glUniform2f(app.uFlowK, 0.f, 0.f);
             glUniform1f(app.uFovOn, 0.f);
         } else if (app.anchor && g_env == 3 && app.hasPassthrough) {
