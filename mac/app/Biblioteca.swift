@@ -39,39 +39,61 @@ func bytesText(_ b: Int64) -> String {
 let STEAM_BLUE = Color(red: 102 / 255, green: 192 / 255, blue: 244 / 255)
 
 // MARK: - Portada (vertical, como la biblioteca de Steam; si el juego no tiene, su imagen horizontal con el nombre)
+/// Un color para los juegos sin imagen (los de fuera de Steam), siempre el mismo para cada nombre
+func nameGradient(_ name: String) -> LinearGradient {
+    var h: UInt32 = 5381
+    for u in name.unicodeScalars { h = (h &* 33) &+ u.value }
+    let hue = Double(h % 360) / 360
+    return LinearGradient(colors: [Color(hue: hue, saturation: 0.55, brightness: 0.75), Color(hue: hue, saturation: 0.7, brightness: 0.18)],
+                          startPoint: .topLeading, endPoint: .bottom)
+}
+
 struct GameCapsule: View {
     let game: SteamGame
     let vr: Bool?
     let open: Bool
     let play: () -> Void
     @State private var hover = false
+
+    private var named: some View {
+        Text(game.name).font(.system(size: 15, weight: .heavy)).lineLimit(3).padding(10)
+            .shadow(color: .black.opacity(0.6), radius: 6)
+    }
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            AsyncImage(url: steamArt(game.id, "library_600x900.jpg")) { phase in
-                if let img = phase.image {
-                    img.resizable().aspectRatio(contentMode: .fill)
-                } else if phase.error != nil {
-                    ZStack(alignment: .bottomLeading) {
-                        AsyncImage(url: steamArt(game.id, "header.jpg")) { i in i.resizable().aspectRatio(contentMode: .fill) } placeholder: { Color.white.opacity(0.06) }
-                            .blur(radius: 18).overlay(Color.black.opacity(0.25))
-                        Text(game.name).font(.system(size: 15, weight: .heavy)).lineLimit(3).padding(10)
-                            .shadow(color: .black.opacity(0.6), radius: 6)
-                    }
+            Group {
+                if game.exe != nil {   // de fuera de Steam: sin imagen de la tienda
+                    ZStack(alignment: .bottomLeading) { Rectangle().fill(nameGradient(game.name)); named }
                 } else {
-                    ZStack { Color.white.opacity(0.06); ProgressView().controlSize(.small) }
+                    AsyncImage(url: steamArt(game.id, "library_600x900.jpg")) { phase in
+                        if let img = phase.image {
+                            img.resizable().aspectRatio(contentMode: .fill)
+                        } else if phase.error != nil {
+                            ZStack(alignment: .bottomLeading) {
+                                AsyncImage(url: steamArt(game.id, "header.jpg")) { i in i.resizable().aspectRatio(contentMode: .fill) } placeholder: { Rectangle().fill(nameGradient(game.name)) }
+                                    .blur(radius: 18).overlay(Color.black.opacity(0.25))
+                                named
+                            }
+                        } else {
+                            ZStack { Color.white.opacity(0.06); ProgressView().controlSize(.small) }
+                        }
+                    }
                 }
             }
             .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity).clipped()
-            Text(vr == false ? L("Plano") : "VR").font(.system(size: 10, weight: .bold))
+            .saturation(game.inLibrary ? 1 : 0.3).opacity(game.inLibrary ? 1 : 0.75)
+            Text(!game.inLibrary ? "GameHub" : game.exe != nil ? "PC" : vr == false ? L("Plano") : "VR").font(.system(size: 10, weight: .bold))
                 .padding(.horizontal, 6).padding(.vertical, 2)
                 .background(RoundedRectangle(cornerRadius: 5).fill(Color.black.opacity(0.55))).padding(7)
-            Button(action: play) {
-                Image(systemName: "play.fill").font(.system(size: 17, weight: .bold)).foregroundStyle(Theme.amberDark)
-                    .frame(width: 46, height: 46).background(Circle().fill(Theme.amber))
+            if game.inLibrary {
+                Button(action: play) {
+                    Image(systemName: "play.fill").font(.system(size: 17, weight: .bold)).foregroundStyle(Theme.amberDark)
+                        .frame(width: 46, height: 46).background(Circle().fill(Theme.amber))
+                }
+                .buttonStyle(.plain).opacity(hover && !open ? 1 : 0)
+                .frame(maxWidth: .infinity, maxHeight: .infinity).offset(y: -12)
+                .help(L("Jugar en el Quest"))
             }
-            .buttonStyle(.plain).opacity(hover && !open ? 1 : 0)
-            .frame(maxWidth: .infinity, maxHeight: .infinity).offset(y: -12)
-            .help(L("Jugar en el Quest"))
         }
         .aspectRatio(2 / 3, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -83,31 +105,59 @@ struct GameCapsule: View {
     }
 }
 
+/// Elegir el .exe de un juego de fuera de Steam
+func pickLocalGame(_ m: AppModel) {
+    let p = NSOpenPanel()
+    p.title = L("Agregar un juego de fuera de Steam")
+    p.message = L("Elegí el .exe del juego (de Windows). El juego se queda donde está.")
+    p.prompt = L("Agregar")
+    p.allowedContentTypes = []
+    p.allowsOtherFileTypes = true
+    p.canChooseDirectories = false
+    p.allowsMultipleSelection = false
+    guard p.runModal() == .OK, let url = p.url else { return }
+    if url.pathExtension.lowercased() != "exe" { m.append(L("No se pudo agregar %@ (tiene que ser un .exe de Windows)", url.lastPathComponent)); return }
+    m.addLocalGame(url)
+}
+
 // MARK: - Biblioteca
 struct LibraryView: View {
     @EnvironmentObject var m: AppModel
     @Binding var gameAdv: SteamGame?
     @State private var query = ""
-    @State private var selected: SteamGame? = nil
+    @State private var selectedID: String? = nil
+    @AppStorage("libraryOrder") private var order = "nombre"   // nombre o recientes
 
     private var games: [SteamGame] {
-        m.games.filter { $0.inLibrary && (query.isEmpty || $0.name.localizedCaseInsensitiveContains(query)) }
+        let l = m.games.filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }
+        // (los de GameHub, al final: se traen antes de jugar)
+        return l.sorted { a, b in
+            if a.inLibrary != b.inLibrary { return a.inLibrary }
+            if order == "recientes" && a.lastPlayed != b.lastPlayed { return a.lastPlayed > b.lastPlayed }
+            return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+        }
     }
-    private func isOpen(_ g: SteamGame) -> Bool { m.openGames.contains(g.installdir.lowercased()) }
+    private var selected: SteamGame? { selectedID.flatMap { id in m.games.first { $0.id == id } } }
+    private func isOpen(_ g: SteamGame) -> Bool { g.inLibrary && m.openGames.contains(g.installdir.lowercased()) }
+    private func select(_ g: SteamGame?) { withAnimation(.easeInOut(duration: 0.25)) { selectedID = g?.id } }
 
     var body: some View {
-        HStack(spacing: 0) {
-            sidebar
-            Rectangle().fill(Theme.line).frame(width: 1)
-            ZStack {
-                grid
-                if let g = selected {
-                    GameDetail(game: g, gameAdv: $gameAdv) { withAnimation(.easeInOut(duration: 0.25)) { selected = nil } }
-                        .transition(.opacity.combined(with: .offset(y: 24)))
+        GeometryReader { geo in
+            HStack(spacing: 0) {
+                if geo.size.width >= 760 {   // (con la ventana angosta, la lista de la izquierda se esconde)
+                    sidebar
+                    Rectangle().fill(Theme.line).frame(width: 1)
                 }
+                ZStack {
+                    grid
+                    if let g = selected {
+                        GameDetail(game: g, gameAdv: $gameAdv) { select(nil) }
+                            .transition(.opacity.combined(with: .offset(y: 24)))
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .safeAreaInset(edge: .bottom, spacing: 0) { DownloadsBar() }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .safeAreaInset(edge: .bottom, spacing: 0) { DownloadsBar() }
         }
     }
 
@@ -124,24 +174,30 @@ struct LibraryView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(games) { g in
-                        Button { withAnimation(.easeInOut(duration: 0.25)) { selected = g } } label: {
+                        Button { select(g) } label: {
                             HStack(spacing: 8) {
-                                AsyncImage(url: steamArt(g.id, "capsule_sm_120.jpg")) { i in i.resizable().aspectRatio(contentMode: .fill) } placeholder: { Color.white.opacity(0.08) }
-                                    .frame(width: 18, height: 18).clipShape(RoundedRectangle(cornerRadius: 3))
+                                Group {
+                                    if g.exe != nil { Rectangle().fill(nameGradient(g.name)) }
+                                    else { AsyncImage(url: steamArt(g.id, "capsule_sm_120.jpg")) { i in i.resizable().aspectRatio(contentMode: .fill) } placeholder: { Color.white.opacity(0.08) } }
+                                }
+                                .frame(width: 18, height: 18).clipShape(RoundedRectangle(cornerRadius: 3))
                                 Text(g.name).lineLimit(1)
                                 Spacer(minLength: 0)
                                 if isOpen(g) { Circle().fill(Theme.amber).frame(width: 6, height: 6) }
                             }
                             .font(.system(size: 12.5))
-                            .foregroundStyle(selected?.id == g.id ? Theme.text : Theme.text2)
+                            .foregroundStyle(selectedID == g.id ? Theme.text : Theme.text2)
+                            .opacity(g.inLibrary ? 1 : 0.6)
                             .padding(.horizontal, 6).padding(.vertical, 5)
-                            .background(RoundedRectangle(cornerRadius: 6).fill(selected?.id == g.id ? STEAM_BLUE.opacity(0.16) : .clear))
+                            .background(RoundedRectangle(cornerRadius: 6).fill(selectedID == g.id ? Theme.amber.opacity(0.16) : .clear))
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                     }
                 }
             }
+            Button { pickLocalGame(m) } label: { Label(L("Agregar un juego"), systemImage: "plus") }
+                .buttonStyle(Pill()).help(L("Un juego de fuera de Steam: elegís su .exe"))
         }
         .padding(10)
         .frame(width: 210)
@@ -152,8 +208,18 @@ struct LibraryView: View {
     private var grid: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 4) {
-                Text(L("Biblioteca")).font(.system(size: 18, weight: .bold))
-                Text(m.steamRunning ? L("Tus juegos de Steam, listos para el Quest") : L("Tus juegos de Steam. Para jugar, Steam tiene que estar abierto."))
+                HStack(alignment: .firstTextBaseline) {
+                    Text(L("Biblioteca")).font(.system(size: 18, weight: .bold))
+                    Spacer()
+                    Picker(L("Ordenar"), selection: $order) {
+                        Text(L("Por nombre")).tag("nombre")
+                        Text(L("Jugados hace poco")).tag("recientes")
+                    }
+                    .pickerStyle(.menu).fixedSize()
+                    Button { pickLocalGame(m) } label: { Image(systemName: "plus") }
+                        .buttonStyle(Pill()).help(L("Agregar un juego de fuera de Steam"))
+                }
+                Text(m.steamRunning ? L("Tus juegos, listos para el Quest") : L("Tus juegos. Los de Steam necesitan que Steam esté abierto."))
                     .font(.callout).foregroundStyle(Theme.text2).padding(.bottom, 10)
                 if !m.steamRunning && m.steamInstalled {
                     HStack {
@@ -164,19 +230,47 @@ struct LibraryView: View {
                     }
                     .padding(10).background(RoundedRectangle(cornerRadius: 8).fill(Theme.amber.opacity(0.12))).padding(.bottom, 8)
                 }
+                steamVRRow
                 if games.isEmpty {
-                    Text(query.isEmpty ? L("Todavía no hay juegos. Buscalos en la Tienda.") : L("Ningún juego se llama así."))
+                    Text(query.isEmpty ? L("Todavía no hay juegos. Buscalos en la Tienda, o agregá uno de fuera de Steam con +.") : L("Ningún juego se llama así."))
                         .font(.callout).foregroundStyle(Theme.text2).padding(.top, 20)
                 }
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 130, maximum: 190), spacing: 16)], spacing: 16) {
                     ForEach(games) { g in
                         GameCapsule(game: g, vr: m.vr[g.id]?.vr, open: isOpen(g)) { m.play(g) }
-                            .onTapGesture { withAnimation(.easeInOut(duration: 0.25)) { selected = g } }
+                            .onTapGesture { select(g) }
                     }
                 }
                 .padding(.vertical, 8)
             }
             .padding(18)
+        }
+    }
+
+    /// SteamVR solo (como al ponerse un Valve Index), o el botón para instalarlo
+    @ViewBuilder private var steamVRRow: some View {
+        if m.steamVRInstalled || m.steamInstalled {
+            HStack(spacing: 10) {
+                Image(systemName: "visionpro").foregroundStyle(m.steamVRInstalled ? Theme.amber : Theme.text2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("SteamVR").font(.system(size: 13, weight: .semibold))
+                    Text(!m.steamVRInstalled ? L("Sin instalar. Con SteamVR real tenés su menú en el visor, y los juegos hechos para otros controles andan mejor.")
+                         : m.steamVRRunning ? L("Abierto en el visor: su menú tiene tu biblioteca de Steam")
+                         : L("Su sala y su menú en el visor, con tu biblioteca de Steam (experimental)"))
+                        .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                if !m.steamVRInstalled {
+                    Button(L("Instalar SteamVR")) { m.installSteamVR() }.buttonStyle(Pill())
+                } else if m.steamVRRunning {
+                    Button(L("Cerrar SteamVR")) { m.closeSteamVR() }.buttonStyle(Pill())
+                } else {
+                    Button(L("Abrir SteamVR")) { m.openSteamVR() }.buttonStyle(Pill(primary: true))
+                }
+            }
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.white.opacity(0.05)))
+            .padding(.bottom, 6)
         }
     }
 }
@@ -189,7 +283,7 @@ struct GameDetail: View {
     let back: () -> Void
     @State private var size: Int64 = 0
 
-    private var open: Bool { m.openGames.contains(game.installdir.lowercased()) }
+    private var open: Bool { game.inLibrary && m.openGames.contains(game.installdir.lowercased()) }
     private static let runtimes: [(id: String, name: String)] = [
         ("auto", "Automático"), ("openxr", "OpenXR"), ("openvr", "OpenComposite"), ("steamvr", "SteamVR real"), ("plano", "Sin VR"),
     ]
@@ -198,67 +292,20 @@ struct GameDetail: View {
         let v = m.vr[game.id]
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                ZStack(alignment: .bottomLeading) {
-                    AsyncImage(url: steamArt(game.id, "library_hero.jpg")) { phase in
-                        if let i = phase.image { i.resizable().aspectRatio(contentMode: .fill) }
-                        else if phase.error != nil {
-                            AsyncImage(url: steamArt(game.id, "header.jpg")) { i in i.resizable().aspectRatio(contentMode: .fill) } placeholder: { Color.white.opacity(0.05) }
-                                .blur(radius: 12)
-                        } else { Color.white.opacity(0.05) }
+                hero
+                // (con la ventana angosta, los datos van debajo del botón)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 18) { mainButton; stats(v); Spacer(minLength: 0); moreMenu(v) }
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack { mainButton; Spacer(); moreMenu(v) }
+                        HStack(spacing: 18) { stats(v) }
                     }
-                    .frame(height: 240).frame(maxWidth: .infinity).clipped()
-                    LinearGradient(colors: [.clear, Theme.bg], startPoint: .center, endPoint: .bottom)
-                    AsyncImage(url: steamArt(game.id, "logo.png")) { phase in
-                        if let i = phase.image { i.resizable().aspectRatio(contentMode: .fit).frame(maxWidth: 320, maxHeight: 96, alignment: .bottomLeading) }
-                        else { Text(game.name).font(.system(size: 32, weight: .heavy)).shadow(color: .black.opacity(0.6), radius: 10) }
-                    }
-                    .padding(.leading, 26).padding(.bottom, 20)
-                    Button(action: back) { Label(L("Biblioteca"), systemImage: "chevron.left").font(.callout) }
-                        .buttonStyle(.plain).padding(.horizontal, 10).padding(.vertical, 5)
-                        .background(RoundedRectangle(cornerRadius: 7).fill(Color.black.opacity(0.45)))
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(14)
-                }
-                .frame(height: 240)
-
-                HStack(spacing: 18) {
-                    if open {
-                        Button { m.forceClose(game) } label: { Label(L("FORZAR CIERRE"), systemImage: "xmark") }
-                            .buttonStyle(BigButton()).help(L("Cierra el juego aunque no responda (Steam sigue abierto)"))
-                    } else if m.steamRunning {
-                        Button { m.play(game) } label: { Label(L("JUGAR EN EL QUEST"), systemImage: "play.fill") }.buttonStyle(BigButton())
-                    } else {
-                        Button { m.run(L("Abriendo Steam"), "abrir_steam.sh") } label: { Label(L("ABRIR STEAM"), systemImage: "arrow.right") }
-                            .buttonStyle(BigButton()).disabled(m.busyTask != nil)
-                    }
-                    stat(open ? L("Abierto") : estado(v), L("Estado"))
-                    stat(v.map { L($0.runtimeNombre) } ?? "…", L("Sistema de VR"))
-                    if size > 0 { stat(bytesText(size), L("Tamaño")) }
-                    Spacer()
                 }
                 .padding(.horizontal, 26).padding(.top, 4)
 
-                HStack(alignment: .top, spacing: 14) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(L("Sistema de VR")).font(.system(size: 13, weight: .semibold))
-                        Picker(L("Sistema de VR"), selection: Binding(get: { v?.perfil.pedido ?? "auto" }, set: { m.setVR(game.id, "runtime", $0) })) {
-                            ForEach(Self.runtimes, id: \.id) { o in Text(L(o.name)).tag(o.id) }
-                        }
-                        .pickerStyle(.segmented).labelsHidden().disabled(v == nil)
-                        Text(L("Si un juego anda mal con OpenComposite, probá SteamVR real, que suele ser lo más estable; si SteamVR real va lento o no abre, probá OpenComposite."))
-                            .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
-                    }
-                    .padding(14).frame(maxWidth: .infinity, alignment: .topLeading)
-                    .background(RoundedRectangle(cornerRadius: 10).fill(Theme.card))
-                    .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.line))
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(L("Calidad")).font(.system(size: 13, weight: .semibold))
-                        Text(m.adv[game.installdir] != nil ? L("Este juego tiene ajustes propios.") : L("Usa los ajustes de «Todos los juegos»."))
-                            .font(.caption).foregroundStyle(Theme.text2)
-                        Button(L("Calidad y rendimiento…")) { m.loadAdv(); gameAdv = game }.buttonStyle(Pill())
-                    }
-                    .padding(14).frame(width: 240, alignment: .topLeading)
-                    .background(RoundedRectangle(cornerRadius: 10).fill(Theme.card))
-                    .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.line))
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .top, spacing: 14) { vrCard(v).frame(minWidth: 420); qualityCard.frame(width: 240) }
+                    VStack(alignment: .leading, spacing: 14) { vrCard(v); qualityCard }
                 }
                 .padding(.horizontal, 26).padding(.vertical, 18)
             }
@@ -270,7 +317,139 @@ struct GameDetail: View {
         }
     }
 
+    private var hero: some View {
+        ZStack(alignment: .bottomLeading) {
+            Group {
+                if game.exe != nil { Rectangle().fill(nameGradient(game.name)) }
+                else {
+                    AsyncImage(url: steamArt(game.id, "library_hero.jpg")) { phase in
+                        if let i = phase.image { i.resizable().aspectRatio(contentMode: .fill) }
+                        else if phase.error != nil {
+                            AsyncImage(url: steamArt(game.id, "header.jpg")) { i in i.resizable().aspectRatio(contentMode: .fill) } placeholder: { Color.white.opacity(0.05) }
+                                .blur(radius: 12)
+                        } else { Color.white.opacity(0.05) }
+                    }
+                }
+            }
+            .frame(height: 240).frame(maxWidth: .infinity).clipped()
+            LinearGradient(colors: [.clear, Theme.bg], startPoint: .center, endPoint: .bottom)
+            Group {
+                if game.exe != nil { title }
+                else {
+                    AsyncImage(url: steamArt(game.id, "logo.png")) { phase in
+                        if let i = phase.image { i.resizable().aspectRatio(contentMode: .fit).frame(maxWidth: 320, maxHeight: 96, alignment: .bottomLeading) }
+                        else { title }
+                    }
+                }
+            }
+            .padding(.leading, 26).padding(.bottom, 20)
+            Button(action: back) { Label(L("Biblioteca"), systemImage: "chevron.left").font(.callout) }
+                .buttonStyle(.plain).padding(.horizontal, 10).padding(.vertical, 5)
+                .background(RoundedRectangle(cornerRadius: 7).fill(Color.black.opacity(0.45)))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(14)
+        }
+        .frame(height: 240)
+    }
+    private var title: some View {
+        Text(game.name).font(.system(size: 32, weight: .heavy)).lineLimit(2).minimumScaleFactor(0.6).shadow(color: .black.opacity(0.6), radius: 10)
+    }
+
+    @ViewBuilder private var mainButton: some View {
+        if !game.inLibrary {
+            Button { m.importGame(game) } label: { Label(L("TRAER DE GAMEHUB"), systemImage: "arrow.down") }
+                .buttonStyle(BigButton()).disabled(m.busyTask != nil || !m.steamInstalled || m.steamRunning)
+                .help(m.steamRunning ? L("Cerrá Steam primero") : L("Copia instantánea desde GameHub"))
+        } else if open {
+            Button { m.forceClose(game) } label: { Label(L("FORZAR CIERRE"), systemImage: "xmark") }
+                .buttonStyle(BigButton()).help(L("Cierra el juego aunque no responda (Steam sigue abierto)"))
+        } else if m.steamRunning || game.exe != nil {
+            Button { m.play(game) } label: { Label(L("JUGAR EN EL QUEST"), systemImage: "play.fill") }.buttonStyle(BigButton())
+        } else {
+            Button { m.run(L("Abriendo Steam"), "abrir_steam.sh") } label: { Label(L("ABRIR STEAM"), systemImage: "arrow.right") }
+                .buttonStyle(BigButton()).disabled(m.busyTask != nil)
+        }
+    }
+
+    @ViewBuilder private func stats(_ v: VRJuego?) -> some View {
+        stat(open ? L("Abierto") : estado(v), L("Estado"))
+        stat(v.map { L($0.runtimeNombre) } ?? "…", L("Sistema de VR"))
+        if game.lastPlayed > 0 { stat(lastPlayedText, L("Última vez")) }
+        if size > 0 { stat(bytesText(size), L("Tamaño")) }
+    }
+    private var lastPlayedText: String {
+        let f = RelativeDateTimeFormatter(); f.locale = Locale(identifier: idioma() == "es" ? "es_AR" : "en_US")
+        return f.localizedString(for: Date(timeIntervalSince1970: TimeInterval(game.lastPlayed)), relativeTo: Date())
+    }
+
+    private func vrCard(_ v: VRJuego?) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(L("Sistema de VR")).font(.system(size: 13, weight: .semibold))
+            Picker(L("Sistema de VR"), selection: Binding(get: { v?.perfil.pedido ?? "auto" }, set: { m.setVR(game.id, "runtime", $0) })) {
+                ForEach(Self.runtimes, id: \.id) { o in Text(L(o.name)).tag(o.id) }
+            }
+            .pickerStyle(.segmented).labelsHidden().disabled(v == nil || !game.inLibrary)
+            Text(L("Si un juego anda mal con OpenComposite, probá SteamVR real, que suele ser lo más estable; si SteamVR real va lento o no abre, probá OpenComposite."))
+                .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14).frame(maxWidth: .infinity, alignment: .topLeading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Theme.card))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.line))
+    }
+    private var qualityCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(L("Calidad")).font(.system(size: 13, weight: .semibold))
+            Text(m.adv[game.installdir] != nil ? L("Este juego tiene ajustes propios.") : L("Usa los ajustes de «Todos los juegos»."))
+                .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+            Button(L("Calidad y rendimiento…")) { m.loadAdv(); gameAdv = game }.buttonStyle(Pill()).disabled(!game.inLibrary)
+        }
+        .padding(14).frame(maxWidth: .infinity, alignment: .topLeading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Theme.card))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.line))
+    }
+
+    /// Lo demás de un juego: cómo abrirlo, diagnóstico, estado, registros, desinstalar
+    private func moreMenu(_ v: VRJuego?) -> some View {
+        Menu {
+            if let v {
+                if game.exe == nil {
+                    Picker(L("Cómo abrirlo"), selection: Binding(get: { v.perfil.lanzar }, set: { m.setVR(game.id, "lanzar", $0) })) {
+                        Text(L("Desde Steam")).tag("steam")
+                        Text(L("Directo (para probar)")).tag("directo")
+                    }
+                }
+                Toggle(L("Diagnóstico detallado (al abrir directo)"), isOn: Binding(get: { v.perfil.diagnostico },
+                                                                              set: { m.setVR(game.id, "diagnostico", $0 ? "1" : "0") }))
+                Picker(L("Estado"), selection: Binding(get: { v.perfil.estado }, set: { m.setVR(game.id, "estado", $0) })) {
+                    ForEach(ESTADOS_JUEGO, id: \.self) { e in Text({ let t = L(e); return t.prefix(1).uppercased() + String(t.dropFirst()) }()).tag(e) }
+                }
+                Divider()
+                Section(L("Detectado")) {
+                    Text(L("APIs: ") + (v.deteccion.apis.isEmpty ? L("ninguna conocida") : v.deteccion.apis.joined(separator: ", ")))
+                    Text(L("Motor: %@", L(v.deteccion.motor)) + (v.deteccion.graficos.isEmpty ? "" : L(" · gráficos: ") + v.deteccion.graficos.joined(separator: ", ")))
+                    if !v.perfil.args.isEmpty { Text(L("Argumentos: ") + v.perfil.args.joined(separator: " ")) }
+                    ForEach(v.deteccion.sugerencias, id: \.self) { Text(L("Sugerencia: ") + $0) }
+                }
+                Divider()
+                Button(L("Volver a detectar")) { m.redetect(game.id) }
+                Button(L("Juntar registros del juego")) { m.gameLogs(game) }
+            }
+            if let exe = game.exe {
+                Button(L("Mostrar en el Finder")) { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: exe)]) }
+                Button(L("Quitar de la biblioteca")) { back(); m.removeLocalGame(game) }
+            } else if game.inLibrary {
+                Button(L("Ver en la tienda de Steam")) { NSWorkspace.shared.open(URL(string: "https://store.steampowered.com/app/\(game.id)")!) }
+                Button(L("Desinstalar…")) { m.uninstallGame(game) }.disabled(!m.steamRunning)
+            }
+        } label: {
+            Image(systemName: "ellipsis").frame(width: 30, height: 30)
+                .background(RoundedRectangle(cornerRadius: 7).fill(Color.white.opacity(0.08)))
+        }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        .help(L("Más opciones de este juego"))
+    }
+
     private func estado(_ v: VRJuego?) -> String {
+        if !game.inLibrary { return L("En GameHub") }
         switch v?.perfil.estado {
         case "funciona": return L("Funciona")
         case "con problemas": return L("Anda con problemas")
@@ -299,33 +478,36 @@ struct BigButton: ButtonStyle {
             .scaleEffect(c.isPressed ? 0.96 : 1)
             .animation(.easeOut(duration: 0.12), value: c.isPressed)
             .opacity(enabled ? 1 : 0.4)
+            .fixedSize()
     }
 }
 
-// MARK: - Barra de descargas (la de Steam: celeste, abajo)
+// MARK: - Barra de descargas (abajo, como la de Steam, en ámbar)
 struct DownloadsBar: View {
     @EnvironmentObject var m: AppModel
     var body: some View {
         if let d = m.downloads.first {
             let k = d.total > 0 ? Double(d.done) / Double(d.total) : 0
             HStack(spacing: 12) {
-                Text(d.paused ? L("En pausa") : L("Descargando")).font(.system(size: 13, weight: .bold))
+                Text(d.paused ? L("En pausa") : L("Descargando")).font(.system(size: 13, weight: .bold)).foregroundStyle(Theme.amberText)
                 Text(d.name).font(.callout).lineLimit(1)
                 if m.downloads.count > 1 { Text(L("y %d más", m.downloads.count - 1)).font(.caption).foregroundStyle(Theme.text2) }
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
                         Capsule().fill(Color.white.opacity(0.1))
-                        Capsule().fill(LinearGradient(colors: [Color(red: 71 / 255, green: 191 / 255, blue: 1), Color(red: 26 / 255, green: 68 / 255, blue: 194 / 255)], startPoint: .leading, endPoint: .trailing))
+                        Capsule().fill(LinearGradient(colors: [Theme.amberText, Theme.amber], startPoint: .leading, endPoint: .trailing))
                             .frame(width: geo.size.width * k)
                             .animation(.easeOut(duration: 0.6), value: k)
                     }
                 }
-                .frame(height: 6)
+                .frame(height: 6).frame(minWidth: 60)
                 Text("\(Int(k * 100)) % · \(bytesText(d.done)) / \(bytesText(d.total))").font(.caption.monospacedDigit()).foregroundStyle(Theme.text2)
+                    .lineLimit(1).fixedSize()
             }
             .padding(.horizontal, 16).frame(height: 46)
-            .background(LinearGradient(colors: [Color(red: 42 / 255, green: 71 / 255, blue: 94 / 255).opacity(0.85), Color(red: 27 / 255, green: 40 / 255, blue: 56 / 255).opacity(0.85)], startPoint: .leading, endPoint: .trailing))
-            .overlay(Rectangle().fill(Theme.line).frame(height: 1), alignment: .top)
+            .background(Theme.amber.opacity(0.10))
+            .background(Theme.bg)
+            .overlay(Rectangle().fill(Theme.amber.opacity(0.5)).frame(height: 1), alignment: .top)
             .transition(.move(edge: .bottom))
         }
     }

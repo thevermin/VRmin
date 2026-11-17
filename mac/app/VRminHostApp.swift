@@ -19,6 +19,8 @@ struct SteamGame: Identifiable, Hashable {
     let installdir: String
     let inLibrary: Bool     // está en el Steam de QuestVRBridge
     let inGameHub: Bool     // está descargado en GameHub
+    var lastPlayed: Int = 0 // la última vez que se jugó (segundos desde 1970; 0: nunca)
+    var exe: String? = nil  // juego de fuera de Steam: su .exe en la Mac (agregado en la Biblioteca)
 }
 
 // MARK: - Runtime de VR de cada juego (lo decide recursos/vrjuegos.py; acá solo se muestra y se elige)
@@ -75,8 +77,8 @@ func parseACF(_ url: URL) -> [String: String] {
     return d
 }
 
-func scanLibrary(_ steamapps: URL) -> [String: (name: String, dir: String)] {
-    var out: [String: (name: String, dir: String)] = [:]
+func scanLibrary(_ steamapps: URL) -> [String: (name: String, dir: String, last: Int)] {
+    var out: [String: (name: String, dir: String, last: Int)] = [:]
     let fm = FileManager.default
     guard let files = try? fm.contentsOfDirectory(atPath: steamapps.path) else { return out }
     for f in files where f.hasPrefix("appmanifest_") && f.hasSuffix(".acf") {
@@ -85,7 +87,7 @@ func scanLibrary(_ steamapps: URL) -> [String: (name: String, dir: String)] {
         //  aparece en su biblioteca)
         guard let id = d["appid"], let dir = d["installdir"], !NOT_GAMES.contains(id), d["LastOwner"] != "0" else { continue }
         if fm.fileExists(atPath: steamapps.appendingPathComponent("common/\(dir)").path) {
-            out[id] = (d["name"] ?? dir, dir)
+            out[id] = (d["name"] ?? dir, dir, Int(d["LastPlayed"] ?? "") ?? 0)
         }
     }
     return out
@@ -570,7 +572,16 @@ final class AppModel: ObservableObject {
         for id in Set(mine.keys).union(gh.keys) {
             let info = mine[id] ?? gh[id]!
             list.append(SteamGame(id: id, name: info.name, installdir: info.dir,
-                                  inLibrary: mine[id] != nil, inGameHub: gh[id] != nil))
+                                  inLibrary: mine[id] != nil, inGameHub: gh[id] != nil, lastPlayed: info.last))
+        }
+        // Los de fuera de Steam (juegos_propios.json, los que todavía existen)
+        struct Propios: Decodable { struct J: Decodable { let id: String; let nombre: String?; let exe: String }; let juegos: [J]? }
+        if let d = try? Data(contentsOf: data.appendingPathComponent("juegos_propios.json")),
+           let p = try? JSONDecoder().decode(Propios.self, from: d) {
+            for j in p.juegos ?? [] where fm.fileExists(atPath: j.exe) {
+                let dir = URL(fileURLWithPath: j.exe).deletingLastPathComponent().lastPathComponent
+                list.append(SteamGame(id: j.id, name: j.nombre ?? dir, installdir: dir, inLibrary: true, inGameHub: false, exe: j.exe))
+            }
         }
         list.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         if list != games { games = list; loadVR() }
@@ -1103,6 +1114,26 @@ final class AppModel: ObservableObject {
         run(L("Juntando un reporte"), "reporte.sh", [f.path], exclusive: false)
     }
 
+    /// Agrega un juego de fuera de Steam (su .exe) a la Biblioteca
+    func addLocalGame(_ exe: URL) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let ok = self.python(["agregar", exe.path, ""]) != nil
+            DispatchQueue.main.async {
+                self.append(ok ? L("Juego agregado: %@", exe.lastPathComponent) : L("No se pudo agregar %@ (tiene que ser un .exe de Windows)", exe.lastPathComponent))
+                self.refresh()
+            }
+        }
+    }
+    /// Lo saca de la Biblioteca (el juego no se borra)
+    func removeLocalGame(_ g: SteamGame) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = self?.python(["quitar", g.id])
+            DispatchQueue.main.async { self?.refresh() }
+        }
+    }
+    /// Le pide a Steam que lo desinstale (Steam pregunta antes)
+    func uninstallGame(_ g: SteamGame) { run(L("Desinstalando %@", g.name), "instalar_juego.sh", [g.id, g.name, "desinstalar"], exclusive: false) }
     func gameLogs(_ g: SteamGame) { run(L("Juntando registros de %@", g.name), "registros_juego.sh", [g.id], exclusive: false) }
 
     /// Abre un juego con su calidad (la propia o la general): si no es la que corre, reinicia el servidor antes
@@ -1123,7 +1154,7 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in if self?.serverRunning == true { self?.play(g) } }
             return
         }
-        if !steamRunning { append(L("Primero abrí Steam y esperá a ver tu biblioteca.")); return }
+        if !steamRunning && g.exe == nil { append(L("Primero abrí Steam y esperá a ver tu biblioteca.")); return }
         // ¿Este juego quiere otra calidad que la que corre ahora?
         loadAdv()
         let q = adv[g.installdir]
@@ -1131,7 +1162,7 @@ final class AppModel: ObservableObject {
         if e != runEye || f != runFps || mb != runMbps || fv != runFov {
             playWith(id: g.id, name: g.name, eye: e, fps: f, mbps: mb, fov: fv); return
         }
-        let dir = steamapps.appendingPathComponent("common/\(g.installdir)")
+        let dir = g.exe.map { URL(fileURLWithPath: $0).deletingLastPathComponent() } ?? steamapps.appendingPathComponent("common/\(g.installdir)")
         let args = [g.id]   // el runtime y los argumentos los decide jugar.sh (perfil del juego)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let fixed = fixSteamVRBindings(gameDir: dir)
@@ -1320,6 +1351,9 @@ struct ContentView: View {
                 .pickerStyle(.segmented).labelsHidden().frame(width: 330)
             }
             .padding(.horizontal, 22).padding(.top, 8).padding(.bottom, 12)
+            if m.crashNote != nil || m.memoryWarning != nil || m.askWorked != nil {
+                notices.padding(.horizontal, 22).padding(.bottom, 12)
+            }
             Rectangle().fill(Theme.line).frame(height: 1)
             switch tab {
             case "biblioteca": LibraryView(gameAdv: $gameAdv)
@@ -1333,7 +1367,6 @@ struct ContentView: View {
                         prepCard
                     }
                     cableCard
-                    gamesCard
                     recordCard
                     logSection
                 }
@@ -1678,8 +1711,9 @@ struct ContentView: View {
         .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.white.opacity(0.05)))
     }
 
-    private var gamesCard: some View {
-        Card(title: L("Juegos"), icon: "square.grid.2x2") {
+    /// Avisos (algo se cerró de golpe, la memoria, «¿funcionó?»): arriba, en todas las pestañas
+    @ViewBuilder private var notices: some View {
+        VStack(alignment: .leading, spacing: 8) {
             if let c = m.crashNote {   // algo se cerró de golpe
                 HStack(alignment: .top, spacing: 10) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.amber)
@@ -1715,192 +1749,7 @@ struct ContentView: View {
                 .padding(10)
                 .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.amber.opacity(0.12)))
             }
-            if m.steamVRInstalled {   // SteamVR solo, como al ponerse un Valve Index: su sala y su menú, con la biblioteca
-                HStack(spacing: 10) {
-                    Image(systemName: "visionpro").foregroundStyle(Theme.amber)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("SteamVR").font(.system(size: 13, weight: .semibold))
-                        Text(m.steamVRRunning ? L("Abierto en el visor: su menú tiene tu biblioteca de Steam")
-                                              : L("Su sala y su menú en el visor, con tu biblioteca de Steam (experimental)"))
-                            .font(.caption).foregroundStyle(Theme.text2)
-                    }
-                    Spacer()
-                    if m.steamVRRunning {
-                        Button(L("Cerrar SteamVR")) { m.closeSteamVR() }.buttonStyle(Pill())
-                    } else {
-                        Button(L("Abrir SteamVR")) { m.openSteamVR() }.buttonStyle(Pill(primary: true))
-                    }
-                }
-                .padding(10)
-                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.white.opacity(0.05)))
-            } else if m.steamInstalled {   // SteamVR real: hace falta instalarlo desde el Steam de VRmin
-                HStack(spacing: 10) {
-                    Image(systemName: "visionpro").foregroundStyle(Theme.text2)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("SteamVR").font(.system(size: 13, weight: .semibold))
-                        Text(L("Sin instalar. Con SteamVR real tenés su menú en el visor, y los juegos hechos para otros controles andan mejor."))
-                            .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer()
-                    Button(L("Instalar SteamVR")) { m.installSteamVR() }.buttonStyle(Pill())
-                }
-                .padding(10)
-                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.white.opacity(0.05)))
-            }
-            if m.games.isEmpty {
-                HStack {
-                    Image(systemName: "tray").font(.system(size: 22)).foregroundStyle(Theme.text2)
-                    Text(L("Todavía no hay juegos. Instalalos desde Steam y aparecen acá (y en el Quest)."))
-                        .font(.callout).foregroundStyle(Theme.text2)
-                    Spacer()
-                    if m.steamInstalled && !m.steamRunning {
-                        Button(L("Abrir Steam")) { m.run(L("Abriendo Steam"), "abrir_steam.sh") }
-                            .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
-                    } else if m.steamRunning {
-                        Button(L("Mostrar Steam")) { m.run(L("Mostrando Steam"), "abrir_steam.sh", ["ventana"], exclusive: false) }.buttonStyle(Pill())
-                    }
-                }
-            } else {
-                let flat = sortedGames.filter { m.vr[$0.id]?.vr == false }
-                let vrGames = sortedGames.filter { m.vr[$0.id]?.vr != false }
-                VStack(alignment: .leading, spacing: 10) {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12, alignment: .top)], alignment: .leading, spacing: 12) {
-                        ForEach(vrGames) { g in gameCard(g) }
-                    }
-                    if !flat.isEmpty {
-                        Text(L("Juegos planos · se abren como una ventana de la Mac (en el visor, en Studio)"))
-                            .font(.callout.weight(.semibold)).foregroundStyle(Theme.text2).padding(.top, 6)
-                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12, alignment: .top)], alignment: .leading, spacing: 12) {
-                            ForEach(flat) { g in gameCard(g) }
-                        }
-                    }
-                }
-                .padding(.vertical, 2)
-                Text(L("Lo más cómodo es elegirlos desde el Quest, en Juegos. ¿No aparece un juego? Abrilo directamente desde Steam."))
-                    .font(.caption).foregroundStyle(Theme.text2)
-            }
         }
-    }
-
-    private func isOpen(_ g: SteamGame) -> Bool { g.inLibrary && m.openGames.contains(g.installdir.lowercased()) }
-    /// En orden alfabético; el juego abierto, primero
-    private var sortedGames: [SteamGame] {
-        m.games.sorted { a, b in
-            let oa = isOpen(a), ob = isOpen(b)
-            if oa != ob { return oa }
-            return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
-        }
-    }
-
-    /// Un juego: su imagen de Steam (con «Forzar cierre» encima si está abierto), nombre, estado y acciones
-    private func gameCard(_ g: SteamGame) -> some View {
-        let open = isOpen(g)
-        return VStack(alignment: .leading, spacing: 6) {
-            ZStack(alignment: .topTrailing) {
-                AsyncImage(url: URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(g.id)/header.jpg")) { img in
-                    img.resizable().aspectRatio(contentMode: .fill)
-                } placeholder: {
-                    ZStack { Color.white.opacity(0.06); Image(systemName: "gamecontroller").font(.system(size: 22)).foregroundStyle(Theme.text2) }
-                }
-                .frame(maxWidth: .infinity).frame(height: 70).clipped()
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(open ? Theme.amber : .clear, lineWidth: 2))
-                if open {
-                    Button(L("Forzar cierre")) { m.forceClose(g) }
-                        .buttonStyle(Pill(primary: true))
-                        .help(L("Cierra el juego aunque no responda (Steam sigue abierto)"))
-                        .padding(6)
-                }
-            }
-            HStack(spacing: 6) {
-                Dot(on: g.inLibrary && m.vr[g.id]?.perfil.estado == "funciona",
-                    warn: g.inLibrary && ["sin probar", "con problemas"].contains(m.vr[g.id]?.perfil.estado ?? "sin probar"))
-                Text(g.name).font(.system(size: 12, weight: .semibold)).lineLimit(1)
-                if open { Text(L("Abierto")).font(.caption.weight(.semibold)).foregroundStyle(Theme.amberText) }
-                Spacer(minLength: 0)
-            }
-            Text(gameStatus(g)).font(.caption2).foregroundStyle(Theme.text2).lineLimit(1).help(gameStatus(g) + "\n" + gameTech(g))
-            HStack(spacing: 6) {
-                if g.inLibrary {
-                    if !open {
-                        Button(L("Jugar")) { m.play(g) }
-                            .buttonStyle(Pill(primary: true))
-                            .disabled(!m.steamRunning)
-                            .help(m.steamRunning ? "" : L("Primero abrí Steam"))
-                    }
-                    if let v = m.vr[g.id] { vrMenu(g, v) }
-                } else {
-                    Button(L("Traer")) { m.importGame(g) }
-                        .buttonStyle(Pill())
-                        .disabled(m.busyTask != nil || !m.steamInstalled || m.steamRunning)
-                        .help(m.steamRunning ? L("Cerrá Steam primero") : L("Copia instantánea desde GameHub"))
-                }
-            }
-        }
-    }
-
-    /// Lo que se ve debajo del nombre de un juego: si funciona, en palabras simples (lo técnico, al pasar el mouse)
-    private func gameStatus(_ g: SteamGame) -> String {
-        guard g.inLibrary else { return L("En GameHub · se puede traer sin volver a bajarlo") }
-        guard let v = m.vr[g.id] else { return L("Revisando el juego…") }
-        var s: String
-        switch v.perfil.estado {
-        case "funciona": s = L("Funciona")
-        case "con problemas": s = L("Anda con problemas")
-        case "no funciona": s = L("No funciona por ahora")
-        default: s = L("Sin probar todavía")
-        }
-        if m.adv[g.installdir] != nil { s += " · " + L("ajustes propios") }
-        if let a = v.perfil.avisos.first { s += L("\nAviso: ") + a }
-        return s
-    }
-    private func gameTech(_ g: SteamGame) -> String {
-        guard let v = m.vr[g.id] else { return "" }
-        let apis = v.deteccion.apis.isEmpty ? L("API no detectada") : v.deteccion.apis.map { $0 == "openxr" ? "OpenXR" : $0 == "openvr" ? "OpenVR" : L("Oculus") }.joined(separator: " + ")
-        return "\(L(v.runtimeNombre))\(v.perfil.pedido == "auto" ? " (auto)" : "") · \(apis) · \(L(v.deteccion.motor))"
-    }
-
-    /// Menú de VR de un juego: runtime, cómo abrirlo, diagnóstico, estado y registros
-    private func vrMenu(_ g: SteamGame, _ v: VRJuego) -> some View {
-        Menu {
-            Button(L("Calidad y rendimiento de este juego…")) { m.loadAdv(); gameAdv = g }
-            Divider()
-            Picker(L("Sistema de VR"), selection: Binding(get: { v.perfil.pedido }, set: { m.setVR(g.id, "runtime", $0) })) {
-                ForEach(RUNTIME_OPCIONES, id: \.id) { o in
-                    Text(o.id == "auto" ? L("Automático (%@)", L(RUNTIME_OPCIONES.first { $0.id == v.deteccion.recomendado }?.nombre ?? v.deteccion.recomendado)) : L(o.nombre)).tag(o.id)
-                }
-            }
-            Section(L("Si un juego anda mal")) {
-                Text(L("Con OpenComposite: probá SteamVR real, que suele ser lo más estable"))
-                Text(L("Con SteamVR real (lento o no abre): probá OpenComposite, que usa menos memoria"))
-            }
-            Picker(L("Cómo abrirlo"), selection: Binding(get: { v.perfil.lanzar }, set: { m.setVR(g.id, "lanzar", $0) })) {
-                Text(L("Desde Steam")).tag("steam")
-                Text(L("Directo (para probar)")).tag("directo")
-            }
-            Toggle(L("Diagnóstico detallado (al abrir directo)"), isOn: Binding(get: { v.perfil.diagnostico },
-                                                                          set: { m.setVR(g.id, "diagnostico", $0 ? "1" : "0") }))
-            Picker(L("Estado"), selection: Binding(get: { v.perfil.estado }, set: { m.setVR(g.id, "estado", $0) })) {
-                ForEach(ESTADOS_JUEGO, id: \.self) { e in Text({ let t = L(e); return t.prefix(1).uppercased() + String(t.dropFirst()) }()).tag(e) }
-            }
-            Divider()
-            Section(L("Detectado")) {
-                Text(L("APIs: ") + (v.deteccion.apis.isEmpty ? L("ninguna conocida") : v.deteccion.apis.joined(separator: ", ")))
-                Text(L("Motor: %@", L(v.deteccion.motor)) + (v.deteccion.graficos.isEmpty ? "" : L(" · gráficos: ") + v.deteccion.graficos.joined(separator: ", ")))
-                if !v.perfil.args.isEmpty { Text(L("Argumentos: ") + v.perfil.args.joined(separator: " ")) }
-                ForEach(v.deteccion.sugerencias, id: \.self) { Text(L("Sugerencia: ") + $0) }
-            }
-            Divider()
-            Button(L("Volver a detectar")) { m.redetect(g.id) }
-            Button(L("Juntar registros del juego")) { m.gameLogs(g) }
-        } label: {
-            Image(systemName: "slider.horizontal.3")
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help(L("Ajustes de este juego: calidad, sistema de VR, cómo abrirlo y registros"))
-        .accessibilityLabel(L("Opciones de VR de %@", g.name))
     }
 
     // Registro: escondido; se abre si hace falta revisar algo

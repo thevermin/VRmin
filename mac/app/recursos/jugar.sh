@@ -10,7 +10,8 @@ cd "$P"
 APPID="$1"; shift
 [ -n "$APPID" ] || { say "Falta el número del juego" "Missing the game number"; exit 1; }
 motor_listo || { say "Primero instalá el motor." "Install the engine first."; exit 1; }
-steam_abierto || { say "Steam no está abierto. Abrilo y esperá a ver tu biblioteca." "Steam isn't open. Open it and wait until you see your library."; exit 1; }
+# (los de fuera de Steam, «p-…», no lo necesitan)
+case "$APPID" in p-*) ;; *) steam_abierto || { say "Steam no está abierto. Abrilo y esperá a ver tu biblioteca." "Steam isn't open. Open it and wait until you see your library."; exit 1; } ;; esac
 
 PERFIL="$(/usr/bin/python3 "$RES/vrjuegos.py" resolver "$APPID")" || exit 1
 eval "$PERFIL"
@@ -56,7 +57,7 @@ if [ "$LANZAR" = "directo" ] && [ -n "$EXE" ] && [ -f "$CARPETA/$EXE" ]; then
   # Directo: el juego es hijo de este proceso, así que recibe las variables de entorno y el diagnóstico.
   # (Steam tiene que estar abierto igual; el juego se conecta a él.)
   say "Abriendo directo: $EXE" "Opening directly: $EXE" | tee -a "$LOG"
-  [ -f "$CARPETA/$(dirname "$EXE")/steam_appid.txt" ] || echo "$APPID" > "$CARPETA/$(dirname "$EXE")/steam_appid.txt"
+  case "$APPID" in p-*) ;; *) [ -f "$CARPETA/$(dirname "$EXE")/steam_appid.txt" ] || echo "$APPID" > "$CARPETA/$(dirname "$EXE")/steam_appid.txt" ;; esac
   if [ "$DIAGNOSTICO" = "1" ]; then
     export WINEDEBUG=err+all,warn+module,+loaddll
     export XR_LOADER_DEBUG=all
