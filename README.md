@@ -158,7 +158,7 @@ Choose a game from the **Games** tab, and play.
 
 ### Updates
 VRmin Host checks for new versions by itself: when there's one, click **Update** at the top. The Quest app updates
-from VRmin Host too, over the USB-C cable.
+from VRmin Host too, over the USB-C cable. On Windows and Linux, VRmin Host updates itself the same way.
 
 ### Windows and Linux (beta)
 There are also early versions for PCs, from the [Releases](../../releases/latest):

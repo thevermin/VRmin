@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VRmin · SteamVR games on your Mac, on your Quest</title>
+<meta name="description" content="Free and open source: play your SteamVR games on an Apple Silicon Mac, streamed to your Meta Quest. Windows and Linux beta too.">
+<meta property="og:title" content="VRmin">
+<meta property="og:description" content="Play your SteamVR games on a Mac. Streamed to your Meta Quest.">
+<meta property="og:image" content="media/title.jpg">
+<link rel="icon" href="media/icon.png">
+<style>
+  :root {
+    --bg: #141416; --card: rgba(255,255,255,.055); --line: rgba(255,255,255,.09);
+    --text: #f3f3f4; --text2: rgba(243,243,244,.62); --amber: #e6a84a; --amber-text: #f2c27a; --amber-dark: #1a1308;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif; }
+  a { color: var(--amber-text); }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 20px; }
+  nav { display: flex; align-items: center; gap: 22px; padding: 18px 0; }
+  nav .logo { display: flex; align-items: center; gap: 10px; font-weight: 700; color: var(--text); text-decoration: none; font-size: 18px; }
+  nav .logo img { width: 30px; height: 30px; border-radius: 7px; }
+  nav .links { margin-left: auto; display: flex; gap: 18px; }
+  nav .links a { color: var(--text2); text-decoration: none; font-size: 14px; }
+  nav .links a:hover { color: var(--text); }
+  header { text-align: center; padding: 48px 0 28px; }
+  h1 { font-size: clamp(34px, 6vw, 58px); line-height: 1.08; margin: 0 0 16px; letter-spacing: -.02em; }
+  h1 em { font-style: normal; color: var(--amber); }
+  .lead { color: var(--text2); font-size: 19px; max-width: 640px; margin: 0 auto 28px; }
+  .btns { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .btn { display: inline-block; padding: 12px 22px; border-radius: 10px; font-weight: 600; text-decoration: none; color: var(--text); background: rgba(255,255,255,.1); }
+  .btn.primary { background: var(--amber); color: var(--amber-dark); }
+  .btn:hover { filter: brightness(1.08); }
+  .small { color: var(--text2); font-size: 14px; margin-top: 14px; }
+  .hero { margin: 36px auto 0; max-width: 820px; border-radius: 16px; overflow: hidden; border: 1px solid var(--line); }
+  .hero img { display: block; width: 100%; }
+  section { padding: 56px 0 8px; }
+  h2 { font-size: 30px; margin: 0 0 8px; letter-spacing: -.01em; }
+  .sub { color: var(--text2); margin: 0 0 28px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  .card img { display: block; width: 100%; aspect-ratio: 16/10; object-fit: cover; background: #000; }
+  .card .body { padding: 16px 18px 18px; }
+  .card h3 { margin: 0 0 6px; font-size: 18px; }
+  .card p { margin: 0; color: var(--text2); font-size: 15px; }
+  .more { columns: 2 280px; gap: 28px; padding: 0; margin: 0; list-style: none; }
+  .more li { break-inside: avoid; padding: 8px 0 8px 22px; position: relative; color: var(--text2); }
+  .more li::before { content: ""; position: absolute; left: 4px; top: 17px; width: 7px; height: 7px; border-radius: 50%; background: var(--amber); }
+  .more b { color: var(--text); font-weight: 600; }
+  .steps { counter-reset: s; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; }
+  .step { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  .step::before { counter-increment: s; content: counter(s); display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: var(--amber); color: var(--amber-dark); font-weight: 700; margin-bottom: 10px; }
+  .step h3 { margin: 0 0 6px; font-size: 17px; }
+  .step p { margin: 0; color: var(--text2); font-size: 15px; }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  td { padding: 12px 14px; border-top: 1px solid var(--line); vertical-align: top; }
+  td:first-child { font-weight: 600; white-space: nowrap; width: 1%; }
+  td:last-child { color: var(--text2); }
+  .note { background: rgba(230,168,74,.1); border: 1px solid rgba(230,168,74,.25); border-radius: 12px; padding: 14px 18px; color: var(--text2); font-size: 15px; }
+  footer { padding: 56px 0 40px; color: var(--text2); font-size: 14px; text-align: center; }
+  footer a { color: var(--text2); }
+  @media (max-width: 600px) { nav .links a.opt { display: none; } td:first-child { white-space: normal; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <a class="logo" href="#"><img src="media/icon.png" alt="">VRmin</a>
+    <div class="links">
+      <a class="opt" href="#features">Features</a>
+      <a class="opt" href="#install">Install</a>
+      <a href="https://github.com/thevermin/VRmin">GitHub</a>
+      <a href="https://ko-fi.com/thevermin">Ko-fi</a>
+    </div>
+  </nav>
+
+  <header>
+    <h1>Your SteamVR games, <em>on a Mac</em>.</h1>
+    <p class="lead">VRmin runs the Windows version of your Steam VR games on an Apple Silicon Mac and streams them to your Meta Quest over Wi‑Fi. Free and open source.</p>
+    <div class="btns">
+      <a class="btn primary" href="https://github.com/thevermin/VRmin/releases/latest">Download</a>
+      <a class="btn" href="#install">How to install</a>
+    </div>
+    <p class="small">Apple Silicon Mac + Meta Quest + Steam · Windows and Linux PC (beta)</p>
+    <div class="hero"><img src="media/hero.gif" alt="SUPERHOT VR running on a Mac, played on a Quest 3"></div>
+  </header>
+
+  <section id="features">
+    <h2>What it does</h2>
+    <p class="sub">Two apps that work together: VRmin Host on the Mac, and VRmin on the Quest.</p>
+    <div class="grid">
+      <div class="card"><img src="media/library.jpg" alt="" loading="lazy"><div class="body"><h3>SteamVR games on your Mac</h3>
+        <p>Your library on Apple Silicon. VRmin picks the right way to run each game: OpenXR, OpenComposite, or the real SteamVR.</p></div></div>
+      <div class="card"><img src="media/desktop.gif" alt="" loading="lazy"><div class="body"><h3>Your Mac in your room</h3>
+        <p>Your whole desktop, or any single window, floating wherever you want.</p></div></div>
+      <div class="card"><img src="media/hands.gif" alt="" loading="lazy"><div class="body"><h3>Your real hands</h3>
+        <p>Hand tracking with your real hands over every window. Touch them directly or point with the laser.</p></div></div>
+      <div class="card"><img src="media/rooms.gif" alt="" loading="lazy"><div class="body"><h3>Pick your room</h3>
+        <p>A living room, space, a cinema… or mixed reality with your real desk still there.</p></div></div>
+      <div class="card"><img src="media/settings.gif" alt="" loading="lazy"><div class="body"><h3>Settings inside the game</h3>
+        <p>Quality, sharpness, frame rate and codec, per game, from a menu in VR.</p></div></div>
+      <div class="card"><img src="media/portal.gif" alt="" loading="lazy"><div class="body"><h3>Draw a portal</h3>
+        <p>Draw a circle in the air and see through to your real room.</p></div></div>
+      <div class="card"><img src="media/sentinel.gif" alt="" loading="lazy"><div class="body"><h3>Sentinel Mode</h3>
+        <p>Put the Quest on your monitor: it tracks you while the game shows on your Mac's screen.</p></div></div>
+    </div>
+    <section style="padding-top:36px">
+      <ul class="more">
+        <li><b>Flat games</b> on a giant screen, and side‑by‑side 3D videos</li>
+        <li><b>Direct GPU copy</b> from the game to the video encoder</li>
+        <li><b>Foveated encoding</b>: sharper where you look</li>
+        <li><b>Controller vibration</b> in your games</li>
+        <li><b>Your Mac's sound</b> in the headset, and the headset keyboard types on your Mac</li>
+        <li><b>Your microphone in games</b></li>
+        <li><b>Simple quality settings</b>, with the right one for your Mac marked</li>
+        <li><b>Updates by itself</b>, the Quest app too (over USB-C)</li>
+      </ul>
+    </section>
+  </section>
+
+  <section id="install">
+    <h2>Install</h2>
+    <p class="sub">The full steps are in the <a href="https://github.com/thevermin/VRmin#install">README</a>.</p>
+    <div class="steps">
+      <div class="step"><h3>On your Mac</h3><p>Download <b>VRmin Host</b>, drag it to Applications and open it (right‑click › Open the first time). Then click <b>Install</b> on the engine and on Steam, and download your VR games.</p></div>
+      <div class="step"><h3>On your Quest</h3><p>Turn on developer mode and install <b>VRmin</b> with SideQuest, or from VRmin Host over a USB-C cable.</p></div>
+      <div class="step"><h3>Play</h3><p>Open VRmin Host on the Mac and VRmin on the Quest, on the same Wi‑Fi. Pick a game and play.</p></div>
+    </div>
+  </section>
+
+  <section id="requirements">
+    <h2>Requirements</h2>
+    <table>
+      <tr><td>Mac</td><td>Apple Silicon (M1 or newer), macOS 14.2 or newer. 16 GB of memory is better for heavy games.</td></tr>
+      <tr><td>Headset</td><td>Meta Quest 3 or 3S (recommended), Quest 2. Quest 1 and Quest Pro are experimental.</td></tr>
+      <tr><td>Network</td><td>The Mac and the Quest on the same router. 5 GHz Wi‑Fi, or the Mac on Ethernet, works best.</td></tr>
+      <tr><td>Steam</td><td>A Steam account with your VR games. VRmin installs its own Steam for Windows.</td></tr>
+      <tr><td>Windows (beta)</td><td>Windows 10 or 11 (64-bit), an NVIDIA, AMD or Intel graphics card.</td></tr>
+      <tr><td>Linux (beta)</td><td>Steam with Proton, X11, PulseAudio or PipeWire, WebKitGTK 4.1, and a GPU with VA-API or NVENC.</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <div class="note">Many SteamVR games that use DirectX 11 work, but not all of them. See the <a href="https://github.com/thevermin/VRmin/discussions/6">list of tested games</a>, and if something doesn't work, <a href="https://github.com/thevermin/VRmin/issues/new/choose">open an issue</a>.</div>
+  </section>
+
+  <footer>
+    VRmin by thevermin · <a href="https://github.com/thevermin/VRmin">GitHub</a> · <a href="https://ko-fi.com/thevermin">Support on Ko-fi</a> · GPL-3.0<br>
+    Not affiliated with Valve or Meta.
+  </footer>
+</div>
+</body>
+</html>
