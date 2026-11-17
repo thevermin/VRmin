@@ -6,7 +6,7 @@ cd "$(dirname "$0")" || exit 1
 D="$PWD"
 P="$HOME/Documents/QuestVRBridge/prototipo"
 WINEDIR="$P/motor/wswine.bundle"
-export WINEPREFIX="$P/prefijo" WINEMSYNC=1 WINEDEBUG=-all,err+module,err+d3d12,err+vkd3d
+export MVK_CONFIG_LOG_LEVEL=0 WINEPREFIX="$P/prefijo" WINEMSYNC=1 WINEDEBUG=-all,err+module,err+d3d12,err+vkd3d
 FW="$P/motor/Frameworks"
 BASE="$WINEDIR/lib:$FW:/usr/lib"
 OUT="$D/resultado.txt"
@@ -16,6 +16,8 @@ xattr -dr com.apple.quarantine "$D" 2>/dev/null
 
 echo "== Vulkan con KosmicKrisp (vulkaninfo, x86_64)" | tee -a "$OUT"
 DYLD_FALLBACK_LIBRARY_PATH="$D/vk" VK_ICD_FILENAMES="$D/kk/kosmickrisp_icd.json" arch -x86_64 "$D/vk/vulkaninfo" --summary >> "$OUT" 2>&1
+DYLD_FALLBACK_LIBRARY_PATH="$D/vk" VK_ICD_FILENAMES="$D/kk/kosmickrisp_icd.json" arch -x86_64 "$D/vk/vulkaninfo" 2>/dev/null \
+  | grep -E "transform_feedback|geometryShader|descriptor_buffer|mutable_descriptor|shaderInt64 |descriptorIndexing|sparseBinding " | sort -u >> "$OUT"
 echo "(salió con $?)" >> "$OUT"
 
 # La dxgi de Wine (la de DXMT no hace cadenas de presentación de D3D12), al lado de la prueba
@@ -34,7 +36,8 @@ prueba() {   # nombre, vulkan (moltenvk/kk), d3d12 (wine/proton)
   (
     export WINEDLLOVERRIDES="$ov;winemenubuilder.exe=d"
     if [ "$2" = kk ]; then
-      export DYLD_FALLBACK_LIBRARY_PATH="$D/vk:$BASE" VK_ICD_FILENAMES="$D/kk/kosmickrisp_icd.json"
+      # (DYLD_LIBRARY_PATH: le gana a la libMoltenVK.dylib del motor, que Wine encuentra antes que el FALLBACK)
+      export DYLD_LIBRARY_PATH="$D/vk" DYLD_FALLBACK_LIBRARY_PATH="$BASE" VK_ICD_FILENAMES="$D/kk/kosmickrisp_icd.json"
     else
       export DYLD_FALLBACK_LIBRARY_PATH="$BASE"
     fi
