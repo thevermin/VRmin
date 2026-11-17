@@ -277,7 +277,11 @@ preparar_runtime() {
       poner_driver_steamvr || return 1
       ajustes_steamvr
       escribir_vrpath "$STEAMVR_WIN" 'C:\questvrbridge\driver_vrmin'
-      [ "$antes" = "steamvr" ] || openxr_activo "$STEAMVR_WIN\\steamxr_win64.json"
+      # (OpenXR de 64 y de 32 bits → SteamVR: con el de 32 todavía en el nuestro, SteamVR avisa «SteamVR isn't set as the
+      #  default OpenXR runtime». .steamxr32: los Windows que ya estaban en este modo con solo el de 64)
+      if [ "$antes" != "steamvr" ] || [ ! -f "$Q/.steamxr32" ]; then
+        openxr_activo "$STEAMVR_WIN\\steamxr_win64.json" "$STEAMVR_WIN\\steamxr_win32.json" && touch "$Q/.steamxr32"
+      fi
       echo "steamvr" > "$Q/.runtime"
       say "Runtime: SteamVR real con el driver de VRmin (experimental)" "Runtime: real SteamVR with the VRmin driver (experimental)"
       ;;

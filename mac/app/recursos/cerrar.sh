@@ -9,11 +9,12 @@ if [ -x "$WINESERVER" ]; then
   for i in $(seq 1 10); do kill -0 $K 2>/dev/null || break; sleep 0.5; done
   kill -9 $K 2>/dev/null
 fi
-# Procesos de Windows (su nombre empieza con «C:\») y los del motor (Wine)
+# Procesos de Windows (su nombre empieza con «C:\»), los del motor (Wine) y los «start.exe /exec C:\…» con que Wine
+# abre programas (pueden quedar vivos solos, y hacían parecer que Steam seguía abierto)
 quedan() {
   ps -axo pid=,command= | awk -v d="$WINEDIR" -v me=$$ '
     { pid = $1; cmd = substr($0, index($0, $2)) }
-    pid != me && (index(cmd, d) > 0 || cmd ~ /^[A-Za-z]:\\/) { print pid }'
+    pid != me && (index(cmd, d) > 0 || cmd ~ /^[A-Za-z]:\\/ || cmd ~ /^start\.exe \/exec [A-Za-z]:\\/) { print pid }'
 }
 P1=$(quedan)
 if [ -n "$P1" ]; then

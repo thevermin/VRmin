@@ -296,6 +296,9 @@ final class AppModel: ObservableObject {
     @Published var rosetta = true
     @Published var openComposite = false
     @Published var steamInstalled = false
+    /// SteamVR real (instalado en el Steam de VRmin, y abierto ahora)
+    @Published var steamVRInstalled = false
+    @Published var steamVRRunning = false
     @Published var games: [SteamGame] = []
     /// Detección y perfil de VR de cada juego (por número de Steam)
     @Published var vr: [String: VRJuego] = [:]
@@ -360,6 +363,19 @@ final class AppModel: ObservableObject {
     func writeMicFile() {
         let uid = micSource == "quest" ? "VRminMic_UID" : micSource
         try? uid.write(to: data.appendingPathComponent("microfono"), atomically: true, encoding: .utf8)
+    }
+    /// Amigos y chat de Steam (también en el visor, con SteamVR). La interfaz de Steam en Wine se dibuja sin la GPU: con
+    /// ellos usa casi un núcleo de la CPU todo el tiempo, por eso vienen apagados. abrir_steam.sh lo lee del archivo
+    /// «steam_amigos»; vale la próxima vez que se abre Steam (steamFriendsPending: Steam está abierto con lo de antes)
+    @Published var steamFriends: Bool = UserDefaults.standard.bool(forKey: "steamFriends") {
+        didSet {
+            UserDefaults.standard.set(steamFriends, forKey: "steamFriends"); writeSteamFriendsFile()
+            if steamRunning { steamFriendsPending.toggle() }
+        } }
+    @Published var steamFriendsPending = false
+    func writeSteamFriendsFile() {
+        let f = data.appendingPathComponent("steam_amigos")
+        if steamFriends { try? "1".write(to: f, atomically: true, encoding: .utf8) } else { try? FileManager.default.removeItem(at: f) }
     }
     var micDriverInstalled: Bool { FileManager.default.fileExists(atPath: "/Library/Audio/Plug-Ins/HAL/VRminMic.driver") }
     /// Instala (o quita) «VRmin Mic»: macOS pide la contraseña de administrador
@@ -453,6 +469,7 @@ final class AppModel: ObservableObject {
         }
         try? fm.createDirectory(at: data, withIntermediateDirectories: true)
         UserDefaults.standard.set(data.path, forKey: "dataDir")
+        writeSteamFriendsFile()
         if !fm.fileExists(atPath: res.appendingPathComponent("servidor.sh").path) {
             append(L("ATENCIÓN: faltan archivos dentro de la app (%@). Volvé a crearla con crear_app.sh", res.path))
         }
@@ -482,6 +499,7 @@ final class AppModel: ObservableObject {
             && !marcaMotor.isEmpty && marca.trimmingCharacters(in: .whitespacesAndNewlines) == marcaMotor   // (otra versión del motor: hay que actualizarla)
         openComposite = fm.fileExists(atPath: data.appendingPathComponent("prefijo/drive_c/questvrbridge/opencomposite/bin/vrclient_x64.dll").path)
         steamInstalled = fm.fileExists(atPath: data.appendingPathComponent("prefijo/drive_c/Program Files (x86)/Steam/steam.exe").path)
+        steamVRInstalled = fm.fileExists(atPath: steamapps.appendingPathComponent("common/SteamVR/bin/win64/vrstartup.exe").path)
 
         let mine = scanLibrary(steamapps)
         let gh = scanLibrary(fm.homeDirectoryForCurrentUser.appendingPathComponent("GameHub/steamapps"))
@@ -510,13 +528,14 @@ final class AppModel: ObservableObject {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-            p.arguments = ["-if", "steam\\.exe"]
+            p.arguments = ["-if", "^c:\\\\program files \\(x86\\)\\\\steam\\\\steam\\.exe"]   // (el steam.exe de verdad: ver steam_abierto en entorno.sh)
             p.standardOutput = FileHandle.nullDevice
             p.standardError = FileHandle.nullDevice
             var running = false
             if (try? p.run()) != nil { p.waitUntilExit(); running = p.terminationStatus == 0 }
             // Juegos abiertos ahora (por la carpeta steamapps\common\<carpeta>\ en la línea de comandos)
             var open = Set<String>()
+            var steamVR = false
             if running {
                 let ps = Process(); let pipe = Pipe()
                 ps.executableURL = URL(fileURLWithPath: "/bin/ps"); ps.arguments = ["-axo", "command="]
@@ -525,6 +544,7 @@ final class AppModel: ObservableObject {
                     let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
                     ps.waitUntilExit()
                     for line in out.split(separator: "\n") {
+                        if line.contains("vrserver.exe") { steamVR = true }
                         // (por Steam: ruta de Windows con «\»; abierto directo: ruta de la Mac con «/»)
                         for sep: Character in ["\\", "/"] {
                             guard let r = line.range(of: "steamapps\(sep)common\(sep)", options: .caseInsensitive) else { continue }
@@ -534,7 +554,10 @@ final class AppModel: ObservableObject {
                     }
                 }
             }
-            DispatchQueue.main.async { if self?.openGames != open { self?.openGames = open } }
+            DispatchQueue.main.async {
+                if self?.openGames != open { self?.openGames = open }
+                if self?.steamVRRunning != steamVR { self?.steamVRRunning = steamVR }
+            }
             // ¿Steam se trabó? Lo avisa él mismo en su registro («BMainLoop appears to have stalled»)
             var stuck = false
             let logURL = self?.data.appendingPathComponent("logs/steam.log")
@@ -553,7 +576,7 @@ final class AppModel: ObservableObject {
                 guard let self else { return }
                 if running && !self.steamRunning { self.steamSince = Date() }
                 self.steamRunning = running
-                if !running { self.steamStuck = false; self.steamSince = .distantFuture }
+                if !running { self.steamStuck = false; self.steamSince = .distantFuture; self.steamFriendsPending = false }
                 else if stuck && !self.steamStuck && Date().timeIntervalSince(self.steamSince) > 120 {
                     self.steamStuck = true
                     self.append(L("⚠︎ Steam se trabó. Tocá «Reiniciar Steam» (cierra Steam y el juego, y lo vuelve a abrir)."))
@@ -670,6 +693,20 @@ final class AppModel: ObservableObject {
         shell("'\(a)' kill-server; pkill -f '\(h)/herramienta[s]/'", timeout: 2)
         // («Resource[s]»: así el propio comando no coincide consigo mismo)
         shell("pkill -f '\(b)/Contents/Resource[s]/'; pkill -f 'qvb/server[.]py'; pkill -f 'qvb/QuestRendere[r]'; sleep 0.2; pkill -9 -f '\(b)/Contents/Resource[s]/'", timeout: 2)
+    }
+
+    /// Al salir de VRmin Host, Steam y lo que corre en el Windows de VRmin también se cierran. cerrar.sh tarda unos
+    /// segundos: sigue solo después de que la app se cierra (no se espera)
+    func closeSteamOnQuit() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = [res.appendingPathComponent("cerrar.sh").path]
+        var env = ProcessInfo.processInfo.environment
+        env["QVB_DATA"] = data.path
+        p.environment = env
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
     }
 
     private func killLeftovers() {
@@ -1017,6 +1054,17 @@ final class AppModel: ObservableObject {
             }
         }
     }
+
+    /// SteamVR real en el visor, sin juego (como al ponerse un Valve Index): su sala y su menú, con la biblioteca de Steam
+    func openSteamVR() {
+        if !serverRunning {   // (la imagen de SteamVR llega al visor por el servidor: se enciende y después se abre)
+            startServer()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in if self?.serverRunning == true { self?.openSteamVR() } }
+            return
+        }
+        run(L("Abriendo SteamVR"), "abrir_steamvr.sh", exclusive: false)   // (si Steam está cerrado, lo abre primero)
+    }
+    func closeSteamVR() { run(L("Cerrando SteamVR"), "abrir_steamvr.sh", ["--cerrar"], exclusive: false) }
 
     /// Cierra ese juego a la fuerza (si no responde): primero le pide que se cierre y, si no, lo termina
     func forceClose(_ g: SteamGame) {
@@ -1536,6 +1584,25 @@ struct ContentView: View {
                 .padding(10)
                 .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.amber.opacity(0.12)))
             }
+            if m.steamVRInstalled {   // SteamVR solo, como al ponerse un Valve Index: su sala y su menú, con la biblioteca
+                HStack(spacing: 10) {
+                    Image(systemName: "visionpro").foregroundStyle(Theme.amber)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("SteamVR").font(.system(size: 13, weight: .semibold))
+                        Text(m.steamVRRunning ? L("Abierto en el visor: su menú tiene tu biblioteca de Steam")
+                                              : L("Su sala y su menú en el visor, con tu biblioteca de Steam (experimental)"))
+                            .font(.caption).foregroundStyle(Theme.text2)
+                    }
+                    Spacer()
+                    if m.steamVRRunning {
+                        Button(L("Cerrar SteamVR")) { m.closeSteamVR() }.buttonStyle(Pill())
+                    } else {
+                        Button(L("Abrir SteamVR")) { m.openSteamVR() }.buttonStyle(Pill(primary: true))
+                    }
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.white.opacity(0.05)))
+            }
             if m.games.isEmpty {
                 HStack {
                     Image(systemName: "tray").font(.system(size: 22)).foregroundStyle(Theme.text2)
@@ -2036,6 +2103,17 @@ struct SettingsView: View {
                 Toggle(L("No dormir mientras el Quest la usa"), isOn: $m.keepAwake).toggleStyle(.switch)
                 Toggle(L("Recibir versiones beta"), isOn: $m.beta).toggleStyle(.switch)
                     .help(L("Las betas traen lo nuevo antes, pero pueden fallar. Si lo apagás, VRmin Host te ofrece volver a la versión estable."))
+                Toggle(L("Amigos y chat de Steam"), isOn: $m.steamFriends).toggleStyle(.switch)
+                Text(L("También en el visor, con SteamVR. Usan casi un núcleo de la CPU mientras Steam está abierto, así que los juegos pueden andar más lento."))
+                    .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+                if m.steamFriendsPending {
+                    HStack {
+                        Text(L("Se aplica al reiniciar Steam (si hay un juego abierto, también se cierra)."))
+                            .font(.caption).foregroundStyle(Theme.amberText).fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        Button(L("Reiniciar Steam")) { m.restartSteam() }.buttonStyle(Pill()).disabled(m.busyTask != nil)
+                    }
+                }
                 HStack {
                     Text(m.data.path).font(.caption).foregroundStyle(Theme.text2).lineLimit(1).truncationMode(.middle)
                     Spacer()
@@ -2094,6 +2172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model?.stopServer(wait: true)
         // El renderizador está dentro de esta app: si sigue vivo, macOS muestra VRmin Host «en segundo plano»
         model?.killAllHelpers()
+        model?.closeSteamOnQuit()   // (después de killAllHelpers: si no, también terminaría a cerrar.sh, que va dentro de la app)
         _exit(0)
     }
 }

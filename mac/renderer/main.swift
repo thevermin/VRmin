@@ -2323,6 +2323,8 @@ final class AudioTap {
 // opcionalmente, una pantalla con el escritorio de la Mac que se puede usar con el control.
 
 let LOBBY_NOT_GAMES: Set<String> = ["228980", "250820", "1070560", "1391110", "1628350"]
+/// SteamVR (su número de Steam): no es un juego, pero va primero en la lista para abrirlo solo (abrir_steamvr.sh)
+let STEAMVR_APPID = "250820"
 
 struct LobbyQuad { var corners: [SIMD4<Float>]; let texture: MTLTexture }
 
@@ -3343,6 +3345,10 @@ final class Lobby {
             out.append(GameEntry(id: id, name: d["name"] ?? dir, vr: vr, dir: dir))
         }
         out.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        // SteamVR primero: abierto solo es como ponerse un Valve Index (su sala y su menú, con la biblioteca de Steam)
+        if FileManager.default.fileExists(atPath: lib.appendingPathComponent("common/SteamVR/bin/win64/vrstartup.exe").path) {
+            out.insert(GameEntry(id: STEAMVR_APPID, name: "SteamVR", vr: true, dir: ""), at: 0)
+        }
         games = out
     }
 
@@ -3351,7 +3357,7 @@ final class Lobby {
     private func steamRunning() -> Bool {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        p.arguments = ["-if", "steam\\.exe"]
+        p.arguments = ["-if", "^c:\\\\program files \\(x86\\)\\\\steam\\\\steam\\.exe"]   // (el steam.exe de verdad: ver steam_abierto en entorno.sh)
         p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
         guard (try? p.run()) != nil else { return false }
         p.waitUntilExit()
@@ -3403,6 +3409,15 @@ final class Lobby {
                 var waited = 0
                 while !steamRunning() && waited < 150 { sleep(2); waited += 2 }
                 if steamRunning() { setStatus(tr("Steam abierto, esperando que termine de cargar…", "Steam is open, waiting for it to finish loading…")); sleep(25) }
+            }
+            if g.id == STEAMVR_APPID {   // SteamVR solo: queda abierto, y los juegos se abren desde su menú
+                setStatus(tr("Abriendo SteamVR…", "Opening SteamVR…"))
+                if !runScript("abrir_steamvr.sh", []) {
+                    setStatus(tr("No se pudo abrir SteamVR. Mirá el registro en la Mac.", "Couldn't open SteamVR. Check the log on the Mac."))
+                }
+                sleep(10)
+                lock.lock(); busy = false; launchingQ = nil; if status.hasPrefix("Abriendo") || status.hasPrefix("Opening") { status = "" }; lock.unlock()
+                return
             }
             setStatus(g.vr ? tr("Abriendo \(g.name)… (si Steam pregunta, elegí VR en la Mac)", "Opening \(g.name)… (if Steam asks, choose VR on the Mac)")
                            : tr("Abriendo \(g.name)… aparece como una ventana de la Mac", "Opening \(g.name)… it shows up as a Mac window"))
@@ -3844,6 +3859,7 @@ final class NativeLink {
     private let lock = NSLock()
     private var pending = 0
     private var needKey = true
+    private var keyAsked = false   // (ya se pidió el cuadro completo para cuando la cola baje)
     private let sendQueue = DispatchQueue(label: "native-send", qos: .userInteractive)
     private let shared: Shared
     private var statSent = 0, statDropped = 0, statWaitKey = 0
@@ -3877,8 +3893,11 @@ final class NativeLink {
         if t == 1 {
             let key = p.count > 5 && p[p.startIndex + 5] == 1
             if needKey && !key { statWaitKey += 1; lock.unlock(); return }
-            if pending > 4_000_000 { statDropped += 1; needKey = true; lock.unlock(); shared.requestKey(); return }
-            needKey = false
+            // (cola llena: se descarta, y el cuadro completo se pide recién cuando la cola baje, abajo. Pedido acá, con
+            //  cada cuadro descartado, la Mac hacía solo cuadros completos, los más caros, mientras nadie los recibía:
+            //  con el Quest apagado, hasta que se diera por perdida la conexión)
+            if pending > 4_000_000 { statDropped += 1; needKey = true; keyAsked = false; lock.unlock(); return }
+            needKey = false; keyAsked = false
             statSent += 1
         } else if t == 2 && pending > 1_000_000 {
             lock.unlock(); return
@@ -3902,7 +3921,11 @@ final class NativeLink {
                 }
                 return true
             }
-            lock.lock(); pending -= size; lock.unlock()
+            lock.lock(); pending -= size
+            let ask = needKey && !keyAsked && pending < 1_000_000 && fd == f
+            if ask { keyAsked = true }
+            lock.unlock()
+            if ask { shared.requestKey() }   // (se descartó video y la cola ya bajó: un cuadro completo para seguir)
             if !ok { Darwin.shutdown(f, SHUT_RDWR) }
         }
     }
@@ -4000,6 +4023,16 @@ final class NativeLink {
                 setsockopt(c, Int32(IPPROTO_TCP), TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
                 var big: Int32 = 4 << 20
                 setsockopt(c, SOL_SOCKET, SO_SNDBUF, &big, socklen_t(MemoryLayout<Int32>.size))
+                // Quest apagado o fuera de alcance: sin respuesta, macOS seguía reintentando más de medio minuto antes de
+                // dar la conexión por perdida. Ahora se corta a los 8 s sin que conteste lo enviado (TCP_RXT_CONNDROPTIME)
+                // o, sin nada que enviar, a los ~11 s (keepalive)
+                var dropAfter: Int32 = 8
+                setsockopt(c, Int32(IPPROTO_TCP), TCP_RXT_CONNDROPTIME, &dropAfter, socklen_t(MemoryLayout<Int32>.size))
+                setsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &one, socklen_t(MemoryLayout<Int32>.size))
+                var kaIdle: Int32 = 5, kaIntvl: Int32 = 2, kaCnt: Int32 = 3
+                setsockopt(c, Int32(IPPROTO_TCP), TCP_KEEPALIVE, &kaIdle, socklen_t(MemoryLayout<Int32>.size))
+                setsockopt(c, Int32(IPPROTO_TCP), TCP_KEEPINTVL, &kaIntvl, socklen_t(MemoryLayout<Int32>.size))
+                setsockopt(c, Int32(IPPROTO_TCP), TCP_KEEPCNT, &kaCnt, socklen_t(MemoryLayout<Int32>.size))
                 var ipBuf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
                 var a6 = peer.sin6_addr
                 inet_ntop(AF_INET6, &a6, &ipBuf, socklen_t(ipBuf.count))
@@ -4035,7 +4068,7 @@ final class NativeLink {
                 // Una sola app a la vez: la nueva reemplaza a la anterior
                 lock.lock()
                 if fd >= 0 { Darwin.shutdown(fd, SHUT_RDWR) }
-                fd = c; needKey = true; pending = 0
+                fd = c; needKey = true; keyAsked = false; pending = 0
                 lock.unlock()
                 print("[quest] App del Quest conectada desde \(ip)")
                 var okMsg = Data([3])
@@ -4402,6 +4435,36 @@ micTimer.setEventHandler {
     if !native.isConnected { micSent = nil }
 }
 micTimer.resume()
+
+// SteamVR abierto solo (abrir_steamvr.sh: sin el vigía de un juego, .vigia_steamvr) y sin el Quest conectado: a los
+// 5 minutos se cierra, para que no siga dibujando a 90 cuadros por segundo para nadie. VRMIN_STEAMVR_IDLE: los segundos
+let steamVRIdleLimit = Double(env["VRMIN_STEAMVR_IDLE"] ?? "") ?? 300
+var steamVRIdleSince: Date?
+let steamVRIdleTimer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "steamvr.solo", qos: .utility))
+steamVRIdleTimer.schedule(deadline: .now() + 15, repeating: 15)
+steamVRIdleTimer.setEventHandler {
+    let data = env["QVB_DATA"] ?? ""
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep"); p.arguments = ["-f", "vrserver\\.exe"]
+    p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+    var open = false
+    if (try? p.run()) != nil { p.waitUntilExit(); open = p.terminationStatus == 0 }
+    let solo = open && !data.isEmpty && !FileManager.default.fileExists(atPath: data + "/prefijo/drive_c/questvrbridge/.vigia_steamvr")
+    if !solo || native.isConnected { steamVRIdleSince = nil; return }
+    if steamVRIdleSince == nil {
+        steamVRIdleSince = Date()
+        print("[steamvr] SteamVR abierto sin el Quest: se cierra en \(Int(steamVRIdleLimit / 60)) minutos si no se conecta")
+    }
+    if let s = steamVRIdleSince, Date().timeIntervalSince(s) >= steamVRIdleLimit {
+        steamVRIdleSince = nil
+        print("[steamvr] Sin el Quest conectado: cerrando SteamVR")
+        let c = Process()
+        c.executableURL = URL(fileURLWithPath: "/bin/bash")
+        c.arguments = [URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("abrir_steamvr.sh").path, "--cerrar"]
+        if (try? c.run()) != nil { c.waitUntilExit() }
+    }
+}
+steamVRIdleTimer.resume()
 
 let t0 = DispatchTime.now().uptimeNanoseconds
 let timer = DispatchSource.makeTimerSource(flags: .strict, queue: renderQueue)
