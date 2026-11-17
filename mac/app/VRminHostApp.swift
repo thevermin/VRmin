@@ -10,6 +10,7 @@ import SwiftUI
 import AppKit
 import ServiceManagement
 import CoreAudio
+import CoreWLAN
 
 // MARK: - Juegos
 struct SteamGame: Identifiable, Hashable {
@@ -1065,6 +1066,24 @@ final class AppModel: ObservableObject {
     }
 
     /// «Algo anda mal»: un .zip en el Escritorio con los registros (también se pide desde el Quest)
+    /// Revisa el Wi-Fi de la Mac (banda, señal, velocidad) y dice qué conviene cambiar para jugar sin cortes
+    @Published var wifiNote: String? = nil
+    func checkWiFi() {
+        guard let i = CWWiFiClient.shared().interface(), i.powerOn(), let ch = i.wlanChannel() else {
+            wifiNote = L("La Mac no está usando Wi-Fi. Si está conectada por cable al router, es lo mejor para jugar.")
+            return
+        }
+        let banda = ch.channelBand.rawValue == 1 ? L("2,4 GHz") : ch.channelBand.rawValue == 3 ? "6 GHz" : "5 GHz"
+        let rssi = i.rssiValue(), mbps = Int(i.transmitRate())
+        var r = [L("Wi-Fi de la Mac: %@, señal %d dBm, %d Mbps.", banda, rssi, mbps)]
+        if ch.channelBand.rawValue == 1 { r.append(L("2,4 GHz es lento y con interferencias: conectá la Mac y el Quest a la red de 5 GHz de tu router.")) }
+        if rssi < -67 { r.append(L("La señal es débil: acercá la Mac al router, o conectala por cable.")) }
+        else if mbps > 0 && mbps < 300 { r.append(L("La velocidad es baja: acercá la Mac al router, o conectala por cable.")) }
+        if r.count == 1 { r.append(L("Está bien para jugar. El Quest también tiene que estar en el mismo router, en 5 GHz.")) }
+        r.append(L("Lo mejor: la Mac por cable al router y el Quest por Wi-Fi 5 GHz, en la misma habitación que el router."))
+        wifiNote = r.joined(separator: "\n")
+    }
+
     func report() {
         let f = data.appendingPathComponent("logs/vrmin_host.log")
         try? (log.joined(separator: "\n") + "\n").write(to: f, atomically: true, encoding: .utf8)
@@ -2209,6 +2228,14 @@ struct SettingsView: View {
                         Spacer()
                         Button(L("Reiniciar Steam")) { m.restartSteam() }.buttonStyle(Pill()).disabled(m.busyTask != nil)
                     }
+                }
+                HStack {
+                    Text(L("Conexión para jugar")).font(.callout)
+                    Spacer()
+                    Button(L("Revisar Wi-Fi")) { m.checkWiFi() }.buttonStyle(Pill())
+                }
+                if let w = m.wifiNote {
+                    Text(w).font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
                 }
                 HStack {
                     Text(m.data.path).font(.caption).foregroundStyle(Theme.text2).lineLimit(1).truncationMode(.middle)
