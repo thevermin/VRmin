@@ -6,16 +6,17 @@ jobs:
   kk:
     runs-on: macos-26
     steps:
+      - uses: actions/checkout@v4
+        with: { path: vrmin }
       - name: Herramientas
         run: |
-          sw_vers; xcodebuild -version; xcrun --show-sdk-version
-          brew install meson ninja pkg-config llvm libclc spirv-llvm-translator spirv-tools bison flex >/dev/null
+          brew install meson ninja pkg-config llvm libclc spirv-llvm-translator spirv-tools bison flex mingw-w64 zstd >/dev/null
           python3 -m venv venv && venv/bin/pip -q install mako packaging pyyaml meson
       - name: Mesa
         run: |
           t=$(git ls-remote --tags https://gitlab.freedesktop.org/mesa/mesa.git 'mesa-26.*' | grep -v '\^{}' | grep -v -- '-rc' | awk -F/ '{print $3}' | sort -V | tail -1)
           echo "tag: $t"; git clone -q --depth 1 -b "$t" https://gitlab.freedesktop.org/mesa/mesa.git mesa
-      - name: Nativo (arm64, y las herramientas de compilación)
+      - name: Nativo (las herramientas de compilación)
         working-directory: mesa
         run: |
           export PATH="$PWD/../venv/bin:$(brew --prefix llvm)/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
@@ -23,31 +24,43 @@ jobs:
             -Dgallium-drivers= -Dopengl=false -Dzstd=disabled -Dmesa-clc=enabled -Dinstall-mesa-clc=true \
             -Dprecomp-compiler=enabled -Dinstall-precomp-compiler=true > ../nat.log 2>&1 || { tail -40 ../nat.log; exit 1; }
           ninja -C nat install > ../natb.log 2>&1 || { grep -B2 -A8 "error" ../natb.log | head -60; exit 1; }
-          ls ../nat/bin ../nat/lib
-      - name: x86_64 (para el Wine de Rosetta)
+      - name: KosmicKrisp x86_64
         working-directory: mesa
         run: |
           export PATH="$PWD/../nat/bin:$PWD/../venv/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
-          cat > x86.txt <<'X'
-          [binaries]
-          c = ['clang', '-arch', 'x86_64']
-          cpp = ['clang++', '-arch', 'x86_64']
-          objc = ['clang', '-arch', 'x86_64']
-          objcpp = ['clang++', '-arch', 'x86_64']
-          ar = 'ar'
-          strip = 'strip'
-          pkg-config = 'false'
-          [host_machine]
-          system = 'darwin'
-          cpu_family = 'x86_64'
-          cpu = 'x86_64'
-          endian = 'little'
-          X
+          printf "%s\n" "[binaries]" "c = ['clang', '-arch', 'x86_64']" "cpp = ['clang++', '-arch', 'x86_64']" \
+            "objc = ['clang', '-arch', 'x86_64']" "objcpp = ['clang++', '-arch', 'x86_64']" "ar = 'ar'" "strip = 'strip'" \
+            "pkg-config = 'false'" "[host_machine]" "system = 'darwin'" "cpu_family = 'x86_64'" "cpu = 'x86_64'" "endian = 'little'" > x86.txt
           meson setup x86 --cross-file x86.txt --prefix="$PWD/../x86" -Dbuildtype=release -Dplatforms=macos \
             -Dvulkan-drivers=kosmickrisp -Dgallium-drivers= -Dopengl=false -Dzstd=disabled -Dmesa-clc=system \
             -Dprecomp-compiler=system -Dllvm=disabled -Dexpat=disabled > ../x86.log 2>&1 || { tail -60 ../x86.log; exit 1; }
           ninja -C x86 install > ../x86b.log 2>&1 || { grep -B2 -A10 "error" ../x86b.log | head -80; exit 1; }
-          find ../x86 -name '*.dylib' -exec lipo -info {} \; ; find ../x86 -name '*.json' -exec cat {} \;
-          otool -L ../x86/lib/libvulkan_kosmickrisp.dylib
+          echo "mesa $(git describe --tags 2>/dev/null || git rev-parse --short HEAD)" > ../kk-version
+      - name: Cargador de Vulkan y vulkaninfo (Vulkan SDK de LunarG, universales)
+        run: |
+          curl -sSL -o sdk.zip "https://sdk.lunarg.com/sdk/download/latest/mac/vulkan-sdk.zip" && unzip -q sdk.zip -d sdk
+          app=$(find sdk -maxdepth 2 -name '*.app' | head -1)
+          "$app/Contents/MacOS/$(basename "$app" .app)" --root "$PWD/vk" --accept-licenses --default-answer --confirm-command install >/dev/null 2>&1 || true
+      - name: vkd3d-proton
+        run: |
+          u=$(curl -sSL https://api.github.com/repos/HansKristian-Work/vkd3d-proton/releases/latest | grep -o 'https://[^"]*\.tar\.zst' | head -1)
+          echo "$u"; curl -sSL -o v.tar.zst "$u" && mkdir v && tar --zstd -xf v.tar.zst -C v --strip-components 1
+          ls v v/x64
+      - name: Empaquetar
+        run: |
+          o=dx12-prueba; mkdir -p $o/kk $o/vk $o/vkd3d-proton
+          cp x86/lib/libvulkan_kosmickrisp.dylib $o/kk/
+          install_name_tool -id @loader_path/libvulkan_kosmickrisp.dylib $o/kk/libvulkan_kosmickrisp.dylib
+          printf '{"file_format_version":"1.0.1","ICD":{"library_path":"./libvulkan_kosmickrisp.dylib","api_version":"1.4.0"}}\n' > $o/kk/kosmickrisp_icd.json
+          L=$(ls vk/macOS/lib/libvulkan.1.*.dylib | head -1)
+          lipo "$L" -thin x86_64 -output $o/vk/libvulkan.1.dylib
+          cp $o/vk/libvulkan.1.dylib $o/vk/libMoltenVK.dylib    # (Wine abre «libMoltenVK.dylib»: acá es el cargador)
+          lipo vk/macOS/bin/vulkaninfo -thin x86_64 -output $o/vk/vulkaninfo 2>/dev/null || cp vk/macOS/bin/vulkaninfo $o/vk/
+          install_name_tool -add_rpath @loader_path $o/vk/vulkaninfo 2>/dev/null || true
+          cp v/x64/d3d12.dll v/x64/d3d12core.dll $o/vkd3d-proton/
+          x86_64-w64-mingw32-gcc -O2 -Wall -o $o/prueba_d3d12.exe vrmin/mac/dx12/prueba_d3d12.c -ld3d12 -ldxgi -luuid -lm
+          cp vrmin/mac/dx12/probar.sh $o/ && cp kk-version $o/
+          find $o -name '*.dylib' -o -name vulkaninfo | xargs -I{} sh -c 'lipo -info "{}"; codesign --force --sign - "{}"'
+          tar -czf dx12-prueba.tar.gz $o && ls -la dx12-prueba.tar.gz
       - uses: actions/upload-artifact@v4
-        with: { name: kosmickrisp-x86_64, path: x86, retention-days: 7 }
+        with: { name: dx12-prueba, path: dx12-prueba.tar.gz, retention-days: 14 }
