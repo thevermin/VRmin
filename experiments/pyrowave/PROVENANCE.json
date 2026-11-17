@@ -1,0 +1,11 @@
+{
+  "metal_upstream": "https://github.com/Themaister/pyrowave",
+  "metal_commit": "79a3232a2199281f33f7a2e2659fc4fac62b022a",
+  "vulkan_upstream_commit": "d2997ac172bdc00e29c58e3f2938acb7e94580bf",
+  "Granite_commit": "842d9d5686ba8c799a7d34a78a68f98d6aeb5a68",
+  "cdf53_prior_art": "https://github.com/JMS1717/Quest3-Pyrowave",
+  "license": "MIT",
+  "scope": "Modified Metal source and Vulkan backend diffs; original client binary adapters are excluded.",
+  "vulkan_patch_base": "d2997ac172bdc00e29c58e3f2938acb7e94580bf",
+  "vulkan_patch_scope": "Cumulative open-source codec/backend changes only; excludes consumer ABI shims and binary hooks. Required generated shader headers are in patches/vulkan-generated-shaders.patch."
+}

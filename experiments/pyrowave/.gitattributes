@@ -1,0 +1,5 @@
+# Preserve the exact upstream and generated shader and patch text.
+patches/*.patch -whitespace
+patches/vulkan-generated-shaders.patch linguist-generated=true
+metal/shaders/*.metal whitespace=-trailing-space
+metal/shaders/*_msl.h whitespace=-trailing-space linguist-generated=true
