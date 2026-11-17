@@ -63,6 +63,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
     static native void nativeSetLaserNoTouch(boolean on);
     static native void nativeSetPortal(boolean on);
     static native void nativeSetImage(float b, float c, float s, float sharp, float warm);
+    static native void nativeSetSgsr(boolean on);
     static native void nativeSetHud(int id);
     static native void nativeSizePanel(int id, float factor);
     static native String nativeStats();
@@ -760,6 +761,7 @@ public class VrActivity extends NativeActivity implements MenuUi.Host {
     @Override public void setFrameGen(int mode) { nativeSetFrameGen(mode); }
     @Override public void setLight(float g) { nativeSetLight(g); }
     @Override public void setImage(float b, float c, float s, float sharp, float warm) { nativeSetImage(b, c, s, sharp, warm); }
+    @Override public void setSgsr(boolean on) { nativeSetSgsr(on); }
     @Override public boolean isWindowOpen(int id) { return panels.containsKey(id); }
     private int env = 0;
 

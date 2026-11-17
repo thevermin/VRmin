@@ -294,6 +294,8 @@ final class I18nEn {
         m.put("IA: la Mac calcula la profundidad de cada imagen (también juegos planos)", "AI: your Mac estimates the depth of every frame (flat games too)");
         m.put("IA\nAutomático", "AI\nAutomatic");
         m.put("Imagen", "Image");
+        m.put("SGSR para juegos VR", "SGSR for VR games");
+        m.put("Mejora la imagen al ampliarla en el visor. Requiere desactivar la codificación foveada.", "Upscales VR game video on the headset. Requires foveated encoding to be off.");
         m.put("Indicador de rendimiento", "Performance overlay");
         m.put("Intensidad  ", "Strength  ");
         m.put("Intensidad del 3D", "3D strength");

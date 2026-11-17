@@ -15,6 +15,7 @@ Host downloads them from their official releases when you install the engine.
 | [BlackHole](https://github.com/ExistentialAudio/BlackHole) (Existential Audio) | GPL 3 | Included, compiled as the “VRmin Mic” virtual microphone (source in `mac/mic`) |
 | steamwebhelper wrapper, from [play-windows-steam-on-mac](https://github.com/ramiabih/play-windows-steam-on-mac) | MIT | Included (steam/steamwebhelper.exe) |
 | [OpenXR SDK](https://github.com/KhronosGroup/OpenXR-SDK) (headers and loader) | Apache 2.0 | Included in the Quest app and the runtime |
+| [Snapdragon Game Super Resolution 1](https://github.com/SnapdragonGameStudios/snapdragon-gsr/tree/d926f074bcb9d714e179f1ce0fcb9ee2eeb5074e/sgsr/v1) | BSD 3-Clause | Adapted GLSL filter in the Quest app (`assets/licenses/snapdragon-gsr.txt` in the APK) |
 
 ## MIT (play-windows-steam-on-mac)
 
