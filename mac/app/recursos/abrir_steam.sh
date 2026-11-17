@@ -33,6 +33,9 @@ fi
 # agrega --disable-gpu --single-process (de ramiabih/play-windows-steam-on-mac, MIT). El original queda como
 # steamwebhelper_real.exe. Se revisa cada vez porque las actualizaciones de Steam lo reemplazan.
 W="$RES/steam/steamwebhelper.exe"
+# (prueba: con el archivo «.steam_gpu» en la carpeta de datos, la interfaz de Steam se dibuja con la GPU: el
+#  intermediario sin --disable-gpu y Steam sin -cef-disable-gpu)
+GPU=0; [ -f "$P/.steam_gpu" ] && GPU=1 && W="$RES/steam/steamwebhelper-gpu.exe"
 for d in "$STEAMDIR/bin/cef/"cef.win*; do
   [ -f "$d/steamwebhelper.exe" ] || continue
   cmp -s "$W" "$d/steamwebhelper.exe" && continue
@@ -49,7 +52,8 @@ EXTRA=""; [ -f "$P/steam_amigos" ] || EXTRA="-nofriendsui -nochatui"
 # queda negra otra vez. -cef-single-process: el navegador de Steam en un solo proceso (igual que el arreglo).
 EXTRA="$EXTRA -noverifyfiles -cef-single-process"
 ajustes_dll
-"$WINE" "C:\\Program Files (x86)\\Steam\\steam.exe" -cef-disable-gpu -cef-disable-gpu-compositing -no-cef-sandbox $EXTRA \
+[ $GPU = 1 ] || EXTRA="-cef-disable-gpu -cef-disable-gpu-compositing $EXTRA"
+"$WINE" "C:\\Program Files (x86)\\Steam\\steam.exe" -no-cef-sandbox $EXTRA \
   > "$P/logs/steam.log" 2>&1 < /dev/null &
 disown
 sleep 2

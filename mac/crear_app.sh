@@ -47,7 +47,7 @@ xcrun clang -bundle -arch x86_64 -arch arm64 -mmacosx-version-min=$MIN_MACOS -O2
 cp mic/Info.plist "$D/Info.plist"
 cp app/recursos/*.sh app/recursos/*.py app/recursos/*.json "$R/"
 cp app/recursos/LICENCIAS_DE_TERCEROS.md "$R/"
-mkdir -p "$R/steam" && cp app/recursos/steam/steamwebhelper.exe "$R/steam/"
+mkdir -p "$R/steam" && cp app/recursos/steam/steamwebhelper.exe app/recursos/steam/steamwebhelper-gpu.exe "$R/steam/"
 cp server.py "$R/"
 cp web/index.html "$R/web/"
 cp openxr/questvrbridge_openxr.dll openxr/questvrbridge_openxr.json "$R/openxr/"
