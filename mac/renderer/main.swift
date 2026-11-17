@@ -624,8 +624,10 @@ final class Encoder {
     @discardableResult
     private func makeSession(lowLatency ll: Bool) -> Bool {
         let lowLatency = [kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String: true] as CFDictionary
-        // HEVC primero (si se eligió); si la Mac no puede, H.264
-        for hevc in (CODEC_HEVC ? [true, false] : [false]) {
+        // HEVC primero (si se eligió); si la Mac no puede, H.264. Si VideoToolbox elige la CPU (pasa con imágenes
+        // muy grandes: en H.264, más de 4096 de ancho), primero se prueba el otro códec por hardware; la CPU, al final
+        var cpu: (VTCompressionSession, Bool, Bool)? = nil
+        search: for hevc in (CODEC_HEVC ? [true, false] : [false, true]) {
             for spec in (ll ? [lowLatency, nil] : [nil]) as [CFDictionary?] {
                 var s: VTCompressionSession?
                 let st = VTCompressionSessionCreate(
@@ -633,14 +635,27 @@ final class Encoder {
                     codecType: hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264, encoderSpecification: spec,
                     imageBufferAttributes: nil, compressedDataAllocator: nil,
                     outputCallback: nil, refcon: nil, compressionSessionOut: &s)
-                if st == noErr, let s = s {
-                    session = s
-                    CODEC_HEVC = hevc
-                    print("Codificador: \(hevc ? "HEVC" : "H.264") por hardware" + (spec != nil ? ", modo baja latencia" : " (sin modo baja latencia)"))
-                    break
+                guard st == noErr, let s = s else { continue }
+                var v: Unmanaged<CFTypeRef>?
+                let hw = VTSessionCopyProperty(s, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                                               allocator: nil, valueOut: &v) == noErr ? (v?.takeRetainedValue() as? Bool) : nil
+                if hw == false {   // (sin dato, como en el modo baja latencia: es el de hardware)
+                    if cpu == nil { cpu = (s, hevc, spec != nil) } else { VTCompressionSessionInvalidate(s) }
+                    continue
                 }
+                if !CODEC_HEVC && hevc { print("Codificador: H.264 no puede por hardware a \(W)x\(H); uso HEVC") }
+                session = s
+                CODEC_HEVC = hevc
+                print("Codificador: \(hevc ? "HEVC" : "H.264") por hardware" + (spec != nil ? ", modo baja latencia" : " (sin modo baja latencia)"))
+                break search
             }
-            if session != nil { break }
+        }
+        if let (s, hevc, lowLat) = cpu {
+            if session == nil {
+                session = s
+                CODEC_HEVC = hevc
+                print("Codificador: \(hevc ? "HEVC" : "H.264") por CPU a \(W)x\(H), más lento: bajá la calidad" + (lowLat ? ", modo baja latencia" : ""))
+            } else { VTCompressionSessionInvalidate(s) }
         }
         if session == nil { return false }
 
