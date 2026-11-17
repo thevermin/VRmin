@@ -25,5 +25,8 @@ grep -q 'VIRGL: TODO BIEN' gpu-mac.txt || r=1
 GPU=(--sysroot gpu-root --env LD_PRELOAD=/usr/lib/burrow/libburrow_drm.so --env VN_DEBUG=init)
 corre vulkaninfo "" $E "${GPU[@]}" gpu-root/usr/bin/vulkaninfo --summary
 grep -q 'Venus' vulkaninfo.txt && echo "(the Linux program sees the Mac's GPU)" || r=1
+# Drawing with it: a triangle in an image, read back (triangulo.ppm)
+corre triangulo "" $E "${GPU[@]}" gpu-root/usr/bin/triangulo
+grep -q 'TRIANGULO: TODO BIEN' triangulo.txt || r=1
 echo
 [ $r = 0 ] && echo "BURROW: TODO BIEN" || echo "BURROW: ALGO FALLÓ"

@@ -29,6 +29,15 @@ jobs:
           out/root/hilos | tee out/hilos.esperado
       - name: GPU test system (Mesa Venus, vulkaninfo, vkcube)
         run: bash burrow/gpu/sysroot-linux.sh "$PWD/out/gpu-root"
+      - name: Drawing test (a triangle with Vulkan, checked here on Mesa's CPU driver)
+        run: |
+          set -e
+          sudo apt-get install -y -qq glslang-tools libvulkan-dev > /dev/null
+          t=burrow/tests
+          glslangValidator -V --vn triangulo_vert -o "$RUNNER_TEMP/triangulo_vert.h" $t/triangulo.vert
+          glslangValidator -V --vn triangulo_frag -o "$RUNNER_TEMP/triangulo_frag.h" $t/triangulo.frag
+          gcc -O2 -Wall -I"$RUNNER_TEMP" -o out/gpu-root/usr/bin/triangulo $t/triangulo.c -lvulkan
+          (cd "$RUNNER_TEMP" && VK_ICD_FILENAMES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1) "$GITHUB_WORKSPACE/out/gpu-root/usr/bin/triangulo")
       - uses: actions/upload-artifact@v4
         with: { name: burrow-tests, path: out, retention-days: 30 }
   mac:
