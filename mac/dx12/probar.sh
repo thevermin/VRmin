@@ -23,6 +23,8 @@ mkdir -p "$D/run"
 cp "$D/prueba_d3d12.exe" "$D/run/"
 cp "$WINEDIR/lib/wine/x86_64-windows/dxgi.dll.wine-original" "$D/run/dxgi.dll" 2>/dev/null \
   || echo "(no encontré dxgi.dll.wine-original)" >> "$OUT"
+# (sin la marca de «Wine builtin DLL»: si no, Wine busca la incorporada, que es la de DXMT, y no la carga)
+/usr/bin/python3 -c "import sys; p=sys.argv[1]; d=open(p,'rb').read(); open(p,'wb').write(d.replace(b'Wine builtin DLL', bytes(16)))" "$D/run/dxgi.dll"
 
 prueba() {   # nombre, vulkan (moltenvk/kk), d3d12 (wine/proton)
   echo "== $1" | tee -a "$OUT"
