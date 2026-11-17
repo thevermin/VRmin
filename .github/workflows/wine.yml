@@ -84,8 +84,10 @@ jobs:
         run: |
           mkdir -p out/bin out/lib/wine/x86_64-unix
           cp wine/server/wineserver out/bin/ && cp wine/dlls/ntdll/ntdll.so out/lib/wine/x86_64-unix/
-          # (rpath de wineserver como el de Gcenx: busca libinotify en ../lib)
+          # (libinotify como en la de Gcenx: @rpath/libinotify.0.dylib, buscada en ../lib)
+          install_name_tool -change libinotify.dylib @rpath/libinotify.0.dylib out/bin/wineserver
           otool -l out/bin/wineserver | grep -q "@loader_path/../lib" || install_name_tool -add_rpath @loader_path/../lib out/bin/wineserver
+          otool -L out/bin/wineserver | grep -q "@rpath/libinotify.0.dylib" || { echo "wineserver sin libinotify"; exit 1; }
           codesign --force --sign - out/bin/wineserver out/lib/wine/x86_64-unix/ntdll.so
           echo "wine $WINE_VERSION + msync ($(cd vrmin && git rev-parse --short HEAD))" > out/version
           tar -czf wine-msync-vrmin.tar.gz -C out .
