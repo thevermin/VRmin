@@ -1909,7 +1909,7 @@ struct App {
     GLuint lineProg = 0, lineVao = 0, lineVbo = 0;
     GLint uVP = -1, uCol = -1, uRound = -1;
     GLint uSx = -1, uSy = -1, uKeepA = -1;
-    GLint uFilt = -1, uRect = -1, uAdj = -1, uWarm = -1, uTexel = -1;
+    GLint uFilt = -1, uRect = -1, uAdj = -1, uWarm = -1, uTexel = -1, uStereo = -1;
     GLint u3Mode = -1;
     XrSpace viewSpace = XR_NULL_HANDLE;   // pegado a la cabeza (indicador de rendimiento)
     double sticksSince = 0;
@@ -2040,7 +2040,8 @@ uniform float filt;
 uniform vec4 rect;
 uniform vec4 adj;      // brillo, contraste, saturación, nitidez
 uniform float warm;    // calidez (-1 fría … +1 cálida)
-uniform vec2 texel;
+uniform highp vec2 texel;
+uniform bool stereo;
 uniform highp sampler2D flow;   // completar cuadros: movimiento de cada zona (píxeles chicos por cuadro, y hacia arriba)
 uniform vec2 flowK;             // x: activado, y: cuánto adelantar (fracción de cuadro / tamaño chico)
 uniform highp sampler2D fovLut; // foveated encoding: de la imagen del juego a la codificada (fila 0/1: x de cada ojo, 2: y)
@@ -2054,17 +2055,25 @@ highp float fl(highp float s, int row) {
     highp float t = f - float(i);
     return mix(texelFetch(fovLut, ivec2(i, row), 0).r, texelFetch(fovLut, ivec2(i + 1, row), 0).r, t);
 }
+vec4 videoSample(highp vec2 tc) {
+    if (stereo) {
+        // The two eyes share a texture; keep bilinear taps inside this eye.
+        highp float halfTexel = 0.5 * texel.x;
+        tc.x = clamp(tc.x, off + halfTexel, off + sx - halfTexel);
+    }
+    return texture(tex, tc);
+}
 void main() {
     highp vec2 u2 = uv;
     if (fovOn > 0.5) u2 = vec2(fl(uv.x, int(fovRow)), fl(uv.y, 2));
     if (flowK.x > 0.5) { vec2 m = texture(flow, u2).xy; u2 = clamp(u2 - vec2(m.x, -m.y) * flowK.y, 0.0, 1.0); }
-    vec2 tc = vec2(off + u2.x * sx, u2.y * sy);
-    vec4 t4 = texture(tex, tc);
+    highp vec2 tc = vec2(off + u2.x * sx, u2.y * sy);
+    vec4 t4 = videoSample(tc);
     vec3 c = t4.rgb;
     if (filt > 0.5 && uv.x >= rect.x && uv.x <= rect.z && uv.y >= rect.y && uv.y <= rect.w) {
         if (adj.w > 0.0) {
-            vec3 b = (texture(tex, tc + vec2(texel.x, 0.0)).rgb + texture(tex, tc - vec2(texel.x, 0.0)).rgb
-                    + texture(tex, tc + vec2(0.0, texel.y)).rgb + texture(tex, tc - vec2(0.0, texel.y)).rgb) * 0.25;
+            vec3 b = (videoSample(tc + vec2(texel.x, 0.0)).rgb + videoSample(tc - vec2(texel.x, 0.0)).rgb
+                    + videoSample(tc + vec2(0.0, texel.y)).rgb + videoSample(tc - vec2(0.0, texel.y)).rgb) * 0.25;
             c += (c - b) * adj.w;
         }
         c = (c - 0.5) * adj.y + 0.5;
@@ -2092,6 +2101,7 @@ void main() {
     app.uAdj = glGetUniformLocation(app.prog, "adj");
     app.uWarm = glGetUniformLocation(app.prog, "warm");
     app.uTexel = glGetUniformLocation(app.prog, "texel");
+    app.uStereo = glGetUniformLocation(app.prog, "stereo");
     app.uFlow = glGetUniformLocation(app.prog, "flow");
     app.uFlowK = glGetUniformLocation(app.prog, "flowK");
     app.uFovLut = glGetUniformLocation(app.prog, "fovLut"); app.uFovOn = glGetUniformLocation(app.prog, "fovOn"); app.uFovRow = glGetUniformLocation(app.prog, "fovRow");
@@ -8725,6 +8735,7 @@ static void renderFrame(App &app) {
             glUniform1f(app.uSrgb, app.srgb ? 1.0f : 0.0f);
             glUniform1f(app.uKeepA, 0.0f);
             { const float full[4] = {0, 0, 1, 1}; setFilter(app, true, full, 1.f / std::max(1, g_vw), 1.f / std::max(1, g_vh)); }
+            glUniform1i(app.uStereo, g_vw >= 2 ? 1 : 0);
             // Completar cuadros: adelantar la imagen según cómo se viene moviendo, hasta que llegue el próximo cuadro
             if (fgFill && g_fg.havePrev) {
                 float k = (float)std::min(1.0, std::max(0.0, (nowMs() - g_fg.lastArrival) / std::max(4.0, g_fg.interval)));
@@ -8762,6 +8773,7 @@ static void renderFrame(App &app) {
             }
             glBindVertexArray(app.vao);
             glDrawArrays(GL_TRIANGLES, 0, 3);
+            glUniform1i(app.uStereo, 0);
             glUniform2f(app.uFlowK, 0.f, 0.f);
             glUniform1f(app.uFovOn, 0.f);
         } else if (app.anchor && g_env == 3 && app.hasPassthrough) {
