@@ -29,13 +29,10 @@ if steam_abierto; then
   say "Steam se actualizó y su ventana no se ve: reiniciándolo con el arreglo…" "Steam updated itself and its window can't show: restarting it with the fix…"
   bash "$RES/cerrar.sh" > /dev/null
 fi
-# Ventana negra de Steam en Wine 11: delante de su navegador (steamwebhelper.exe) va un intermediario que le
-# agrega --disable-gpu --single-process (de ramiabih/play-windows-steam-on-mac, MIT). El original queda como
-# steamwebhelper_real.exe. Se revisa cada vez porque las actualizaciones de Steam lo reemplazan.
+# Delante del navegador de Steam (steamwebhelper.exe) va un intermediario que le agrega --single-process (de
+# ramiabih/play-windows-steam-on-mac, MIT; sin su --disable-gpu: la interfaz de Steam se dibuja con la GPU). El
+# original queda como steamwebhelper_real.exe. Se revisa cada vez porque las actualizaciones de Steam lo reemplazan.
 W="$RES/steam/steamwebhelper.exe"
-# (prueba: con el archivo «.steam_gpu» en la carpeta de datos, la interfaz de Steam se dibuja con la GPU: el
-#  intermediario sin --disable-gpu y Steam sin -cef-disable-gpu)
-GPU=0; [ -f "$P/.steam_gpu" ] && GPU=1 && W="$RES/steam/steamwebhelper-gpu.exe"
 for d in "$STEAMDIR/bin/cef/"cef.win*; do
   [ -f "$d/steamwebhelper.exe" ] || continue
   cmp -s "$W" "$d/steamwebhelper.exe" && continue
@@ -45,14 +42,13 @@ done
 say "Abriendo Steam (tarda ~1 minuto en aparecer; la primera vez se actualiza y pide iniciar sesión)" "Opening Steam (takes ~1 minute to appear; the first time it updates and asks you to sign in)"
 # Ojo: sin "nohup" ni "env": son programas protegidos de macOS y borran DYLD_FALLBACK_LIBRARY_PATH,
 # que Wine necesita para encontrar sus bibliotecas.
-# Menos carga para Steam (su interfaz es un navegador que en Wine dibuja sin GPU): sin amigos ni chat, salvo que se
+# Menos carga para Steam (su interfaz es un navegador): sin amigos ni chat, salvo que se
 # pidan en VRmin Host › Ajustes (archivo «steam_amigos»: con ellos, Steam usa casi un núcleo de la CPU todo el tiempo)
 EXTRA=""; [ -f "$P/steam_amigos" ] || EXTRA="-nofriendsui -nochatui"
 # -noverifyfiles: si Steam verifica sus archivos al arrancar, vuelve a poner su steamwebhelper.exe y la ventana
 # queda negra otra vez. -cef-single-process: el navegador de Steam en un solo proceso (igual que el arreglo).
 EXTRA="$EXTRA -noverifyfiles -cef-single-process"
 ajustes_dll
-[ $GPU = 1 ] || EXTRA="-cef-disable-gpu -cef-disable-gpu-compositing $EXTRA"
 "$WINE" "C:\\Program Files (x86)\\Steam\\steam.exe" -no-cef-sandbox $EXTRA \
   > "$P/logs/steam.log" 2>&1 < /dev/null &
 disown

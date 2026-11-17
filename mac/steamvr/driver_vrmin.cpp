@@ -11,6 +11,7 @@
 #include <openvr_driver.h>
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_3.h>
 #include <d3dcompiler.h>
 #include <dxgi.h>
 
@@ -415,6 +416,8 @@ class FrameSender {
   std::mutex lock;
   ID3D11Device *dev = nullptr;
   ID3D11DeviceContext *ctx = nullptr;
+  ID3D11DeviceContext3 *ctx3 = nullptr;   // (Flush1 with an event: set when the GPU finished the copy)
+  HANDLE copied = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   bool failed = false;   // (no D3D11 or no shared textures: frames aren't sent)
   // image connection
   SOCKET fs = INVALID_SOCKET;
@@ -529,6 +532,7 @@ private:
   bool init_device() {
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx);
     if (FAILED(hr)) { logf("Frames: no D3D11 device (%lx)", (unsigned long)hr); return false; }
+    if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext3), (void **)&ctx3))) ctx3 = nullptr;
     HMODULE gdi = LoadLibraryA("gdi32.dll");
     kmt_fn kOpenAd = (kmt_fn)GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid"), kCreate = (kmt_fn)GetProcAddress(gdi, "D3DKMTCreateDevice");
     kQuery = (kmt_fn)GetProcAddress(gdi, "D3DKMTQueryResourceInfo");
@@ -785,7 +789,8 @@ public:
     }
     draw_overlays(tex[slot], sd.Width / 2, sd.Height, over);
     ctx->End(query[slot]);
-    ctx->Flush();
+    if (ctx3 && copied) { ResetEvent(copied); ctx3->Flush1(D3D11_CONTEXT_TYPE_ALL, copied); }
+    else ctx->Flush();
     pending = slot;
     pendingPose = pose;
     pendingW = sd.Width / 2;
@@ -796,9 +801,11 @@ public:
   void finish() {
     if (pending < 0 || fs == INVALID_SOCKET) return;
     BOOL done = FALSE;
-    for (double until = now_s() + 0.02; ctx->GetData(query[pending], &done, sizeof done, 0) != S_OK;) {
+    // (waits for the event instead of asking the GPU in a loop, which kept a CPU core busy in vrserver)
+    if (ctx3 && copied) WaitForSingleObject(copied, 20);
+    for (double until = now_s() + 0.02; ctx->GetData(query[pending], &done, sizeof done, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK;) {
       if (now_s() > until) return;   // (checked again with the next frame)
-      Sleep(0);
+      Sleep(1);
     }
     int slot = pending;
     pending = -1;
