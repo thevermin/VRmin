@@ -3,7 +3,26 @@ on:
   push:
     branches: [explorar-dx12]
 jobs:
+  vkd3d:
+    # vkd3d-proton con mac/dx12/vkd3d-proton.patch (lo que le falta a KosmicKrisp, como aviso y no como error)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: vrmin }
+      - name: Compilar
+        run: |
+          sudo apt-get -qq update && sudo apt-get -qq install -y mingw-w64 mingw-w64-tools glslang-tools ninja-build >/dev/null
+          pip install -q --break-system-packages meson
+          git clone -q --recursive https://github.com/HansKristian-Work/vkd3d-proton.git v && cd v
+          git checkout -q bfdb811c6d7ccd8c6151f19532654b063a6631f2 && git submodule -q update --init --recursive
+          git apply ../vrmin/mac/dx12/vkd3d-proton.patch
+          meson setup --cross-file build-win64.txt --buildtype release -Denable_tests=false b64 > ../m.log 2>&1 || { tail -40 ../m.log; exit 1; }
+          ninja -C b64 > ../n.log 2>&1 || { grep -B2 -A6 error ../n.log | head -50; exit 1; }
+          mkdir -p ../out && cp $(find b64 -name 'd3d12.dll' -o -name 'd3d12core.dll') ../out/ && ls -la ../out
+      - uses: actions/upload-artifact@v4
+        with: { name: vkd3d-proton-vrmin, path: out, retention-days: 14 }
   kk:
+    if: false
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4

@@ -1,0 +1,28 @@
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 3139d6d..09fdc72 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2509,8 +2509,9 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+ 
+     if (!physical_device_info->xfb_properties.transformFeedbackQueries)
+     {
+-        ERR("Lacking support for transform feedback.\n");
+-        return E_INVALIDARG;
++        /* VRmin: KosmicKrisp (Vulkan on Metal) has no transform feedback yet. Few games use D3D12 stream output,
++         * so keep going: only those draws are affected. */
++        WARN("Lacking support for transform feedback, stream output will not work.\n");
+     }
+ 
+     single_storage_texel =
+@@ -2524,8 +2525,9 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+ 
+     if (!single_storage_texel || !single_uniform_texel)
+     {
+-        ERR("Lacking support for single texel alignment.\n");
+-        return E_INVALIDARG;
++        /* VRmin: KosmicKrisp needs 16-byte aligned texel buffer offsets. Keep going; unaligned typed buffer
++         * views may read from the wrong place. */
++        WARN("Lacking support for single texel alignment.\n");
+     }
+ 
+     /* Disable unused Vulkan features. The following features need to remain enabled
