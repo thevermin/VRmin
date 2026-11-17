@@ -3334,7 +3334,7 @@ final class Lobby {
                 guard let k = Range(m.range(at: 1), in: txt), let v = Range(m.range(at: 2), in: txt) else { continue }
                 if d[String(txt[k])] == nil { d[String(txt[k])] = String(txt[v]) }
             }
-            guard let id = d["appid"], let dir = d["installdir"], !LOBBY_NOT_GAMES.contains(id),
+            guard let id = d["appid"], let dir = d["installdir"], !LOBBY_NOT_GAMES.contains(id), d["LastOwner"] != "0",   // (ver scanLibrary en VRmin Host)
                   FileManager.default.fileExists(atPath: lib.appendingPathComponent("common/\(dir)").path) else { continue }
             // VR o plano: lo decide VRmin Host (vrjuegos.py, con la tienda de Steam) y queda en perfiles/detectado
             var vr = true

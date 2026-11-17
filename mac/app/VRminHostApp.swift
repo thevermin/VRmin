@@ -80,7 +80,9 @@ func scanLibrary(_ steamapps: URL) -> [String: (name: String, dir: String)] {
     guard let files = try? fm.contentsOfDirectory(atPath: steamapps.path) else { return out }
     for f in files where f.hasPrefix("appmanifest_") && f.hasSuffix(".acf") {
         let d = parseACF(steamapps.appendingPathComponent(f))
-        guard let id = d["appid"], let dir = d["installdir"], !NOT_GAMES.contains(id) else { continue }
+        // (LastOwner 0: Steam lo bajó solo como parte de otro juego, por ejemplo Lost Coast con Half-Life 2, y no
+        //  aparece en su biblioteca)
+        guard let id = d["appid"], let dir = d["installdir"], !NOT_GAMES.contains(id), d["LastOwner"] != "0" else { continue }
         if fm.fileExists(atPath: steamapps.appendingPathComponent("common/\(dir)").path) {
             out[id] = (d["name"] ?? dir, dir)
         }
