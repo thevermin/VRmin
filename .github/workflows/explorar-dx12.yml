@@ -27,6 +27,14 @@ jobs:
           meson setup --cross-file ../lm.txt --buildtype release -Denable_tests=false b64 > ../m.log 2>&1 || { tail -40 ../m.log; exit 1; }
           ninja -C b64 > ../n.log 2>&1 || { grep -B2 -A6 error ../n.log | head -50; exit 1; }
           mkdir -p ../out && cp $(find b64 -name 'd3d12.dll' -o -name 'd3d12core.dll') ../out/ && ls -la ../out
+      - name: dxgi de DXVK (para las ventanas de vkd3d-proton), con mac/dx12/dxvk-dxgi.patch
+        run: |
+          export PATH="$PWD/lm/bin:$PATH"
+          git clone -q --recursive -b v2.7.1 https://github.com/doitsujin/dxvk.git dx && cd dx
+          git apply ../vrmin/mac/dx12/dxvk-dxgi.patch
+          meson setup --cross-file ../lm.txt --buildtype release b64 > ../dm.log 2>&1 || { tail -40 ../dm.log; exit 1; }
+          ninja -C b64 src/dxgi/dxgi.dll > ../dn.log 2>&1 || { grep -B2 -A6 error ../dn.log | head -50; exit 1; }
+          cp b64/src/dxgi/dxgi.dll ../out/ && ls -la ../out
       - uses: actions/upload-artifact@v4
         with: { name: vkd3d-proton-vrmin, path: out, retention-days: 14 }
   kk:
