@@ -51,7 +51,7 @@ jobs:
       - name: Configurar (x86_64, con Rosetta; opciones de Gcenx)
         working-directory: wine
         run: |
-          export PATH="$(brew --prefix bison)/bin:$PWD/../llvm-mingw/bin:$PATH" MACOSX_DEPLOYMENT_TARGET=10.15
+          export PATH="$(brew --prefix bison)/bin:$PATH:$PWD/../llvm-mingw/bin" MACOSX_DEPLOYMENT_TARGET=10.15
           I="$PWD/../inotify"
           arch -x86_64 ./configure --build=x86_64-apple-darwin --enable-archs=i386,x86_64 --disable-tests \
             --disable-winebth_sys --with-mingw="$PWD/../llvm-mingw/bin/clang" --with-inotify --with-pthread \
@@ -59,15 +59,15 @@ jobs:
             --without-freetype --without-gettext --without-gettextpo --without-gphoto --without-gnutls \
             --without-gssapi --without-gstreamer --without-krb5 --without-netapi --without-opencl \
             --without-opengl --without-oss --without-pcap --without-pcsclite --without-pulse --without-sane \
-            --without-sdl --without-udev --without-usb --without-v4l2 --without-va --without-vulkan \
+            --without-sdl --without-udev --without-usb --without-v4l2 --without-vulkan \
             --without-wayland --without-x \
-            CC="clang -arch x86_64" CPPFLAGS="-I$I/include" LDFLAGS="-L$I/lib" > ../configure.log 2>&1 \
+            CC="/usr/bin/clang -arch x86_64" CPPFLAGS="-I$I/include" LDFLAGS="-L$I/lib" > ../configure.log 2>&1 \
             || { tail -60 ../configure.log; exit 1; }
           grep -E "HAVE_SYS_INOTIFY_H|SONAME_|HAVE_LINUX_NTSYNC" include/config.h | head
       - name: Compilar wineserver y ntdll.so
         working-directory: wine
         run: |
-          export PATH="$(brew --prefix bison)/bin:$PWD/../llvm-mingw/bin:$PATH" MACOSX_DEPLOYMENT_TARGET=10.15
+          export PATH="$(brew --prefix bison)/bin:$PATH:$PWD/../llvm-mingw/bin" MACOSX_DEPLOYMENT_TARGET=10.15
           arch -x86_64 make -j"$(sysctl -n hw.ncpu)" server/wineserver dlls/ntdll/ntdll.so > ../make.log 2>&1 \
             || { grep -E "error|Error" -A3 ../make.log | head -80; exit 1; }
           grep -i "warning:.*msync" ../make.log | head -20 || true
