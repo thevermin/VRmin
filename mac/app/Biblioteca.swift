@@ -31,9 +31,9 @@ func steamArt(_ id: String, _ file: String) -> URL? { URL(string: "https://cdn.c
 
 /// Bytes en palabras («3,2 GB»)
 func bytesText(_ b: Int64) -> String {
-    let f = ByteCountFormatter(); f.countStyle = .file
-    f.locale = Locale(identifier: idioma() == "es" ? "es_AR" : "en_US")
-    return f.string(fromByteCount: b)
+    let gb = Double(b) / 1_000_000_000
+    let n = gb >= 1 ? String(format: "%.1f GB", gb) : String(format: "%.0f MB", Double(b) / 1_000_000)
+    return idioma() == "es" ? n.replacingOccurrences(of: ".", with: ",") : n
 }
 
 let STEAM_BLUE = Color(red: 102 / 255, green: 192 / 255, blue: 244 / 255)
