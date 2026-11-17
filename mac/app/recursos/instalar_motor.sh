@@ -106,16 +106,18 @@ if [ -f "$WINEPREFIX/system.reg" ] && [ -x "$WINESERVER" ]; then
   "$WINESERVER" -k 2>/dev/null || true
   esperar_wine 15
 fi
-# msync: wineserver y ntdll.so con msync encima de los de Gcenx (los originales quedan como .sin-msync). Se pone de nuevo
-# si el motor se bajó otra vez o si cambió (.msync guarda cuál está puesto)
+# msync y los demás parches de Wine de VRmin (mac/wine): lo que cambian, encima del Wine de Gcenx (los originales quedan
+# como .sin-msync). Se pone de nuevo si el motor se bajó otra vez o si cambió (.msync guarda cuál está puesto)
 if [ "$(cat "$WINEDIR/.msync" 2>/dev/null)" != "$MSYNC_SHA" ]; then
   paso "Instalando msync en el motor" "Installing msync into the engine"
   bajar "$MSYNC_URL" msync.tar.gz "$MSYNC_SHA"
-  for f in bin/wineserver lib/wine/x86_64-unix/ntdll.so; do
-    [ -f "$WINEDIR/$f.sin-msync" ] || cp -p "$WINEDIR/$f" "$WINEDIR/$f.sin-msync"
+  # (primero vuelven los originales: así no queda nada de un parche que ya no está)
+  find "$WINEDIR" -name '*.sin-msync' | while IFS= read -r b; do mv -f "$b" "${b%.sin-msync}"; done
+  tar -tzf msync.tar.gz | grep -v '/$' | grep -vx './version' | while IFS= read -r f; do
+    f="${f#./}"; if [ -f "$WINEDIR/$f" ]; then cp -p "$WINEDIR/$f" "$WINEDIR/$f.sin-msync"; fi
   done
-  tar -xzf msync.tar.gz -C "$WINEDIR" ./bin/wineserver ./lib/wine/x86_64-unix/ntdll.so && rm msync.tar.gz
-  xattr -d com.apple.quarantine "$WINEDIR/bin/wineserver" "$WINEDIR/lib/wine/x86_64-unix/ntdll.so" 2>/dev/null || true
+  tar -xzf msync.tar.gz -C "$WINEDIR" --exclude ./version && rm msync.tar.gz
+  xattr -dr com.apple.quarantine "$WINEDIR/bin" "$WINEDIR/lib/wine" 2>/dev/null || true
   echo "$MSYNC_SHA" > "$WINEDIR/.msync"
 fi
 paso "Instalando DXMT dentro del motor" "Installing DXMT into the engine"

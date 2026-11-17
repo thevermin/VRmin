@@ -1,0 +1,5 @@
+# Lo que se compila con los parches de esta carpeta y se pone encima del Wine de Gcenx en el motor:
+# <lo que se compila (en el código de Wine)> <dónde va en el motor (wswine.bundle)>
+# Un parche nuevo que cambia otra parte de Wine: agregar acá lo que cambia (y el .patch en esta carpeta; van por orden).
+server/wineserver bin/wineserver
+dlls/ntdll/ntdll.so lib/wine/x86_64-unix/ntdll.so
