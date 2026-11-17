@@ -231,6 +231,8 @@ private let EN: [String: String] = [
     "Cerrando SteamVR": "Closing SteamVR",
     "Abrir SteamVR": "Open SteamVR",
     "Instalar SteamVR": "Install SteamVR",
+    "Tu Mac se quedó sin memoria libre y está usando el disco: el juego puede trabarse, sobre todo al girar.": "Your Mac ran out of free memory and is using the disk: the game may stutter, especially when you turn.",
+    "Tu Mac se quedó sin memoria libre y está usando el disco: el juego puede trabarse, sobre todo al girar. Cerrá lo que no uses mientras jugás: %@.": "Your Mac ran out of free memory and is using the disk: the game may stutter, especially when you turn. Close what you don't need while you play: %@.",
     "Instalando SteamVR": "Installing SteamVR",
     "Sin instalar. Con SteamVR real tenés su menú en el visor, y los juegos hechos para otros controles andan mejor.": "Not installed. With real SteamVR you get its menu in the headset, and games made for other controllers work better.",
     "Cerrar SteamVR": "Close SteamVR",

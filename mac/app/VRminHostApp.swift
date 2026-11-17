@@ -447,6 +447,44 @@ final class AppModel: ObservableObject {
     }
     /// Si se terminó de probar un juego nuevo: «¿Funcionó?» (una vez, al cerrarlo)
     @Published var askWorked: SteamGame? = nil
+    /// Con un juego abierto, la Mac sin memoria libre (macOS pasa memoria al disco y el juego se traba): qué conviene
+    /// cerrar. Una vez por partida
+    @Published var memoryWarning: String? = nil
+    private var lowMemoryChecks = 0, memoryWarned = false
+
+    /// Nivel de presión de memoria de macOS: 1 normal, 2 aviso, 4 crítico
+    private func memoryPressureLevel() -> Int32 {
+        var level: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        return sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &size, nil, 0) == 0 ? level : 0
+    }
+    /// Las apps abiertas que más memoria usan (sin VRmin ni lo que corre en su Windows), de mayor a menor
+    private func biggestApps(_ n: Int) -> [(name: String, bytes: UInt64)] {
+        var out: [(name: String, bytes: UInt64)] = []
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+            guard app.processIdentifier != ProcessInfo.processInfo.processIdentifier, let name = app.localizedName,
+                  !(app.bundleURL?.path.contains("wswine") ?? false), !(app.executableURL?.path.contains("wine") ?? false) else { continue }
+            var info = rusage_info_v2()
+            let r = withUnsafeMutablePointer(to: &info) {
+                $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(app.processIdentifier, RUSAGE_INFO_V2, $0) }
+            }
+            if r == 0 { out.append((name, info.ri_phys_footprint)) }
+        }
+        return Array(out.sorted { $0.bytes > $1.bytes }.prefix(n))
+    }
+    private func checkMemory() {
+        let playing = !openGames.isEmpty || steamVRRunning
+        if !playing { lowMemoryChecks = 0; memoryWarned = false; if memoryWarning != nil { memoryWarning = nil }; return }
+        lowMemoryChecks = memoryPressureLevel() >= 2 ? lowMemoryChecks + 1 : 0
+        guard lowMemoryChecks >= 5, !memoryWarned else { return }   // (unos 15 segundos seguidos)
+        memoryWarned = true
+        let apps = biggestApps(3).filter { $0.bytes > 300_000_000 }
+            .map { "\($0.name) (\(ByteCountFormatter.string(fromByteCount: Int64($0.bytes), countStyle: .memory)))" }
+        memoryWarning = apps.isEmpty
+            ? L("Tu Mac se quedó sin memoria libre y está usando el disco: el juego puede trabarse, sobre todo al girar.")
+            : L("Tu Mac se quedó sin memoria libre y está usando el disco: el juego puede trabarse, sobre todo al girar. Cerrá lo que no uses mientras jugás: %@.", apps.joined(separator: ", "))
+        append(memoryWarning ?? "")
+    }
 
     private var server: Process?
     private var checkedGames: Set<String> = []
@@ -492,6 +530,7 @@ final class AppModel: ObservableObject {
 
     // MARK: Estado
     func refresh() {
+        checkMemory()
         let fm = FileManager.default
         let marca = (try? String(contentsOf: data.appendingPathComponent("prefijo/.wine_usado"), encoding: .utf8)) ?? ""
         #if arch(arm64)
@@ -1574,6 +1613,16 @@ struct ContentView: View {
 
     private var gamesCard: some View {
         Card(title: L("Juegos"), icon: "square.grid.2x2") {
+            if let w = m.memoryWarning {   // con un juego abierto, la Mac sin memoria libre
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "memorychip").foregroundStyle(Theme.amber)
+                    Text(w).font(.callout).fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button { m.memoryWarning = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless).help(L("Ahora no"))
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.amber.opacity(0.12)))
+            }
             if let g = m.askWorked {   // al cerrar un juego que no se había probado
                 HStack(spacing: 10) {
                     Image(systemName: "hand.raised.fill").foregroundStyle(Theme.amber)
