@@ -386,6 +386,16 @@ final class AppModel: ObservableObject {
             if steamRunning { steamFriendsPending.toggle() }
         } }
     @Published var steamFriendsPending = false
+    /// Biblioteca de VRmin (Steam abierto de fondo, sin su ventana) o la ventana de Steam de siempre. abrir_steam.sh
+    /// lo lee del archivo «steam_ventana»; vale la próxima vez que se abre Steam
+    @Published var libraryVRmin: Bool = !UserDefaults.standard.bool(forKey: "steamWindow") {
+        didSet { UserDefaults.standard.set(!libraryVRmin, forKey: "steamWindow"); writeSteamWindowFile() } }
+    func writeSteamWindowFile() {
+        let f = data.appendingPathComponent("steam_ventana")
+        if libraryVRmin { try? FileManager.default.removeItem(at: f) } else { try? "1".write(to: f, atomically: true, encoding: .utf8) }
+    }
+    /// Lo que Steam está bajando ahora (Biblioteca y Tienda)
+    @Published var downloads: [SteamDownload] = []
     func writeSteamFriendsFile() {
         let f = data.appendingPathComponent("steam_amigos")
         if steamFriends { try? "1".write(to: f, atomically: true, encoding: .utf8) } else { try? FileManager.default.removeItem(at: f) }
@@ -521,6 +531,7 @@ final class AppModel: ObservableObject {
         try? fm.createDirectory(at: data, withIntermediateDirectories: true)
         UserDefaults.standard.set(data.path, forKey: "dataDir")
         writeSteamFriendsFile()
+        writeSteamWindowFile()
         if !fm.fileExists(atPath: res.appendingPathComponent("servidor.sh").path) {
             append(L("ATENCIÓN: faltan archivos dentro de la app (%@). Volvé a crearla con crear_app.sh", res.path))
         }
@@ -563,6 +574,8 @@ final class AppModel: ObservableObject {
         }
         list.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         if list != games { games = list; loadVR() }
+        let dl = scanDownloads(steamapps)
+        if dl != downloads { withAnimation { downloads = dl } }
         // Arreglos de compatibilidad apenas un juego aparece en la biblioteca
         // (así también sirven si el juego se abre directo desde Steam)
         for g in list where g.inLibrary && !checkedGames.contains(g.id) {
@@ -1142,6 +1155,8 @@ final class AppModel: ObservableObject {
     func closeSteamVR() { run(L("Cerrando SteamVR"), "abrir_steamvr.sh", ["--cerrar"], exclusive: false) }
     /// Le pide al Steam de VRmin que instale SteamVR (si Steam está cerrado, lo abre primero)
     func installSteamVR() { run(L("Instalando SteamVR"), "instalar_steamvr.sh", exclusive: false) }
+    /// Le pide al Steam de VRmin que instale un juego (desde la Tienda)
+    func installGame(_ id: String, _ name: String) { run(L("Instalando %@", name), "instalar_juego.sh", [id, name], exclusive: false) }
 
     /// Cierra ese juego a la fuerza (si no responde): primero le pide que se cierre y, si no, lo termina
     func forceClose(_ g: SteamGame) {
@@ -1291,22 +1306,40 @@ struct ContentView: View {
     @State private var showVigiaHelp = false
     @State private var tut: TutPresent? = nil   // tutorial o Ayuda en pantalla
     @State private var gameAdv: SteamGame? = nil   // ajustes de un juego (desde su menú)
+    @State private var tab = "inicio"   // inicio, biblioteca o tienda
 
     var body: some View {
-        // (toda la ventana se desplaza: así los juegos se ven enteros, sin una lista chica con su propia barra)
-        ScrollView {
-        VStack(alignment: .leading, spacing: 16) {
-            header
-            HStack(alignment: .top, spacing: 16) {
-                connectionCard
-                prepCard
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 12) {
+                header
+                Picker("", selection: $tab) {
+                    Text(L("Inicio")).tag("inicio")
+                    Text(L("Biblioteca")).tag("biblioteca")
+                    Text(L("Tienda")).tag("tienda")
+                }
+                .pickerStyle(.segmented).labelsHidden().frame(width: 330)
             }
-            cableCard
-            gamesCard
-            recordCard
-            logSection
-        }
-        .padding(.horizontal, 22).padding(.bottom, 20).padding(.top, 8)
+            .padding(.horizontal, 22).padding(.top, 8).padding(.bottom, 12)
+            Rectangle().fill(Theme.line).frame(height: 1)
+            switch tab {
+            case "biblioteca": LibraryView(gameAdv: $gameAdv)
+            case "tienda": StoreView()
+            default:
+                // (toda la pestaña se desplaza: así los juegos se ven enteros, sin una lista chica con su propia barra)
+                ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(alignment: .top, spacing: 16) {
+                        connectionCard
+                        prepCard
+                    }
+                    cableCard
+                    gamesCard
+                    recordCard
+                    logSection
+                }
+                .padding(.horizontal, 22).padding(.bottom, 20).padding(.top, 16)
+                }
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Theme.bg.ignoresSafeArea())
@@ -1520,7 +1553,7 @@ struct ContentView: View {
                         if m.steamStuck {
                             Button(L("Reiniciar Steam")) { m.restartSteam() }.buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
                         }
-                        else { Button(L("Mostrar")) { m.run(L("Mostrando Steam"), "abrir_steam.sh", exclusive: false) }.buttonStyle(Pill()) }
+                        else { Button(L("Mostrar")) { m.run(L("Mostrando Steam"), "abrir_steam.sh", ["ventana"], exclusive: false) }.buttonStyle(Pill()) }
                         Button(L("Cerrar")) { m.closeAll() }.buttonStyle(Pill())
                     }
                 }
@@ -1724,7 +1757,7 @@ struct ContentView: View {
                         Button(L("Abrir Steam")) { m.run(L("Abriendo Steam"), "abrir_steam.sh") }
                             .buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
                     } else if m.steamRunning {
-                        Button(L("Mostrar Steam")) { m.run(L("Mostrando Steam"), "abrir_steam.sh", exclusive: false) }.buttonStyle(Pill())
+                        Button(L("Mostrar Steam")) { m.run(L("Mostrando Steam"), "abrir_steam.sh", ["ventana"], exclusive: false) }.buttonStyle(Pill())
                     }
                 }
             } else {
@@ -2218,6 +2251,8 @@ struct SettingsView: View {
                 Toggle(L("No dormir mientras el Quest la usa"), isOn: $m.keepAwake).toggleStyle(.switch)
                 Toggle(L("Recibir versiones beta"), isOn: $m.beta).toggleStyle(.switch)
                     .help(L("Las betas traen lo nuevo antes, pero pueden fallar. Si lo apagás, VRmin Host te ofrece volver a la versión estable."))
+                Text(L("Biblioteca de juegos")).font(.system(size: 13, weight: .semibold)).padding(.top, 4)
+                LibraryModePicker()
                 Toggle(L("Amigos y chat de Steam"), isOn: $m.steamFriends).toggleStyle(.switch)
                 Text(L("También en el visor, con SteamVR. Usan casi un núcleo de la CPU mientras Steam está abierto, así que los juegos pueden andar más lento."))
                     .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)

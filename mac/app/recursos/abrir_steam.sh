@@ -1,5 +1,5 @@
 #!/bin/bash
-# Abre Steam (Windows). Queda abierto en segundo plano.
+# Abre Steam (Windows). Queda abierto en segundo plano. Con «ventana», muestra su ventana aunque se use la Biblioteca de VRmin.
 source "$(dirname "$0")/entorno.sh"
 cd "$P"
 export WINEDEBUG=-all,err+module
@@ -48,6 +48,11 @@ EXTRA=""; [ -f "$P/steam_amigos" ] || EXTRA="-nofriendsui -nochatui"
 # -noverifyfiles: si Steam verifica sus archivos al arrancar, vuelve a poner su steamwebhelper.exe y la ventana
 # queda negra otra vez. -cef-single-process: el navegador de Steam en un solo proceso (igual que el arreglo).
 EXTRA="$EXTRA -noverifyfiles -cef-single-process"
+# Biblioteca de VRmin (Ajustes): Steam de fondo, sin su ventana (-silent), salvo que se pida verla («ventana») o se
+# haya elegido la ventana de Steam (archivo «steam_ventana»). Sin una sesión guardada aparece igual, para iniciarla.
+if [ "$1" != ventana ] && [ ! -f "$P/steam_ventana" ] && grep -qs '"RememberPassword"[[:space:]]*"1"' "$STEAMDIR/config/loginusers.vdf"; then
+  EXTRA="$EXTRA -silent"
+fi
 ajustes_dll
 "$WINE" "C:\\Program Files (x86)\\Steam\\steam.exe" -no-cef-sandbox $EXTRA \
   > "$P/logs/steam.log" 2>&1 < /dev/null &

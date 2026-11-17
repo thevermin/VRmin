@@ -30,7 +30,7 @@ rm -rf "$NUEVA"
 mkdir -p "$NUEVA/Contents/MacOS" "$R/web" "$R/openxr"
 cp app/Info.plist "$NUEVA/Contents/Info.plist"
 echo "1/3 Compilando la app..."
-swc app/compilacion.log -O -parse-as-library app/VRminHostApp.swift app/Idioma.swift app/Tutoriales.swift app/LogEn.swift -o "$NUEVA/Contents/MacOS/VRminHost" || falla app/compilacion.log
+swc app/compilacion.log -O -parse-as-library app/VRminHostApp.swift app/Biblioteca.swift app/Idioma.swift app/Tutoriales.swift app/LogEn.swift -o "$NUEVA/Contents/MacOS/VRminHost" || falla app/compilacion.log
 echo "2/3 Compilando el renderizador..."
 swc renderer/compilacion.log -O renderer/main.swift -o "$R/QuestRenderer" || falla renderer/compilacion.log
 echo "3/3 Copiando archivos..."
