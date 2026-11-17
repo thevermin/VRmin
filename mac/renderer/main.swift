@@ -582,7 +582,7 @@ final class Link {
     }
 }
 
-// MARK: - Codificador H.264 por hardware
+// MARK: - VideoToolbox game encoder
 final class Encoder {
     private var session: VTCompressionSession!
     private let link: Link
@@ -624,6 +624,7 @@ final class Encoder {
     @discardableResult
     private func makeSession(lowLatency ll: Bool) -> Bool {
         let lowLatency = [kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String: true] as CFDictionary
+        var usesLowLatencyRateControl = false
         // HEVC primero (si se eligió); si la Mac no puede, H.264
         for hevc in (CODEC_HEVC ? [true, false] : [false]) {
             for spec in (ll ? [lowLatency, nil] : [nil]) as [CFDictionary?] {
@@ -636,7 +637,7 @@ final class Encoder {
                 if st == noErr, let s = s {
                     session = s
                     CODEC_HEVC = hevc
-                    print("Codificador: \(hevc ? "HEVC" : "H.264") por hardware" + (spec != nil ? ", modo baja latencia" : " (sin modo baja latencia)"))
+                    usesLowLatencyRateControl = spec != nil
                     break
                 }
             }
@@ -658,7 +659,30 @@ final class Encoder {
         set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: FPS))
         set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: FPS * 2))
         VTCompressionSessionPrepareToEncodeFrames(session)
+        reportBackend(usesLowLatencyRateControl: usesLowLatencyRateControl)
         return true
+    }
+
+    private func reportBackend(usesLowLatencyRateControl: Bool) {
+        var acceleration: Unmanaged<CFTypeRef>?
+        let status = VTSessionCopyProperty(session, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                                           allocator: nil, valueOut: &acceleration)
+        let backend: String
+        if status == noErr, let value = acceleration?.takeRetainedValue(),
+           CFGetTypeID(value) == CFBooleanGetTypeID(), let hardware = (value as? NSNumber)?.boolValue {
+            backend = hardware ? "hardware" : "software"
+        } else {
+            backend = tr("aceleración desconocida", "acceleration unknown")
+        }
+        var encoderID: Unmanaged<CFTypeRef>?
+        let idStatus = VTSessionCopyProperty(session, key: kVTCompressionPropertyKey_EncoderID,
+                                             allocator: nil, valueOut: &encoderID)
+        let id = idStatus == noErr ? (encoderID?.takeRetainedValue() as? String) : nil
+        let mode = usesLowLatencyRateControl
+            ? tr(", control de tasa de baja latencia solicitado", ", low-latency rate control requested")
+            : ""
+        print("[mac] Encoder: \(CODEC_HEVC ? "HEVC" : "H.264") \(W)x\(H), \(backend)" +
+              (id.map { " (\($0))" } ?? "") + mode)
     }
 
     @discardableResult
