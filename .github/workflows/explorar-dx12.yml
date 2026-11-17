@@ -32,7 +32,8 @@ jobs:
           export PATH="$PWD/lm/bin:$PATH"
           git clone -q --recursive -b v2.7.1 https://github.com/doitsujin/dxvk.git dx && cd dx
           git apply ../vrmin/mac/dx12/dxvk-dxgi.patch
-          meson setup --cross-file ../lm.txt --buildtype release b64 > ../dm.log 2>&1 || { tail -40 ../dm.log; exit 1; }
+          # (DXVK 2.7.1 usa std::transform sin incluir <algorithm>; con la libc++ de llvm-mingw no compila)
+          CXXFLAGS="-include algorithm" meson setup --cross-file ../lm.txt --buildtype release b64 > ../dm.log 2>&1 || { tail -40 ../dm.log; exit 1; }
           ninja -C b64 src/dxgi/dxgi.dll > ../dn.log 2>&1 || { grep -B2 -A6 error ../dn.log | head -50; exit 1; }
           cp b64/src/dxgi/dxgi.dll ../out/ && ls -la ../out
       - uses: actions/upload-artifact@v4
