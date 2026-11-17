@@ -39,8 +39,8 @@ struct VRLista: Decodable { let juegos: [VRJuego]; let steamvr: Bool; let driver
 let RUNTIME_OPCIONES: [(id: String, nombre: String)] = [
     ("auto", "Automático"),
     ("openxr", "OpenXR (directo a VRmin)"),
-    ("openvr", "OpenVR / SteamVR vía OpenComposite"),
-    ("steamvr", "SteamVR real · experimental"),
+    ("openvr", "OpenVR vía OpenComposite · más liviano"),
+    ("steamvr", "SteamVR real · más estable (beta)"),
     ("oculus", "Oculus (ReVive) · próximamente"),
     ("plano", "Sin VR (pantalla plana)"),
 ]
@@ -1727,6 +1727,10 @@ struct ContentView: View {
                 ForEach(RUNTIME_OPCIONES, id: \.id) { o in
                     Text(o.id == "auto" ? L("Automático (%@)", L(RUNTIME_OPCIONES.first { $0.id == v.deteccion.recomendado }?.nombre ?? v.deteccion.recomendado)) : L(o.nombre)).tag(o.id)
                 }
+            }
+            Section(L("Si un juego anda mal")) {
+                Text(L("Con OpenComposite: probá SteamVR real, que suele ser lo más estable"))
+                Text(L("Con SteamVR real (lento o no abre): probá OpenComposite, que usa menos memoria"))
             }
             Picker(L("Cómo abrirlo"), selection: Binding(get: { v.perfil.lanzar }, set: { m.setVR(g.id, "lanzar", $0) })) {
                 Text(L("Desde Steam")).tag("steam")

@@ -343,12 +343,20 @@ def resolver_juego(juego, det=None):
         pedido = "auto"
     runtime = pedido if pedido != "auto" else (inc.get("runtime") or det.get("recomendado") or "openvr")
     avisos = []
-    # Automático: si la vez anterior no llegó ninguna imagen con este runtime, probar el otro; si uno ya anduvo, ese
+    # Automático: si la vez anterior no llegó ninguna imagen con este runtime, probar otro; si uno ya anduvo, ese.
+    # Un juego OpenVR que no arrancó con OpenComposite prueba SteamVR real (si está instalado), que suele ser lo más
+    # estable; si tampoco anduvo con SteamVR real, vuelve a lo de siempre o prueba la otra API
     if pedido == "auto" and not inc.get("runtime"):
         prev = leer_json(INTENTOS, {}).get(appid)
-        if prev and prev.get("runtime") in ("openxr", "openvr"):
+        if prev and prev.get("runtime") in ("openxr", "openvr", "steamvr"):
             if prev.get("ok"):
                 runtime = prev["runtime"]
+            elif prev["runtime"] == runtime == "openvr" and driver_steamvr_listo() and steamvr_instalado():
+                avisos.append(T("La vez anterior no arrancó con %s: ahora pruebo %s") % (NOMBRES[runtime], NOMBRES["steamvr"]))
+                runtime = "steamvr"
+            elif prev["runtime"] == "steamvr" and alternativa(det, runtime):
+                avisos.append(T("La vez anterior no arrancó con %s: ahora pruebo %s") % (NOMBRES["steamvr"], NOMBRES[alternativa(det, runtime)]))
+                runtime = alternativa(det, runtime)
             elif prev["runtime"] == runtime and alternativa(det, runtime):
                 avisos.append(T("La vez anterior no arrancó con %s: ahora pruebo %s") % (NOMBRES[runtime], NOMBRES[alternativa(det, runtime)]))
                 runtime = alternativa(det, runtime)
