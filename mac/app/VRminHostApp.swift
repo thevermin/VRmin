@@ -1067,6 +1067,8 @@ final class AppModel: ObservableObject {
         run(L("Abriendo SteamVR"), "abrir_steamvr.sh", exclusive: false)   // (si Steam está cerrado, lo abre primero)
     }
     func closeSteamVR() { run(L("Cerrando SteamVR"), "abrir_steamvr.sh", ["--cerrar"], exclusive: false) }
+    /// Le pide al Steam de VRmin que instale SteamVR (si Steam está cerrado, lo abre primero)
+    func installSteamVR() { run(L("Instalando SteamVR"), "instalar_steamvr.sh", exclusive: false) }
 
     /// Cierra ese juego a la fuerza (si no responde): primero le pide que se cierre y, si no, lo termina
     func forceClose(_ g: SteamGame) {
@@ -1601,6 +1603,19 @@ struct ContentView: View {
                     } else {
                         Button(L("Abrir SteamVR")) { m.openSteamVR() }.buttonStyle(Pill(primary: true))
                     }
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.white.opacity(0.05)))
+            } else if m.steamInstalled {   // SteamVR real: hace falta instalarlo desde el Steam de VRmin
+                HStack(spacing: 10) {
+                    Image(systemName: "visionpro").foregroundStyle(Theme.text2)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("SteamVR").font(.system(size: 13, weight: .semibold))
+                        Text(L("Sin instalar. Con SteamVR real tenés su menú en el visor, y los juegos hechos para otros controles andan mejor."))
+                            .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Button(L("Instalar SteamVR")) { m.installSteamVR() }.buttonStyle(Pill())
                 }
                 .padding(10)
                 .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.white.opacity(0.05)))
