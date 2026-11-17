@@ -1,0 +1,97 @@
+name: Wine con msync para VRmin
+
+# El Wine que instala instalar_motor.sh (wine-devel 11.8 de Gcenx, el de WineHQ) no tiene msync: toda la sincronización
+# entre programas de Windows (eventos, mutex, semáforos) pasa por wineserver, que hace una cosa a la vez. msync
+# (Marc-Aurel Zent, el de CrossOver) la hace con memoria compartida y semáforos de Mach, sin pasar por wineserver.
+# mac/wine/msync.patch: msync de CrossOver 26.3 (Wine 11.0, como forma de los «inproc sync» de Wine 11) sobre Wine 11.8.
+# Solo cambian wineserver y ntdll.so: se compilan esos dos, con las mismas opciones que la compilación de Gcenx, y se
+# reemplazan en el motor (el resto de Wine queda igual). Se activa con WINEMSYNC=1 (entorno.sh).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['mac/wine/**', '.github/workflows/wine.yml']
+
+env:
+  WINE_VERSION: '11.8'
+  GCENX_URL: https://github.com/Gcenx/macOS_Wine_builds/releases/download/11.8/wine-devel-11.8-osx64.tar.xz
+  GCENX_SHA: 5c9f0984961ee6289f4f2c4fe751c27f02b6c28855154e3f99b7e2bd8108b620
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: vrmin }
+      - name: Herramientas (Rosetta, bison, llvm-mingw)
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          sudo softwareupdate --install-rosetta --agree-to-license >/dev/null 2>&1 || true
+          brew install bison >/dev/null
+          url=$(gh api repos/mstorsjo/llvm-mingw/releases/latest --jq '.assets[]|select(.name|test("ucrt-macos-universal.tar.xz$"))|.browser_download_url')
+          echo "llvm-mingw: $url"
+          mkdir -p llvm-mingw && curl -sSL "$url" | tar -xJ -C llvm-mingw --strip-components 1
+      - name: Código de Wine 11.8 + msync
+        run: |
+          curl -sSL -o wine.tar.xz "https://dl.winehq.org/wine/source/11.x/wine-$WINE_VERSION.tar.xz"
+          shasum -a 256 wine.tar.xz
+          tar -xJf wine.tar.xz && mv "wine-$WINE_VERSION" wine
+          cd wine && patch -p1 < ../vrmin/mac/wine/msync.patch
+      - name: libinotify (la misma de la compilación de Gcenx; wineserver la usa)
+        run: |
+          curl -sSL -o gcenx.tar.xz "$GCENX_URL"
+          echo "$GCENX_SHA  gcenx.tar.xz" | shasum -a 256 -c -
+          mkdir gcenx && tar -xJf gcenx.tar.xz -C gcenx
+          G="gcenx/Wine Devel.app/Contents/Resources/wine"
+          mkdir -p inotify/lib inotify/include/sys
+          cp "$G/lib/libinotify.0.dylib" inotify/lib/ && ln -s libinotify.0.dylib inotify/lib/libinotify.dylib
+          git clone -q --depth 1 https://github.com/libinotify-kqueue/libinotify-kqueue.git inotify/src
+          cp inotify/src/sys/inotify.h inotify/include/sys/
+          cp "$G/bin/wineserver" "$G/lib/wine/x86_64-unix/ntdll.so" .   # (para comparar)
+      - name: Configurar (x86_64, con Rosetta; opciones de Gcenx)
+        working-directory: wine
+        run: |
+          export PATH="$(brew --prefix bison)/bin:$PWD/../llvm-mingw/bin:$PATH" MACOSX_DEPLOYMENT_TARGET=10.15
+          I="$PWD/../inotify"
+          arch -x86_64 ./configure --build=x86_64-apple-darwin --enable-archs=i386,x86_64 --disable-tests \
+            --disable-winebth_sys --with-mingw="$PWD/../llvm-mingw/bin/clang" --with-inotify --with-pthread \
+            --without-alsa --without-capi --without-coreaudio --without-cups --without-dbus --without-ffmpeg \
+            --without-freetype --without-gettext --without-gettextpo --without-gphoto --without-gnutls \
+            --without-gssapi --without-gstreamer --without-krb5 --without-netapi --without-opencl \
+            --without-opengl --without-oss --without-pcap --without-pcsclite --without-pulse --without-sane \
+            --without-sdl --without-udev --without-usb --without-v4l2 --without-va --without-vulkan \
+            --without-wayland --without-x \
+            CC="clang -arch x86_64" CPPFLAGS="-I$I/include" LDFLAGS="-L$I/lib" > ../configure.log 2>&1 \
+            || { tail -60 ../configure.log; exit 1; }
+          grep -E "HAVE_SYS_INOTIFY_H|SONAME_|HAVE_LINUX_NTSYNC" include/config.h | head
+      - name: Compilar wineserver y ntdll.so
+        working-directory: wine
+        run: |
+          export PATH="$(brew --prefix bison)/bin:$PWD/../llvm-mingw/bin:$PATH" MACOSX_DEPLOYMENT_TARGET=10.15
+          arch -x86_64 make -j"$(sysctl -n hw.ncpu)" server/wineserver dlls/ntdll/ntdll.so > ../make.log 2>&1 \
+            || { grep -E "error|Error" -A3 ../make.log | head -80; exit 1; }
+          grep -i "warning:.*msync" ../make.log | head -20 || true
+      - name: Revisar (bibliotecas y funciones iguales a las de Gcenx, más las de msync)
+        run: |
+          for f in wineserver ntdll.so; do
+            n=wine/server/wineserver; [ $f = ntdll.so ] && n=wine/dlls/ntdll/ntdll.so
+            echo "== $f"; file "$n"; otool -L "$n"; otool -l "$n" | grep -A2 LC_RPATH | grep path || true
+            nm -gU "$f" | awk '{print $3}' | sort > a.txt; nm -gU "$n" | awk '{print $3}' | sort > b.txt
+            echo "solo en Gcenx:"; comm -23 a.txt b.txt; echo "solo en la nuestra:"; comm -13 a.txt b.txt
+          done
+          strings -a wine/dlls/ntdll/ntdll.so | grep -q "WINEMSYNC" && echo "msync: sí"
+      - name: Empaquetar
+        run: |
+          mkdir -p out/bin out/lib/wine/x86_64-unix
+          cp wine/server/wineserver out/bin/ && cp wine/dlls/ntdll/ntdll.so out/lib/wine/x86_64-unix/
+          # (rpath de wineserver como el de Gcenx: busca libinotify en ../lib)
+          otool -l out/bin/wineserver | grep -q "@loader_path/../lib" || install_name_tool -add_rpath @loader_path/../lib out/bin/wineserver
+          codesign --force --sign - out/bin/wineserver out/lib/wine/x86_64-unix/ntdll.so
+          echo "wine $WINE_VERSION + msync ($(cd vrmin && git rev-parse --short HEAD))" > out/version
+          tar -czf wine-msync-vrmin.tar.gz -C out .
+          shasum -a 256 wine-msync-vrmin.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wine-msync-vrmin
+          path: wine-msync-vrmin.tar.gz
+          retention-days: 30
