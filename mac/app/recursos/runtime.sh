@@ -152,19 +152,7 @@ poner_driver_steamvr() {
   [ "$(cat "$Q/driver_vrmin/.version" 2>/dev/null)" = "$sha" ] && return 0
   rm -rf "$Q/driver_vrmin" && cp -R "$d" "$Q/driver_vrmin" && echo "$sha" > "$Q/driver_vrmin/.version"
 }
-# Delante del navegador de los paneles de SteamVR va el mismo intermediario que delante del de Steam (steam/): sus
-# páginas comparten un proceso en vez de uno por panel (cada uno usaba ~400 MB; con 8 GB, la Mac pasaba al disco).
-# El original queda como vrwebhelper_real.exe; se revisa cada vez porque las actualizaciones de SteamVR lo reemplazan
-intermediario_vrwebhelper() {
-  local d="$STEAMLIB/common/SteamVR/bin/vrwebhelper/win64" w="$RES/steam/vrwebhelper.exe"
-  [ -f "$w" ] && [ -f "$d/vrwebhelper.exe" ] || return 0
-  cmp -s "$w" "$d/vrwebhelper.exe" && return 0
-  pgrep -f 'vrwebhelper' >/dev/null && return 0   # (abierto: se cambia la próxima vez)
-  [ "$(stat -f %z "$d/vrwebhelper.exe")" -gt 500000 ] && cp "$d/vrwebhelper.exe" "$d/vrwebhelper_real.exe"
-  [ -f "$d/vrwebhelper_real.exe" ] && cp "$w" "$d/vrwebhelper.exe"
-}
 ajustes_steamvr() {
-  intermediario_vrwebhelper
   # (pruebas anteriores para que Steam no se conecte a SteamVR; ahora lo hace ajustes_dll, en entorno.sh, para todo)
   if [ -f "$Q/.steam_sin_vrclient" ]; then
     "$WINE" reg delete 'HKCU\Software\Wine\AppDefaults\steam.exe\DllOverrides' /v vrclient /f >/dev/null 2>&1
@@ -239,7 +227,7 @@ cerrar_steamvr() {
   local v; v="$(cat "$Q/.vigia_steamvr" 2>/dev/null)"
   [ -n "$v" ] && kill "$v" 2>/dev/null; rm -f "$Q/.vigia_steamvr"
   pgrep -f 'vrserver.exe' >/dev/null 2>&1 || return 0
-  local p; for p in vrmonitor vrcompositor vrdashboard vrwebhelper vrserver vrstartup; do pkill -f "$p(_real)?\.exe" 2>/dev/null; done
+  local p; for p in vrmonitor vrcompositor vrdashboard vrwebhelper vrserver vrstartup; do pkill -f "$p.exe" 2>/dev/null; done
   sleep 2
 }
 
@@ -262,7 +250,7 @@ cerrar_steamvr_con_el_juego() {
       elif [ $(( $(date +%s) - desde )) -gt 300 ]; then sin=999
       fi
       if [ $sin -ge 30 ]; then
-        for p in vrmonitor vrcompositor vrdashboard vrwebhelper vrserver vrstartup; do pkill -f "$p(_real)?\.exe" 2>/dev/null; done
+        for p in vrmonitor vrcompositor vrdashboard vrwebhelper vrserver vrstartup; do pkill -f "$p.exe" 2>/dev/null; done
         break
       fi
     done

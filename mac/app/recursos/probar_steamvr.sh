@@ -66,7 +66,7 @@ pgrep -fl 'vrserver|vrcompositor|vrmonitor|vrwebhelper|vrdashboard' | cut -c1-16
 say "Procesos de SteamVR que quedaron abiertos:" "SteamVR processes still open:"; cat "$OUT/procesos.txt"
 
 # Cerrar SteamVR y juntar sus registros
-for p in vrmonitor vrcompositor vrdashboard vrwebhelper vrserver vrstartup; do pkill -f "$p(_real)?\.exe" 2>/dev/null; done
+for p in vrmonitor vrcompositor vrdashboard vrwebhelper vrserver vrstartup; do pkill -f "$p.exe" 2>/dev/null; done
 sleep 3
 cp "$Q/openvr/logs/"*.txt "$STEAM/logs/"vr*.txt "$Q/driver_vrmin.log" "$OUT/" 2>/dev/null
 if [ -f "$OUT/steamvr.vrsettings.antes" ]; then cp "$OUT/steamvr.vrsettings.antes" "$CFG"; else rm -f "$CFG"; fi

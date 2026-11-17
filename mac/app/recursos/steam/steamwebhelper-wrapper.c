@@ -1,11 +1,7 @@
 /* De github.com/ramiabih/play-windows-steam-on-mac (licencia MIT, Copyright (c) 2026 Daniil Efimenko), sin cambios.
  * Arreglaba la ventana negra de Steam en Wine 11 (Mac) agregando --disable-gpu --single-process a steamwebhelper.
  * Único cambio de VRmin: sin --disable-gpu (el DXMT de VRmin dibuja en las ventanas hijas de Chromium), así la interfaz
- * de Steam se dibuja con la GPU en vez de la CPU. Compilar como programa de ventanas (-mwindows), sin consola.
- * El mismo intermediario va delante del navegador de los paneles de SteamVR (vrwebhelper.exe: un solo proceso para
- * todas sus páginas, en vez de uno por panel), compilado con
- *   -DREAL_BINARY='L"vrwebhelper_real.exe"'
- *   -DEXTRA_FLAGS_SUFFIX='L"--renderer-process-limit=1 --process-per-site --disable-site-isolation-trials --disable-features=SpareRendererForSitePerProcess"' */
+ * de Steam se dibuja con la GPU en vez de la CPU. Compilar como programa de ventanas (-mwindows), sin consola. */
 /*
  * steamwebhelper-wrapper — prepend Chromium flags and delegate to
  * steamwebhelper_real.exe. Fixes black Steam UI on Wine/macOS.
@@ -26,14 +22,10 @@
 #include <stdlib.h>
 #include <wchar.h>
 
-#ifndef EXTRA_FLAGS_SUFFIX
 #define EXTRA_FLAGS_SUFFIX \
     L"--single-process " \
     L"--disable-features=IsolateOrigins,site-per-process,SpareRendererForSitePerProcess"
-#endif
-#ifndef REAL_BINARY
 #define REAL_BINARY L"steamwebhelper_real.exe"
-#endif
 
 static wchar_t *resolve_real_binary(void)
 {
