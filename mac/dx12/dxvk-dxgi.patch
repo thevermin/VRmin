@@ -1,5 +1,5 @@
 diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
-index 9a45f10..938c974 100644
+index 9a45f10..7ca858d 100644
 --- a/src/dxvk/dxvk_device_info.cpp
 +++ b/src/dxvk/dxvk_device_info.cpp
 @@ -705,33 +705,35 @@ namespace dxvk {
@@ -7,7 +7,7 @@ index 9a45f10..938c974 100644
          require, #name }
  
 +    // VRmin: only DXVK's dxgi is used, for vkd3d-proton (D3D12) on KosmicKrisp, which lacks some of these.
-+    // The D3D11 device isn't used, so a missing core feature just stays disabled instead of hiding the GPU.
++    // The D3D11 device isn't used, so a missing feature or extension just stays disabled instead of hiding the GPU.
      return {{
 -      ENABLE_FEATURE(core.features, depthBiasClamp, true),
 +      ENABLE_FEATURE(core.features, depthBiasClamp, false),
@@ -113,3 +113,38 @@ index 9a45f10..938c974 100644
  
        /* Allows sampling currently bound render targets for client APIs */
        ENABLE_EXT_FEATURE(extAttachmentFeedbackLoopLayout, attachmentFeedbackLoopLayout, false),
+@@ -837,9 +839,9 @@ namespace dxvk {
+       ENABLE_EXT_FEATURE(extPageableDeviceLocalMemory, pageableDeviceLocalMemory, false),
+ 
+       /* Robustness, all features effectively required for correctness */
+-      ENABLE_EXT_FEATURE(extRobustness2, robustBufferAccess2, true),
++      ENABLE_EXT_FEATURE(extRobustness2, robustBufferAccess2, false),
+       ENABLE_EXT_FEATURE(extRobustness2, robustImageAccess2, false),
+-      ENABLE_EXT_FEATURE(extRobustness2, nullDescriptor, true),
++      ENABLE_EXT_FEATURE(extRobustness2, nullDescriptor, false),
+ 
+       /* Shader module identifier, used for pipeline lifetime management in 32-bit */
+       ENABLE_EXT_FEATURE(extShaderModuleIdentifier, shaderModuleIdentifier, false),
+@@ -870,19 +872,19 @@ namespace dxvk {
+       ENABLE_EXT(khrLoadStoreOpNone, false),
+ 
+       /* Maintenance features, relied on in various parts of the code */
+-      ENABLE_EXT_FEATURE(khrMaintenance5, maintenance5, true),
++      ENABLE_EXT_FEATURE(khrMaintenance5, maintenance5, false),
+       ENABLE_EXT_FEATURE(khrMaintenance6, maintenance6, false),
+       ENABLE_EXT_FEATURE(khrMaintenance7, maintenance7, false),
+ 
+       /* Dependency for graphics pipeline library */
+-      ENABLE_EXT(khrPipelineLibrary, true),
++      ENABLE_EXT(khrPipelineLibrary, false),
+ 
+       /* Present wait, used for frame pacing and statistics */
+       ENABLE_EXT_FEATURE(khrPresentId, presentId, false),
+       ENABLE_EXT_FEATURE(khrPresentWait, presentWait, false),
+ 
+       /* Swapchain, needed for presentation */
+-      ENABLE_EXT(khrSwapchain, true),
++      ENABLE_EXT(khrSwapchain, false),
+ 
+       /* Mutable format used to change srgb-ness of swapchain views */
+       ENABLE_EXT(khrSwapchainMutableFormat, false),
