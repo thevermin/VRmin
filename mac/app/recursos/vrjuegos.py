@@ -82,6 +82,14 @@ EN = {
     "Controles de Touch para OpenComposite: el grip agarra (%d botones arreglados)":
         "Touch controls for OpenComposite: the grip grabs (%d buttons fixed)",
     "La vez anterior no arrancó con %s: ahora pruebo %s": "Last time it didn't start with %s: now trying %s",
+    "The Lab: Robot Repair y otras salas se hicieron para los controles de Vive (SteamVR real los adapta a los del Quest)":
+        "The Lab: Robot Repair and other rooms were made for Vive controllers (real SteamVR adapts them to the Quest's)",
+    "DOOM VFR se hizo para los controles de Vive (SteamVR real los adapta a los del Quest)":
+        "DOOM VFR was made for Vive controllers (real SteamVR adapts them to the Quest's)",
+    "Hecho para otros controles (Vive o Index): anda mejor con SteamVR real, que los adapta a los del Quest":
+        "Made for other controllers (Vive or Index): works better with real SteamVR, which adapts them to the Quest's",
+    "Este juego se hizo para otros controles: anda mejor con SteamVR real (instalalo desde Steam, en Herramientas)":
+        "This game was made for other controllers: it works better with real SteamVR (install it from Steam, under Tools)",
     "Gráficos: se pide DirectX 11 (%s), lo único que entiende nuestro runtime": "Graphics: asking for DirectX 11 (%s), the only one our runtime understands",
     "Se abre directo (sin el lanzador hlvr.bat) con Vulkan y algunos efectos bajados para que ande fluido":
         "Opens directly (without the hlvr.bat launcher) with Vulkan and a few effects lowered so it runs smoothly",
@@ -104,6 +112,8 @@ SENALES = {
 }
 # Mods de VR para juegos planos (dejan estos archivos en la carpeta del juego): al instalarlos, el juego pasa a ser de VR
 MODS_VR = {"awvr_readme.md": "openxr", "uninstall_alanwakevr.exe": "openxr"}   # Alan Wake VR (fholger)
+# (versión de lo que guarda la detección: al cambiar, los juegos se vuelven a detectar)
+DETECCION_V = 2
 EXE_DESCARTAR = re.compile(r"(crash|unins|setup|redist|vc_?redist|dxsetup|prereq|launcher_helper|easyanticheat|be?service|cefprocess|ue4prereq|ue5prereq)", re.I)
 
 
@@ -179,7 +189,7 @@ def a_windows(ruta_unix):
 # ---------------------------------------------------------------- detección
 def detectar(juego):
     raiz = juego["carpeta"]
-    nombres, carpetas, exes = set(), set(), []
+    nombres, carpetas, exes, jsons = set(), set(), [], []
     vistos = 0
     base = raiz.rstrip("/").count("/")
     for dirpath, dirnames, filenames in os.walk(raiz):
@@ -192,6 +202,9 @@ def detectar(juego):
             vistos += 1
             fl = f.lower()
             nombres.add(fl)
+            # (manifiestos de acciones y controles de SteamVR Input: actions.json, bindings_*.json)
+            if fl.endswith(".json") and ("action" in fl or "binding" in fl) and len(jsons) < 80:
+                jsons.append(os.path.join(dirpath, f))
             if fl.endswith(".exe") and prof <= 4 and not EXE_DESCARTAR.search(fl):
                 ruta = os.path.join(dirpath, f)
                 try:
@@ -234,7 +247,30 @@ def detectar(juego):
     else:
         rec = "openvr"   # muchos juegos viejos de SteamVR traen OpenVR dentro de su motor
 
+    # Controles: un juego OpenVR hecho para otros controles (los de Vive o Index) anda mejor con SteamVR real, que se los
+    # adapta a los del Quest como en Windows. Sin controles del Quest en su SteamVR Input, o sin SteamVR Input (los
+    # juegos viejos de SteamVR, pensados para los de Vive)
+    controles = ""
+    if rec == "openvr" and ("openvr" in apis or not apis):
+        tipos, manifiesto = set(), False
+        for ruta in jsons:
+            d = leer_json(ruta, None)
+            if not isinstance(d, dict):
+                continue
+            if isinstance(d.get("default_bindings"), list):
+                manifiesto = True
+                tipos |= {str(b.get("controller_type", "")).lower() for b in d["default_bindings"] if isinstance(b, dict)}
+            elif d.get("controller_type"):
+                manifiesto = True
+                tipos.add(str(d["controller_type"]).lower())
+        quest = any(t.startswith("oculus") or t.startswith("rift") or "touch" in t for t in tipos)
+        # (en Unreal el manifiesto lo arma el juego al abrir: sin él no se sabe)
+        if (manifiesto and not quest) or (not manifiesto and motor != "unreal"):
+            controles = "steamvr"
+
     sugerencias = []
+    if controles:
+        sugerencias.append(T("Hecho para otros controles (Vive o Index): anda mejor con SteamVR real, que los adapta a los del Quest"))
     if rec == "openxr" and graficos:
         sugerencias.append(T("Puede usar %s y nuestro runtime OpenXR solo tiene DirectX 11: si no arranca, probá OpenVR o el argumento %s")
                            % (" / ".join(graficos), "-force-d3d11" if motor == "unity" else "-dx11"))
@@ -245,7 +281,7 @@ def detectar(juego):
     if not apis:
         sugerencias.append(T("No encontré archivos de VR conocidos: puede estar dentro del motor. Se prueba con OpenVR primero"))
 
-    return {"apis": apis, "motor": motor, "graficos": graficos, "exe": exe, "recomendado": rec,
+    return {"apis": apis, "motor": motor, "graficos": graficos, "exe": exe, "recomendado": rec, "controles": controles, "v": DETECCION_V,
             "sugerencias": sugerencias, "idioma": IDIOMA, "actualizado": juego.get("actualizado", ""), "fecha": int(time.time())}
 
 
@@ -275,7 +311,8 @@ def deteccion(juego, forzar=False):
             raiz = set()
         if any(m in raiz and api not in d.get("apis", []) for m, api in MODS_VR.items()):
             forzar = True
-    if forzar or not d or d.get("actualizado") != juego.get("actualizado", "") or d.get("idioma") != IDIOMA:
+    if forzar or not d or d.get("actualizado") != juego.get("actualizado", "") or d.get("idioma") != IDIOMA \
+            or d.get("v") != DETECCION_V:
         vr = d.get("vr") if d else None
         d = detectar(juego)
         if vr is not None:
@@ -343,10 +380,17 @@ def resolver_juego(juego, det=None):
         pedido = "auto"
     runtime = pedido if pedido != "auto" else (inc.get("runtime") or det.get("recomendado") or "openvr")
     avisos = []
+    # Automático, en un juego hecho para otros controles: siempre SteamVR real (si está instalado)
+    otros_controles = pedido == "auto" and runtime == "openvr" and (inc.get("controles") or det.get("controles")) == "steamvr"
+    if otros_controles:
+        if driver_steamvr_listo() and steamvr_instalado():
+            runtime = "steamvr"
+        else:
+            avisos.append(T("Este juego se hizo para otros controles: anda mejor con SteamVR real (instalalo desde Steam, en Herramientas)"))
     # Automático: si la vez anterior no llegó ninguna imagen con este runtime, probar otro; si uno ya anduvo, ese.
     # Un juego OpenVR que no arrancó con OpenComposite prueba SteamVR real (si está instalado), que suele ser lo más
     # estable; si tampoco anduvo con SteamVR real, vuelve a lo de siempre o prueba la otra API
-    if pedido == "auto" and not inc.get("runtime"):
+    if pedido == "auto" and not inc.get("runtime") and runtime != "steamvr":
         prev = leer_json(INTENTOS, {}).get(appid)
         if prev and prev.get("runtime") in ("openxr", "openvr", "steamvr"):
             if prev.get("ok"):
@@ -495,6 +539,9 @@ def cmd_listar():
     for appid, j in sorted(juegos_instalados().items(), key=lambda kv: kv[1]["nombre"].lower()):
         det = deteccion(j)
         r = resolver_juego(j, det)
+        if (incluidos().get(appid, {}).get("controles") or det.get("controles")) == "steamvr" and r["pedido"] == "auto" \
+                and r["runtime"] == "steamvr":
+            det = dict(det, recomendado="steamvr")   # (lo que muestra «Automático (…)» en VRmin Host)
         out.append({"id": appid, "nombre": j["nombre"], "deteccion": det, "perfil": r, "vr": es_vr(det),
                     "runtimeNombre": T(NOMBRES.get(r["runtime"], r["runtime"]))})
     print(json.dumps({"juegos": out, "steamvr": steamvr_instalado(), "driverSteamvr": driver_steamvr_listo(),

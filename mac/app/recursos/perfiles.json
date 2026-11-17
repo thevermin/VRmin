@@ -1,5 +1,5 @@
 {
-  "_ayuda": "Ajustes conocidos por juego (por número de Steam). Lo que elijas en la app para un juego tiene prioridad. Claves: runtime (auto|openxr|openvr|steamvr|oculus|plano), args (lista), env (solo al abrir en modo directo), lanzar (steam|directo), exe (ruta dentro de la carpeta del juego), nota, estado (sin probar|funciona|con problemas|no funciona).",
+  "_ayuda": "Ajustes conocidos por juego (por número de Steam). Lo que elijas en la app para un juego tiene prioridad. Claves: runtime (auto|openxr|openvr|steamvr|oculus|plano), controles (steamvr: hecho para otros controles; en automático usa SteamVR real si está instalado), args (lista), env (solo al abrir en modo directo), lanzar (steam|directo), exe (ruta dentro de la carpeta del juego), nota, estado (sin probar|funciona|con problemas|no funciona).",
   "juegos": {
     "469610": {
       "runtime": "openvr",
@@ -58,6 +58,14 @@
     "108710": {
       "runtime": "openxr",
       "nota": "Alan Wake con el mod Alan Wake VR de fholger (alanwake.vrmods.eu): sin el mod es un juego plano. El mod trae su propio DXVK (DirectX 9 por Vulkan), mucho más rápido en la Mac que el DirectX 9 de Wine"
+    },
+    "450390": {
+      "controles": "steamvr",
+      "nota": "The Lab: Robot Repair y otras salas se hicieron para los controles de Vive (SteamVR real los adapta a los del Quest)"
+    },
+    "650000": {
+      "controles": "steamvr",
+      "nota": "DOOM VFR se hizo para los controles de Vive (SteamVR real los adapta a los del Quest)"
     }
   }
 }
