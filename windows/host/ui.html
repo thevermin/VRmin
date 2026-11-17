@@ -166,8 +166,8 @@ function render() {
     <span class="small">v${h(S.version)} · ${lin ? "Linux" : "Windows"}</span>
     <span class="grow"></span>
     ${S.busy ? `<span class="small ell">${h(S.busy)}</span>` : ""}
-    ${!lin && S.upd.host && !S.upd.busy ? `<button class="pill primary" data-act="updateHost" title="${t("Se baja, VRmin Host se cierra y se abre la versión nueva", "It downloads, VRmin Host closes and the new version opens")}">${S.upd.hostBack ? t("Volver a la estable ", "Back to stable ") : t("Actualizar a ", "Update to ")}${h(S.upd.host)}</button>` : ""}
-    ${!lin && S.upd.busy ? `<span class="small ell amber">${h(S.upd.busy)}</span>` : ""}
+    ${S.upd.host && !S.upd.busy ? `<button class="pill primary" data-act="updateHost" title="${t("Se baja, VRmin Host se cierra y se abre la versión nueva", "It downloads, VRmin Host closes and the new version opens")}">${S.upd.hostBack ? t("Volver a la estable ", "Back to stable ") : t("Actualizar a ", "Update to ")}${h(S.upd.host)}</button>` : ""}
+    ${S.upd.busy ? `<span class="small ell amber">${h(S.upd.busy)}</span>` : ""}
     <button class="status ${falta ? "fix" : ""}" data-act="fix" ${falta ? "" : "disabled"} title="${falta ? t("Tocá para hacerlo ahora", "Click to do it now") : ""}">
       ${dot(S.quest.connected && !falta, !!falta || !S.quest.connected)} ${h(pill)} ${falta ? `<span class="amber">${I.arrow}</span>` : ""}</button>
     <button class="pill primary" data-url="https://ko-fi.com/thevermin" title="${t("VRmin es gratis. Si te sirve, podés invitarme un café en Ko-fi", "VRmin is free. If it helps you, you can buy me a coffee on Ko-fi")}">${I.cup} ${t("Apoyar en Ko-fi", "Support on Ko-fi")}</button>
@@ -362,8 +362,8 @@ function settingsSheet() {
       <div class="row"><span class="grow">${es ? "Idioma" : "Language"}</span>${seg("lang", [["en", "English"], ["es", "Español"]], S.lang)}</div>
       ${lin ? "" : `${sw("openAtLogin", t("Abrir VRmin Host al iniciar Windows", "Open VRmin Host when Windows starts"), S.pc.openAtLogin)}
       ${sw("keepAwake", t("No suspender mientras el Quest la usa", "Don't sleep while the Quest is using it"), S.pc.keepAwake)}
-      ${sw("beta", t("Recibir versiones beta", "Get beta versions"), S.upd.beta, t("Las versiones de prueba, antes que todos. Apagado: solo las estables.", "Test versions, before everyone else. Off: stable versions only."))}
-      <div class="row"><button class="pill" data-act="checkUpdates">${t("Buscar actualizaciones", "Check for updates")}</button><span class="tiny grow">${h(S.upd.msg || "")}</span></div>`}
+      ${sw("beta", t("Recibir versiones beta", "Get beta versions"), S.upd.beta, t("Las versiones de prueba, antes que todos. Apagado: solo las estables.", "Test versions, before everyone else. Off: stable versions only."))}`}
+      <div class="row"><button class="pill" data-act="checkUpdates">${t("Buscar actualizaciones", "Check for updates")}</button><span class="tiny grow">${h(S.upd.msg || "")}</span></div>
       <div class="row"><span class="tiny grow ell">${h(S.dataDir)}</span><button class="pill" data-act="data">${t("Mostrar datos", "Show data")}</button></div>
       <div class="row"><span class="grow">${t("Quest emparejados con esta PC", "Quests paired with this PC")}</span><button class="pill" data-act="forget">${t("Olvidar todos", "Forget all")}</button></div>
     </div>

@@ -83,7 +83,8 @@ static Json stateJson() {
      .set("games", games).set("askWorked", Json()).set("busy", gamesBusy() ? gamesStatus() : "").set("stats", stats)
      .set("lastLog", tail.empty() ? std::string() : tail.back())
      .set("cfg", Json::object().set("eye", s.eye).set("fps", s.fps).set("mbps", s.mbps).set("codec", s.hevc ? "hevc" : "h264").set("fov", s.fov).set("audio", s.audio))
-     .set("gpu", Json::object().set("name", pcGpu()).set("vram", pcVram())).set("prof", prof).set("dataDir", dataDir());
+     .set("gpu", Json::object().set("name", pcGpu()).set("vram", pcVram())).set("prof", prof).set("dataDir", dataDir())
+     .set("upd", updatesState());
     return o;
 }
 
@@ -117,6 +118,8 @@ static std::string handle(const std::string &cmd, const Json &a) {
         logmsg("[quest] Paired Quests forgotten: they'll ask for the code next time");
         return "true";
     }
+    if (cmd == "updateHost") { std::thread(updatesInstallHost).detach(); return "true"; }
+    if (cmd == "checkUpdates") { std::thread([] { updatesCheck(true); }).detach(); return "true"; }
     if (cmd == "jsError") { logmsg("[window] Page error: %s", a.str().c_str()); return "true"; }
     return "null";
 }

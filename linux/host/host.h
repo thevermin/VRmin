@@ -20,6 +20,13 @@ std::string readFile(const std::string &path);
 bool writeFile(const std::string &path, const std::string &data);
 uint64_t nowNs();
 void sleepMs(int ms);
+std::string exeDir();                   // la carpeta del programa
+
+// ---------- Actualizaciones (update.cpp) ----------
+void updatesStart();
+void updatesCheck(bool manual);
+Json updatesState();                    // {host, hostBack, msg, busy}
+bool updatesInstallHost();
 
 // ---------- Ajustes (los elige el Quest, quedan en settings.json) ----------
 struct Settings {

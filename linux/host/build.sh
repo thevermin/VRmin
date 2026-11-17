@@ -26,7 +26,7 @@ else
 fi
 g++ -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -pthread -o build/vrmin-host \
   main.cpp common.cpp quest.cpp game.cpp messages.cpp convert.cpp encoder.cpp games.cpp vrsetup.cpp pendiente.cpp ui.cpp \
-  desktop.cpp windows.cpp audio.cpp mic.cpp \
+  desktop.cpp windows.cpp audio.cpp mic.cpp update.cpp \
   $(pkg-config ${VRMIN_FFMPEG_STATIC:+--static} --cflags --libs libavcodec libavutil) $(pkg-config --cflags --libs libpulse-simple libpulse) \
   $(pkg-config --cflags --libs x11 xext xtst xrandr xcomposite) ${UI[@]+"${UI[@]}"}
 echo "build/vrmin-host"

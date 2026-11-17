@@ -97,7 +97,7 @@ static bool setVrpath(const Target &t, bool ours) {
 }
 
 // ---------- Instalar el runtime y OpenComposite (desde la carpeta del programa) ----------
-static std::string exeDir() {
+std::string exeDir() {
     char b[PATH_MAX];
     ssize_t n = readlink("/proc/self/exe", b, sizeof b - 1);
     std::string p = n > 0 ? std::string(b, n) : "";
