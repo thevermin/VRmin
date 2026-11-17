@@ -3,6 +3,8 @@
 #  - Wine 11 (compilación para Mac de Gcenx, la que distribuye WineHQ) + bibliotecas de Sikarugir (GStreamer…)
 #    (Wine 11: texturas compartidas entre programas, para la copia directa de DXMT. El Wine 11 de Sikarugir
 #     no puede abrir programas nuevos: wineboot falla con «failed to start wineboot 1», probado en CI)
+#  - msync (de CrossOver: la sincronización entre programas de Windows sin pasar por wineserver): wineserver y
+#    ntdll.so de Wine 11.8 compilados con mac/wine/msync.patch (.github/workflows/wine.yml), encima del Wine de Gcenx
 #  - DXMT (DirectX 11 -> Metal): la versión de notpop (github.com/notpop/dxmt, Wine 11 Metal view fix) con
 #    mac/dxmt/msaa-8x-to-4x.patch, compilada por VRmin (.github/workflows/dxmt.yml) y publicada con VRmin 0.55. El
 #    DXMT oficial v0.80 no puede crear la ventana de Metal con el Wine de Gcenx («Failed to create metal view»: los
@@ -25,9 +27,11 @@ ENGINE_APP="Wine Devel.app"
 TPL="Template-1.0.21"
 TPL_URL="$BASE/Template/releases/download/v1.0/$TPL.tar.xz"
 TPL_SHA="bbe996e4e4375318485953d0c7818b7b4b0a4dc1f13303bcc584f99f7602f78d"
-DXMT_URL="https://github.com/thevermin/VRmin/releases/download/v0.55/dxmt-vrmin-1.tar.gz"
-DXMT_SHA="c840fc9d736cd65a996ae20d0a5691de46696a5f62ab6c9cf868dd0e2c91e56d"
-DXMT_DIR="$P/dxmt/vrmin-1"
+DXMT_URL="https://github.com/thevermin/VRmin/releases/download/v0.58/dxmt-vrmin-2.tar.gz"
+DXMT_SHA="82246ba1cca170f3f1a424c81477a4c946b661eb590e5236b8f1436fc62dd344"
+DXMT_DIR="$P/dxmt/vrmin-2"
+MSYNC_URL="https://github.com/thevermin/VRmin/releases/download/v0.58/wine-msync-vrmin-1.tar.gz"
+MSYNC_SHA="16045d9a75e8eeb0c1a50a9941ada2850ce39ab5903fa947d882a3364e74a2d9"
 export WINEDEBUG=-all
 
 paso() { echo; say "==> $1" "==> ${2:-$1}"; }
@@ -102,6 +106,18 @@ if [ -f "$WINEPREFIX/system.reg" ] && [ -x "$WINESERVER" ]; then
   "$WINESERVER" -k 2>/dev/null || true
   esperar_wine 15
 fi
+# msync: wineserver y ntdll.so con msync encima de los de Gcenx (los originales quedan como .sin-msync). Se pone de nuevo
+# si el motor se bajó otra vez o si cambió (.msync guarda cuál está puesto)
+if [ "$(cat "$WINEDIR/.msync" 2>/dev/null)" != "$MSYNC_SHA" ]; then
+  paso "Instalando msync en el motor" "Installing msync into the engine"
+  bajar "$MSYNC_URL" msync.tar.gz "$MSYNC_SHA"
+  for f in bin/wineserver lib/wine/x86_64-unix/ntdll.so; do
+    [ -f "$WINEDIR/$f.sin-msync" ] || cp -p "$WINEDIR/$f" "$WINEDIR/$f.sin-msync"
+  done
+  tar -xzf msync.tar.gz -C "$WINEDIR" ./bin/wineserver ./lib/wine/x86_64-unix/ntdll.so && rm msync.tar.gz
+  xattr -d com.apple.quarantine "$WINEDIR/bin/wineserver" "$WINEDIR/lib/wine/x86_64-unix/ntdll.so" 2>/dev/null || true
+  echo "$MSYNC_SHA" > "$WINEDIR/.msync"
+fi
 paso "Instalando DXMT dentro del motor" "Installing DXMT into the engine"
 for f in d3d11.dll dxgi.dll d3d10core.dll winemetal.dll; do
   dst="$WINEDIR/lib/wine/x86_64-windows/$f"
@@ -109,6 +125,7 @@ for f in d3d11.dll dxgi.dll d3d10core.dll winemetal.dll; do
   cp "$DXMT_DIR/x86_64-windows/$f" "$dst"
 done
 cp "$DXMT_DIR/x86_64-unix/winemetal.so" "$WINEDIR/lib/wine/x86_64-unix/winemetal.so"
+rm -rf "$P/dxmt/vrmin-1"   # (el DXMT de VRmin 0.55 a 0.57)
 
 if [ ! -f "$WINEPREFIX/system.reg" ]; then
   paso "Creando el Windows de QuestVRBridge (1-2 minutos)" "Creating VRmin's Windows (1-2 minutes)"

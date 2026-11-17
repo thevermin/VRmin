@@ -43,6 +43,16 @@ jobs:
             echo "$sha  dxmt/dxmt-vrmin.tar.gz" | sha256sum -c -
             cp dxmt/dxmt-vrmin.tar.gz "out/${url##*/}"
           fi
+          # El Wine con msync que pone instalar_motor.sh, igual que el DXMT: el último compilado («Wine con msync para
+          # VRmin»), solo si es exactamente el que espera
+          url=$(grep -o '^MSYNC_URL="[^"]*' mac/app/recursos/instalar_motor.sh | sed 's/^MSYNC_URL="//')
+          if [ "${url%/*}" = "https://github.com/$GITHUB_REPOSITORY/releases/download/${{ inputs.tag }}" ]; then
+            sha=$(grep -o '^MSYNC_SHA="[^"]*' mac/app/recursos/instalar_motor.sh | sed 's/^MSYNC_SHA="//')
+            ms=$(gh run list -R "$GITHUB_REPOSITORY" --workflow wine.yml --branch main --limit 10 --json databaseId,conclusion -q '[.[] | select(.conclusion == "success")][0].databaseId')
+            gh run download "$ms" -R "$GITHUB_REPOSITORY" -n wine-msync-vrmin -D msync
+            echo "$sha  msync/wine-msync-vrmin.tar.gz" | sha256sum -c -
+            cp msync/wine-msync-vrmin.tar.gz "out/${url##*/}"
+          fi
           ls -la out
       - name: Publicar
         run: |
