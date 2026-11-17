@@ -1,0 +1,113 @@
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index 53a0341..1c8bc1c 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -1574,6 +1574,84 @@ struct macdrv_functions_t {
+   void (*on_main_thread)(dispatch_block_t b);
+ };
+ 
++/* Child windows (Chromium's and CEF's compositor windows, for example) have no
++ * NSWindow of their own: macdrv gives them a Cocoa view inside their top-level
++ * window through a "client surface", the same way winevulkan draws into them.
++ * The layout below is Wine 11's `struct client_surface` (wine/gdi_driver.h)
++ * followed by winemac.drv's `struct macdrv_client_surface` fields. */
++struct vrmin_client_surface {
++  const void *funcs;
++  struct { void *next, *prev; } entry;
++  int32_t ref;
++  HWND hwnd;
++  int32_t updated;
++  int32_t offscreen;
++};
++struct vrmin_macdrv_client_surface {
++  struct vrmin_client_surface client;
++  macdrv_view cocoa_view;
++  macdrv_metal_device metal_device;
++  macdrv_metal_view metal_view;
++};
++
++/* Metal views made on a child window's client surface, to release the surface with the view */
++static struct { macdrv_metal_view view; struct vrmin_macdrv_client_surface *surface; } child_views[64];
++static pthread_mutex_t child_views_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static macdrv_metal_view
++create_child_metal_view(HWND hwnd, macdrv_metal_device device,
++                        macdrv_metal_view (*pfn_create_metal_view)(macdrv_view, macdrv_metal_device)) {
++  HWND (*pfn_get_ancestor)(HWND, unsigned int) = dlsym(RTLD_DEFAULT, "NtUserGetAncestor");
++  struct vrmin_macdrv_client_surface *(*pfn_surface_create)(HWND) = dlsym(RTLD_DEFAULT, "macdrv_client_surface_create");
++  void (*pfn_add_surface)(HWND, struct vrmin_client_surface *) = dlsym(RTLD_DEFAULT, "add_window_client_surface");
++  void (*pfn_surface_release)(struct vrmin_client_surface *) = dlsym(RTLD_DEFAULT, "client_surface_release");
++  if (!pfn_get_ancestor || !pfn_surface_create || !pfn_add_surface || !pfn_surface_release)
++    return NULL;
++  if (pfn_get_ancestor(hwnd, 2 /* GA_ROOT */) == hwnd)
++    return NULL; /* (a top-level window: not a child) */
++
++  struct vrmin_macdrv_client_surface *surface = pfn_surface_create(hwnd);
++  if (!surface || !surface->cocoa_view) {
++    if (surface)
++      pfn_surface_release(&surface->client);
++    return NULL;
++  }
++  /* (registered with win32u: macdrv moves and resizes the view with the window) */
++  pfn_add_surface(hwnd, &surface->client);
++  macdrv_metal_view view = pfn_create_metal_view(surface->cocoa_view, device);
++  if (!view) {
++    pfn_surface_release(&surface->client);
++    return NULL;
++  }
++  pthread_mutex_lock(&child_views_lock);
++  unsigned i;
++  for (i = 0; i < 64 && child_views[i].view; i++)
++    ;
++  if (i < 64) {
++    child_views[i].view = view;
++    child_views[i].surface = surface;
++  }
++  pthread_mutex_unlock(&child_views_lock);
++  return view;
++}
++
++static void
++release_child_surface(macdrv_metal_view view) {
++  struct vrmin_macdrv_client_surface *surface = NULL;
++  pthread_mutex_lock(&child_views_lock);
++  for (unsigned i = 0; i < 64; i++)
++    if (child_views[i].view == view) {
++      surface = child_views[i].surface;
++      child_views[i].view = NULL;
++      child_views[i].surface = NULL;
++      break;
++    }
++  pthread_mutex_unlock(&child_views_lock);
++  void (*pfn_surface_release)(struct vrmin_client_surface *) = dlsym(RTLD_DEFAULT, "client_surface_release");
++  if (surface && pfn_surface_release)
++    pfn_surface_release(&surface->client);
++}
++
+ static NTSTATUS
+ _CreateMetalViewFromHWND(void *obj) {
+   struct unixcall_create_metal_view_from_hwnd *params = obj;
+@@ -1661,6 +1739,15 @@ _CreateMetalViewFromHWND(void *obj) {
+   if (debug_metal_view)
+     fprintf(stderr, "[dxmt/winemetal] CreateMetalViewFromHWND: cocoa_window=%p\n", (void *)window);
+   if (!window) {
++    macdrv_metal_view child_view = create_child_metal_view(hwnd, device, pfn_create_metal_view);
++    if (child_view) {
++      params->ret_view = (obj_handle_t)child_view;
++      params->ret_layer = (obj_handle_t)pfn_get_metal_layer(child_view);
++      if (debug_metal_view)
++        fprintf(stderr, "[dxmt/winemetal] CreateMetalViewFromHWND: child window hwnd=%p view=%p\n",
++                (void *)(uintptr_t)params->hwnd, (void *)child_view);
++      return STATUS_SUCCESS;
++    }
+     fprintf(stderr,
+             "[dxmt/winemetal] CreateMetalViewFromHWND: macdrv_get_cocoa_window "
+             "returned NULL for hwnd=%p. The window is probably still in the "
+@@ -1744,6 +1831,7 @@ _ReleaseMetalView(void *obj) {
+    * `OnMainThread` here would be a re-entrant deadlock — the same
+    * issue described in `_CreateMetalViewFromHWND` above. */
+   pfn_macdrv_view_release_metal_view(victim);
++  release_child_surface(victim);
+ 
+   return STATUS_SUCCESS;
+ }
