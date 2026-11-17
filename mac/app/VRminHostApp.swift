@@ -153,11 +153,21 @@ final class AppModel: ObservableObject {
     @Published var steamRunning = false
     @Published var openGames = Set<String>() {   // carpetas (en minúsculas) de los juegos abiertos ahora
         didSet {
+            for dir in openGames.subtracting(oldValue) { gameOpenedAt[dir] = Date() }
             for dir in oldValue.subtracting(openGames) {
                 if let g = games.first(where: { $0.installdir.lowercased() == dir }), vr[g.id]?.perfil.estado == "sin probar" { askWorked = g }
+                // (cerrado al minuto de abrirse: puede haberse cerrado solo)
+                if let t = gameOpenedAt.removeValue(forKey: dir), Date().timeIntervalSince(t) < 60 {
+                    let name = games.first(where: { $0.installdir.lowercased() == dir })?.name ?? dir
+                    crashNote = L("%@ se cerró al poco tiempo de abrir. Si se cerró solo, armá un reporte así lo revisamos.", name)
+                }
             }
         }
     }
+    private var gameOpenedAt: [String: Date] = [:]
+    /// Algo se cerró de golpe (el servidor, o un juego al poco tiempo de abrir): ofrece armar el reporte
+    @Published var crashNote: String? = nil
+    private var stopRequested = false
     /// Modo Centinela: herramientas de Android (adb) para que el visor apoyado no apague la pantalla
     @Published var adbInstalled = false
     @Published var vigiaActive = false   // el Modo Centinela está andando (lo dice el renderizador)
@@ -895,9 +905,13 @@ final class AppModel: ObservableObject {
                                        "VR_CABLE_ONLY": cableOnly ? "1" : "0", "VR_FOV": runFov, "VR_CODEC": codec,
                                        "VR_MIC": micSource == "quest" ? "quest" : "",
                                        "VR_GEN_EYE": "\(eye)", "VR_GEN_FPS": "\(fps)", "VR_GEN_MBPS": "\(mbps)", "VR_GEN_FOV": fov])
-        p.terminationHandler = { [weak self] _ in
+        stopRequested = false
+        p.terminationHandler = { [weak self] pr in
             DispatchQueue.main.async {
                 guard let self else { return }
+                if pr.terminationStatus != 0 && !self.stopRequested {
+                    self.crashNote = L("El servidor de VRmin se cerró de golpe. Armá un reporte así lo revisamos.")
+                }
                 self.server = nil; self.serverRunning = false; self.questConnected = false; self.vigiaActive = false
                 self.questURL = nil; self.statsLine = ""; self.audioOK = false; self.pendingRestart = false
                 self.append(L("■ Servidor detenido"))
@@ -970,6 +984,7 @@ final class AppModel: ObservableObject {
 
     func stopServer(wait: Bool = false) {
         guard let p = server else { return }
+        stopRequested = true
         p.terminate()   // servidor.sh cierra servidor y renderizador al recibir esta señal
         // (por si quedó el Modo Centinela: el sensor de proximidad del visor vuelve a la normalidad)
         if adbState == "device" {
@@ -1613,6 +1628,17 @@ struct ContentView: View {
 
     private var gamesCard: some View {
         Card(title: L("Juegos"), icon: "square.grid.2x2") {
+            if let c = m.crashNote {   // algo se cerró de golpe
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.amber)
+                    Text(c).font(.callout).fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button(L("Armar reporte")) { m.crashNote = nil; m.report() }.buttonStyle(Pill(primary: true))
+                    Button { m.crashNote = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless).help(L("Ahora no"))
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.amber.opacity(0.12)))
+            }
             if let w = m.memoryWarning {   // con un juego abierto, la Mac sin memoria libre
                 HStack(alignment: .top, spacing: 10) {
                     Image(systemName: "memorychip").foregroundStyle(Theme.amber)
