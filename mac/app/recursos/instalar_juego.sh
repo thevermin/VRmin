@@ -17,7 +17,7 @@ if [ "$QUE" = install ]; then
   if [ -f "$STEAMLIB/appmanifest_$ID.acf" ]; then
     say "$NOMBRE ya está en Steam (instalado o bajando)." "$NOMBRE is already in Steam (installed or downloading)."; exit 0
   fi
-  if es_tuyo "$ID" && ! ps -axo command= | grep -qi 'steamapps.common'; then
+  if es_tuyo "$ID" && ! ps -axo command= | grep -qi '[s]teamapps.common'; then
     CARP=$(printf '%s' "$NOMBRE" | tr -d ':*?"<>|/\\' | sed 's/[[:space:]]*$//')
     [ -n "$CARP" ] || CARP="$ID"
     printf '"AppState"\n{\n\t"appid"\t\t"%s"\n\t"Universe"\t\t"1"\n\t"name"\t\t"%s"\n\t"StateFlags"\t\t"1026"\n\t"installdir"\t\t"%s"\n\t"LastUpdated"\t\t"0"\n\t"SizeOnDisk"\t\t"0"\n\t"buildid"\t\t"0"\n\t"BytesToDownload"\t\t"0"\n\t"BytesDownloaded"\t\t"0"\n\t"AutoUpdateBehavior"\t\t"0"\n\t"AllowOtherDownloadsWhileRunning"\t\t"0"\n\t"ScheduledAutoUpdate"\t\t"0"\n\t"UserConfig"\n\t{\n\t}\n\t"MountedConfig"\n\t{\n\t}\n}\n' \
@@ -44,6 +44,12 @@ disown
 if [ "$QUE" = uninstall ]; then
   say "Steam pregunta en la Mac si desinstalar $NOMBRE." "Steam asks on the Mac whether to uninstall $NOMBRE."
 else
+  # Biblioteca de VRmin: de Steam solo queda a la vista la ventanita de instalar (o la de comprar); si además se abre
+  # la principal, se esconde
+  if [ ! -f "$P/steam_ventana" ]; then
+    ( for i in 1 2 3; do sleep 6; bash "$RES/ocultar_steam.sh" > /dev/null; done ) > /dev/null 2>&1 < /dev/null &
+    disown
+  fi
   say "Steam muestra la instalación de $NOMBRE en la Mac: tocá «Instalar» ahí." \
       "Steam shows $NOMBRE's installation on the Mac: click “Install” there."
 fi

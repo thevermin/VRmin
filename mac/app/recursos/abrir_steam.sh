@@ -6,6 +6,10 @@ export WINEDEBUG=-all,err+module
 motor_listo || { say "Hay una versión nueva del motor: tocá «Instalar» en «Motor de juegos de Windows» (Steam y los juegos se conservan)." "There's a new engine version: press “Install” on “Windows games engine” (Steam and games are kept)."; exit 1; }
 [ -f "$STEAMDIR/steam.exe" ] || { say "Primero instalá Steam." "Install Steam first."; exit 1; }
 if steam_abierto; then
+  # Biblioteca de VRmin: ya está abierto de fondo y su ventana no se muestra (salvo que se pida con «ventana»)
+  if [ "$1" != ventana ] && [ ! -f "$P/steam_ventana" ]; then
+    say "Steam ya está abierto (de fondo)." "Steam is already open (in the background)."; exit 0
+  fi
   # ¿Steam se actualizó después de abrirse (la primera vez siempre) y su navegador nuevo quedó sin el arreglo de la
   # ventana (más abajo)? Entonces su ventana no se ve: se cierra y se abre de nuevo, con el arreglo. Si hay un juego
   # abierto no se toca (se cerraría el juego)
@@ -13,7 +17,7 @@ if steam_abierto; then
   for d in "$STEAMDIR/bin/cef/"cef.win*; do
     [ -f "$d/steamwebhelper.exe" ] && [ "$(stat -f %z "$d/steamwebhelper.exe")" -gt 500000 ] && sin_arreglo=1
   done
-  juego=0; ps -axo command= | grep -qi 'steamapps.common' && juego=1
+  juego=0; ps -axo command= | grep -qi '[s]teamapps.common' && juego=1
   if [ $sin_arreglo = 0 ] || [ $juego = 1 ]; then
     # Ya abierto: traer su ventana adelante
     WINEDEBUG=-all "$WINE" "C:\\Program Files (x86)\\Steam\\steam.exe" "steam://open/main" >/dev/null 2>&1 < /dev/null &
