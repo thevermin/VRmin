@@ -142,7 +142,7 @@ struct GameCapsule: View {
                 .padding(10)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            Text(!game.inLibrary ? "GameHub" : game.exe != nil ? "PC" : vr == false ? L("Plano") : "VR").font(.system(size: 10, weight: .bold))
+            Text(game.inGameHub && !game.inLibrary ? "GameHub" : !game.inLibrary ? L("Sin instalar") : game.exe != nil ? "PC" : vr == false ? L("Plano") : "VR").font(.system(size: 10, weight: .bold))
                 .padding(.horizontal, 6).padding(.vertical, 2)
                 .background(RoundedRectangle(cornerRadius: 5).fill(Color.black.opacity(0.55))).padding(7)
             if game.inLibrary && progress == nil {
@@ -188,12 +188,17 @@ struct LibraryView: View {
     @State private var selectedID: String? = nil
     @AppStorage("libraryOrder") private var order = "nombre"   // nombre o recientes
     @AppStorage("librarySideFolded") private var folded = false   // la lista de la izquierda, solo con los íconos
+    @AppStorage("libraryShowAll") private var showAll = false   // también los juegos de VR de tu cuenta sin instalar
+    @ObservedObject private var account = AccountGames.shared
 
     private var games: [SteamGame] {
         // (los que se están bajando aparecen desde que empiezan, como en Steam)
         let bajando = m.downloads.filter { d in !m.games.contains { $0.id == d.id } }
             .map { SteamGame(id: $0.id, name: $0.name, installdir: "", inLibrary: true, inGameHub: false) }
-        let l = (m.games + bajando).filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }
+        // («Todos»: también los juegos de VR de tu cuenta que no están instalados, como en Steam)
+        let sinInstalar = !showAll ? [] : account.vr.filter { a in !m.games.contains { $0.id == a.id } && !bajando.contains { $0.id == a.id } }
+            .map { SteamGame(id: $0.id, name: $0.name, installdir: "", inLibrary: false, inGameHub: false) }
+        let l = (m.games + bajando + sinInstalar).filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }
         // (los de GameHub, al final: se traen antes de jugar)
         return l.sorted { a, b in
             if a.inLibrary != b.inLibrary { return a.inLibrary }
@@ -222,6 +227,9 @@ struct LibraryView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .safeAreaInset(edge: .bottom, spacing: 0) { DownloadsBar() }
             }
+        }
+        .onAppear {
+            AccountGames.shared.start(steamDir: m.steamapps.deletingLastPathComponent(), cache: m.data.appendingPathComponent("tienda_cache.json"))
         }
     }
 
@@ -287,7 +295,7 @@ struct LibraryView: View {
         .padding(10)
         .frame(width: small ? 58 : 210)
         .frame(maxHeight: .infinity, alignment: .top)
-        .background(LinearGradient(colors: [Color(red: 42 / 255, green: 71 / 255, blue: 94 / 255).opacity(0.25), .clear], startPoint: .top, endPoint: .bottom))
+        .background(LinearGradient(colors: [Theme.amber.opacity(0.07), Theme.amber.opacity(0.015)], startPoint: .top, endPoint: .bottom))
     }
 
     private var grid: some View {
@@ -296,6 +304,12 @@ struct LibraryView: View {
                 HStack(alignment: .firstTextBaseline) {
                     Text(L("Biblioteca")).font(.system(size: 18, weight: .bold))
                     Spacer()
+                    Picker("", selection: $showAll) {
+                        Text(L("Instalados")).tag(false)
+                        Text(L("Todos")).tag(true)
+                    }
+                    .pickerStyle(.segmented).labelsHidden().fixedSize()
+                    .help(L("«Todos» suma los juegos de VR de tu cuenta que no están instalados"))
                     Picker(L("Ordenar"), selection: $order) {
                         Text(L("Por nombre")).tag("nombre")
                         Text(L("Jugados hace poco")).tag("recientes")
@@ -450,6 +464,9 @@ struct GameDetail: View {
         if let d = m.downloads.first(where: { $0.id == game.id }) {
             Button {} label: { Label(d.total > 0 ? L("DESCARGANDO · %d %%", Int(d.fraction * 100)) : L("PREPARANDO LA DESCARGA"), systemImage: "arrow.down.circle") }
                 .buttonStyle(BigButton()).disabled(true)
+        } else if !game.inLibrary && !game.inGameHub {
+            Button { m.installGame(game.id, game.name) } label: { Label(L("INSTALAR"), systemImage: "arrow.down") }
+                .buttonStyle(BigButton()).disabled(!m.steamInstalled)
         } else if !game.inLibrary {
             Button { m.importGame(game) } label: { Label(L("TRAER DE GAMEHUB"), systemImage: "arrow.down") }
                 .buttonStyle(BigButton()).disabled(m.busyTask != nil || !m.steamInstalled || m.steamRunning)
@@ -548,7 +565,7 @@ struct GameDetail: View {
     }
 
     private func estado(_ v: VRJuego?) -> String {
-        if !game.inLibrary { return L("En GameHub") }
+        if !game.inLibrary { return game.inGameHub ? L("En GameHub") : L("Sin instalar") }
         switch v?.perfil.estado {
         case "funciona": return L("Funciona")
         case "con problemas": return L("Anda con problemas")
