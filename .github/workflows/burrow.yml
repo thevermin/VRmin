@@ -29,6 +29,8 @@ jobs:
           out/root/hilos | tee out/hilos.esperado
       - name: GPU test system (Mesa Venus, vulkaninfo, vkcube)
         run: bash burrow/gpu/sysroot-linux.sh "$PWD/out/gpu-root"
+      - name: Half-Life Alyx test system (the GPU one plus what the game asks for and doesn't bring)
+        run: bash burrow/gpu/sysroot-alyx.sh "$PWD/out/gpu-root" "$PWD/out/alyx-root"
       - name: Drawing test (a triangle with Vulkan, checked here on Mesa's CPU driver)
         run: |
           set -e
