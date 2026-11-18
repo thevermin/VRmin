@@ -96,12 +96,12 @@ struct Motion {
   uint32_t lastId = 0;
   double lastT = 0, pos[3] = {}, q[4] = {0, 0, 0, 1}, vel[3] = {}, ang[3] = {};
   void reset() { lastId = 0; for (int i = 0; i < 3; i++) vel[i] = ang[i] = 0; }
-  // Position and rotation (x y z w) of a new pose, and its time in seconds
+  // Position and rotation (x y z w) of a new pose; dt from the time it arrived here
   void update(uint32_t id, const double *p, const double *r, double now) {
     if (id == lastId) return;
     double dt = now - lastT;
     if (lastId && dt > 0.002 && dt < 0.1) {
-      const double k = 0.35;   // (smoothed: the poses come over Wi-Fi, not quite evenly)
+      const double k = 0.6;   // (smoothed a little: the poses come over Wi-Fi, not quite evenly)
       for (int i = 0; i < 3; i++) vel[i] = k * (p[i] - pos[i]) / dt + (1 - k) * vel[i];
       // turn since the last pose, in the world: r × inverse(last)
       double x = r[3] * -q[0] + r[0] * q[3] + r[1] * -q[2] - r[2] * -q[1];
@@ -119,16 +119,8 @@ struct Motion {
     for (int i = 0; i < 3; i++) pos[i] = p[i];
     for (int i = 0; i < 4; i++) q[i] = r[i];
   }
-  // SteamVR moves the hand ahead with this velocity: small movements (where it's mostly noise) go without it, or the
-  // hand shakes when you barely move it. It grows to the full velocity between 0.1 and 0.3 m/s (0.6 and 1.6 rad/s
-  // turning): punches and throws are well above that.
-  static double ramp(const double *v, double from, double to) {
-    double n = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-    return n <= from ? 0 : n >= to ? 1 : (n - from) / (to - from);
-  }
   void apply(DriverPose_t &p) const {
-    double a = ramp(vel, 0.1, 0.3), b = ramp(ang, 0.6, 1.6);
-    for (int i = 0; i < 3; i++) { p.vecVelocity[i] = vel[i] * a; p.vecAngularVelocity[i] = ang[i] * b; }
+    for (int i = 0; i < 3; i++) { p.vecVelocity[i] = vel[i]; p.vecAngularVelocity[i] = ang[i]; }
   }
 };
 
@@ -206,7 +198,6 @@ static SOCKET host_connect() {
 enum { IN_TRIGGER, IN_SQUEEZE, IN_TX, IN_TY, IN_TCLICK, IN_A, IN_B, IN_TTOUCH, IN_THTOUCH, IN_ATOUCH, IN_BTOUCH, IN_MENU, IN_COUNT };
 struct Track {
   uint32_t id = 0;
-  double tms = 0;   // (the Quest's time of the pose, in ms)
   bool valid = false, handValid[2] = {};
   double eye[2][7] = {}, fov[2][4] = {}, grip[2][7] = {}, aim[2][7] = {};
   float in[2][IN_COUNT] = {};
@@ -273,7 +264,6 @@ static void parse_pose(const char *line) {
   Track t;
   int k = 0;
   t.id = (uint32_t)strtoul(idp + 5, nullptr, 10);
-  if (const char *tq = strstr(line, "\"t\":")) t.tms = strtod(tq + 4, nullptr);
   t.valid = v[k++] > 0.5;
   for (int e = 0; e < 2; e++) {
     for (int i = 0; i < 7; i++) t.eye[e][i] = v[k++];
@@ -1261,7 +1251,7 @@ public:
     else if (t.handValid[h]) {
       raw_from_grip(t.grip[h], left, raw);
       p = pose_at(raw[0], raw[1], raw[2], raw + 3);
-      motion.update(t.id, raw, raw + 3, t.tms > 0 ? t.tms / 1000 : now_s());   // (the Quest's time: steadier than when it got here)
+      motion.update(t.id, raw, raw + 3, now_s());
       motion.apply(p);
     }
     else { p = GetPose(); p.poseIsValid = false; p.result = TrackingResult_Running_OutOfRange; }   // (put down or out of sight)
