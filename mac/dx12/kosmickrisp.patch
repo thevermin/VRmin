@@ -1,3 +1,48 @@
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index 63d2ec1..51b41ab 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -1307,6 +1307,15 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+                P(ctx, "%c", "xyzw"[component + i]);
+       }
+       P(ctx, " = ");
++      /* (an integer value into the float4 position: bit-cast it) */
++      static const char *const fsuf[] = {"", "", "2", "3", "4"};
++      unsigned written = util_bitcount(write_mask & BITFIELD_MASK(num_components));
++      const char *src_ty = msl_type_for_def(ctx->types, instr->src[0].ssa);
++      bool cast_pos = ctx->shader->info.stage == MESA_SHADER_VERTEX &&
++                      location == VARYING_SLOT_POS && src_ty &&
++                      (strncmp(src_ty, "uint", 4) == 0 || strncmp(src_ty, "int", 3) == 0);
++      if (cast_pos)
++         P(ctx, "as_type<float%s>(", fsuf[written]);
+       src_to_msl(ctx, &instr->src[0]);
+       if (num_components > 1u) {
+          P(ctx, ".");
+@@ -1314,6 +1323,8 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+             if ((write_mask >> i) & 1)
+                P(ctx, "%c", "xyzw"[i]);
+       }
++      if (cast_pos)
++         P(ctx, ")");
+       P(ctx, ";\n");
+       break;
+    }
+@@ -2387,6 +2398,15 @@ msl_gather_info(struct nir_to_msl_ctx *ctx, struct nir_to_msl_options *options)
+    if (ctx->shader->info.stage == MESA_SHADER_VERTEX ||
+        ctx->shader->info.stage == MESA_SHADER_FRAGMENT) {
+       msl_gather_io_info(ctx, ctx->inputs_info, ctx->outputs_info);
++      /* VRmin: Metal wants [[position]] as float4. D3D12 shaders translated
++       * by dxil-spirv can write it from integer values (bit casts), and the
++       * inferred type became uint3, which Metal rejects. The stores bit-cast
++       * back to float (see store_output). */
++      if (ctx->shader->info.stage == MESA_SHADER_VERTEX &&
++          (ctx->shader->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_POS))) {
++         ctx->outputs_info[VARYING_SLOT_POS].type = nir_type_float32;
++         ctx->outputs_info[VARYING_SLOT_POS].num_components = 4;
++      }
+ 
+       if (ctx->shader->info.stage == MESA_SHADER_FRAGMENT) {
+          /* Metal does not have a system value for sample position but an
 diff --git a/src/kosmickrisp/vulkan/kk_query_pool.c b/src/kosmickrisp/vulkan/kk_query_pool.c
 index 8c78cf5..214fe86 100644
 --- a/src/kosmickrisp/vulkan/kk_query_pool.c
