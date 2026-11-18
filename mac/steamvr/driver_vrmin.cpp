@@ -89,14 +89,14 @@ static DriverPose_t pose_at(double x, double y, double z, const double *q = null
   return p;
 }
 
-// How fast a device moves and turns, from the Quest's poses (each one once: between two new poses the same one is
+// How fast a hand moves and turns, from the Quest's poses (each one once: between two new poses the same one is
 // sent again). Games that use it: SUPERHOT VR (time moves when you move, and the strength of a punch), throwing in
 // many others. Without it they saw the hands as still, however they moved.
 struct Motion {
   uint32_t lastId = 0;
   double lastT = 0, pos[3] = {}, q[4] = {0, 0, 0, 1}, vel[3] = {}, ang[3] = {};
   void reset() { lastId = 0; for (int i = 0; i < 3; i++) vel[i] = ang[i] = 0; }
-  // Position and rotation (x y z w) of a new pose; dt from the time it arrived here
+  // Position and rotation (x y z w) of a new pose, and its time in seconds
   void update(uint32_t id, const double *p, const double *r, double now) {
     if (id == lastId) return;
     double dt = now - lastT;
@@ -198,6 +198,7 @@ static SOCKET host_connect() {
 enum { IN_TRIGGER, IN_SQUEEZE, IN_TX, IN_TY, IN_TCLICK, IN_A, IN_B, IN_TTOUCH, IN_THTOUCH, IN_ATOUCH, IN_BTOUCH, IN_MENU, IN_COUNT };
 struct Track {
   uint32_t id = 0;
+  double tms = 0;   // (the Quest's time of the pose, in ms)
   bool valid = false, handValid[2] = {};
   double eye[2][7] = {}, fov[2][4] = {}, grip[2][7] = {}, aim[2][7] = {};
   float in[2][IN_COUNT] = {};
@@ -264,6 +265,7 @@ static void parse_pose(const char *line) {
   Track t;
   int k = 0;
   t.id = (uint32_t)strtoul(idp + 5, nullptr, 10);
+  if (const char *tq = strstr(line, "\"t\":")) t.tms = strtod(tq + 4, nullptr);
   t.valid = v[k++] > 0.5;
   for (int e = 0; e < 2; e++) {
     for (int i = 0; i < 7; i++) t.eye[e][i] = v[k++];
@@ -1108,7 +1110,6 @@ class VRminHmd : public ITrackedDeviceServerDriver {
   VRminDirectMode directMode;
   VRInputComponentHandle_t proximity = 0;
 public:
-  Motion motion;
   uint32_t id = k_unTrackedDeviceIndexInvalid;
   EVRInitError Activate(uint32_t objectId) override {
     id = objectId;
@@ -1153,12 +1154,9 @@ public:
     if (id == k_unTrackedDeviceIndexInvalid) return;
     DriverPose_t p = t.valid ? pose_at((t.eye[0][0] + t.eye[1][0]) / 2, (t.eye[0][1] + t.eye[1][1]) / 2, (t.eye[0][2] + t.eye[1][2]) / 2, t.eye[0] + 3)
                              : GetPose();
-    if (t.valid) {
-      remember_head(t.id, p);
-      const double pos[3] = {p.vecPosition[0], p.vecPosition[1], p.vecPosition[2]}, r[4] = {p.qRotation.x, p.qRotation.y, p.qRotation.z, p.qRotation.w};
-      motion.update(t.id, pos, r, now_s());
-      motion.apply(p);
-    } else motion.reset();
+    // (without velocity: with it SteamVR moves the head ahead by itself, the frames no longer match a pose the Quest
+    // sent, and the headset corrects with the wrong one: the image shakes when you move your head)
+    if (t.valid) remember_head(t.id, p);
     VRServerDriverHost()->TrackedDevicePoseUpdated(id, p, sizeof p);
   }
 };
@@ -1255,7 +1253,7 @@ public:
     else if (t.handValid[h]) {
       raw_from_grip(t.grip[h], left, raw);
       p = pose_at(raw[0], raw[1], raw[2], raw + 3);
-      motion.update(t.id, raw, raw + 3, now_s());
+      motion.update(t.id, raw, raw + 3, t.tms > 0 ? t.tms / 1000 : now_s());   // (the Quest's time: steadier than when it got here)
       motion.apply(p);
     }
     else { p = GetPose(); p.poseIsValid = false; p.result = TrackingResult_Running_OutOfRange; }   // (put down or out of sight)

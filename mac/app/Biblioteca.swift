@@ -215,7 +215,11 @@ struct LibraryView: View {
     // (también los que se están bajando o están sin instalar: su página tiene «Instalar»)
     private var selected: SteamGame? { selectedID.flatMap { id in m.games.first { $0.id == id } ?? games.first { $0.id == id } } }
     private func isOpen(_ g: SteamGame) -> Bool { g.inLibrary && m.openGames.contains(g.installdir.lowercased()) }
-    private func select(_ g: SteamGame?) { withAnimation(.easeInOut(duration: 0.25)) { selectedID = g?.id } }
+    @State private var lastOpenedID: String? = nil   // (al volver a la grilla, queda donde estaba: en ese juego)
+    private func select(_ g: SteamGame?) {
+        if let g { lastOpenedID = g.id }
+        withAnimation(.easeInOut(duration: 0.25)) { selectedID = g?.id }
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -321,6 +325,7 @@ struct LibraryView: View {
     }
 
     private var grid: some View {
+        ScrollViewReader { proxy in
         ScrollView {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
@@ -358,11 +363,14 @@ struct LibraryView: View {
                     ForEach(games) { g in
                         GameCapsule(game: g, vr: m.vr[g.id]?.vr, open: isOpen(g), progress: m.downloads.first { $0.id == g.id }?.fraction) { m.play(g) }
                             .onTapGesture { select(g) }
+                            .id(g.id)
                     }
                 }
                 .padding(.vertical, 8)
             }
             .padding(18)
+        }
+        .onAppear { if let id = lastOpenedID { proxy.scrollTo(id, anchor: .center) } }
         }
     }
 
