@@ -98,7 +98,7 @@ jobs:
           lipo vk/macOS/bin/vulkaninfo -thin x86_64 -output $o/vk/vulkaninfo 2>/dev/null || cp vk/macOS/bin/vulkaninfo $o/vk/
           install_name_tool -add_rpath @loader_path $o/vk/vulkaninfo 2>/dev/null || true
           cp v/x64/d3d12.dll v/x64/d3d12core.dll $o/vkd3d-proton/
-          x86_64-w64-mingw32-gcc -O2 -Wall -o $o/prueba_d3d12.exe vrmin/mac/dx12/prueba_d3d12.c -ld3d12 -ldxgi -luuid -lm
+          x86_64-w64-mingw32-gcc -O2 -Wall -o $o/prueba_d3d12.exe vrmin/mac/dx12/prueba_d3d12.c -ld3d12 -ldxgi -ld3dcompiler -luuid -lm
           cp vrmin/mac/dx12/probar.sh $o/ && cp kk-version $o/
           find $o -name '*.dylib' -o -name vulkaninfo | xargs -I{} sh -c 'lipo -info "{}"; codesign --force --sign - "{}"'
           tar -czf dx12-prueba.tar.gz $o && ls -la dx12-prueba.tar.gz
