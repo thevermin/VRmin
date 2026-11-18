@@ -245,13 +245,22 @@ abrir_steamvr() {
   say "SteamVR listo" "SteamVR ready"
 }
 
+# Cierra SteamVR como al tocar la X de su ventana (vrmonitor.exe), y espera a que termine. Cerrarlo de golpe le
+# parece una falla: la vez siguiente arranca en modo seguro y avisa «se ha desactivado debido a un fallo en la última
+# ejecución». Solo si en 15 segundos no se cerró, a la fuerza.
+cerrar_steamvr_bien() {
+  pgrep -f 'vrserver.exe' >/dev/null 2>&1 || return 0
+  WINEDEBUG=-all "$WINE" taskkill /IM vrmonitor.exe >/dev/null 2>&1 < /dev/null
+  local i; for i in $(seq 1 30); do pgrep -f 'vrserver.exe' >/dev/null 2>&1 || return 0; sleep 0.5; done
+  local p; for p in vrmonitor vrcompositor vrdashboard vrwebhelper vrserver vrstartup; do pkill -f "$p.exe" 2>/dev/null; done
+  sleep 2
+}
+
 # Cierra SteamVR (y deja de vigilar el juego que lo usaba)
 cerrar_steamvr() {
   local v; v="$(cat "$Q/.vigia_steamvr" 2>/dev/null)"
   [ -n "$v" ] && kill "$v" 2>/dev/null; rm -f "$Q/.vigia_steamvr"
-  pgrep -f 'vrserver.exe' >/dev/null 2>&1 || return 0
-  local p; for p in vrmonitor vrcompositor vrdashboard vrwebhelper vrserver vrstartup; do pkill -f "$p.exe" 2>/dev/null; done
-  sleep 2
+  cerrar_steamvr_bien
 }
 
 # Cierra SteamVR cuando el juego se cierra (si no, sigue dibujando y calentando la Mac): espera a que aparezca algún
@@ -272,10 +281,7 @@ cerrar_steamvr_con_el_juego() {
       elif [ $visto = 1 ]; then sin=$((sin + 5))
       elif [ $(( $(date +%s) - desde )) -gt 300 ]; then sin=999
       fi
-      if [ $sin -ge 30 ]; then
-        for p in vrmonitor vrcompositor vrdashboard vrwebhelper vrserver vrstartup; do pkill -f "$p.exe" 2>/dev/null; done
-        break
-      fi
+      if [ $sin -ge 30 ]; then cerrar_steamvr_bien; break; fi
     done
     rm -f "$Q/.vigia_steamvr"
   ) > /dev/null 2>&1 < /dev/null &

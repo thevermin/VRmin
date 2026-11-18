@@ -3,6 +3,8 @@
 # Aunque Steam esté trabado: primero se le pide a Wine que cierre todo (con límite de tiempo) y después se
 # terminan a la fuerza los procesos que hayan quedado (solo los de este Windows, no el Steam de Mac).
 source "$(dirname "$0")/entorno.sh"
+# SteamVR primero y por las buenas (ver cerrar_steamvr_bien en runtime.sh): si no, la vez siguiente arranca en modo seguro
+if pgrep -f 'vrserver.exe' >/dev/null 2>&1; then source "$RES/runtime.sh"; cerrar_steamvr; fi
 if [ -x "$WINESERVER" ]; then
   "$WINESERVER" -k 2>/dev/null &
   K=$!
