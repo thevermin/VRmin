@@ -101,7 +101,7 @@ struct Motion {
     if (id == lastId) return;
     double dt = now - lastT;
     if (lastId && dt > 0.002 && dt < 0.1) {
-      const double k = 0.6;   // (smoothed a little: the poses come over Wi-Fi, not quite evenly)
+      const double k = 0.35;   // (smoothed: the poses come over Wi-Fi, not quite evenly)
       for (int i = 0; i < 3; i++) vel[i] = k * (p[i] - pos[i]) / dt + (1 - k) * vel[i];
       // turn since the last pose, in the world: r × inverse(last)
       double x = r[3] * -q[0] + r[0] * q[3] + r[1] * -q[2] - r[2] * -q[1];
@@ -119,8 +119,16 @@ struct Motion {
     for (int i = 0; i < 3; i++) pos[i] = p[i];
     for (int i = 0; i < 4; i++) q[i] = r[i];
   }
+  // SteamVR moves the hand ahead with this velocity: small movements (where it's mostly noise) go without it, or the
+  // hand shakes when you barely move it. It grows to the full velocity between 0.1 and 0.3 m/s (0.6 and 1.6 rad/s
+  // turning): punches and throws are well above that.
+  static double ramp(const double *v, double from, double to) {
+    double n = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    return n <= from ? 0 : n >= to ? 1 : (n - from) / (to - from);
+  }
   void apply(DriverPose_t &p) const {
-    for (int i = 0; i < 3; i++) { p.vecVelocity[i] = vel[i]; p.vecAngularVelocity[i] = ang[i]; }
+    double a = ramp(vel, 0.1, 0.3), b = ramp(ang, 0.6, 1.6);
+    for (int i = 0; i < 3; i++) { p.vecVelocity[i] = vel[i] * a; p.vecAngularVelocity[i] = ang[i] * b; }
   }
 };
 
