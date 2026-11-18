@@ -18,7 +18,9 @@ func folderBytes(_ url: URL) -> Int64 {
     var n: Int64 = 0
     for case let f as URL in en {
         let v = try? f.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileSizeKey])
-        n += Int64(v?.fileSize ?? 0)
+        // (lo que ocupa de verdad en el disco, no su tamaño: Steam reserva el tamaño entero de cada archivo al
+        // empezar, y esos archivos quedan casi vacíos hasta que se bajan)
+        n += Int64(v?.totalFileAllocatedSize ?? v?.fileSize ?? 0)
     }
     return n
 }
@@ -420,14 +422,17 @@ struct GameDetail: View {
                         }
                     }
                     .padding(.horizontal, 26).padding(.top, 4)
-                    Group {
-                        if mid {
-                            HStack(alignment: .top, spacing: 14) { vrCard(v); qualityCard.frame(width: 220) }
-                        } else {
-                            VStack(alignment: .leading, spacing: 14) { vrCard(v); qualityCard }
+                    // (sin instalar no hay nada que elegir: se elige después de bajarlo)
+                    if game.inLibrary {
+                        Group {
+                            if mid {
+                                HStack(alignment: .top, spacing: 14) { vrCard(v, segmented: true); qualityCard.frame(width: 220) }
+                            } else {
+                                VStack(alignment: .leading, spacing: 14) { vrCard(v, segmented: geo.size.width >= 600); qualityCard }
+                            }
                         }
+                        .padding(.horizontal, 26).padding(.vertical, 18)
                     }
-                    .padding(.horizontal, 26).padding(.vertical, 18)
                 }
                 .frame(width: geo.size.width)
             }
@@ -453,7 +458,7 @@ struct GameDetail: View {
                     }
                 }
             }
-            .frame(height: 240).frame(maxWidth: .infinity).clipped()
+            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 240, maxHeight: 240).clipped()
             LinearGradient(colors: [.clear, Theme.bg], startPoint: .center, endPoint: .bottom)
             Group {
                 if game.exe != nil { title }
@@ -478,8 +483,11 @@ struct GameDetail: View {
 
     @ViewBuilder private var mainButton: some View {
         if let d = m.downloads.first(where: { $0.id == game.id }) {
-            Button {} label: { Label(d.total > 0 ? L("DESCARGANDO · %d %%", Int(d.fraction * 100)) : L("PREPARANDO LA DESCARGA"), systemImage: "arrow.down.circle") }
-                .buttonStyle(BigButton()).disabled(true)
+            HStack(spacing: 10) {
+                Button {} label: { Label(d.paused ? L("EN PAUSA · %d %%", Int(d.fraction * 100)) : d.total > 0 ? L("DESCARGANDO · %d %%", Int(d.fraction * 100)) : L("PREPARANDO LA DESCARGA"), systemImage: d.paused ? "pause.circle" : "arrow.down.circle") }
+                    .buttonStyle(BigButton()).disabled(true)
+                DownloadControls(d: d)
+            }
         } else if !game.inLibrary && !game.inGameHub {
             Button { m.installGame(game.id, game.name) } label: { Label(L("INSTALAR"), systemImage: "arrow.down") }
                 .buttonStyle(BigButton()).disabled(!m.steamInstalled)
@@ -513,13 +521,17 @@ struct GameDetail: View {
         return f.localizedString(for: Date(timeIntervalSince1970: TimeInterval(game.lastPlayed)), relativeTo: Date())
     }
 
-    private func vrCard(_ v: VRJuego?) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+    private func vrCard(_ v: VRJuego?, segmented: Bool) -> some View {
+        let pick = Picker(L("Sistema de VR"), selection: Binding(get: { v?.perfil.pedido ?? "auto" }, set: { m.setVR(game.id, "runtime", $0) })) {
+            ForEach(Self.runtimes, id: \.id) { o in Text(L(o.name)).tag(o.id) }
+        }
+        return VStack(alignment: .leading, spacing: 8) {
             Text(L("Sistema de VR")).font(.system(size: 13, weight: .semibold))
-            Picker(L("Sistema de VR"), selection: Binding(get: { v?.perfil.pedido ?? "auto" }, set: { m.setVR(game.id, "runtime", $0) })) {
-                ForEach(Self.runtimes, id: \.id) { o in Text(L(o.name)).tag(o.id) }
+            // (las cinco opciones juntas no se achican: con la ventana angosta, en un menú)
+            Group {
+                if segmented { pick.pickerStyle(.segmented) } else { pick.pickerStyle(.menu).fixedSize() }
             }
-            .pickerStyle(.segmented).labelsHidden().disabled(v == nil || !game.inLibrary)
+            .labelsHidden().disabled(v == nil || !game.inLibrary)
             Text(L("Si un juego anda mal con OpenComposite, probá SteamVR real, que suele ser lo más estable; si SteamVR real va lento o no abre, probá OpenComposite."))
                 .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
         }
@@ -646,12 +658,35 @@ struct DownloadsBar: View {
                 .frame(height: 6).frame(minWidth: 60)
                 Text(d.total <= 0 ? L("Preparando…") : "\(Int(k * 100)) % · \(bytesText(d.done)) / \(bytesText(d.total))" + speedText(d))
                     .font(.caption.monospacedDigit()).foregroundStyle(Theme.text2).lineLimit(1).fixedSize()
+                DownloadControls(d: d)
             }
             .padding(.horizontal, 16).frame(height: 46)
             .background(Theme.amber.opacity(0.10))
             .background(Theme.bg)
             .overlay(Rectangle().fill(Theme.amber.opacity(0.5)).frame(height: 1), alignment: .top)
             .transition(.move(edge: .bottom))
+        }
+    }
+}
+
+/// Pausar / seguir y cancelar (con confirmación) una descarga
+struct DownloadControls: View {
+    @EnvironmentObject var m: AppModel
+    let d: SteamDownload
+    @State private var askCancel = false
+    var body: some View {
+        HStack(spacing: 6) {
+            Button { m.pauseDownload(d) } label: { Image(systemName: d.paused ? "play.fill" : "pause.fill").frame(width: 14) }
+                .help(d.paused ? L("Seguir la descarga") : L("Pausar la descarga"))
+            Button { askCancel = true } label: { Image(systemName: "xmark").frame(width: 14) }
+                .help(L("Cancelar la descarga"))
+        }
+        .buttonStyle(Pill())
+        .alert(L("¿Cancelar la descarga de %@?", d.name), isPresented: $askCancel) {
+            Button(L("Cancelar la descarga"), role: .destructive) { m.cancelDownload(d) }
+            Button(L("Seguir bajando"), role: .cancel) {}
+        } message: {
+            Text(L("Se borra lo que ya bajó. Steam se reinicia de fondo un momento."))
         }
     }
 }

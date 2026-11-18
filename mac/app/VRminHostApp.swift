@@ -1220,6 +1220,11 @@ final class AppModel: ObservableObject {
     func installSteamVR() { run(L("Instalando SteamVR"), "instalar_steamvr.sh", exclusive: false) }
     /// Le pide al Steam de VRmin que instale un juego (desde la Tienda)
     func installGame(_ id: String, _ name: String) { run(L("Instalando %@", name), "instalar_juego.sh", [id, name], exclusive: false) }
+    /// Pausar, seguir o cancelar una descarga de Steam (Steam se reinicia de fondo: ver descarga.sh)
+    func pauseDownload(_ d: SteamDownload) {
+        run(d.paused ? L("Siguiendo la descarga de %@", d.name) : L("Pausando la descarga de %@", d.name), "descarga.sh", [d.id, d.paused ? "seguir" : "pausar"], exclusive: false)
+    }
+    func cancelDownload(_ d: SteamDownload) { run(L("Cancelando la descarga de %@", d.name), "descarga.sh", [d.id, "cancelar"], exclusive: false) }
 
     /// Cierra ese juego a la fuerza (si no responde): primero le pide que se cierre y, si no, lo termina
     func forceClose(_ g: SteamGame) {
