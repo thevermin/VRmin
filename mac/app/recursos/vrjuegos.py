@@ -387,23 +387,35 @@ def resolver_juego(juego, det=None):
             runtime = "steamvr"
         else:
             avisos.append(T("Este juego se hizo para otros controles: anda mejor con SteamVR real (instalalo desde Steam, en Herramientas)"))
-    # Automático: si la vez anterior no llegó ninguna imagen con este runtime, probar otro; si uno ya anduvo, ese.
-    # Un juego OpenVR que no arrancó con OpenComposite prueba SteamVR real (si está instalado), que suele ser lo más
-    # estable; si tampoco anduvo con SteamVR real, vuelve a lo de siempre o prueba la otra API
-    if pedido == "auto" and not inc.get("runtime") and runtime != "steamvr":
+    # Automático: los juegos OpenVR van primero con SteamVR real (si está instalado), como en una PC con Windows (su
+    # menú, sus perfiles de controles); OpenComposite queda de respaldo. Los que tienen un runtime probado en
+    # perfiles.json siguen con ese.
+    svr = driver_steamvr_listo() and steamvr_instalado()
+    if pedido == "auto" and not inc.get("runtime") and runtime == "openvr" and svr:
+        runtime = "steamvr"
+    # Automático: si la vez anterior no llegó ninguna imagen con este runtime, probar otro; si uno ya anduvo, ese
+    # (menos OpenComposite, que ya no le gana a SteamVR real). Si SteamVR real no arrancó: OpenComposite; si tampoco
+    # anduvo OpenComposite: la otra API (o SteamVR real de nuevo)
+    if pedido == "auto" and not inc.get("runtime"):
         prev = leer_json(INTENTOS, {}).get(appid)
         if prev and prev.get("runtime") in ("openxr", "openvr", "steamvr"):
+            antes = prev["runtime"]
             if prev.get("ok"):
-                runtime = prev["runtime"]
-            elif prev["runtime"] == runtime == "openvr" and driver_steamvr_listo() and steamvr_instalado():
-                avisos.append(T("La vez anterior no arrancó con %s: ahora pruebo %s") % (NOMBRES[runtime], NOMBRES["steamvr"]))
-                runtime = "steamvr"
-            elif prev["runtime"] == "steamvr" and alternativa(det, runtime):
-                avisos.append(T("La vez anterior no arrancó con %s: ahora pruebo %s") % (NOMBRES["steamvr"], NOMBRES[alternativa(det, runtime)]))
-                runtime = alternativa(det, runtime)
-            elif prev["runtime"] == runtime and alternativa(det, runtime):
-                avisos.append(T("La vez anterior no arrancó con %s: ahora pruebo %s") % (NOMBRES[runtime], NOMBRES[alternativa(det, runtime)]))
-                runtime = alternativa(det, runtime)
+                if not (antes == "openvr" and runtime == "steamvr"):
+                    runtime = antes
+            else:
+                nuevo = None
+                if antes == "steamvr" and runtime == "steamvr":
+                    nuevo = "openvr"
+                elif antes == "openvr" and runtime in ("openvr", "steamvr"):
+                    nuevo = alternativa(det, "openvr") or ("steamvr" if runtime == "steamvr" else None)
+                elif antes == runtime:
+                    nuevo = alternativa(det, runtime)
+                    if nuevo == "openvr" and svr:
+                        nuevo = "steamvr"
+                if nuevo and nuevo != antes:
+                    avisos.append(T("La vez anterior no arrancó con %s: ahora pruebo %s") % (NOMBRES[antes], NOMBRES[nuevo]))
+                    runtime = nuevo
     # Lo que todavía no está: se usa lo más parecido, y se avisa
     if runtime == "oculus":
         avisos.append(T("Oculus (ReVive) todavía no está incluido: se usa OpenVR"))
@@ -541,8 +553,7 @@ def cmd_listar():
     for appid, j in sorted(juegos_instalados().items(), key=lambda kv: kv[1]["nombre"].lower()):
         det = deteccion(j)
         r = resolver_juego(j, det)
-        if (incluidos().get(appid, {}).get("controles") or det.get("controles")) == "steamvr" and r["pedido"] == "auto" \
-                and r["runtime"] == "steamvr":
+        if r["pedido"] == "auto" and r["runtime"] == "steamvr":
             det = dict(det, recomendado="steamvr")   # (lo que muestra «Automático (…)» en VRmin Host)
         out.append({"id": appid, "nombre": j["nombre"], "deteccion": det, "perfil": r, "vr": es_vr(det),
                     "runtimeNombre": T(NOMBRES.get(r["runtime"], r["runtime"]))})
