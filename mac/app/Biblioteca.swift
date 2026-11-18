@@ -188,7 +188,8 @@ struct LibraryView: View {
     @State private var selectedID: String? = nil
     @AppStorage("libraryOrder") private var order = "nombre"   // nombre o recientes
     @AppStorage("librarySideFolded") private var folded = false   // la lista de la izquierda, solo con los íconos
-    @AppStorage("libraryShowAll") private var showAll = false   // también los juegos de VR de tu cuenta sin instalar
+    @AppStorage("libraryShowAll") private var showAll = false   // también los juegos de tu cuenta sin instalar
+    @AppStorage("libraryKind") private var kind = "vr"   // vr o plano: qué juegos muestra la lista
     @ObservedObject private var account = AccountGames.shared
 
     private var games: [SteamGame] {
@@ -196,9 +197,12 @@ struct LibraryView: View {
         let bajando = m.downloads.filter { d in !m.games.contains { $0.id == d.id } }
             .map { SteamGame(id: $0.id, name: $0.name, installdir: "", inLibrary: true, inGameHub: false) }
         // («Todos»: también los juegos de VR de tu cuenta que no están instalados, como en Steam)
-        let sinInstalar = !showAll ? [] : account.vr.filter { a in !m.games.contains { $0.id == a.id } && !bajando.contains { $0.id == a.id } }
+        let cuenta = kind == "plano" ? account.flat : account.vr
+        let sinInstalar = !showAll ? [] : cuenta.filter { a in !m.games.contains { $0.id == a.id } && !bajando.contains { $0.id == a.id } }
             .map { SteamGame(id: $0.id, name: $0.name, installdir: "", inLibrary: false, inGameHub: false) }
-        let l = (m.games + bajando + sinInstalar).filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }
+        // (los planos son los que la tienda de Steam dice que no son de VR; los demás, en VR)
+        let instalados = (m.games + bajando).filter { (m.vr[$0.id]?.vr == false) == (kind == "plano") }
+        let l = (instalados + sinInstalar).filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }
         // (los de GameHub, al final: se traen antes de jugar)
         return l.sorted { a, b in
             if a.inLibrary != b.inLibrary { return a.inLibrary }
@@ -253,8 +257,19 @@ struct LibraryView: View {
                 }
             }
             if !small {
+                Picker("", selection: $kind) {
+                    Text("VR").tag("vr")
+                    Text(L("Planos")).tag("plano")
+                }
+                .pickerStyle(.segmented).labelsHidden().padding(.top, 6)
                 Text(L("JUEGOS · %d", games.count)).font(.system(size: 11, weight: .semibold)).foregroundStyle(Theme.text2)
-                    .padding(.top, 8).padding(.leading, 4)
+                    .padding(.top, 4).padding(.leading, 4)
+            } else {
+                Button { kind = kind == "vr" ? "plano" : "vr" } label: {
+                    Text(kind == "vr" ? "VR" : L("Plano")).font(.system(size: 10, weight: .bold)).frame(width: 34, height: 20)
+                        .background(RoundedRectangle(cornerRadius: 5).fill(Theme.amber.opacity(0.18)))
+                }
+                .buttonStyle(.plain).help(kind == "vr" ? L("Mostrando los juegos de VR: tocá para ver los planos") : L("Mostrando los juegos planos: tocá para ver los de VR"))
             }
             ScrollView {
                 VStack(alignment: small ? .center : .leading, spacing: 2) {
@@ -295,7 +310,7 @@ struct LibraryView: View {
         .padding(10)
         .frame(width: small ? 58 : 210)
         .frame(maxHeight: .infinity, alignment: .top)
-        .background(LinearGradient(colors: [Theme.amber.opacity(0.07), Theme.amber.opacity(0.015)], startPoint: .top, endPoint: .bottom))
+        .background(LinearGradient(colors: [Theme.amber.opacity(0.025), Color.white.opacity(0.02)], startPoint: .top, endPoint: .bottom))
     }
 
     private var grid: some View {
@@ -650,8 +665,9 @@ struct StoreItem: Identifiable, Decodable {
 /// tus cuentas de Steam, y si son de VR según la tienda (se pregunta de a uno, despacio, y se guarda en tienda_cache.json)
 final class AccountGames: ObservableObject {
     static let shared = AccountGames()
-    struct Info: Codable { let n: String; let vr: Bool }
+    struct Info: Codable { let n: String; let vr: Bool; var game: Bool? = nil }   // (game false: no es un juego: programas, demos, contenido)
     @Published var vr: [(id: String, name: String)] = []
+    @Published var flat: [(id: String, name: String)] = []
     @Published var checking: (done: Int, total: Int)? = nil
     private var started = false
 
@@ -674,9 +690,12 @@ final class AccountGames: ObservableObject {
             }
             var known = (try? JSONDecoder().decode([String: Info].self, from: Data(contentsOf: cache))) ?? [:]
             func publish() {
-                let list = known.filter { ids.contains($0.key) && $0.value.vr }.map { (id: $0.key, name: $0.value.n) }
-                    .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-                DispatchQueue.main.async { self.vr = list }
+                func list(_ vr: Bool) -> [(id: String, name: String)] {
+                    known.filter { ids.contains($0.key) && $0.value.vr == vr && ($0.value.game ?? ($0.value.n != $0.key)) }.map { (id: $0.key, name: $0.value.n) }
+                        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                }
+                let v = list(true), f = list(false)
+                DispatchQueue.main.async { self.vr = v; self.flat = f }
             }
             publish()
             let missing = ids.filter { known[$0] == nil }.sorted { (Int($0) ?? 0) < (Int($1) ?? 0) }
@@ -688,9 +707,9 @@ final class AccountGames: ObservableObject {
                       let e = j[id] as? [String: Any] else { Thread.sleep(forTimeInterval: 5); continue }
                 if let x = e["data"] as? [String: Any], (x["type"] as? String) == "game" {
                     let cats = (x["categories"] as? [[String: Any]] ?? []).compactMap { $0["description"] as? String }
-                    known[id] = Info(n: x["name"] as? String ?? id, vr: cats.contains { $0.contains("VR") })
+                    known[id] = Info(n: x["name"] as? String ?? id, vr: cats.contains { $0.contains("VR") }, game: true)
                 } else {
-                    known[id] = Info(n: id, vr: false)
+                    known[id] = Info(n: id, vr: false, game: false)
                 }
                 if i % 10 == 9 || i == missing.count - 1 {
                     try? JSONEncoder().encode(known).write(to: cache)
@@ -853,6 +872,10 @@ struct LibraryModePicker: View {
                     Image(systemName: "person.crop.circle").foregroundStyle(Theme.text2)
                     Text(L("Cuenta de Steam: %@", a)).font(.callout)
                     Spacer()
+                    if m.steamRunning {
+                        Button(L("Mostrar Steam")) { m.run(L("Mostrando Steam"), "abrir_steam.sh", ["ventana"], exclusive: false) }.buttonStyle(Pill())
+                        Button(L("Ocultar Steam")) { m.hideSteam() }.buttonStyle(Pill()).help(L("Esconde la ventana de Steam; Steam sigue abierto de fondo"))
+                    }
                     Button(L("Cerrar sesión")) { askSignOut = true }.buttonStyle(Pill()).disabled(m.busyTask != nil)
                 }
                 .padding(.top, 2)

@@ -49,8 +49,9 @@ EXTRA=""; [ -f "$P/steam_amigos" ] || EXTRA="-nofriendsui -nochatui"
 # queda negra otra vez. -cef-single-process: el navegador de Steam en un solo proceso (igual que el arreglo).
 EXTRA="$EXTRA -noverifyfiles -cef-single-process"
 # Biblioteca de VRmin (Ajustes): Steam de fondo, sin su ventana (-silent), salvo que se pida verla («ventana») o se
-# haya elegido la ventana de Steam (archivo «steam_ventana»). Sin una sesión guardada aparece igual, para iniciarla.
-if [ "$1" != ventana ] && [ ! -f "$P/steam_ventana" ] && grep -qs '"RememberPassword"[[:space:]]*"1"' "$STEAMDIR/config/loginusers.vdf"; then
+# haya elegido la ventana de Steam (archivo «steam_ventana»). Sin una sesión guardada, Steam muestra solo la ventana
+# de iniciar sesión, y después de entrar VRmin Host esconde la principal (ocultar_steam.sh).
+if [ "$1" != ventana ] && [ ! -f "$P/steam_ventana" ]; then
   EXTRA="$EXTRA -silent"
 fi
 ajustes_dll

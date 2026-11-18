@@ -400,7 +400,14 @@ final class AppModel: ObservableObject {
     @Published var downloads: [SteamDownload] = []
     private var dlPrev: [String: (done: Int64, at: Date)] = [:]
     /// La cuenta de Steam con la sesión guardada (la última que entró), si hay
-    @Published var steamAccount: String? = nil
+    @Published var steamAccount: String? = nil {
+        didSet {   // (recién entró: con la Biblioteca de VRmin, la ventana principal de Steam se esconde sola)
+            if oldValue == nil, steamAccount != nil, libraryVRmin, steamRunning {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.hideSteam() }
+            }
+        }
+    }
+    func hideSteam() { run(L("Escondiendo Steam"), "ocultar_steam.sh", exclusive: false) }
     func signOutSteam() { run(L("Cerrando la sesión de Steam"), "cerrar_sesion_steam.sh") }
     func writeSteamFriendsFile() {
         let f = data.appendingPathComponent("steam_amigos")
