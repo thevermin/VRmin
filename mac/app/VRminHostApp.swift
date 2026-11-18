@@ -398,6 +398,8 @@ final class AppModel: ObservableObject {
     }
     /// Lo que Steam está bajando ahora (Biblioteca y Tienda)
     @Published var downloads: [SteamDownload] = []
+    /// Los que se pidió desinstalar y Steam todavía no terminó (su ventanita de confirmar tarda en aparecer)
+    @Published var uninstalling: [String: Date] = [:]
     private var dlPrev: [String: (done: Int64, at: Date)] = [:]
     /// La cuenta de Steam con la sesión guardada (la última que entró), si hay
     @Published var steamAccount: String? = nil {
@@ -596,6 +598,10 @@ final class AppModel: ObservableObject {
         }
         list.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         if list != games { games = list; loadVR() }
+        // (ya se desinstaló, o pasó un rato: se dijo que no en la ventanita de Steam)
+        let ahora = Date()
+        let quedan = uninstalling.filter { e in mine[e.key] != nil && ahora.timeIntervalSince(e.value) < 120 }
+        if quedan != uninstalling { uninstalling = quedan }
         steamAccount = steamSavedAccount(steamapps.deletingLastPathComponent().appendingPathComponent("config/loginusers.vdf"))
         let sa = steamapps
         DispatchQueue.global(qos: .utility).async { [weak self] in   // (lee el tamaño de las carpetas: no en el hilo de la ventana)
@@ -1160,7 +1166,10 @@ final class AppModel: ObservableObject {
         }
     }
     /// Le pide a Steam que lo desinstale (Steam pregunta antes)
-    func uninstallGame(_ g: SteamGame) { run(L("Desinstalando %@", g.name), "instalar_juego.sh", [g.id, g.name, "desinstalar"], exclusive: false) }
+    func uninstallGame(_ g: SteamGame) {
+        uninstalling[g.id] = Date()
+        run(L("Desinstalando %@", g.name), "instalar_juego.sh", [g.id, g.name, "desinstalar"], exclusive: false)
+    }
     /// Esta vez sin VR, en una ventana de la Mac (sin el Quest)
     func playOnMac(_ g: SteamGame) {
         if !steamRunning && g.exe == nil { append(L("Primero abrí Steam y esperá a ver tu biblioteca.")); return }

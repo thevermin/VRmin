@@ -219,19 +219,23 @@ struct LibraryView: View {
 
     var body: some View {
         GeometryReader { geo in
+            // (con la ventana angosta, la lista queda plegada: solo los íconos)
+            let small = folded || geo.size.width < 760
             HStack(spacing: 0) {
-                // (con la ventana angosta, la lista queda plegada: solo los íconos)
-                sidebar(folded || geo.size.width < 760, canUnfold: geo.size.width >= 760)
+                sidebar(small, canUnfold: geo.size.width >= 760)
                 Rectangle().fill(Theme.line).frame(width: 1)
+                // (la página de un juego en lugar de la grilla, no encima: la grilla detrás se acomodaba a su ancho
+                // y corría todo hacia la izquierda, una y otra vez. Y el ancho, fijo: el que queda al lado de la lista)
                 ZStack {
-                    grid
                     if let g = selected {
                         GameDetail(game: g, gameAdv: $gameAdv) { select(nil) }
                             .id(g.id)   // (cada juego, su propia página: si no, quedaban datos del anterior)
                             .transition(.opacity.combined(with: .offset(y: 24)))
+                    } else {
+                        grid.transition(.opacity)
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(width: max(0, geo.size.width - (small ? 58 : 210) - 1)).frame(maxHeight: .infinity).clipped()
                 .safeAreaInset(edge: .bottom, spacing: 0) { DownloadsBar() }
             }
         }
@@ -487,6 +491,15 @@ struct GameDetail: View {
                 Button {} label: { Label(d.paused ? L("EN PAUSA · %d %%", Int(d.fraction * 100)) : d.total > 0 ? L("DESCARGANDO · %d %%", Int(d.fraction * 100)) : L("PREPARANDO LA DESCARGA"), systemImage: d.paused ? "pause.circle" : "arrow.down.circle") }
                     .buttonStyle(BigButton()).disabled(true)
                 DownloadControls(d: d)
+            }
+        } else if let t = m.uninstalling[game.id] {
+            // (Steam tarda en mostrar su ventanita de confirmar: mientras, que se vea que se está haciendo)
+            HStack(spacing: 12) {
+                Button {} label: { Label(L("DESINSTALANDO…"), systemImage: "trash") }.buttonStyle(BigButton()).disabled(true)
+                TimelineView(.periodic(from: t, by: 5)) { c in
+                    Text(c.date.timeIntervalSince(t) < 15 ? L("Pidiéndoselo a Steam…") : L("Confirmalo en la ventanita de Steam."))
+                        .font(.callout).foregroundStyle(Theme.text2)
+                }
             }
         } else if !game.inLibrary && !game.inGameHub {
             Button { m.installGame(game.id, game.name) } label: { Label(L("INSTALAR"), systemImage: "arrow.down") }
