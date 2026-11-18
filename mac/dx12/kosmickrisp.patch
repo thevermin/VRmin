@@ -1,15 +1,16 @@
 diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
-index 63d2ec1..51b41ab 100644
+index 63d2ec1..45f97de 100644
 --- a/src/kosmickrisp/compiler/nir_to_msl.c
 +++ b/src/kosmickrisp/compiler/nir_to_msl.c
-@@ -1307,6 +1307,15 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+@@ -1307,6 +1307,16 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
                 P(ctx, "%c", "xyzw"[component + i]);
        }
        P(ctx, " = ");
 +      /* (an integer value into the float4 position: bit-cast it) */
 +      static const char *const fsuf[] = {"", "", "2", "3", "4"};
 +      unsigned written = util_bitcount(write_mask & BITFIELD_MASK(num_components));
-+      const char *src_ty = msl_type_for_def(ctx->types, instr->src[0].ssa);
++      /* (the type at this use: src_to_msl bit-casts the value to it) */
++      const char *src_ty = msl_type_for_src(ctx->types, &instr->src[0]);
 +      bool cast_pos = ctx->shader->info.stage == MESA_SHADER_VERTEX &&
 +                      location == VARYING_SLOT_POS && src_ty &&
 +                      (strncmp(src_ty, "uint", 4) == 0 || strncmp(src_ty, "int", 3) == 0);
@@ -18,7 +19,7 @@ index 63d2ec1..51b41ab 100644
        src_to_msl(ctx, &instr->src[0]);
        if (num_components > 1u) {
           P(ctx, ".");
-@@ -1314,6 +1323,8 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+@@ -1314,6 +1324,8 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
              if ((write_mask >> i) & 1)
                 P(ctx, "%c", "xyzw"[i]);
        }
@@ -27,7 +28,7 @@ index 63d2ec1..51b41ab 100644
        P(ctx, ";\n");
        break;
     }
-@@ -2387,6 +2398,15 @@ msl_gather_info(struct nir_to_msl_ctx *ctx, struct nir_to_msl_options *options)
+@@ -2387,6 +2399,15 @@ msl_gather_info(struct nir_to_msl_ctx *ctx, struct nir_to_msl_options *options)
     if (ctx->shader->info.stage == MESA_SHADER_VERTEX ||
         ctx->shader->info.stage == MESA_SHADER_FRAGMENT) {
        msl_gather_io_info(ctx, ctx->inputs_info, ctx->outputs_info);
