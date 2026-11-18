@@ -4,6 +4,7 @@
 #   sysroot-linux.sh <folder>
 set -euo pipefail
 root=$1
+sudo apt-get update -qq > /dev/null
 sudo apt-get install -y -qq mesa-vulkan-drivers vulkan-tools libvulkan1 libdrm-dev > /dev/null
 mkdir -p "$root"
 copy() { local f; for f in "$@"; do [ -e "$f" ] || continue; mkdir -p "$root$(dirname "$f")"; cp -L "$f" "$root$f"; done; }
