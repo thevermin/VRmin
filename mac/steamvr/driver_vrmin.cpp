@@ -89,38 +89,34 @@ static DriverPose_t pose_at(double x, double y, double z, const double *q = null
   return p;
 }
 
-// How fast a hand moves and turns, from the Quest's poses (each one once: between two new poses the same one is
+// How fast a hand moves, from the Quest's poses (each one once: between two new poses the same one is
 // sent again). Games that use it: SUPERHOT VR (time moves when you move, and the strength of a punch), throwing in
 // many others. Without it they saw the hands as still, however they moved.
 struct Motion {
   uint32_t lastId = 0;
-  double lastT = 0, pos[3] = {}, q[4] = {0, 0, 0, 1}, vel[3] = {}, ang[3] = {};
-  void reset() { lastId = 0; for (int i = 0; i < 3; i++) vel[i] = ang[i] = 0; }
-  // Position and rotation (x y z w) of a new pose; dt from the time it arrived here
-  void update(uint32_t id, const double *p, const double *r, double now) {
+  double lastT = 0, pos[3] = {}, vel[3] = {};
+  void reset() { lastId = 0; for (int i = 0; i < 3; i++) vel[i] = 0; }
+  // Position of a new pose, and the Quest's time for it in seconds (taken once per frame on the Quest, so even: the
+  // time it got here comes in bunches over Wi-Fi, and two poses arriving together looked like a very fast hand)
+  void update(uint32_t id, const double *p, double t) {
     if (id == lastId) return;
-    double dt = now - lastT;
-    if (lastId && dt > 0.002 && dt < 0.1) {
-      const double k = 0.6;   // (smoothed a little: the poses come over Wi-Fi, not quite evenly)
+    double dt = t - lastT;
+    if (lastId && dt > 0.004 && dt < 0.1) {
+      const double k = 0.6;   // (smoothed a little)
       for (int i = 0; i < 3; i++) vel[i] = k * (p[i] - pos[i]) / dt + (1 - k) * vel[i];
-      // turn since the last pose, in the world: r × inverse(last)
-      double x = r[3] * -q[0] + r[0] * q[3] + r[1] * -q[2] - r[2] * -q[1];
-      double y = r[3] * -q[1] - r[0] * -q[2] + r[1] * q[3] + r[2] * -q[0];
-      double z = r[3] * -q[2] + r[0] * -q[1] - r[1] * -q[0] + r[2] * q[3];
-      double w = r[3] * q[3] - r[0] * -q[0] - r[1] * -q[1] - r[2] * -q[2];
-      if (w < 0) { x = -x; y = -y; z = -z; w = -w; }
-      double s = std::sqrt(x * x + y * y + z * z), a = 2 * std::atan2(s, w);
-      double f = s > 1e-9 ? a / s / dt : 0;
-      ang[0] = k * x * f + (1 - k) * ang[0]; ang[1] = k * y * f + (1 - k) * ang[1]; ang[2] = k * z * f + (1 - k) * ang[2];
-    } else if (dt >= 0.1) {
-      for (int i = 0; i < 3; i++) vel[i] = ang[i] = 0;
+      // (no hand moves faster than 10 m/s: above that it's a jump in tracking, not a punch)
+      double n = std::sqrt(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]);
+      if (n > 10) for (int i = 0; i < 3; i++) vel[i] *= 10 / n;
+    } else if (dt >= 0.1 || dt <= 0) {
+      for (int i = 0; i < 3; i++) vel[i] = 0;
     }
-    lastId = id; lastT = now;
+    lastId = id; lastT = t;
     for (int i = 0; i < 3; i++) pos[i] = p[i];
-    for (int i = 0; i < 4; i++) q[i] = r[i];
   }
+  // Only how fast it moves, not how fast it turns: SteamVR adds the turning to the speed of the controller's tip, and
+  // with it a small turn of the wrist became a strong punch
   void apply(DriverPose_t &p) const {
-    for (int i = 0; i < 3; i++) { p.vecVelocity[i] = vel[i]; p.vecAngularVelocity[i] = ang[i]; }
+    for (int i = 0; i < 3; i++) p.vecVelocity[i] = vel[i];
   }
 };
 
@@ -198,6 +194,7 @@ static SOCKET host_connect() {
 enum { IN_TRIGGER, IN_SQUEEZE, IN_TX, IN_TY, IN_TCLICK, IN_A, IN_B, IN_TTOUCH, IN_THTOUCH, IN_ATOUCH, IN_BTOUCH, IN_MENU, IN_COUNT };
 struct Track {
   uint32_t id = 0;
+  double tms = 0;   // (the Quest's time of the pose, in ms)
   bool valid = false, handValid[2] = {};
   double eye[2][7] = {}, fov[2][4] = {}, grip[2][7] = {}, aim[2][7] = {};
   float in[2][IN_COUNT] = {};
@@ -264,6 +261,7 @@ static void parse_pose(const char *line) {
   Track t;
   int k = 0;
   t.id = (uint32_t)strtoul(idp + 5, nullptr, 10);
+  if (const char *tq = strstr(line, "\"t\":")) t.tms = strtod(tq + 4, nullptr);
   t.valid = v[k++] > 0.5;
   for (int e = 0; e < 2; e++) {
     for (int i = 0; i < 7; i++) t.eye[e][i] = v[k++];
@@ -1251,7 +1249,7 @@ public:
     else if (t.handValid[h]) {
       raw_from_grip(t.grip[h], left, raw);
       p = pose_at(raw[0], raw[1], raw[2], raw + 3);
-      motion.update(t.id, raw, raw + 3, now_s());
+      motion.update(t.id, raw, t.tms > 0 ? t.tms / 1000 : now_s());
       motion.apply(p);
     }
     else { p = GetPose(); p.poseIsValid = false; p.result = TrackingResult_Running_OutOfRange; }   // (put down or out of sight)
