@@ -89,6 +89,41 @@ static DriverPose_t pose_at(double x, double y, double z, const double *q = null
   return p;
 }
 
+// How fast a device moves and turns, from the Quest's poses (each one once: between two new poses the same one is
+// sent again). Games that use it: SUPERHOT VR (time moves when you move, and the strength of a punch), throwing in
+// many others. Without it they saw the hands as still, however they moved.
+struct Motion {
+  uint32_t lastId = 0;
+  double lastT = 0, pos[3] = {}, q[4] = {0, 0, 0, 1}, vel[3] = {}, ang[3] = {};
+  void reset() { lastId = 0; for (int i = 0; i < 3; i++) vel[i] = ang[i] = 0; }
+  // Position and rotation (x y z w) of a new pose; dt from the time it arrived here
+  void update(uint32_t id, const double *p, const double *r, double now) {
+    if (id == lastId) return;
+    double dt = now - lastT;
+    if (lastId && dt > 0.002 && dt < 0.1) {
+      const double k = 0.6;   // (smoothed a little: the poses come over Wi-Fi, not quite evenly)
+      for (int i = 0; i < 3; i++) vel[i] = k * (p[i] - pos[i]) / dt + (1 - k) * vel[i];
+      // turn since the last pose, in the world: r × inverse(last)
+      double x = r[3] * -q[0] + r[0] * q[3] + r[1] * -q[2] - r[2] * -q[1];
+      double y = r[3] * -q[1] - r[0] * -q[2] + r[1] * q[3] + r[2] * -q[0];
+      double z = r[3] * -q[2] + r[0] * -q[1] - r[1] * -q[0] + r[2] * q[3];
+      double w = r[3] * q[3] - r[0] * -q[0] - r[1] * -q[1] - r[2] * -q[2];
+      if (w < 0) { x = -x; y = -y; z = -z; w = -w; }
+      double s = std::sqrt(x * x + y * y + z * z), a = 2 * std::atan2(s, w);
+      double f = s > 1e-9 ? a / s / dt : 0;
+      ang[0] = k * x * f + (1 - k) * ang[0]; ang[1] = k * y * f + (1 - k) * ang[1]; ang[2] = k * z * f + (1 - k) * ang[2];
+    } else if (dt >= 0.1) {
+      for (int i = 0; i < 3; i++) vel[i] = ang[i] = 0;
+    }
+    lastId = id; lastT = now;
+    for (int i = 0; i < 3; i++) pos[i] = p[i];
+    for (int i = 0; i < 4; i++) q[i] = r[i];
+  }
+  void apply(DriverPose_t &p) const {
+    for (int i = 0; i < 3; i++) { p.vecVelocity[i] = vel[i]; p.vecAngularVelocity[i] = ang[i]; }
+  }
+};
+
 // ---- headset ----
 // Methods that return a struct (ComputeDistortion; GetPose too, but SteamVR never calls it) can't be written the normal way: SteamVR is built with
 // MSVC, which passes the address for the result after «this», and mingw's g++ passes it before (vrserver crashed
@@ -1073,6 +1108,7 @@ class VRminHmd : public ITrackedDeviceServerDriver {
   VRminDirectMode directMode;
   VRInputComponentHandle_t proximity = 0;
 public:
+  Motion motion;
   uint32_t id = k_unTrackedDeviceIndexInvalid;
   EVRInitError Activate(uint32_t objectId) override {
     id = objectId;
@@ -1117,7 +1153,12 @@ public:
     if (id == k_unTrackedDeviceIndexInvalid) return;
     DriverPose_t p = t.valid ? pose_at((t.eye[0][0] + t.eye[1][0]) / 2, (t.eye[0][1] + t.eye[1][1]) / 2, (t.eye[0][2] + t.eye[1][2]) / 2, t.eye[0] + 3)
                              : GetPose();
-    if (t.valid) remember_head(t.id, p);
+    if (t.valid) {
+      remember_head(t.id, p);
+      const double pos[3] = {p.vecPosition[0], p.vecPosition[1], p.vecPosition[2]}, r[4] = {p.qRotation.x, p.qRotation.y, p.qRotation.z, p.qRotation.w};
+      motion.update(t.id, pos, r, now_s());
+      motion.apply(p);
+    } else motion.reset();
     VRServerDriverHost()->TrackedDevicePoseUpdated(id, p, sizeof p);
   }
 };
@@ -1125,6 +1166,7 @@ public:
 // ---- controllers (Touch, so SteamVR uses Valve's Touch bindings for each game) ----
 class VRminController : public ITrackedDeviceServerDriver {
   bool left;
+  Motion motion;
   VRInputComponentHandle_t joyX = 0, joyY = 0, joyClick = 0, joyTouch = 0, trigger = 0, triggerClick = 0, triggerTouch = 0,
                            grip = 0, gripTouch = 0, lower = 0, lowerTouch = 0, upper = 0, upperTouch = 0, system = 0,
                            tsX = 0, tsY = 0, tsClick = 0, tsTouch = 0;
@@ -1210,8 +1252,14 @@ public:
     DriverPose_t p;
     double raw[7];
     if (!t.valid) p = GetPose();
-    else if (t.handValid[h]) { raw_from_grip(t.grip[h], left, raw); p = pose_at(raw[0], raw[1], raw[2], raw + 3); }
+    else if (t.handValid[h]) {
+      raw_from_grip(t.grip[h], left, raw);
+      p = pose_at(raw[0], raw[1], raw[2], raw + 3);
+      motion.update(t.id, raw, raw + 3, now_s());
+      motion.apply(p);
+    }
     else { p = GetPose(); p.poseIsValid = false; p.result = TrackingResult_Running_OutOfRange; }   // (put down or out of sight)
+    if (!t.valid || !t.handValid[h]) motion.reset();
     VRServerDriverHost()->TrackedDevicePoseUpdated(id, p, sizeof p);
     if (!t.valid) return;
     const float *v = t.in[h];
