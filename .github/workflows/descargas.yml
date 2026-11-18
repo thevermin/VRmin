@@ -1,0 +1,42 @@
+name: Programa de descargas (DepotDownloader)
+# DepotDownloader (SteamRE, GPL-2.0): baja juegos de Steam sin la ventana de Steam, con inicio de sesión por QR (la app
+# de Steam del celular). Se compila para Mac con .NET adentro (no hace falta instalar .NET) y VRmin Host lo baja la
+# primera vez que se usa, como las piezas del motor. Es un programa aparte: VRmin Host solo lo abre y lee lo que dice.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['mac/descargas/**', '.github/workflows/descargas.yml']
+
+env:
+  DD_TAG: DepotDownloader_3.4.0
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: vrmin }
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: '9.0.x' }
+      - name: Código
+        run: |
+          git clone -q --depth 1 -b "$DD_TAG" https://github.com/SteamRE/DepotDownloader.git dd
+          cd dd && git log -1 --format='%H %cd' && grep -m1 TargetFramework DepotDownloader/DepotDownloader.csproj
+          for p in ../vrmin/mac/descargas/*.patch; do [ -f "$p" ] && { echo "== $p"; git apply "$p"; }; done; true
+      - name: Compilar (Apple Silicon, con .NET adentro, un solo archivo)
+        working-directory: dd
+        run: |
+          dotnet publish DepotDownloader/DepotDownloader.csproj -c Release -r osx-arm64 --self-contained true \
+            -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=none -o ../out > ../pub.log 2>&1 \
+            || { tail -40 ../pub.log; exit 1; }
+          ls -la ../out
+      - name: Empaquetar
+        run: |
+          mkdir -p pkg && cp out/DepotDownloader pkg/ && cp dd/LICENSE pkg/LICENSE-DepotDownloader.txt
+          codesign --force --sign - pkg/DepotDownloader
+          file pkg/DepotDownloader; ./pkg/DepotDownloader 2>&1 | head -5 || true
+          echo "$DD_TAG ($(cd dd && git rev-parse --short HEAD))" > pkg/version
+          tar -czf descargas-vrmin.tar.gz -C pkg . && shasum -a 256 descargas-vrmin.tar.gz && ls -la descargas-vrmin.tar.gz
+      - uses: actions/upload-artifact@v4
+        with: { name: descargas-vrmin, path: descargas-vrmin.tar.gz, retention-days: 30 }
