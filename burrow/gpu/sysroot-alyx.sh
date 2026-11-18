@@ -6,7 +6,9 @@
 set -euo pipefail
 gpu=$1 root=$2
 sudo apt-get install -y -qq libstdc++6 libx11-6 libx11-xcb1 libxcb1 libuuid1 libssl3t64 libogg0 libglib2.0-0t64 \
-  libfribidi0 libfreetype6 libfontconfig1 libharfbuzz0b libpango-1.0-0 libpng16-16t64 libbz2-1.0 libbrotli1 libexpat1 libudev1 libzstd1 libdrm2 libwayland-client0 > /dev/null
+  libfribidi0 libfreetype6 libfontconfig1 libharfbuzz0b libpango-1.0-0 libpng16-16t64 libbz2-1.0 libbrotli1 libexpat1 \
+  libudev1 libzstd1 libdrm2 libwayland-client0 libsdl2-2.0-0 libxext6 libxrandr2 libxcursor1 libxi6 libxfixes3 libxss1 \
+  libxkbcommon0 > /dev/null
 rm -rf "$root"; cp -a "$gpu" "$root"
 copy() { local f; for f in "$@"; do [ -e "$f" ] || continue; mkdir -p "$root$(dirname "$f")"; cp -L "$f" "$root$f"; done; }
 # (los nombres que piden las bibliotecas del juego: ver burrow/tests/alyx.sh)
@@ -14,7 +16,10 @@ pide="libstdc++.so.6 libgcc_s.so.1 libX11.so.6 libX11-xcb.so.1 libxcb.so.1 libuu
   libogg.so.0 libglib-2.0.so.0 libgobject-2.0.so.0 libgio-2.0.so.0 libfribidi.so.0 libpng16.so.16 libbz2.so.1.0
   libbrotlidec.so.1 libexpat.so.1 libudev.so.1 libz.so.1 libzstd.so.1 libdrm.so.2 libwayland-client.so.0 libdl.so.2
   librt.so.1 libpthread.so.0 libm.so.6 libc.so.6
-  libfreetype.so.6 libfontconfig.so.1 libharfbuzz.so.0 libpango-1.0.so.0"   # (estas el juego las trae con otro nombre)
+  libfreetype.so.6 libfontconfig.so.1 libharfbuzz.so.0 libpango-1.0.so.0
+  libSDL2-2.0.so.0 libXext.so.6 libXrandr.so.2 libXcursor.so.1 libXi.so.6 libXfixes.so.3 libXss.so.1 libxkbcommon.so.0"
+# (freetype, fontconfig, harfbuzz y pango el juego las trae con otro nombre; SDL2 la pide con el nombre del sistema y
+#  abre sola las de X11)
 todo=""
 for n in $pide; do
   f=$(ldconfig -p | awk -v n="$n" '$1 == n && /AArch64/ { print $NF; exit }')
