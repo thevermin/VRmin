@@ -20,6 +20,12 @@ cp "$C/questvrbridge/questvrbridge_log_anterior.txt" "$D/runtime_openxr_anterior
 cp "$P/perfiles_juegos.json" "$D/" 2>/dev/null
 cp "$P/perfiles/"*.json "$D/perfiles/" 2>/dev/null
 cp -R "$P/perfiles/detectado" "$D/perfiles/" 2>/dev/null
+# SteamVR real: sus registros (el servidor, el compositor, la sala) y sus ajustes, y el del driver de VRmin
+mkdir -p "$D/steamvr"
+for f in "$C/questvrbridge/openvr/logs/"*.txt "$C/questvrbridge/driver_vrmin.log"; do
+  [ -f "$f" ] && tail -c 1500000 "$f" > "$D/steamvr/$(basename "$f")"
+done
+cp "$C/questvrbridge/openvr/config/steamvr.vrsettings" "$D/steamvr/" 2>/dev/null
 # Lo que escribieron los juegos en las últimas 3 horas (Unity: Player.log u output_log.txt · Unreal: Saved/Logs), el final
 mkdir -p "$D/juegos/propios"
 n=0
