@@ -18,6 +18,7 @@ if [ -z "$P1" ]; then
   if [ -z "${1:-}" ] && pgrep -f 'vrserver\.exe' >/dev/null; then
     source "$RES/runtime.sh"
     cerrar_steamvr
+    ( esconder_steam ) > /dev/null 2>&1 < /dev/null &
     say "SteamVR cerrado." "SteamVR closed."
     exit 0
   fi
