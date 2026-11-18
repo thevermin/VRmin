@@ -2014,6 +2014,7 @@ struct GameSettingsSheet: View {
 struct SettingsView: View {
     @EnvironmentObject var m: AppModel
     @Environment(\.dismiss) private var dismiss
+    @State private var askReinstallAll = false
 
     private func group<C: View>(_ title: String, _ hint: String? = nil, @ViewBuilder _ c: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -2161,6 +2162,21 @@ struct SettingsView: View {
                         Spacer()
                         Button(L("Reiniciar Steam")) { m.restartSteam() }.buttonStyle(Pill()).disabled(m.busyTask != nil)
                     }
+                }
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(L("Reinstalar todo")).font(.callout)
+                        Text(L("Si Steam o los juegos quedaron mal: el Windows de VRmin y el motor quedan como nuevos, sin volver a bajar los juegos."))
+                            .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Button(L("Reinstalar…")) { askReinstallAll = true }.buttonStyle(Pill()).disabled(m.busyTask != nil)
+                }
+                .alert(L("¿Reinstalar todo?"), isPresented: $askReinstallAll) {
+                    Button(L("Reinstalar"), role: .destructive) { m.run(L("Reinstalando todo"), "reinstalar.sh") }
+                    Button(L("Cancelar"), role: .cancel) {}
+                } message: {
+                    Text(L("Se cierra Steam y se borra el Windows de VRmin con su motor; después se instalan de nuevo (baja varios cientos de MB). Tus juegos, las partidas que guardan en la Mac y los ajustes de VRmin se apartan y vuelven solos. Al final, abrí Steam e iniciá sesión."))
                 }
                 HStack {
                     Text(L("Conexión para jugar")).font(.callout)
