@@ -895,7 +895,7 @@ static const int GAME_MENU_ID = 0x2FFFFFD0;
 static std::atomic<bool> g_gameMenu{false};      // el menú del juego está abierto (el juego no recibe los botones)
 static std::atomic<bool> g_gameHidden{false};    // «Menú principal» desde el menú del juego: el juego sigue abierto, se ve la sala
 static std::atomic<bool> g_gameHands{false};     // manos reales también durante el juego (experimental)
-static std::atomic<bool> g_steamVR{false};       // el juego corre con SteamVR real (lo avisa la Mac)
+static std::atomic<bool> g_steamVR{false};       // el juego corre con SteamVR real (lo avisa la Mac): se le mandan los dedos
 static std::atomic<bool> g_handGestures{true};
 // Ajuste del ángulo de las manos y el láser en los juegos (grados, se suma a lo de fábrica):
 // inclinación (arriba/abajo) y giro (sobre el eje largo de la mano). Vale con manos y con controles.
@@ -1732,7 +1732,7 @@ static void networkLoop() {
                     }
                     else if (t.find("\"type\":\"steamvr\"") != std::string::npos) {
                         const bool on = t.find("\"on\":true") != std::string::npos;
-                        if (on != g_steamVR.exchange(on)) sendLog(on ? "SteamVR real: tus manos reales se ven en el juego (sin controles)" : "SteamVR real cerrado");
+                        if (on != g_steamVR.exchange(on)) sendLog(on ? "SteamVR real: el juego recibe tus dedos (seguimiento de manos)" : "SteamVR real cerrado");
                     }
                     else if (t.find("\"panels\"") != std::string::npos) receivePanels(t);
                     else if (t.find("\"exitvr\"") != std::string::npos) g_exitVR = true;
@@ -4044,6 +4044,8 @@ static void sendPose(App &app, const XrView views[2], XrTime t) {
         add(tanf(views[e].fov.angleLeft)); add(tanf(views[e].fov.angleRight));
         add(tanf(views[e].fov.angleDown)); add(tanf(views[e].fov.angleUp));
     }
+    // Con SteamVR real: las 26 articulaciones de cada mano seguida (sin control), para que el juego vea tus dedos
+    std::string hj;
     for (int h = 0; h < 2; h++) {
         XrSpaceLocation g{XR_TYPE_SPACE_LOCATION}, a{XR_TYPE_SPACE_LOCATION};
         xrLocateSpace(app.gripSpace[h], app.space, t, &g);
@@ -4073,6 +4075,20 @@ static void sendPose(App &app, const XrView views[2], XrTime t) {
                 add(!blk && V.trig > 0.1f); add(!blk && V.joy);
                 add(!blk && V.a); add(!blk && V.b);
                 add(h == 0 ? (float)V.menu : 0.f);
+                XrHandJointLocationEXT jl[XR_HAND_JOINT_COUNT_EXT];
+                const XrSpaceLocationFlags jv = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+                if (g_steamVR && H.tracker && locateJoints(g_rh.h[h], app.space, t, jl, nullptr) &&
+                    std::all_of(jl, jl + XR_HAND_JOINT_COUNT_EXT, [&](const XrHandJointLocationEXT &j) { return (j.locationFlags & jv) == jv; })) {
+                    hj += h ? ",\"hj1\":[" : ",\"hj0\":[";
+                    for (int j = 0; j < XR_HAND_JOINT_COUNT_EXT; j++) {
+                        XrPosef p = jl[j].pose;
+                        if (vg) vigiaXf(p);
+                        if (j) hj += ',';
+                        const float v7[7] = {p.position.x, p.position.y, p.position.z, p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w};
+                        for (int k = 0; k < 7; k++) { if (k) hj += ','; appendNum(hj, v7[k]); }
+                    }
+                    hj += ']';
+                }
                 continue;
             }
             for (int k = 0; k < 27; k++) add(0);
@@ -4151,7 +4167,9 @@ static void sendPose(App &app, const XrView views[2], XrTime t) {
         add(!blk && getBool(app, app.aATouch, h)); add(!blk && getBool(app, app.aBTouch, h));
         add(h == 0 ? getBool(app, app.aMenu, h) : 0.f);
     }
-    s += "]}";
+    s += ']';
+    s += hj;
+    s += '}';
     sendPacket(s);
 }
 
@@ -9113,12 +9131,10 @@ static void renderFrame(App &app) {
     // debajo del láser
     ctlModelsTry(app);
     portalUpdate();
-    // Durante un juego, la cámara y las manos solo si se activaron las manos en el juego (experimental), o con SteamVR
-    // real y seguimiento de manos: ahí se ven solas (los gestos los recibe SteamVR como un control)
-    const bool gameHands = g_gameHands || (g_steamVR && !g_ctlInUse);
-    const bool handsHere = showUi || (g_inGameNow && gameHands);
-    camSetActive(!g_inGameNow || gameHands);
-    if (!g_inGameNow || gameHands) camFrameUpdate(app, fs.predictedDisplayTime); else g_camMode = false;
+    // Durante un juego, la cámara y las manos solo si se activaron las manos en el juego (experimental)
+    const bool handsHere = showUi || (g_inGameNow && g_gameHands);
+    camSetActive(!g_inGameNow || g_gameHands);
+    if (!g_inGameNow || g_gameHands) camFrameUpdate(app, fs.predictedDisplayTime); else g_camMode = false;
     // Sala passthrough: tus manos y controles sobre las pantallas con el passthrough del propio visor (proyectado sobre
     // su forma), así calzan con tu mano real de al lado. Con la cámara de VRmin la imagen quedaba más chica y corrida.
     const bool ptRoom = g_env == 3 && !g_inGameNow && app.ptRunning && g_rh.ok;
@@ -9134,7 +9150,7 @@ static void renderFrame(App &app) {
     }
     XrCompositionLayerProjection over{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     XrCompositionLayerProjectionView ov[2];
-    const bool overlayGame = g_inGameNow && valid && (g_gameMenu || (gameHands && g_camMode));
+    const bool overlayGame = g_inGameNow && valid && (g_gameMenu || (g_gameHands && g_camMode));
     if (((showUi && nq + ncyl > 0 && valid) || overlayGame) && app.overlay[0].handle && app.overlay[1].handle) {
         Ray rays[2];
         std::vector<Bar> bars;

@@ -16,10 +16,22 @@ Host downloads them from their official releases when you install the engine.
 | steamwebhelper wrapper, from [play-windows-steam-on-mac](https://github.com/ramiabih/play-windows-steam-on-mac) | MIT | Included (steam/steamwebhelper.exe) |
 | [OpenXR SDK](https://github.com/KhronosGroup/OpenXR-SDK) (headers and loader) | Apache 2.0 | Included in the Quest app and the runtime |
 | [Snapdragon Game Super Resolution 1](https://github.com/SnapdragonGameStudios/snapdragon-gsr/tree/d926f074bcb9d714e179f1ce0fcb9ee2eeb5074e/sgsr/v1) | BSD 3-Clause | Adapted GLSL filter in the Quest app (`assets/licenses/snapdragon-gsr.txt` in the APK) |
+| [ALVR](https://github.com/alvr-org/ALVR) | MIT | The conversion of the Quest's hand joints to SteamVR's hand skeleton, adapted in the SteamVR driver (`mac/steamvr/driver_vrmin.cpp`) |
 
 ## MIT (play-windows-steam-on-mac)
 
 Copyright (c) 2026 Daniil Efimenko (play-windows-steam-on-mac)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## MIT (ALVR)
+
+Copyright (c) 2018-2019 polygraphene
+Copyright (c) 2020-2024 alvr-org
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 

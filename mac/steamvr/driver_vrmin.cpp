@@ -216,6 +216,10 @@ struct Track {
   bool valid = false, handValid[2] = {};
   double eye[2][7] = {}, fov[2][4] = {}, grip[2][7] = {}, aim[2][7] = {};
   float in[2][IN_COUNT] = {};
+  // With real SteamVR and a hand tracked without its controller: its 26 OpenXR joints (position, rotation x y z w),
+  // "hj0"/"hj1" after "xr"
+  bool hj[2] = {};
+  float joint[2][26][7] = {};
 };
 static std::mutex g_trackLock;
 static Track g_track;
@@ -290,6 +294,22 @@ static void parse_pose(const char *line) {
     for (int i = 0; i < 7; i++) t.grip[h][i] = v[k++];
     for (int i = 0; i < 7; i++) t.aim[h][i] = v[k++];
     for (int i = 0; i < IN_COUNT; i++) t.in[h][i] = (float)v[k++];
+  }
+  for (int h = 0; h < 2; h++) {
+    const char *q = strstr(line, h ? "\"hj1\":[" : "\"hj0\":[");
+    if (!q) continue;
+    q += 7;
+    int m = 0;
+    while (m < 26 * 7 && *q && *q != ']') {
+      char *end;
+      float d = strtof(q, &end);
+      if (end == q) { q++; continue; }
+      if (!std::isfinite(d) || std::fabs(d) > 1000) break;
+      t.joint[h][m / 7][m % 7] = d;
+      m++;
+      q = end;
+    }
+    t.hj[h] = m == 26 * 7;
   }
   std::lock_guard<std::mutex> g(g_trackLock);
   g_track = t;
@@ -1187,10 +1207,80 @@ public:
   }
 };
 
+// ---- the hand's skeleton (SteamVR's 31 bones) from the Quest's 26 OpenXR joints ----
+// SteamVR wants each bone relative to its parent, in its own axes for each bone (different for each hand); the wrist and
+// the 5 «aux» bones relative to the device's pose. Which axes go where is ALVR's conversion (MIT, see
+// mac/app/recursos/LICENCIAS_DE_TERCEROS.md).
+struct Q { double x, y, z, w; };
+static Q qmul(const Q &a, const Q &b) {
+  return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+          a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+static Q qconj(const Q &a) { return {-a.x, -a.y, -a.z, a.w}; }
+static void qrot(const Q &q, const double v[3], double out[3]) {
+  Q r = qmul(qmul(q, {v[0], v[1], v[2], 0}), qconj(q));
+  out[0] = r.x; out[1] = r.y; out[2] = r.z;
+}
+struct BonePose { Q q; double p[3]; };
+static VRBoneTransform_t bone(const BonePose &b) {
+  VRBoneTransform_t t;
+  t.position = {{(float)b.p[0], (float)b.p[1], (float)b.p[2], 1.f}};
+  t.orientation = {(float)b.q.w, (float)b.q.x, (float)b.q.y, (float)b.q.z};
+  return t;
+}
+// dev: the device's pose (x y z, x y z w), as SteamVR has it
+static void hand_skeleton(bool left, const double dev[7], const float j[26][7], VRBoneTransform_t out[31]) {
+  BonePose g[26];
+  for (int i = 0; i < 26; i++) g[i] = {{j[i][3], j[i][4], j[i][5], j[i][6]}, {j[i][0], j[i][1], j[i][2]}};
+  const Q devQ = {dev[3], dev[4], dev[5], dev[6]}, devInv = qconj(devQ);
+  // (rotations: ALVR's Euler angles as quaternions)
+  const Q wristFix = {0.5, -0.5, 0.5, 0.5};                                   // YXZ (-90°, 90°, 0)
+  const Q rootFix = left ? Q{0.7071068, 0.7071068, 0, 0} : Q{0.7071068, -0.7071068, 0, 0};   // XZY (180°, ∓90°, 0)
+  const Q auxFix = left ? Q{0.5, -0.5, 0.5, 0.5} : Q{-0.5, 0.5, 0.5, 0.5};    // YXZ (∓90°, ±90°, 0)
+  auto fromDevice = [&](const BonePose &b) {   // a joint relative to the device
+    BonePose r;
+    r.q = qmul(qmul(devInv, b.q), rootFix);
+    double d[3] = {b.p[0] - dev[0], b.p[1] - dev[1], b.p[2] - dev[2]};
+    qrot(devInv, d, r.p);
+    return r;
+  };
+  auto local = [&](const BonePose &parent, const BonePose &cur) {   // a joint relative to its parent, in SteamVR's axes
+    const Q pinv = qconj(parent.q), o = qmul(pinv, cur.q);
+    double d[3] = {cur.p[0] - parent.p[0], cur.p[1] - parent.p[1], cur.p[2] - parent.p[2]}, p[3];
+    qrot(pinv, d, p);
+    BonePose r;
+    if (left) { r.q = {-o.z, -o.y, -o.x, o.w}; r.p[0] = -p[2]; r.p[1] = -p[1]; r.p[2] = -p[0]; }
+    else { r.q = {o.z, o.y, -o.x, o.w}; r.p[0] = p[2]; r.p[1] = p[1]; r.p[2] = -p[0]; }
+    return r;
+  };
+  const BonePose wrist = {qmul(g[1].q, wristFix), {g[1].p[0], g[1].p[1], g[1].p[2]}};
+  out[0] = bone({{0, 0, 0, 1}, {0, 0, 0}});   // (the root: the device itself)
+  out[1] = bone(fromDevice(g[1]));
+  // thumb (2-5) from the wrist; each other finger (index 6-10, middle 11-15, ring 16-20, little 21-25) from the wrist
+  // through its metacarpal to its tip
+  for (int f = 0; f < 5; f++) {
+    const int first = f == 0 ? 2 : 6 + (f - 1) * 5, last = f == 0 ? 5 : first + 4;
+    out[first] = bone(local(wrist, g[first]));
+    for (int i = first + 1; i <= last; i++) out[i] = bone(local(g[i - 1], g[i]));
+  }
+  // aux bones: the last joint of each finger, relative to the device
+  const int aux[5] = {4, 9, 14, 19, 24};
+  for (int f = 0; f < 5; f++) {
+    BonePose b = fromDevice(g[aux[f]]);
+    b.q = qmul(b.q, auxFix);
+    out[26 + f] = bone(b);
+  }
+}
+
 // ---- controllers (Touch, so SteamVR uses Valve's Touch bindings for each game) ----
+// Each hand has two devices: the Touch controller, and «the hand» (the same Touch controller, with the skeleton of
+// your fingers) that takes its place while the Quest follows that hand without a controller, with real SteamVR. Only
+// one of the two is connected at a time (like ALVR's separate hand trackers).
 class VRminController : public ITrackedDeviceServerDriver {
-  bool left;
+  bool left, hand;
+  bool handLogged = false;
   Motion motion;
+  VRInputComponentHandle_t skeleton = 0;
   VRInputComponentHandle_t joyX = 0, joyY = 0, joyClick = 0, joyTouch = 0, trigger = 0, triggerClick = 0, triggerTouch = 0,
                            grip = 0, gripTouch = 0, lower = 0, lowerTouch = 0, upper = 0, upperTouch = 0, system = 0,
                            tsX = 0, tsY = 0, tsClick = 0, tsTouch = 0;
@@ -1199,15 +1289,17 @@ public:
   bool isLeft() const { return left; }
   double takePeak() { double v = motion.peak; motion.peak = 0; return v; }   // (for the log)
   uint32_t id = k_unTrackedDeviceIndexInvalid;
-  explicit VRminController(bool l) : left(l) {}
+  VRminController(bool l, bool h) : left(l), hand(h) {}
   EVRInitError Activate(uint32_t objectId) override {
     PropertyContainerHandle_t c = VRProperties()->TrackedDeviceToPropertyContainer(objectId);
     // (like SteamVR's own Touch for Quest 2: {oculus}/input/touch_profile.json's simulation_settings, which older games
     //  that use SteamVR's legacy input read: buttons, axes, model)
     VRProperties()->SetStringProperty(c, Prop_ModelNumber_String, left ? "Oculus Quest2 (Left Controller)" : "Oculus Quest2 (Right Controller)");
-    VRProperties()->SetStringProperty(c, Prop_SerialNumber_String, left ? "VRMIN-LEFT" : "VRMIN-RIGHT");
-    VRProperties()->SetStringProperty(c, Prop_RegisteredDeviceType_String, left ? "oculus/VRMIN_Controller_Left" : "oculus/VRMIN_Controller_Right");
-    VRProperties()->SetStringProperty(c, Prop_AttachedDeviceId_String, left ? "VRMIN-LEFT" : "VRMIN-RIGHT");
+    const char *serial = hand ? (left ? "VRMIN-HAND-LEFT" : "VRMIN-HAND-RIGHT") : (left ? "VRMIN-LEFT" : "VRMIN-RIGHT");
+    VRProperties()->SetStringProperty(c, Prop_SerialNumber_String, serial);
+    VRProperties()->SetStringProperty(c, Prop_RegisteredDeviceType_String, hand ? (left ? "oculus/VRMIN_Hand_Left" : "oculus/VRMIN_Hand_Right")
+                                                                                : (left ? "oculus/VRMIN_Controller_Left" : "oculus/VRMIN_Controller_Right"));
+    VRProperties()->SetStringProperty(c, Prop_AttachedDeviceId_String, serial);
     VRProperties()->SetUint64Property(c, Prop_SupportedButtons_Uint64, (1ull << k_EButton_System) | (1ull << k_EButton_ApplicationMenu) | (1ull << k_EButton_Grip) |
                                                                          (1ull << k_EButton_A) | (1ull << k_EButton_SteamVR_Touchpad) | (1ull << k_EButton_SteamVR_Trigger) |
                                                                          (1ull << k_EButton_Axis2));
@@ -1246,8 +1338,12 @@ public:
     in->CreateBooleanComponent(c, left ? "/input/y/touch" : "/input/b/touch", &upperTouch);
     if (left) in->CreateBooleanComponent(c, "/input/system/click", &system);   // (the Quest's menu button)
     in->CreateHapticComponent(c, "/output/haptic", &haptic);
+    // The hand: the skeleton of your fingers, relative to this device's pose (as SteamVR has it, the «raw» one)
+    if (hand)
+      in->CreateSkeletonComponent(c, left ? "/input/skeleton/left" : "/input/skeleton/right", left ? "/skeleton/hand/left" : "/skeleton/hand/right",
+                                  "/pose/raw", VRSkeletalTracking_Full, nullptr, 0, &skeleton);
     id = objectId;   // (after its inputs: from here on the pose thread updates it)
-    logf("%s controller activated (device %u)", left ? "Left" : "Right", id);
+    logf("%s %s activated (device %u)", left ? "Left" : "Right", hand ? "hand (fingers)" : "controller", id);
     return VRInitError_None;
   }
   void Deactivate() override { id = k_unTrackedDeviceIndexInvalid; }
@@ -1276,6 +1372,14 @@ public:
     int h = left ? 0 : 1;
     DriverPose_t p;
     double raw[7];
+    // Hand followed with its fingers: the hand is connected and the controller isn't; otherwise the other way round
+    const bool fingers = t.valid && t.handValid[h] && t.hj[h];
+    if (hand != fingers) {
+      p = GetPose(); p.poseIsValid = false; p.deviceIsConnected = false; p.result = TrackingResult_Uninitialized;
+      motion.reset();
+      VRServerDriverHost()->TrackedDevicePoseUpdated(id, p, sizeof p);
+      return;
+    }
     if (!t.valid) p = GetPose();
     else if (t.handValid[h]) {
       raw_from_grip(t.grip[h], left, raw);
@@ -1287,6 +1391,13 @@ public:
     if (!t.valid || !t.handValid[h]) motion.reset();
     VRServerDriverHost()->TrackedDevicePoseUpdated(id, p, sizeof p);
     if (!t.valid) return;
+    if (hand) {
+      VRBoneTransform_t bones[31];
+      hand_skeleton(left, raw, t.joint[h], bones);
+      VRDriverInput()->UpdateSkeletonComponent(skeleton, VRSkeletalMotionRange_WithController, bones, 31);
+      VRDriverInput()->UpdateSkeletonComponent(skeleton, VRSkeletalMotionRange_WithoutController, bones, 31);
+      if (!handLogged) { handLogged = true; logf("%s hand: fingers followed", left ? "Left" : "Right"); }
+    }
     const float *v = t.in[h];
     IVRDriverInput *in = VRDriverInput();
     in->UpdateScalarComponent(joyX, v[IN_TX], 0);
@@ -1313,7 +1424,7 @@ public:
 // ---- the driver ----
 class VRminProvider : public IServerTrackedDeviceProvider {
   VRminHmd hmd;
-  VRminController leftHand{true}, rightHand{false};
+  VRminController leftHand{true, false}, rightHand{false, false}, leftFingers{true, true}, rightFingers{false, true};
   HostControl host;
   std::atomic<bool> running{false};
   std::thread poses;
@@ -1329,6 +1440,8 @@ public:
     if (!VRServerDriverHost()->TrackedDeviceAdded("VRMIN-HMD", TrackedDeviceClass_HMD, &hmd)) logf("SteamVR didn't take the headset");
     VRServerDriverHost()->TrackedDeviceAdded("VRMIN-LEFT", TrackedDeviceClass_Controller, &leftHand);
     VRServerDriverHost()->TrackedDeviceAdded("VRMIN-RIGHT", TrackedDeviceClass_Controller, &rightHand);
+    VRServerDriverHost()->TrackedDeviceAdded("VRMIN-HAND-LEFT", TrackedDeviceClass_Controller, &leftFingers);
+    VRServerDriverHost()->TrackedDeviceAdded("VRMIN-HAND-RIGHT", TrackedDeviceClass_Controller, &rightFingers);
     running = true;
     // Each new pose from the Quest goes to SteamVR (without the Quest: every 11 ms, the fixed ones)
     poses = std::thread([this] {
@@ -1348,6 +1461,8 @@ public:
           hmd.update(t);
           leftHand.update(t);
           rightHand.update(t);
+          leftFingers.update(t);
+          rightFingers.update(t);
           // (every 2 s with the hands moving: how fast they went, to check the velocity the games get)
           static double logAt = 0;
           if (now - logAt > 2) {
@@ -1376,7 +1491,7 @@ public:
       // A game's vibration: to the Quest's controller, through VRmin Host (the same message as VRmin's OpenXR runtime)
       if (e.eventType == VREvent_Input_HapticVibration) {
         const VREvent_HapticVibration_t &h = e.data.hapticVibration;
-        for (VRminController *c : {&leftHand, &rightHand})
+        for (VRminController *c : {&leftHand, &rightHand, &leftFingers, &rightFingers})
           if (c->haptic && h.componentHandle == c->haptic) {
             char m[128];
             // (no duration: the shortest vibration the controller can do, as OpenXR's XR_MIN_HAPTIC_DURATION, which
