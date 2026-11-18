@@ -181,6 +181,10 @@ fijo = {
                 "showMirrorView": False, "startMonitorFromAppLaunch": False, "startOverlayAppsFromDashboard": False,
                 "allowDisplayLockedMode": True},
 }
+# Si SteamVR se cerró de golpe, la vez siguiente bloquea los drivers («modo seguro»: «Debido a un cierre inesperado,
+# algunos complementos se bloquearon») y su botón para volver a activarlos abre una ventana que en VRmin no se usa:
+# sin el de VRmin no hay visor. Se vuelve a activar siempre.
+s.setdefault("driver_vrmin", {}).update({"enable": True, "blocked_by_safe_mode": False})
 # (de versiones anteriores de VRmin)
 s.get("dashboard", {}).pop("enableDashboard", None)
 s.get("dashboard", {}).pop("allowDashboardAutoLaunchWithSteamVRHome", None)
