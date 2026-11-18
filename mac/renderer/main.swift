@@ -1162,6 +1162,13 @@ final class GameLink {
     var configLine: String { GameProfiles.shared.configLine(fps: halfRate ? FPS / 2 : FPS, hello: false) }
     /// Mensajes para la app del Quest (la vibración de los controles)
     var sendNative: (Data) -> Void = { _ in }
+    /// La conexión del driver de SteamVR (-1: no hay): con SteamVR real el Quest muestra tus manos reales en el juego
+    private var steamVRFd: Int32 = -1
+    /// Le dice al Quest si el juego corre con SteamVR real (también cuando el Quest se vuelve a conectar)
+    func sendSteamVR() {
+        lock.lock(); let on = steamVRFd >= 0; lock.unlock()
+        var d = Data([3]); d.append(Data("{\"type\":\"steamvr\",\"on\":\(on)}".utf8)); sendNative(d)
+    }
     /// Todas las conexiones de juegos abiertas (puede haber copias viejas en segundo plano).
     private var clients: [Int32: Int] = [:]      // fd -> envíos fallidos seguidos
     private let lock = NSLock()
@@ -1320,7 +1327,9 @@ final class GameLink {
                     sendTo(c, Data(configLine.utf8))
                     shared.requestKey()
                     readLoop(c)
-                    lock.lock(); clients[c] = nil; pending[c] = nil; let left = clients.count; lock.unlock()
+                    lock.lock(); clients[c] = nil; pending[c] = nil; let left = clients.count
+                    let wasSteamVR = steamVRFd == c; if wasSteamVR { steamVRFd = -1 }; lock.unlock()
+                    if wasSteamVR { sendSteamVR() }
                     Darwin.close(c)
                     print("[juego] Conexión con un juego cerrada (quedan: \(left))")
                     if left == 0 { GameProfiles.shared.end() }
@@ -1411,6 +1420,7 @@ final class GameLink {
                 let app = String(decoding: buf[1..<n], as: UTF8.self)
                 GameProfiles.shared.begin(app: app)
                 sendTo(fd, Data(GameProfiles.shared.configLine(fps: halfRate ? FPS / 2 : FPS, hello: true).utf8))
+                if app == "SteamVR" { lock.lock(); steamVRFd = fd; lock.unlock(); sendSteamVR() }
             case 4:
                 // Esta conexión es solo de imágenes: no le mandamos poses
                 lock.lock(); clients[fd] = nil; pending[fd] = nil; let left = clients.count; lock.unlock()
@@ -4372,6 +4382,7 @@ func handleQuestMessage(_ line: Data, fromWeb: Bool = false) {
             if is2D || isRoom { renderer.lobby?.handle2D(InMsg.desk(false)) }   // el escritorio arranca oculto
         }
         print(is2D ? "[quest] Ventana del Quest (2D): lista de juegos y escritorio" : isRoom ? "[quest] Sala VR con menú y ventanas" : "[quest] Modo VR")
+        game.sendSteamVR()
     } else if m.type == "rejoin" {
         // «Volver al juego»: el runtime del juego rearma su conexión de imágenes y se pide un cuadro completo
         game.sendLine(Data("{\"resetimg\":1}".utf8))

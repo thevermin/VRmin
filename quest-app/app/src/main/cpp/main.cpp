@@ -895,6 +895,7 @@ static const int GAME_MENU_ID = 0x2FFFFFD0;
 static std::atomic<bool> g_gameMenu{false};      // el menú del juego está abierto (el juego no recibe los botones)
 static std::atomic<bool> g_gameHidden{false};    // «Menú principal» desde el menú del juego: el juego sigue abierto, se ve la sala
 static std::atomic<bool> g_gameHands{false};     // manos reales también durante el juego (experimental)
+static std::atomic<bool> g_steamVR{false};       // el juego corre con SteamVR real (lo avisa la Mac)
 static std::atomic<bool> g_handGestures{true};
 // Ajuste del ángulo de las manos y el láser en los juegos (grados, se suma a lo de fábrica):
 // inclinación (arriba/abajo) y giro (sobre el eje largo de la mano). Vale con manos y con controles.
@@ -1728,6 +1729,10 @@ static void networkLoop() {
                         c.yaw = jsonNum(t, "\"yaw\":"); c.pitch = jsonNum(t, "\"pitch\":");
                         std::lock_guard<std::mutex> lk(g_camHeadLock);
                         g_camHead = c;
+                    }
+                    else if (t.find("\"type\":\"steamvr\"") != std::string::npos) {
+                        const bool on = t.find("\"on\":true") != std::string::npos;
+                        if (on != g_steamVR.exchange(on)) sendLog(on ? "SteamVR real: tus manos reales se ven en el juego (sin controles)" : "SteamVR real cerrado");
                     }
                     else if (t.find("\"panels\"") != std::string::npos) receivePanels(t);
                     else if (t.find("\"exitvr\"") != std::string::npos) g_exitVR = true;
@@ -9108,10 +9113,12 @@ static void renderFrame(App &app) {
     // debajo del láser
     ctlModelsTry(app);
     portalUpdate();
-    // Durante un juego, la cámara y las manos solo si se activaron las manos en el juego (experimental)
-    const bool handsHere = showUi || (g_inGameNow && g_gameHands);
-    camSetActive(!g_inGameNow || g_gameHands);
-    if (!g_inGameNow || g_gameHands) camFrameUpdate(app, fs.predictedDisplayTime); else g_camMode = false;
+    // Durante un juego, la cámara y las manos solo si se activaron las manos en el juego (experimental), o con SteamVR
+    // real y seguimiento de manos: ahí se ven solas (los gestos los recibe SteamVR como un control)
+    const bool gameHands = g_gameHands || (g_steamVR && !g_ctlInUse);
+    const bool handsHere = showUi || (g_inGameNow && gameHands);
+    camSetActive(!g_inGameNow || gameHands);
+    if (!g_inGameNow || gameHands) camFrameUpdate(app, fs.predictedDisplayTime); else g_camMode = false;
     // Sala passthrough: tus manos y controles sobre las pantallas con el passthrough del propio visor (proyectado sobre
     // su forma), así calzan con tu mano real de al lado. Con la cámara de VRmin la imagen quedaba más chica y corrida.
     const bool ptRoom = g_env == 3 && !g_inGameNow && app.ptRunning && g_rh.ok;
@@ -9127,7 +9134,7 @@ static void renderFrame(App &app) {
     }
     XrCompositionLayerProjection over{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     XrCompositionLayerProjectionView ov[2];
-    const bool overlayGame = g_inGameNow && valid && (g_gameMenu || (g_gameHands && g_camMode));
+    const bool overlayGame = g_inGameNow && valid && (g_gameMenu || (gameHands && g_camMode));
     if (((showUi && nq + ncyl > 0 && valid) || overlayGame) && app.overlay[0].handle && app.overlay[1].handle) {
         Ray rays[2];
         std::vector<Bar> bars;
