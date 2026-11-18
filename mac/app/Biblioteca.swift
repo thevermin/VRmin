@@ -30,7 +30,8 @@ func scanDownloads(_ steamapps: URL) -> [SteamDownload] {
     var out: [SteamDownload] = []
     for f in files where f.hasPrefix("appmanifest_") && f.hasSuffix(".acf") {
         let d = parseACF(steamapps.appendingPathComponent(f))
-        guard let id = d["appid"] else { continue }
+        // (LastOwner 0: Steam lo dejó como parte de otro juego, como Lost Coast con Half-Life 2, y nunca lo baja)
+        guard let id = d["appid"], d["LastOwner"] != "0" else { continue }
         let flags = Int(d["StateFlags"] ?? "") ?? 0
         var total = Int64(d["BytesToDownload"] ?? "") ?? 0, done = Int64(d["BytesDownloaded"] ?? "") ?? 0
         // Steam escribe esos números en el appmanifest pocas veces: lo que ya bajó se ve mejor en steamapps/downloading
@@ -41,7 +42,7 @@ func scanDownloads(_ steamapps: URL) -> [SteamDownload] {
             let staged = folderBytes(dl)
             if total <= 0 || Double(staged) / Double(stage) > Double(done) / Double(max(total, 1)) { total = stage; done = min(staged, stage) }
         }
-        let needs = flags & (2 | 1024 | 256) != 0   // (hay que actualizar, empezó o está bajando)
+        let needs = flags & (1024 | 256 | 512) != 0   // (empezó, está bajando o en pausa; no «hay que actualizar» a secas)
         guard total > 0 || needs else { continue }
         if flags & 4 != 0 && !needs && done >= total { continue }   // (ya terminó)
         out.append(SteamDownload(id: id, name: d["name"] ?? id, done: done, total: total, paused: flags & 512 != 0 && flags & 256 == 0))
@@ -214,6 +215,7 @@ struct LibraryView: View {
                     grid
                     if let g = selected {
                         GameDetail(game: g, gameAdv: $gameAdv) { select(nil) }
+                            .id(g.id)   // (cada juego, su propia página: si no, quedaban datos del anterior)
                             .transition(.opacity.combined(with: .offset(y: 24)))
                     }
                 }
@@ -371,24 +373,33 @@ struct GameDetail: View {
 
     var body: some View {
         let v = m.vr[game.id]
-        ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-                hero
-                // (con la ventana angosta, los datos van debajo del botón)
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 18) { mainButton; stats(v); Spacer(minLength: 0); moreMenu(v) }
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack { mainButton; Spacer(); moreMenu(v) }
-                        HStack(spacing: 18) { stats(v) }
+        GeometryReader { geo in
+            // (con la ventana angosta, los datos van debajo del botón y los cuadros, uno debajo del otro)
+            let wide = geo.size.width >= 900, mid = geo.size.width >= 720
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    hero
+                    Group {
+                        if wide {
+                            HStack(spacing: 18) { mainButton; stats(v); Spacer(minLength: 0); moreMenu(v) }
+                        } else {
+                            VStack(alignment: .leading, spacing: 12) {
+                                HStack { mainButton; Spacer(minLength: 0); moreMenu(v) }
+                                HStack(spacing: 18) { stats(v) }
+                            }
+                        }
                     }
+                    .padding(.horizontal, 26).padding(.top, 4)
+                    Group {
+                        if mid {
+                            HStack(alignment: .top, spacing: 14) { vrCard(v); qualityCard.frame(width: 220) }
+                        } else {
+                            VStack(alignment: .leading, spacing: 14) { vrCard(v); qualityCard }
+                        }
+                    }
+                    .padding(.horizontal, 26).padding(.vertical, 18)
                 }
-                .padding(.horizontal, 26).padding(.top, 4)
-
-                ViewThatFits(in: .horizontal) {
-                    HStack(alignment: .top, spacing: 14) { vrCard(v).frame(minWidth: 420); qualityCard.frame(width: 240) }
-                    VStack(alignment: .leading, spacing: 14) { vrCard(v); qualityCard }
-                }
-                .padding(.horizontal, 26).padding(.vertical, 18)
+                .frame(width: geo.size.width)
             }
         }
         .background(Theme.bg)
@@ -618,8 +629,66 @@ struct StoreItem: Identifiable, Decodable {
     let id: Int; let name: String; let tiny_image: String?; let price: Price?
 }
 
+/// Los juegos de VR de tu cuenta que no están instalados (para la Tienda, como en GameHub): los de la configuración de
+/// tus cuentas de Steam, y si son de VR según la tienda (se pregunta de a uno, despacio, y se guarda en tienda_cache.json)
+final class AccountGames: ObservableObject {
+    static let shared = AccountGames()
+    struct Info: Codable { let n: String; let vr: Bool }
+    @Published var vr: [(id: String, name: String)] = []
+    @Published var checking: (done: Int, total: Int)? = nil
+    private var started = false
+
+    func start(steamDir: URL, cache: URL) {
+        guard !started else { return }
+        started = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            var ids = Set<String>()
+            let ud = steamDir.appendingPathComponent("userdata")
+            for u in (try? FileManager.default.contentsOfDirectory(atPath: ud.path)) ?? [] {
+                guard let t = try? String(contentsOf: ud.appendingPathComponent("\(u)/config/localconfig.vdf"), encoding: .utf8),
+                      let r = t.range(of: "\"apps\"") else { continue }
+                let rest = String(t[r.upperBound...].prefix(600_000))
+                if let re = try? NSRegularExpression(pattern: "\n\t{5}\"(\\d+)\"\n\t{5}\\{") {
+                    for mm in re.matches(in: rest, range: NSRange(rest.startIndex..., in: rest)) {
+                        if let g = Range(mm.range(at: 1), in: rest) { ids.insert(String(rest[g])) }
+                    }
+                }
+            }
+            var known = (try? JSONDecoder().decode([String: Info].self, from: Data(contentsOf: cache))) ?? [:]
+            func publish() {
+                let list = known.filter { ids.contains($0.key) && $0.value.vr }.map { (id: $0.key, name: $0.value.n) }
+                    .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                DispatchQueue.main.async { self.vr = list }
+            }
+            publish()
+            let missing = ids.filter { known[$0] == nil }.sorted { (Int($0) ?? 0) < (Int($1) ?? 0) }
+            for (i, id) in missing.enumerated() {
+                DispatchQueue.main.async { self.checking = (i, missing.count) }
+                guard let url = URL(string: "https://store.steampowered.com/api/appdetails?appids=\(id)&l=english"),
+                      let d = try? Data(contentsOf: url),
+                      let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+                      let e = j[id] as? [String: Any] else { Thread.sleep(forTimeInterval: 5); continue }
+                if let x = e["data"] as? [String: Any], (x["type"] as? String) == "game" {
+                    let cats = (x["categories"] as? [[String: Any]] ?? []).compactMap { $0["description"] as? String }
+                    known[id] = Info(n: x["name"] as? String ?? id, vr: cats.contains { $0.contains("VR") })
+                } else {
+                    known[id] = Info(n: id, vr: false)
+                }
+                if i % 10 == 9 || i == missing.count - 1 {
+                    try? JSONEncoder().encode(known).write(to: cache)
+                    publish()
+                }
+                Thread.sleep(forTimeInterval: 1.3)   // (la tienda no quiere muchas preguntas seguidas)
+            }
+            DispatchQueue.main.async { self.checking = nil }
+        }
+    }
+}
+
 struct StoreView: View {
     @EnvironmentObject var m: AppModel
+    @ObservedObject private var account = AccountGames.shared
     @State private var query = ""
     @State private var results: [StoreItem] = []
     @State private var searching = false
@@ -647,14 +716,52 @@ struct StoreView: View {
                                  : L("Resultados de la tienda de Steam"))
                 .font(.callout).foregroundStyle(Theme.text2)
             ScrollView {
+                if results.isEmpty && query.isEmpty { accountSection }
                 VStack(spacing: 10) {
                     ForEach(results) { r in row(r) }
                 }
             }
         }
         .padding(18)
+        .onAppear {
+            let steam = m.steamapps.deletingLastPathComponent()
+            AccountGames.shared.start(steamDir: steam, cache: m.data.appendingPathComponent("tienda_cache.json"))
+        }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .safeAreaInset(edge: .bottom, spacing: 0) { DownloadsBar() }
+    }
+
+    /// Tus juegos de VR sin instalar, con su botón de instalar
+    @ViewBuilder private var accountSection: some View {
+        let list = account.vr.filter { a in !m.games.contains { $0.id == a.id } }
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(L("Tus juegos de VR sin instalar")).font(.system(size: 15, weight: .semibold))
+                if let c = account.checking {
+                    ProgressView().controlSize(.small)
+                    Text(L("Revisando tu cuenta… %d de %d", c.done, c.total)).font(.caption).foregroundStyle(Theme.text2)
+                }
+            }
+            if list.isEmpty && account.checking == nil {
+                Text(L("No encontramos juegos de VR tuyos sin instalar.")).font(.callout).foregroundStyle(Theme.text2)
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 200, maximum: 280), spacing: 14)], spacing: 14) {
+                ForEach(list, id: \.id) { a in
+                    let downloading = m.downloads.contains { $0.id == a.id }
+                    VStack(alignment: .leading, spacing: 6) {
+                        AsyncImage(url: steamArt(a.id, "header.jpg")) { i in i.resizable().aspectRatio(contentMode: .fill) } placeholder: { Color.white.opacity(0.06) }
+                            .aspectRatio(460 / 215, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 7))
+                        HStack {
+                            Text(a.name).font(.system(size: 12.5, weight: .semibold)).lineLimit(1)
+                            Spacer()
+                            if downloading { Text(L("Descargando")).font(.caption.weight(.semibold)).foregroundStyle(Theme.amberText) }
+                            else { Button(L("Instalar")) { m.installGame(a.id, a.name) }.buttonStyle(Pill(primary: true)).disabled(!m.steamInstalled) }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.bottom, 16)
     }
 
     private func row(_ r: StoreItem) -> some View {
