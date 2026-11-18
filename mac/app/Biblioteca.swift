@@ -26,6 +26,25 @@ func scanDownloads(_ steamapps: URL) -> [SteamDownload] {
     return out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
 }
 
+/// La cuenta de Steam que entra sola (loginusers.vdf: la más reciente que guardó la sesión): su nombre visible
+func steamSavedAccount(_ loginusers: URL) -> String? {
+    guard let t = try? String(contentsOf: loginusers, encoding: .utf8) else { return nil }
+    // (un bloque por cuenta: "7656…" { "AccountName" "…" "PersonaName" "…" "RememberPassword" "1" "MostRecent" "1" })
+    var best: String? = nil
+    for block in t.components(separatedBy: "}") {
+        func val(_ k: String) -> String? {
+            guard let r = block.range(of: "\"\(k)\"\\s+\"([^\"]*)\"", options: .regularExpression) else { return nil }
+            let m = block[r]; let parts = m.split(separator: "\"")
+            return parts.count >= 3 ? String(parts[parts.count - 1]) : nil
+        }
+        guard val("RememberPassword") == "1" || val("AllowAutoLogin") == "1" else { continue }
+        let name = val("PersonaName") ?? val("AccountName")
+        if val("MostRecent") == "1" { return name }
+        if best == nil { best = name }
+    }
+    return best
+}
+
 /// Imágenes de un juego en la tienda de Steam
 func steamArt(_ id: String, _ file: String) -> URL? { URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/\(file)") }
 
@@ -127,6 +146,7 @@ struct LibraryView: View {
     @State private var query = ""
     @State private var selectedID: String? = nil
     @AppStorage("libraryOrder") private var order = "nombre"   // nombre o recientes
+    @AppStorage("librarySideFolded") private var folded = false   // la lista de la izquierda, solo con los íconos
 
     private var games: [SteamGame] {
         let l = m.games.filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }
@@ -144,10 +164,9 @@ struct LibraryView: View {
     var body: some View {
         GeometryReader { geo in
             HStack(spacing: 0) {
-                if geo.size.width >= 760 {   // (con la ventana angosta, la lista de la izquierda se esconde)
-                    sidebar
-                    Rectangle().fill(Theme.line).frame(width: 1)
-                }
+                // (con la ventana angosta, la lista queda plegada: solo los íconos)
+                sidebar(folded || geo.size.width < 760, canUnfold: geo.size.width >= 760)
+                Rectangle().fill(Theme.line).frame(width: 1)
                 ZStack {
                     grid
                     if let g = selected {
@@ -161,18 +180,31 @@ struct LibraryView: View {
         }
     }
 
-    private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 6) {
+    private func sidebar(_ small: Bool, canUnfold: Bool) -> some View {
+        VStack(alignment: small ? .center : .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass").foregroundStyle(Theme.text2)
-                TextField(L("Buscar en tu biblioteca"), text: $query).textFieldStyle(.plain)
+                if !small {
+                    HStack(spacing: 6) {
+                        Image(systemName: "magnifyingglass").foregroundStyle(Theme.text2)
+                        TextField(L("Buscar en tu biblioteca"), text: $query).textFieldStyle(.plain)
+                    }
+                    .padding(.horizontal, 9).padding(.vertical, 6)
+                    .background(RoundedRectangle(cornerRadius: 7).fill(Color.white.opacity(0.07)))
+                }
+                if canUnfold {
+                    Button { withAnimation(.easeInOut(duration: 0.2)) { folded.toggle(); if folded { query = "" } } } label: {
+                        Image(systemName: "sidebar.left").frame(width: 26, height: 26)
+                            .background(RoundedRectangle(cornerRadius: 7).fill(Color.white.opacity(0.07)))
+                    }
+                    .buttonStyle(.plain).help(folded ? L("Mostrar la lista") : L("Plegar la lista"))
+                }
             }
-            .padding(.horizontal, 9).padding(.vertical, 6)
-            .background(RoundedRectangle(cornerRadius: 7).fill(Color.white.opacity(0.07)))
-            Text(L("JUEGOS · %d", games.count)).font(.system(size: 11, weight: .semibold)).foregroundStyle(Theme.text2)
-                .padding(.top, 8).padding(.leading, 4)
+            if !small {
+                Text(L("JUEGOS · %d", games.count)).font(.system(size: 11, weight: .semibold)).foregroundStyle(Theme.text2)
+                    .padding(.top, 8).padding(.leading, 4)
+            }
             ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: small ? .center : .leading, spacing: 2) {
                     ForEach(games) { g in
                         Button { select(g) } label: {
                             HStack(spacing: 8) {
@@ -180,27 +212,35 @@ struct LibraryView: View {
                                     if g.exe != nil { Rectangle().fill(nameGradient(g.name)) }
                                     else { AsyncImage(url: steamArt(g.id, "capsule_sm_120.jpg")) { i in i.resizable().aspectRatio(contentMode: .fill) } placeholder: { Color.white.opacity(0.08) } }
                                 }
-                                .frame(width: 18, height: 18).clipShape(RoundedRectangle(cornerRadius: 3))
-                                Text(g.name).lineLimit(1)
-                                Spacer(minLength: 0)
-                                if isOpen(g) { Circle().fill(Theme.amber).frame(width: 6, height: 6) }
+                                .frame(width: small ? 30 : 18, height: small ? 30 : 18).clipShape(RoundedRectangle(cornerRadius: small ? 6 : 3))
+                                .overlay(alignment: .topTrailing) {
+                                    if small && isOpen(g) { Circle().fill(Theme.amber).frame(width: 8, height: 8).offset(x: 3, y: -3) }
+                                }
+                                if !small {
+                                    Text(g.name).lineLimit(1)
+                                    Spacer(minLength: 0)
+                                    if isOpen(g) { Circle().fill(Theme.amber).frame(width: 6, height: 6) }
+                                }
                             }
                             .font(.system(size: 12.5))
                             .foregroundStyle(selectedID == g.id ? Theme.text : Theme.text2)
                             .opacity(g.inLibrary ? 1 : 0.6)
-                            .padding(.horizontal, 6).padding(.vertical, 5)
+                            .padding(.horizontal, small ? 4 : 6).padding(.vertical, small ? 3 : 5)
                             .background(RoundedRectangle(cornerRadius: 6).fill(selectedID == g.id ? Theme.amber.opacity(0.16) : .clear))
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .help(g.name)
                     }
                 }
             }
-            Button { pickLocalGame(m) } label: { Label(L("Agregar un juego"), systemImage: "plus") }
-                .buttonStyle(Pill()).help(L("Un juego de fuera de Steam: elegís su .exe"))
+            Button { pickLocalGame(m) } label: {
+                if small { Image(systemName: "plus") } else { Label(L("Agregar un juego"), systemImage: "plus") }
+            }
+            .buttonStyle(Pill()).help(L("Un juego de fuera de Steam: elegís su .exe"))
         }
         .padding(10)
-        .frame(width: 210)
+        .frame(width: small ? 58 : 210)
         .frame(maxHeight: .infinity, alignment: .top)
         .background(LinearGradient(colors: [Color(red: 42 / 255, green: 71 / 255, blue: 94 / 255).opacity(0.25), .clear], startPoint: .top, endPoint: .bottom))
     }
@@ -216,8 +256,6 @@ struct LibraryView: View {
                         Text(L("Jugados hace poco")).tag("recientes")
                     }
                     .pickerStyle(.menu).fixedSize()
-                    Button { pickLocalGame(m) } label: { Image(systemName: "plus") }
-                        .buttonStyle(Pill()).help(L("Agregar un juego de fuera de Steam"))
                 }
                 Text(m.steamRunning ? L("Tus juegos, listos para el Quest") : L("Tus juegos. Los de Steam necesitan que Steam esté abierto."))
                     .font(.callout).foregroundStyle(Theme.text2).padding(.bottom, 10)
@@ -232,7 +270,7 @@ struct LibraryView: View {
                 }
                 steamVRRow
                 if games.isEmpty {
-                    Text(query.isEmpty ? L("Todavía no hay juegos. Buscalos en la Tienda, o agregá uno de fuera de Steam con +.") : L("Ningún juego se llama así."))
+                    Text(query.isEmpty ? L("Todavía no hay juegos. Buscalos en la Tienda, o agregá uno de fuera de Steam con «Agregar un juego».") : L("Ningún juego se llama así."))
                         .font(.callout).foregroundStyle(Theme.text2).padding(.top, 20)
                 }
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 130, maximum: 190), spacing: 16)], spacing: 16) {
@@ -625,8 +663,24 @@ struct LibraryModePicker: View {
                    L("Como siempre: la ventana de Steam para Windows, con todo lo de Steam (amigos, chat, la tienda completa)."))
             Text(L("Podés cambiarlo cuando quieras; tus juegos y partidas no se tocan. Vale la próxima vez que se abre Steam."))
                 .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+            if let a = m.steamAccount {
+                HStack {
+                    Image(systemName: "person.crop.circle").foregroundStyle(Theme.text2)
+                    Text(L("Cuenta de Steam: %@", a)).font(.callout)
+                    Spacer()
+                    Button(L("Cerrar sesión")) { askSignOut = true }.buttonStyle(Pill()).disabled(m.busyTask != nil)
+                }
+                .padding(.top, 2)
+                .alert(L("¿Cerrar la sesión de Steam?"), isPresented: $askSignOut) {
+                    Button(L("Cerrar sesión"), role: .destructive) { m.signOutSteam() }
+                    Button(L("Cancelar"), role: .cancel) {}
+                } message: {
+                    Text(L("Se cierra Steam (y el juego que esté abierto). La próxima vez que se abra, pide iniciar sesión. Tus juegos y partidas no se tocan."))
+                }
+            }
         }
     }
+    @State private var askSignOut = false
     private func option(_ vrmin: Bool, _ title: String, _ badge: String?, _ text: String) -> some View {
         let on = m.libraryVRmin == vrmin
         return Button { m.libraryVRmin = vrmin } label: {

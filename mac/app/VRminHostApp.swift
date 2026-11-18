@@ -398,6 +398,9 @@ final class AppModel: ObservableObject {
     }
     /// Lo que Steam está bajando ahora (Biblioteca y Tienda)
     @Published var downloads: [SteamDownload] = []
+    /// La cuenta de Steam con la sesión guardada (la última que entró), si hay
+    @Published var steamAccount: String? = nil
+    func signOutSteam() { run(L("Cerrando la sesión de Steam"), "cerrar_sesion_steam.sh") }
     func writeSteamFriendsFile() {
         let f = data.appendingPathComponent("steam_amigos")
         if steamFriends { try? "1".write(to: f, atomically: true, encoding: .utf8) } else { try? FileManager.default.removeItem(at: f) }
@@ -585,6 +588,7 @@ final class AppModel: ObservableObject {
         }
         list.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         if list != games { games = list; loadVR() }
+        steamAccount = steamSavedAccount(steamapps.deletingLastPathComponent().appendingPathComponent("config/loginusers.vdf"))
         let dl = scanDownloads(steamapps)
         if dl != downloads { withAnimation { downloads = dl } }
         // Arreglos de compatibilidad apenas un juego aparece en la biblioteca
