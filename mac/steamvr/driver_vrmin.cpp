@@ -90,33 +90,43 @@ static DriverPose_t pose_at(double x, double y, double z, const double *q = null
 }
 
 // How fast a hand moves, from the Quest's poses (each one once: between two new poses the same one is
-// sent again). Games that use it: SUPERHOT VR (time moves when you move, and the strength of a punch), throwing in
+// sent again; timed by the Quest, once per frame there, because over Wi-Fi they arrive in bunches). Games that use it: SUPERHOT VR (time moves when you move, and the strength of a punch), throwing in
 // many others. Without it they saw the hands as still, however they moved.
 struct Motion {
+  // The last poses (time in seconds, position); the velocity is the slope of the straight line that best fits the
+  // ones from the last ~80 ms. With only the last two, the Quest's tracking (it moves a millimeter or two from frame to
+  // frame even with the hand still) already looked like 0.1-0.2 m/s, and SUPERHOT took it as moving and punching.
+  static const int N = 6;
   uint32_t lastId = 0;
-  double lastT = 0, pos[3] = {}, vel[3] = {};
-  void reset() { lastId = 0; for (int i = 0; i < 3; i++) vel[i] = 0; }
-  // Position of a new pose, and the Quest's time for it in seconds (taken once per frame on the Quest, so even: the
-  // time it got here comes in bunches over Wi-Fi, and two poses arriving together looked like a very fast hand)
-  void update(uint32_t id, const double *p, double t) {
+  int n = 0, head = 0;
+  double t[N] = {}, p[N][3] = {}, vel[3] = {};
+  double peak = 0;   // (the fastest since the last log line)
+  void reset() { lastId = 0; n = 0; for (int i = 0; i < 3; i++) vel[i] = 0; }
+  void update(uint32_t id, const double *pos, double now) {
     if (id == lastId) return;
-    double dt = t - lastT;
-    if (lastId && dt > 0.004 && dt < 0.1) {
-      const double k = 0.6;   // (smoothed a little)
-      for (int i = 0; i < 3; i++) vel[i] = k * (p[i] - pos[i]) / dt + (1 - k) * vel[i];
-      // (no hand moves faster than 10 m/s: above that it's a jump in tracking, not a punch)
-      double n = std::sqrt(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]);
-      if (n > 10) for (int i = 0; i < 3; i++) vel[i] *= 10 / n;
-    } else if (dt >= 0.1 || dt <= 0) {
-      for (int i = 0; i < 3; i++) vel[i] = 0;
+    lastId = id;
+    if (n && (now - t[(head + N - 1) % N] > 0.1 || now <= t[(head + N - 1) % N])) n = 0;   // (a gap: start again)
+    t[head] = now; for (int i = 0; i < 3; i++) p[head][i] = pos[i];
+    head = (head + 1) % N; if (n < N) n++;
+    for (int i = 0; i < 3; i++) vel[i] = 0;
+    if (n < 3) return;
+    double mt = 0, mp[3] = {};
+    for (int k = 0; k < n; k++) { int j = (head + N - 1 - k) % N; mt += t[j]; for (int i = 0; i < 3; i++) mp[i] += p[j][i]; }
+    mt /= n; for (int i = 0; i < 3; i++) mp[i] /= n;
+    double stt = 0, stp[3] = {};
+    for (int k = 0; k < n; k++) {
+      int j = (head + N - 1 - k) % N; double dt = t[j] - mt;
+      stt += dt * dt; for (int i = 0; i < 3; i++) stp[i] += dt * (p[j][i] - mp[i]);
     }
-    lastId = id; lastT = t;
-    for (int i = 0; i < 3; i++) pos[i] = p[i];
+    if (stt < 1e-8) return;
+    for (int i = 0; i < 3; i++) vel[i] = stp[i] / stt;
+    double m = std::sqrt(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]);
+    if (m > 10) { for (int i = 0; i < 3; i++) vel[i] *= 10 / m; m = 10; }   // (faster than any hand: a jump in tracking)
+    if (m > peak) peak = m;
   }
-  // Only how fast it moves, not how fast it turns: SteamVR adds the turning to the speed of the controller's tip, and
-  // with it a small turn of the wrist became a strong punch
-  void apply(DriverPose_t &p) const {
-    for (int i = 0; i < 3; i++) p.vecVelocity[i] = vel[i];
+  // Only how fast it moves, not how fast it turns: SteamVR adds the turning to the speed of the controller's tip
+  void apply(DriverPose_t &pose) const {
+    for (int i = 0; i < 3; i++) pose.vecVelocity[i] = vel[i];
   }
 };
 
@@ -1167,6 +1177,7 @@ class VRminController : public ITrackedDeviceServerDriver {
 public:
   VRInputComponentHandle_t haptic = 0;
   bool isLeft() const { return left; }
+  double takePeak() { double v = motion.peak; motion.peak = 0; return v; }   // (for the log)
   uint32_t id = k_unTrackedDeviceIndexInvalid;
   explicit VRminController(bool l) : left(l) {}
   EVRInitError Activate(uint32_t objectId) override {
@@ -1317,6 +1328,13 @@ public:
           hmd.update(t);
           leftHand.update(t);
           rightHand.update(t);
+          // (every 2 s with the hands moving: how fast they went, to check the velocity the games get)
+          static double logAt = 0;
+          if (now - logAt > 2) {
+            logAt = now;
+            double l = leftHand.takePeak(), r = rightHand.takePeak();
+            if (l > 0.05 || r > 0.05) logf("Hands: fastest %.2f m/s left, %.2f m/s right", l, r);
+          }
         }
         Sleep(1);
       }

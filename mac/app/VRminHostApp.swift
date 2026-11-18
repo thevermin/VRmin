@@ -167,7 +167,7 @@ final class AppModel: ObservableObject {
             }
         }
     }
-    private var gameOpenedAt: [String: Date] = [:]
+    private(set) var gameOpenedAt: [String: Date] = [:]
     /// Algo se cerró de golpe (el servidor, o un juego al poco tiempo de abrir): ofrece armar el reporte
     @Published var crashNote: String? = nil
     private var stopRequested = false
@@ -1408,6 +1408,8 @@ struct ContentView: View {
                 // (toda la pestaña se desplaza: así los juegos se ven enteros, sin una lista chica con su propia barra)
                 ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    // (lo que está abierto ahora, primero: para cerrarlo si no responde)
+                    if !openNow.isEmpty { playingCard }
                     HStack(alignment: .top, spacing: 16) {
                         connectionCard
                         prepCard
@@ -1642,6 +1644,39 @@ struct ContentView: View {
     }
 
     /// Lo que usa el cable USB-C: el Modo Centinela y la app del Quest
+    /// Los juegos abiertos ahora (de la Biblioteca)
+    private var openNow: [SteamGame] { m.games.filter { $0.inLibrary && m.openGames.contains($0.installdir.lowercased()) } }
+    private var playingCard: some View {
+        Card(title: L("Jugando ahora"), icon: "gamecontroller") {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(openNow) { g in
+                    HStack(spacing: 12) {
+                        Group {
+                            if g.exe != nil { Rectangle().fill(nameGradient(g.name)) }
+                            else { AsyncImage(url: steamArt(g.id, "capsule_sm_120.jpg")) { i in i.resizable().aspectRatio(contentMode: .fill) } placeholder: { Color.white.opacity(0.08) } }
+                        }
+                        .frame(width: 64, height: 30).clipShape(RoundedRectangle(cornerRadius: 5))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(g.name).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                            if let at = m.gameOpenedAt[g.installdir.lowercased()] {
+                                TimelineView(.periodic(from: .now, by: 30)) { c in
+                                    Text(L("Abierto hace %@", openedText(at, c.date))).font(.caption).foregroundStyle(Theme.text2)
+                                }
+                            }
+                        }
+                        Spacer()
+                        Button { m.forceClose(g) } label: { Label(L("Forzar cierre"), systemImage: "xmark") }
+                            .buttonStyle(Pill()).help(L("Cierra el juego aunque no responda (Steam sigue abierto)"))
+                    }
+                }
+            }
+        }
+    }
+    private func openedText(_ at: Date, _ now: Date) -> String {
+        let s = Int(now.timeIntervalSince(at))
+        return s < 60 ? L("un momento") : s < 3600 ? L("%d min", s / 60) : L("%d h %d min", s / 3600, (s % 3600) / 60)
+    }
+
     private var cableCard: some View {
         Card(title: L("Visor por cable USB-C"), icon: "cable.connector") {
             HStack(alignment: .top, spacing: 20) {
