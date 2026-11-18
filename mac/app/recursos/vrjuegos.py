@@ -417,6 +417,8 @@ def resolver_juego(juego, det=None):
     if runtime == "steamvr" and any(str(a).lower() in ("-vulkan", "-force-vulkan") for a in list(inc.get("args", [])) + list(usr.get("args", []))):
         avisos.append(T("SteamVR real todavía no anda con juegos que usan Vulkan: se usa %s") % NOMBRES[inc.get("runtime") or "openvr"])
         runtime = inc.get("runtime") or "openvr"
+    if os.environ.get("VRMIN_EN_LA_MAC"):   # («Jugar en la Mac»: esta vez sin VR, en una ventana de la Mac)
+        runtime = "plano"
     if runtime == "openvr" and not opencomposite_instalado():
         avisos.append(T("Falta OpenComposite: reinstalá el motor desde la app"))
 

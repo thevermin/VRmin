@@ -7,7 +7,20 @@ import AppKit
 
 // MARK: - Descargas (de los appmanifest de Steam)
 struct SteamDownload: Identifiable, Equatable {
-    let id: String; let name: String; let done: Int64; let total: Int64; let paused: Bool
+    let id: String; let name: String; var done: Int64; var total: Int64; let paused: Bool
+    var speed: Double = 0   // bytes por segundo (de dos lecturas seguidas)
+    var fraction: Double { total > 0 ? min(1, Double(done) / Double(total)) : 0 }
+}
+
+/// Cuánto ocupa una carpeta (lo que Steam ya bajó de un juego, en steamapps/downloading/<appid>)
+func folderBytes(_ url: URL) -> Int64 {
+    guard let en = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileSizeKey]) else { return 0 }
+    var n: Int64 = 0
+    for case let f as URL in en {
+        let v = try? f.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileSizeKey])
+        n += Int64(v?.fileSize ?? 0)
+    }
+    return n
 }
 
 /// Lo que Steam está bajando o actualizando: los appmanifest con bytes por bajar (StateFlags 512 = en pausa)
@@ -17,10 +30,20 @@ func scanDownloads(_ steamapps: URL) -> [SteamDownload] {
     var out: [SteamDownload] = []
     for f in files where f.hasPrefix("appmanifest_") && f.hasSuffix(".acf") {
         let d = parseACF(steamapps.appendingPathComponent(f))
-        guard let id = d["appid"], let total = Int64(d["BytesToDownload"] ?? ""), total > 0 else { continue }
-        let done = Int64(d["BytesDownloaded"] ?? "") ?? 0
+        guard let id = d["appid"] else { continue }
         let flags = Int(d["StateFlags"] ?? "") ?? 0
-        if done >= total && flags & 4 != 0 { continue }   // (ya terminó)
+        var total = Int64(d["BytesToDownload"] ?? "") ?? 0, done = Int64(d["BytesDownloaded"] ?? "") ?? 0
+        // Steam escribe esos números en el appmanifest pocas veces: lo que ya bajó se ve mejor en steamapps/downloading
+        // (sin comprimir: se compara con BytesToStage)
+        let stage = Int64(d["BytesToStage"] ?? "") ?? 0
+        let dl = steamapps.appendingPathComponent("downloading/\(id)")
+        if stage > 0, fm.fileExists(atPath: dl.path) {
+            let staged = folderBytes(dl)
+            if total <= 0 || Double(staged) / Double(stage) > Double(done) / Double(max(total, 1)) { total = stage; done = min(staged, stage) }
+        }
+        let needs = flags & (2 | 1024 | 256) != 0   // (hay que actualizar, empezó o está bajando)
+        guard total > 0 || needs else { continue }
+        if flags & 4 != 0 && !needs && done >= total { continue }   // (ya terminó)
         out.append(SteamDownload(id: id, name: d["name"] ?? id, done: done, total: total, paused: flags & 512 != 0 && flags & 256 == 0))
     }
     return out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -71,6 +94,7 @@ struct GameCapsule: View {
     let game: SteamGame
     let vr: Bool?
     let open: Bool
+    var progress: Double? = nil   // bajándose: cuánto va
     let play: () -> Void
     @State private var hover = false
 
@@ -100,11 +124,27 @@ struct GameCapsule: View {
                 }
             }
             .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity).clipped()
-            .saturation(game.inLibrary ? 1 : 0.3).opacity(game.inLibrary ? 1 : 0.75)
+            .saturation(game.inLibrary && progress == nil ? 1 : 0.3).opacity(game.inLibrary && progress == nil ? 1 : 0.75)
+            if let p = progress {   // (como en Steam: la portada apagada y el avance abajo)
+                VStack(spacing: 6) {
+                    Spacer()
+                    Text(p > 0 ? "\(Int(p * 100)) %" : L("Preparando…")).font(.system(size: 13, weight: .bold)).shadow(color: .black, radius: 4)
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Color.black.opacity(0.5))
+                            Capsule().fill(Theme.amber).frame(width: max(6, geo.size.width * p))
+                                .animation(.easeOut(duration: 0.6), value: p)
+                        }
+                    }
+                    .frame(height: 5)
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
             Text(!game.inLibrary ? "GameHub" : game.exe != nil ? "PC" : vr == false ? L("Plano") : "VR").font(.system(size: 10, weight: .bold))
                 .padding(.horizontal, 6).padding(.vertical, 2)
                 .background(RoundedRectangle(cornerRadius: 5).fill(Color.black.opacity(0.55))).padding(7)
-            if game.inLibrary {
+            if game.inLibrary && progress == nil {
                 Button(action: play) {
                     Image(systemName: "play.fill").font(.system(size: 17, weight: .bold)).foregroundStyle(Theme.amberDark)
                         .frame(width: 46, height: 46).background(Circle().fill(Theme.amber))
@@ -149,7 +189,10 @@ struct LibraryView: View {
     @AppStorage("librarySideFolded") private var folded = false   // la lista de la izquierda, solo con los íconos
 
     private var games: [SteamGame] {
-        let l = m.games.filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }
+        // (los que se están bajando aparecen desde que empiezan, como en Steam)
+        let bajando = m.downloads.filter { d in !m.games.contains { $0.id == d.id } }
+            .map { SteamGame(id: $0.id, name: $0.name, installdir: "", inLibrary: true, inGameHub: false) }
+        let l = (m.games + bajando).filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }
         // (los de GameHub, al final: se traen antes de jugar)
         return l.sorted { a, b in
             if a.inLibrary != b.inLibrary { return a.inLibrary }
@@ -275,7 +318,7 @@ struct LibraryView: View {
                 }
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 130, maximum: 190), spacing: 16)], spacing: 16) {
                     ForEach(games) { g in
-                        GameCapsule(game: g, vr: m.vr[g.id]?.vr, open: isOpen(g)) { m.play(g) }
+                        GameCapsule(game: g, vr: m.vr[g.id]?.vr, open: isOpen(g), progress: m.downloads.first { $0.id == g.id }?.fraction) { m.play(g) }
                             .onTapGesture { select(g) }
                     }
                 }
@@ -393,7 +436,10 @@ struct GameDetail: View {
     }
 
     @ViewBuilder private var mainButton: some View {
-        if !game.inLibrary {
+        if let d = m.downloads.first(where: { $0.id == game.id }) {
+            Button {} label: { Label(d.total > 0 ? L("DESCARGANDO · %d %%", Int(d.fraction * 100)) : L("PREPARANDO LA DESCARGA"), systemImage: "arrow.down.circle") }
+                .buttonStyle(BigButton()).disabled(true)
+        } else if !game.inLibrary {
             Button { m.importGame(game) } label: { Label(L("TRAER DE GAMEHUB"), systemImage: "arrow.down") }
                 .buttonStyle(BigButton()).disabled(m.busyTask != nil || !m.steamInstalled || m.steamRunning)
                 .help(m.steamRunning ? L("Cerrá Steam primero") : L("Copia instantánea desde GameHub"))
@@ -401,7 +447,11 @@ struct GameDetail: View {
             Button { m.forceClose(game) } label: { Label(L("FORZAR CIERRE"), systemImage: "xmark") }
                 .buttonStyle(BigButton()).help(L("Cierra el juego aunque no responda (Steam sigue abierto)"))
         } else if m.steamRunning || game.exe != nil {
-            Button { m.play(game) } label: { Label(L("JUGAR EN EL QUEST"), systemImage: "play.fill") }.buttonStyle(BigButton())
+            HStack(spacing: 10) {
+                Button { m.play(game) } label: { Label(L("JUGAR EN EL QUEST"), systemImage: "play.fill") }.buttonStyle(BigButton())
+                Button { m.playOnMac(game) } label: { Label(L("En la Mac"), systemImage: "macbook") }
+                    .buttonStyle(Pill()).fixedSize().help(L("Abrirlo sin VR, en una ventana de la Mac (sin el Quest)"))
+            }
         } else {
             Button { m.run(L("Abriendo Steam"), "abrir_steam.sh") } label: { Label(L("ABRIR STEAM"), systemImage: "arrow.right") }
                 .buttonStyle(BigButton()).disabled(m.busyTask != nil)
@@ -520,12 +570,23 @@ struct BigButton: ButtonStyle {
     }
 }
 
+/// «· 24 MB/s · faltan 3 min»
+func speedText(_ d: SteamDownload) -> String {
+    guard d.speed > 100_000, !d.paused else { return "" }
+    var t = String(format: " · %.0f MB/s", d.speed / 1_000_000)
+    let left = Double(d.total - d.done) / d.speed
+    if left > 0 && left < 86400 {
+        t += " · " + (left < 60 ? L("falta menos de un minuto") : L("faltan %d min", Int((left / 60).rounded(.up))))
+    }
+    return idioma() == "es" ? t.replacingOccurrences(of: ".", with: ",") : t
+}
+
 // MARK: - Barra de descargas (abajo, como la de Steam, en ámbar)
 struct DownloadsBar: View {
     @EnvironmentObject var m: AppModel
     var body: some View {
         if let d = m.downloads.first {
-            let k = d.total > 0 ? Double(d.done) / Double(d.total) : 0
+            let k = d.fraction
             HStack(spacing: 12) {
                 Text(d.paused ? L("En pausa") : L("Descargando")).font(.system(size: 13, weight: .bold)).foregroundStyle(Theme.amberText)
                 Text(d.name).font(.callout).lineLimit(1)
@@ -539,8 +600,8 @@ struct DownloadsBar: View {
                     }
                 }
                 .frame(height: 6).frame(minWidth: 60)
-                Text("\(Int(k * 100)) % · \(bytesText(d.done)) / \(bytesText(d.total))").font(.caption.monospacedDigit()).foregroundStyle(Theme.text2)
-                    .lineLimit(1).fixedSize()
+                Text(d.total <= 0 ? L("Preparando…") : "\(Int(k * 100)) % · \(bytesText(d.done)) / \(bytesText(d.total))" + speedText(d))
+                    .font(.caption.monospacedDigit()).foregroundStyle(Theme.text2).lineLimit(1).fixedSize()
             }
             .padding(.horizontal, 16).frame(height: 46)
             .background(Theme.amber.opacity(0.10))
@@ -617,7 +678,7 @@ struct StoreView: View {
                     Text(priceText(c, cur)).font(.caption).foregroundStyle(Theme.text2)
                 }
                 Button(L("Instalar")) { m.installGame(id, r.name) }.buttonStyle(Pill(primary: true)).disabled(!m.steamInstalled)
-                    .help(L("Steam muestra su ventana de instalación: si el juego no es tuyo, te ofrece comprarlo"))
+                    .help(L("Si el juego es tuyo, se baja de fondo y lo ves en la barra de abajo. Si no, Steam te muestra dónde comprarlo."))
             }
             Button { NSWorkspace.shared.open(URL(string: "https://store.steampowered.com/app/\(id)")!) } label: { Image(systemName: "safari") }
                 .buttonStyle(Pill()).help(L("Ver en la tienda de Steam"))

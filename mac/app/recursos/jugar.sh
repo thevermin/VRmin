@@ -1,5 +1,5 @@
 #!/bin/bash
-# Abre un juego VR:  jugar.sh APPID [argumentos extra]
+# Abre un juego VR:  jugar.sh APPID [--en-la-mac] [argumentos extra]
 # 1) decide el runtime y los argumentos del juego (vrjuegos.py: tu elección > lo conocido > lo detectado)
 # 2) deja el Windows de VRmin apuntando a ese runtime (runtime.sh)
 # 3) lo abre por Steam (lo normal) o directo (para probar con variables de entorno y diagnóstico)
@@ -8,6 +8,8 @@ source "$(dirname "$0")/entorno.sh"
 source "$RES/runtime.sh"
 cd "$P"
 APPID="$1"; shift
+# («--en-la-mac»: esta vez sin VR, en una ventana de la Mac, sin el Quest)
+[ "$1" = "--en-la-mac" ] && { export VRMIN_EN_LA_MAC=1; shift; }
 [ -n "$APPID" ] || { say "Falta el número del juego" "Missing the game number"; exit 1; }
 motor_listo || { say "Primero instalá el motor." "Install the engine first."; exit 1; }
 # (los de fuera de Steam, «p-…», no lo necesitan)

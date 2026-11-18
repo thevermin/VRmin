@@ -398,6 +398,7 @@ final class AppModel: ObservableObject {
     }
     /// Lo que Steam está bajando ahora (Biblioteca y Tienda)
     @Published var downloads: [SteamDownload] = []
+    private var dlPrev: [String: (done: Int64, at: Date)] = [:]
     /// La cuenta de Steam con la sesión guardada (la última que entró), si hay
     @Published var steamAccount: String? = nil
     func signOutSteam() { run(L("Cerrando la sesión de Steam"), "cerrar_sesion_steam.sh") }
@@ -589,8 +590,23 @@ final class AppModel: ObservableObject {
         list.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         if list != games { games = list; loadVR() }
         steamAccount = steamSavedAccount(steamapps.deletingLastPathComponent().appendingPathComponent("config/loginusers.vdf"))
-        let dl = scanDownloads(steamapps)
-        if dl != downloads { withAnimation { downloads = dl } }
+        let sa = steamapps
+        DispatchQueue.global(qos: .utility).async { [weak self] in   // (lee el tamaño de las carpetas: no en el hilo de la ventana)
+            var dl = scanDownloads(sa)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let now = Date()
+                for i in dl.indices {
+                    let before = self.downloads.first { $0.id == dl[i].id }?.speed ?? 0
+                    if let p = self.dlPrev[dl[i].id], now.timeIntervalSince(p.at) > 0.5 {
+                        let sp = max(0, Double(dl[i].done - p.done) / now.timeIntervalSince(p.at))
+                        dl[i].speed = before > 0 ? before * 0.6 + sp * 0.4 : sp   // (suavizada)
+                    } else { dl[i].speed = before }
+                    self.dlPrev[dl[i].id] = (dl[i].done, now)
+                }
+                if dl != self.downloads { withAnimation(.easeOut(duration: 0.4)) { self.downloads = dl } }
+            }
+        }
         // Arreglos de compatibilidad apenas un juego aparece en la biblioteca
         // (así también sirven si el juego se abre directo desde Steam)
         for g in list where g.inLibrary && !checkedGames.contains(g.id) {
@@ -1138,6 +1154,11 @@ final class AppModel: ObservableObject {
     }
     /// Le pide a Steam que lo desinstale (Steam pregunta antes)
     func uninstallGame(_ g: SteamGame) { run(L("Desinstalando %@", g.name), "instalar_juego.sh", [g.id, g.name, "desinstalar"], exclusive: false) }
+    /// Esta vez sin VR, en una ventana de la Mac (sin el Quest)
+    func playOnMac(_ g: SteamGame) {
+        if !steamRunning && g.exe == nil { append(L("Primero abrí Steam y esperá a ver tu biblioteca.")); return }
+        run(L("Abriendo %@ en la Mac", g.name), "jugar.sh", [g.id, "--en-la-mac"], exclusive: false)
+    }
     func gameLogs(_ g: SteamGame) { run(L("Juntando registros de %@", g.name), "registros_juego.sh", [g.id], exclusive: false) }
 
     /// Abre un juego con su calidad (la propia o la general): si no es la que corre, reinicia el servidor antes
@@ -1355,7 +1376,7 @@ struct ContentView: View {
                 .pickerStyle(.segmented).labelsHidden().frame(width: 330)
             }
             .padding(.horizontal, 22).padding(.top, 8).padding(.bottom, 12)
-            if m.crashNote != nil || m.memoryWarning != nil || m.askWorked != nil {
+            if m.crashNote != nil || m.memoryWarning != nil || m.askWorked != nil || needsSignIn {
                 notices.padding(.horizontal, 22).padding(.bottom, 12)
             }
             Rectangle().fill(Theme.line).frame(height: 1)
@@ -1715,9 +1736,26 @@ struct ContentView: View {
         .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.white.opacity(0.05)))
     }
 
-    /// Avisos (algo se cerró de golpe, la memoria, «¿funcionó?»): arriba, en todas las pestañas
+    /// Steam instalado y sin una sesión guardada (por ejemplo, después de «Cerrar sesión»)
+    private var needsSignIn: Bool { m.engineReady && m.steamInstalled && m.steamAccount == nil && m.busyTask == nil }
+    /// Avisos (algo se cerró de golpe, la memoria, «¿funcionó?», iniciar sesión): arriba, en todas las pestañas
     @ViewBuilder private var notices: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if needsSignIn {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "person.crop.circle.badge.exclamationmark").foregroundStyle(Theme.amber)
+                    Text(m.steamRunning ? L("Iniciá sesión en la ventana de Steam para ver y bajar tus juegos.")
+                                        : L("Iniciá sesión en Steam para ver y bajar tus juegos."))
+                        .font(.callout).fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button(m.steamRunning ? L("Mostrar Steam") : L("Iniciar sesión")) {
+                        m.run(L("Abriendo Steam"), "abrir_steam.sh", ["ventana"], exclusive: false)
+                    }
+                    .buttonStyle(Pill(primary: true))
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.amber.opacity(0.12)))
+            }
             if let c = m.crashNote {   // algo se cerró de golpe
                 HStack(alignment: .top, spacing: 10) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.amber)
