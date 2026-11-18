@@ -1,0 +1,62 @@
+diff --git a/src/kosmickrisp/vulkan/kk_query_pool.c b/src/kosmickrisp/vulkan/kk_query_pool.c
+index 8c78cf5..214fe86 100644
+--- a/src/kosmickrisp/vulkan/kk_query_pool.c
++++ b/src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -198,8 +198,9 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
+    } else if (kk_pool_is_ts(pool)) {
+       /* Timestamps are sampled into a Metal counter heap (one entry per query)
+        * and resolved into `bo` after the GPU writes them. */
++      pool->ts.heap_count = MIN2(pool->vk.query_count, 4096);
+       pool->ts.heap =
+-         mtl_new_timestamp_counter_heap(dev->mtl_handle, pool->vk.query_count);
++         mtl_new_timestamp_counter_heap(dev->mtl_handle, pool->ts.heap_count);
+       if (pool->ts.heap == NULL) {
+          kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool), pAllocator);
+          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+@@ -364,7 +365,7 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+    enum mtl_render_stages mtl_stage =
+       kk_pipeline_stages_to_mtl_render_stage(stage);
+ 
+-   uint32_t heap_index = query;
++   uint32_t heap_index = query % pool->ts.heap_count;
+ 
+    if (cmd->metal.render) {
+       /* If we've already issued a timestamp write for a render stage, reuse it
+@@ -383,11 +384,11 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+       if (!reused) {
+          struct kk_ts_stage_entry entry = {.heap = pool->ts.heap,
+                                            .stage = mtl_stage,
+-                                           .index = query};
++                                           .index = heap_index};
+          util_dynarray_append(&cmd->ts_stage_map, entry);
+ 
+          mtl_render_write_timestamp(cmd->metal.render, mtl_stage, pool->ts.heap,
+-                                    query);
++                                    heap_index);
+       }
+    } else {
+       /* compute encoder active or nothing active. If the latter, the write will
+@@ -399,7 +400,7 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+                       kk_query_report_addr(dev, pool, query),
+                       (uint32_t)LIBKK_QUERY_UNAVAILABLE);
+ 
+-      mtl_compute_write_timestamp(cmd->metal.compute, pool->ts.heap, query);
++      mtl_compute_write_timestamp(cmd->metal.compute, pool->ts.heap, heap_index);
+    }
+ 
+    /* Resolve the Metal timestamp value to all multiview query indices so that
+diff --git a/src/kosmickrisp/vulkan/kk_query_pool.h b/src/kosmickrisp/vulkan/kk_query_pool.h
+index 0670fd5..a421728 100644
+--- a/src/kosmickrisp/vulkan/kk_query_pool.h
++++ b/src/kosmickrisp/vulkan/kk_query_pool.h
+@@ -17,6 +17,10 @@ struct kk_ts_state {
+     * sampled into this heap and later resolved into `bo` (see kk_query_pool.c).
+     * NULL for non-timestamp pools. */
+    mtl_counter_heap *heap;
++   /* VRmin: Metal counter heaps hold at most 4096 entries; bigger pools (D3D12
++    * games ask for 8192) share them, query % heap_count. Timestamps that land on
++    * the same entry can read each other's value, which only skews profiling. */
++   uint32_t heap_count;
+ };
+ 
+ struct kk_oq_state {

@@ -43,7 +43,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with: { name: vkd3d-proton-vrmin, path: out, retention-days: 14 }
   kk:
-    if: false
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
@@ -56,6 +55,8 @@ jobs:
         run: |
           t=$(git ls-remote --tags https://gitlab.freedesktop.org/mesa/mesa.git 'mesa-26.*' | grep -v '\^{}' | grep -v -- '-rc' | awk -F/ '{print $3}' | sort -V | tail -1)
           echo "tag: $t"; git clone -q --depth 1 -b "$t" https://gitlab.freedesktop.org/mesa/mesa.git mesa
+          # (lo que le cambia VRmin: mac/dx12/kosmickrisp.patch)
+          cd mesa && git apply ../vrmin/mac/dx12/kosmickrisp.patch && echo "parche aplicado"
       - name: Nativo (las herramientas de compilación)
         working-directory: mesa
         run: |
