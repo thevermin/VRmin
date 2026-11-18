@@ -125,8 +125,12 @@ struct Motion {
     if (m > peak) peak = m;
   }
   // Only how fast it moves, not how fast it turns: SteamVR adds the turning to the speed of the controller's tip
+  // And 0.3 m/s less: with the hand almost still the Quest's tracking still reaches 0.2-0.5 m/s now and then (from the
+  // log), which SUPERHOT took as a punch; real punches are 2-5 m/s and barely change
   void apply(DriverPose_t &pose) const {
-    for (int i = 0; i < 3; i++) pose.vecVelocity[i] = vel[i];
+    double m = std::sqrt(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]);
+    double k = m > 0.3 ? (m - 0.3) / m : 0;
+    for (int i = 0; i < 3; i++) pose.vecVelocity[i] = vel[i] * k;
   }
 };
 
