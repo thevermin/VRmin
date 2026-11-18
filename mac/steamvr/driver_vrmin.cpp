@@ -48,7 +48,11 @@ static double now_s() {
 
 // ---- what the headset is like (Quest 3 defaults, until VRmin Host and the Quest's first pose say: wait_display) ----
 static uint32_t EYE_W = 1832, EYE_H = 1920;
-static float HZ = 72.f, IPD = 0.063f;
+// (HZ changes while SteamVR is open when VRmin Host asks for another rate: see VRminHmd::applyRate)
+static std::atomic<float> HZ{72.f};
+static float IPD = 0.063f;
+// The rates the Quest can show (the ones VRmin Host offers): SteamVR lists them and can switch while it's open
+static const float RATES[] = {72.f, 80.f, 90.f, 120.f};
 // Per eye: left, right, top, bottom, as GetProjectionRaw wants them: tangents where «top» is the lower edge (negative) and
 // «bottom» the upper one (Valve's projection matrix uses y downwards: m[1][2] = (bottom + top) / (bottom - top))
 static float FOV[2][4] = {{-1, 1, -1, 1}, {-1, 1, -1, 1}};
@@ -327,7 +331,7 @@ static void wait_display() {
     double d[3] = {t.eye[1][0] - t.eye[0][0], t.eye[1][1] - t.eye[0][1], t.eye[1][2] - t.eye[0][2]};
     IPD = (float)std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
   }
-  logf("Display: %ux%u per eye, %.0f Hz, eyes %.1f mm apart, field of view %.2f %.2f %.2f %.2f / %.2f %.2f %.2f %.2f (%s)", EYE_W, EYE_H, HZ,
+  logf("Display: %ux%u per eye, %.0f Hz, eyes %.1f mm apart, field of view %.2f %.2f %.2f %.2f / %.2f %.2f %.2f %.2f (%s)", EYE_W, EYE_H, HZ.load(),
        IPD * 1000, FOV[0][0], FOV[0][1], FOV[0][2], FOV[0][3], FOV[1][0], FOV[1][1], FOV[1][2], FOV[1][3],
        g_cfgFps && t.valid ? "from VRmin Host and the Quest" : g_cfgFps ? "no pose from the Quest: default field of view" : "VRmin Host didn't answer: defaults");
 }
@@ -1109,7 +1113,7 @@ public:
   // After Present: VRmin Host is told about the frame, then this waits for the headset's next vsync
   void PostPresent(const Throttling_t *) override {
     { std::lock_guard<std::mutex> g(frames.mutex()); frames.finish(); }
-    double period = 1.0 / HZ, t = now_s() - t0;
+    double period = 1.0 / HZ.load(), t = now_s() - t0;
     double next = (std::floor(t / period) + 1) * period;
     while ((t = now_s() - t0) < next) Sleep((DWORD)((next - t) * 1000 > 1 ? (next - t) * 1000 - 1 : 0));
   }
@@ -1130,7 +1134,11 @@ public:
     VRProperties()->SetStringProperty(c, Prop_RenderModelName_String, "generic_hmd");
     VRProperties()->SetFloatProperty(c, Prop_UserIpdMeters_Float, IPD);
     VRProperties()->SetFloatProperty(c, Prop_UserHeadToEyeDepthMeters_Float, 0.f);
-    VRProperties()->SetFloatProperty(c, Prop_DisplayFrequency_Float, HZ);
+    VRProperties()->SetFloatProperty(c, Prop_DisplayFrequency_Float, HZ.load());
+    // The Quest's rates, and that the rate can change with SteamVR open (when VRmin Host asks for another one)
+    VRProperties()->SetBoolProperty(c, Prop_DisplaySupportsMultipleFramerates_Bool, true);
+    VRProperties()->SetBoolProperty(c, Prop_DisplaySupportsRuntimeFramerateChange_Bool, true);
+    VRProperties()->SetProperty(c, Prop_DisplayAvailableFrameRates_Float_Array, (void *)RATES, sizeof RATES, k_unFloatPropertyTag);
     VRProperties()->SetFloatProperty(c, Prop_SecondsFromVsyncToPhotons_Float, 0.011f);
     VRProperties()->SetUint64Property(c, Prop_CurrentUniverseId_Uint64, UNIVERSE);
     VRProperties()->SetBoolProperty(c, Prop_IsOnDesktop_Bool, false);
@@ -1147,8 +1155,16 @@ public:
     VRProperties()->SetBoolProperty(c, Prop_ContainsProximitySensor_Bool, true);
     VRDriverInput()->CreateBooleanComponent(c, "/proximity", &proximity);
     VRDriverInput()->UpdateBooleanComponent(proximity, true, 0);
-    logf("Headset activated (device %u): %ux%u per eye, %.0f Hz", id, EYE_W, EYE_H, HZ);
+    logf("Headset activated (device %u): %ux%u per eye, %.0f Hz", id, EYE_W, EYE_H, HZ.load());
     return VRInitError_None;
+  }
+  // VRmin Host asked for another rate (its quality settings, or frame generation: the game draws half the frames):
+  // SteamVR switches to it without closing, and the frames go to VRmin Host at that rate
+  void applyRate(int fps) {
+    if (id == k_unTrackedDeviceIndexInvalid || fps <= 0 || (float)fps == HZ.load()) return;
+    logf("Rate: %.0f Hz -> %d Hz (asked by VRmin Host)", HZ.load(), fps);
+    HZ = (float)fps;
+    VRProperties()->SetFloatProperty(VRProperties()->TrackedDeviceToPropertyContainer(id), Prop_DisplayFrequency_Float, (float)fps);
   }
   void Deactivate() override { id = k_unTrackedDeviceIndexInvalid; }
   void EnterStandby() override {}
@@ -1354,6 +1370,7 @@ public:
   }
   const char *const *GetInterfaceVersions() override { return k_InterfaceVersions; }
   void RunFrame() override {
+    hmd.applyRate(g_cfgFps);
     VREvent_t e;
     while (VRServerDriverHost()->PollNextEvent(&e, sizeof e)) {
       // A game's vibration: to the Quest's controller, through VRmin Host (the same message as VRmin's OpenXR runtime)
