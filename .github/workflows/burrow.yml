@@ -19,6 +19,8 @@ jobs:
           gcc -O2 -static -o out/prueba-static burrow/tests/prueba.c
           gcc -O2 -o out/prueba-dynamic burrow/tests/prueba.c
           gcc -O2 -pthread -o out/root/hilos burrow/tests/hilos.c
+          gcc -O2 -pthread -o out/root/exec-hilos burrow/tests/exec-hilos.c
+          (cd out && root/exec-hilos | tee exec-hilos.esperado)
           sudo apt-get install -y -qq busybox-static > /dev/null && cp /bin/busybox out/busybox
           # A minimal Linux for the dynamic one: its loader and libc, where it looks for them
           cp -L /lib/ld-linux-aarch64.so.1 out/root/lib/
@@ -71,7 +73,7 @@ jobs:
       - run: mkdir -p tests && tar -xf burrow-tests.tar -C tests
       - name: Run (if this Mac allows the Hypervisor framework)
         run: |
-          chmod +x tests/prueba-* tests/root/prueba tests/root/hilos tests/busybox
+          chmod +x tests/prueba-* tests/root/prueba tests/root/hilos tests/root/exec-hilos tests/busybox
           if [ "$(sysctl -n kern.hv_support 2>/dev/null)" != 1 ]; then
             echo "::warning::This GitHub Mac has no Hypervisor framework: Burrow is built but not run here"; exit 0
           fi
@@ -96,7 +98,7 @@ jobs:
             install_name_tool -add_rpath @loader_path "$f" 2>/dev/null || true
             codesign -f -s - "$f"
           done
-          otool -L pkg/virgl-prueba pkg/lib/*.dylib | grep -v ':$' | sort -u && cp burrow/tests/probar.sh burrow/tests/alyx.sh burrow/tests/steam-arm64.sh burrow/tests/abrir-steam.sh pkg/ && cp -R tests/. pkg/ && chmod +x pkg/elfuse pkg/*.sh pkg/prueba-* pkg/busybox pkg/root/prueba pkg/root/hilos pkg/gpu-root/usr/bin/*
+          otool -L pkg/virgl-prueba pkg/lib/*.dylib | grep -v ':$' | sort -u && cp burrow/tests/probar.sh burrow/tests/alyx.sh burrow/tests/steam-arm64.sh burrow/tests/abrir-steam.sh pkg/ && cp -R tests/. pkg/ && chmod +x pkg/elfuse pkg/*.sh pkg/prueba-* pkg/busybox pkg/root/prueba pkg/root/hilos pkg/root/exec-hilos pkg/gpu-root/usr/bin/*
           tar -czf burrow-prueba.tar.gz -C pkg .
       - uses: actions/upload-artifact@v4
         with: { name: burrow-prueba, path: burrow-prueba.tar.gz, retention-days: 30 }

@@ -18,6 +18,8 @@ if ! grep -q 'HILOS:' hilos.txt; then
   $E -v --sysroot root root/hilos > hilos-v.txt 2>&1 & p=$!; sleep 10; kill -9 $p 2>/dev/null; wait $p 2>/dev/null
   tail -300 hilos-v.txt > hilos-v-final.txt; echo "(elfuse's log for hilos: hilos-v-final.txt)"
 fi
+# Un hilo que no es el principal abre programas (como Steam): posix_spawn, fork + execve y execve directo
+corre exec-hilos exec-hilos.esperado $E --sysroot root root/exec-hilos
 corre busybox "" $E ./busybox sh -c 'echo hola desde busybox; ls / | head -3; uname -a; seq 3 | wc -l'
 corre gpu-mac "" ./virgl-prueba
 grep -q 'VIRGL: TODO BIEN' gpu-mac.txt || r=1
