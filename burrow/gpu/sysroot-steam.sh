@@ -6,7 +6,7 @@
 set -euo pipefail
 trap 'echo "::error::sysroot-steam.sh: falló la línea $LINENO"' ERR
 alyx=$1 root=$2
-sudo apt-get install -y -qq dash xvfb x11vnc x11-xkb-utils xkb-data fonts-dejavu-core fontconfig-config ca-certificates \
+sudo apt-get install -y -qq dash bash libgl1-mesa-dri libglx-mesa0 xvfb x11vnc x11-xkb-utils xkb-data fonts-dejavu-core fontconfig-config ca-certificates \
   libgl1 libegl1 libice6 libsm6 libxcomposite1 libxdamage1 libxinerama1 libxtst6 libatk1.0-0t64 libatk-bridge2.0-0t64 \
   libatspi2.0-0t64 libcairo2 libcups2t64 libgdk-pixbuf-2.0-0 libgtk2.0-0t64 libibus-1.0-5 libnghttp2-14 libnm0 \
   libnspr4 libnss3 libopenal1 libpipewire-0.3-0t64 libssh2-1t64 libva2 libvdpau1 libpulse0 > /dev/null
@@ -17,7 +17,11 @@ pide="libGL.so.1 libEGL.so.1 libICE.so.6 libSM.so.6 libXcomposite.so.1 libXdamag
   libXrender.so.1 libatk-1.0.so.0 libatk-bridge-2.0.so.0 libatspi.so.0 libcairo.so.2 libcups.so.2 libgdk_pixbuf-2.0.so.0
   libgtk-x11-2.0.so.0 libgdk-x11-2.0.so.0 libibus-1.0.so.5 libnghttp2.so.14 libnm.so.0 libnspr4.so libnss3.so
   libnssutil3.so libsmime3.so libopenal.so.1 libpipewire-0.3.so.0 libssh2.so.1 libva.so.2 libvdpau.so.1 libpulse.so.0"
-todo="/usr/bin/Xvfb /usr/bin/x11vnc /usr/bin/xkbcomp /bin/dash /usr/bin/sleep"
+todo="/usr/bin/Xvfb /usr/bin/x11vnc /usr/bin/xkbcomp /bin/dash /bin/bash /usr/bin/sleep"
+# (GLX: la ventana de Steam lo pide. Xvfb lo da con el dibujo por software de Mesa, y los programas lo abren con el
+#  proveedor de Mesa de libglvnd)
+todo="$todo $( (ls /usr/lib/aarch64-linux-gnu/dri/swrast_dri.so /usr/lib/aarch64-linux-gnu/libGLX_mesa.so.0 \
+  /usr/lib/aarch64-linux-gnu/libgallium-*.so 2>/dev/null || true) | tr '\n' ' ')"
 for n in $pide; do
   f=$(ldconfig -p | awk -v n="$n" '$1 == n && /AArch64/ { print $NF; exit }')
   [ -n "$f" ] || { echo "::error::Falta $n"; exit 1; }
