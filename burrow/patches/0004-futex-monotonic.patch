@@ -1,0 +1,44 @@
+diff --git a/src/runtime/futex.c b/src/runtime/futex.c
+index 63ce1ef..9e338af 100644
+--- a/src/runtime/futex.c
++++ b/src/runtime/futex.c
+@@ -675,7 +675,25 @@ static int futex_make_deadline(guest_t *g,
+     if (!linux_timespec_is_valid(&lts))
+         return -2;
+ 
+-    if (is_absolute) {
++    if (is_absolute == 2) {
++        /* FUTEX_WAIT_BITSET without FUTEX_CLOCK_REALTIME: the deadline is on
++         * CLOCK_MONOTONIC (glibc's pthread_cond_clockwait, sem_clockwait,
++         * condvars with a monotonic condattr). Waits here run on CLOCK_REALTIME,
++         * so move it over: now on the realtime clock plus what is left on the
++         * monotonic one. Taken as is, a monotonic deadline reads as decades
++         * past and the wait times out at once.
++         */
++        struct timespec mono, rt;
++        clock_gettime(CLOCK_MONOTONIC, &mono);
++        clock_gettime(CLOCK_REALTIME, &rt);
++        int64_t left_ns = ((int64_t) lts.tv_sec - (int64_t) mono.tv_sec) * 1000000000LL +
++                          ((int64_t) lts.tv_nsec - (int64_t) mono.tv_nsec);
++        if (left_ns < 0)
++            left_ns = 0;
++        out->tv_sec = rt.tv_sec + (time_t) (left_ns / 1000000000LL);
++        out->tv_nsec = rt.tv_nsec + (long) (left_ns % 1000000000LL);
++        timespec_normalize(out);
++    } else if (is_absolute) {
+         out->tv_sec = (time_t) lts.tv_sec;
+         out->tv_nsec = (long) lts.tv_nsec;
+     } else {
+@@ -1880,7 +1898,11 @@ int64_t sys_futex(guest_t *g,
+                              val3);
+ 
+     case FUTEX_WAIT_BITSET:
+-        return futex_wait(g, uaddr, val, timeout_gva, val3, /*is_absolute=*/1);
++        /* is_absolute 1: on CLOCK_REALTIME (FUTEX_CLOCK_REALTIME, 0x100); 2: on
++         * CLOCK_MONOTONIC, Linux's default for this operation
++         */
++        return futex_wait(g, uaddr, val, timeout_gva, val3,
++                          /*is_absolute=*/(op & 0x100) ? 1 : 2);
+ 
+     case FUTEX_WAKE_BITSET:
+         return futex_wake(g, uaddr, val, val3);
