@@ -148,23 +148,61 @@ def leer_acf(ruta):
     return d
 
 
+def ruta_mac(win):
+    """Una ruta de Windows del prefijo en la Mac: C: es drive_c, y cada letra lo que dice dosdevices (Z: es «/»)"""
+    if len(win) < 2 or win[1] != ":":
+        return None
+    raiz = os.path.realpath(os.path.join(PREFIJO, "dosdevices", win[0].lower() + ":"))
+    resto = [x for x in win[2:].split("\\") if x]
+    return os.path.join(raiz, *resto)
+
+
+def ruta_windows(mac):
+    """Al revés: la del prefijo con C:, cualquier otra con Z: (toda la Mac)"""
+    mac = os.path.realpath(mac)
+    c = os.path.realpath(C)
+    if mac == c or mac.startswith(c + os.sep):
+        return "C:\\" + os.path.relpath(mac, c).replace(os.sep, "\\").lstrip(".")
+    return "Z:" + mac.replace(os.sep, "\\")
+
+
+def bibliotecas():
+    """Las carpetas «steamapps» de las bibliotecas de Steam: la de VRmin primero y las que se agregaron
+    (steamapps/libraryfolders.vdf). Solo las que existen."""
+    out = [STEAMAPPS]
+    try:
+        with open(os.path.join(STEAMAPPS, "libraryfolders.vdf"), encoding="utf-8", errors="replace") as f:
+            texto = f.read()
+    except Exception:
+        texto = ""
+    for m in re.finditer(r'"path"\s+"([^"]+)"', texto):
+        mac = ruta_mac(m.group(1).replace("\\\\", "\\"))
+        if not mac:
+            continue
+        sa = os.path.join(mac, "steamapps")
+        if os.path.isdir(sa) and all(os.path.realpath(sa).lower() != os.path.realpath(x).lower() for x in out):
+            out.append(sa)
+    return out
+
+
 def juegos_instalados():
     out = {}
-    try:
-        archivos = os.listdir(STEAMAPPS)
-    except Exception:
-        archivos = []
-    for f in archivos:
-        if not (f.startswith("appmanifest_") and f.endswith(".acf")):
-            continue
-        d = leer_acf(os.path.join(STEAMAPPS, f))
-        appid, carpeta = d.get("appid"), d.get("installdir")
-        if not appid or not carpeta or appid in NO_JUEGOS:
-            continue
-        ruta = os.path.join(STEAMAPPS, "common", carpeta)
-        if os.path.isdir(ruta):
-            out[appid] = {"id": appid, "nombre": d.get("name", carpeta), "carpeta": ruta,
-                          "actualizado": d.get("LastUpdated", d.get("buildid", ""))}
+    for sa in bibliotecas():
+        try:
+            archivos = os.listdir(sa)
+        except Exception:
+            archivos = []
+        for f in archivos:
+            if not (f.startswith("appmanifest_") and f.endswith(".acf")):
+                continue
+            d = leer_acf(os.path.join(sa, f))
+            appid, carpeta = d.get("appid"), d.get("installdir")
+            if not appid or not carpeta or appid in NO_JUEGOS or appid in out:
+                continue
+            ruta = os.path.join(sa, "common", carpeta)
+            if os.path.isdir(ruta):
+                out[appid] = {"id": appid, "nombre": d.get("name", carpeta), "carpeta": ruta,
+                              "actualizado": d.get("LastUpdated", d.get("buildid", ""))}
     out.update(juegos_propios())
     return out
 
@@ -634,8 +672,36 @@ def cmd_controles_oc(carpeta, *destinos):
         print(T("Controles de Touch para OpenComposite: el grip agarra (%d botones arreglados)") % cambios)
 
 
+def cmd_agregar_biblioteca(carpeta):
+    """Suma una carpeta como biblioteca de Steam (con Steam cerrado: al cerrarse reescribe libraryfolders.vdf)"""
+    sa = os.path.join(carpeta, "steamapps")
+    os.makedirs(os.path.join(sa, "common"), exist_ok=True)
+    if any(os.path.realpath(sa).lower() == os.path.realpath(x).lower() for x in bibliotecas()):
+        return
+    vdf = os.path.join(STEAMAPPS, "libraryfolders.vdf")
+    try:
+        with open(vdf, encoding="utf-8", errors="replace") as f:
+            texto = f.read()
+    except Exception:
+        texto = '"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"%s"\n\t\t"apps"\n\t\t{\n\t\t}\n\t}\n}\n' % \
+            ruta_windows(os.path.dirname(STEAMAPPS)).replace("\\", "\\\\")
+    usados = [int(n) for n in re.findall(r'^\t"(\d+)"\s*$', texto, re.M)]
+    n = max(usados) + 1 if usados else 1
+    nueva = '\t"%d"\n\t{\n\t\t"path"\t\t"%s"\n\t\t"label"\t\t""\n\t\t"apps"\n\t\t{\n\t\t}\n\t}\n' % \
+        (n, ruta_windows(carpeta).replace("\\", "\\\\"))
+    i = texto.rstrip().rfind("}")
+    texto = texto[:i] + nueva + "}\n"
+    with open(vdf + ".nuevo", "w", encoding="utf-8") as f:
+        f.write(texto)
+    os.replace(vdf + ".nuevo", vdf)
+
+
 def main(a):
-    if len(a) >= 2 and a[0] == "detectar":
+    if a and a[0] == "bibliotecas":
+        print("\n".join(bibliotecas()))
+    elif len(a) >= 2 and a[0] == "agregar_biblioteca":
+        cmd_agregar_biblioteca(a[1])
+    elif len(a) >= 2 and a[0] == "detectar":
         cmd_detectar(a[1])
     elif len(a) >= 2 and a[0] == "resolver":
         cmd_resolver(a[1])

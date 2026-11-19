@@ -451,7 +451,7 @@ struct GameDetail: View {
         }
         .background(Theme.bg)
         .onAppear {
-            let acf = m.steamapps.appendingPathComponent("appmanifest_\(game.id).acf")
+            let acf = (game.library ?? m.steamapps).appendingPathComponent("appmanifest_\(game.id).acf")
             size = Int64(parseACF(acf)["SizeOnDisk"] ?? "") ?? 0
         }
     }

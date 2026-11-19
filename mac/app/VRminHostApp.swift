@@ -21,7 +21,11 @@ struct SteamGame: Identifiable, Hashable {
     let inGameHub: Bool     // está descargado en GameHub
     var lastPlayed: Int = 0 // la última vez que se jugó (segundos desde 1970; 0: nunca)
     var exe: String? = nil  // juego de fuera de Steam: su .exe en la Mac (agregado en la Biblioteca)
+    var library: URL? = nil // su biblioteca de Steam (la carpeta «steamapps»), si no es la de VRmin
 }
+
+/// Un juego que se va a instalar: VRmin Host pregunta dónde (InstallWhereSheet)
+struct InstallAsk: Identifiable { let id: String; let name: String }
 
 // MARK: - Runtime de VR de cada juego (lo decide recursos/vrjuegos.py; acá solo se muestra y se elige)
 struct VRDeteccion: Decodable, Equatable {
@@ -75,6 +79,30 @@ func parseACF(_ url: URL) -> [String: String] {
         if d[key] == nil { d[key] = String(s[v]) }   // la primera aparición es la del juego
     }
     return d
+}
+
+/// Las bibliotecas de Steam (cada una, su carpeta «steamapps»): la de VRmin primero y las que se sumaron al instalar
+/// (steamapps/libraryfolders.vdf, con rutas de Windows: cada letra es lo que dice dosdevices; Z: es toda la Mac).
+/// Solo las que existen (un disco externo desconectado no aparece). Igual que bibliotecas() en vrjuegos.py.
+func steamLibraries(prefix: URL) -> [URL] {
+    let main = prefix.appendingPathComponent("drive_c/Program Files (x86)/Steam/steamapps")
+    var out = [main]
+    guard let s = try? String(contentsOf: main.appendingPathComponent("libraryfolders.vdf"), encoding: .utf8),
+          let re = try? NSRegularExpression(pattern: #""path"\s+"([^"]+)""#) else { return out }
+    let fm = FileManager.default
+    for m in re.matches(in: s, range: NSRange(s.startIndex..., in: s)) {
+        guard let r = Range(m.range(at: 1), in: s) else { continue }
+        let win = s[r].replacingOccurrences(of: "\\\\", with: "\\")
+        guard win.count >= 2, Array(win)[1] == ":" else { continue }
+        let root = prefix.appendingPathComponent("dosdevices/\(win.prefix(1).lowercased()):").resolvingSymlinksInPath()
+        let sa = win.dropFirst(2).split(separator: "\\").reduce(root) { $0.appendingPathComponent(String($1)) }
+            .appendingPathComponent("steamapps")
+        if fm.fileExists(atPath: sa.path),
+           !out.contains(where: { $0.resolvingSymlinksInPath().path.lowercased() == sa.resolvingSymlinksInPath().path.lowercased() }) {
+            out.append(sa)
+        }
+    }
+    return out
 }
 
 func scanLibrary(_ steamapps: URL) -> [String: (name: String, dir: String, last: Int)] {
@@ -528,6 +556,10 @@ final class AppModel: ObservableObject {
     private var partial: [String: String] = [:]
 
     var steamapps: URL { data.appendingPathComponent("prefijo/drive_c/Program Files (x86)/Steam/steamapps") }
+    /// Todas las bibliotecas de Steam de VRmin (la de VRmin primero)
+    var libraries: [URL] { steamLibraries(prefix: data.appendingPathComponent("prefijo")) }
+    /// El juego que se va a instalar: se pregunta dónde
+    @Published var installAsk: InstallAsk? = nil
     var runtimeLog: URL { data.appendingPathComponent("prefijo/drive_c/questvrbridge/questvrbridge_log.txt") }
 
     init() {
@@ -579,13 +611,16 @@ final class AppModel: ObservableObject {
         steamInstalled = fm.fileExists(atPath: data.appendingPathComponent("prefijo/drive_c/Program Files (x86)/Steam/steam.exe").path)
         steamVRInstalled = fm.fileExists(atPath: steamapps.appendingPathComponent("common/SteamVR/bin/win64/vrstartup.exe").path)
 
-        let mine = scanLibrary(steamapps)
+        // (en todas las bibliotecas de Steam: la de VRmin y las que se sumaron al instalar)
+        let libs = libraries
+        var mine: [String: (name: String, dir: String, last: Int)] = [:], libOf: [String: URL] = [:]
+        for lib in libs { for (id, info) in scanLibrary(lib) where mine[id] == nil { mine[id] = info; libOf[id] = lib } }
         let gh = scanLibrary(fm.homeDirectoryForCurrentUser.appendingPathComponent("GameHub/steamapps"))
         var list: [SteamGame] = []
         for id in Set(mine.keys).union(gh.keys) {
             let info = mine[id] ?? gh[id]!
             list.append(SteamGame(id: id, name: info.name, installdir: info.dir,
-                                  inLibrary: mine[id] != nil, inGameHub: gh[id] != nil, lastPlayed: info.last))
+                                  inLibrary: mine[id] != nil, inGameHub: gh[id] != nil, lastPlayed: info.last, library: libOf[id]))
         }
         // Los de fuera de Steam (juegos_propios.json, los que todavía existen)
         struct Propios: Decodable { struct J: Decodable { let id: String; let nombre: String?; let exe: String }; let juegos: [J]? }
@@ -603,9 +638,8 @@ final class AppModel: ObservableObject {
         let quedan = uninstalling.filter { e in mine[e.key] != nil && ahora.timeIntervalSince(e.value) < 120 }
         if quedan != uninstalling { uninstalling = quedan }
         steamAccount = steamSavedAccount(steamapps.deletingLastPathComponent().appendingPathComponent("config/loginusers.vdf"))
-        let sa = steamapps
         DispatchQueue.global(qos: .utility).async { [weak self] in   // (lee el tamaño de las carpetas: no en el hilo de la ventana)
-            var dl = scanDownloads(sa)
+            var dl = libs.flatMap { scanDownloads($0) }
             DispatchQueue.main.async {
                 guard let self else { return }
                 let now = Date()
@@ -624,7 +658,7 @@ final class AppModel: ObservableObject {
         // (así también sirven si el juego se abre directo desde Steam)
         for g in list where g.inLibrary && !checkedGames.contains(g.id) {
             checkedGames.insert(g.id)
-            let dir = steamapps.appendingPathComponent("common/\(g.installdir)")
+            let dir = (g.library ?? steamapps).appendingPathComponent("common/\(g.installdir)")
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 let fixed = fixSteamVRBindings(gameDir: dir)
                 DispatchQueue.main.async {
@@ -1203,7 +1237,7 @@ final class AppModel: ObservableObject {
         if e != runEye || f != runFps || mb != runMbps || fv != runFov {
             playWith(id: g.id, name: g.name, eye: e, fps: f, mbps: mb, fov: fv); return
         }
-        let dir = g.exe.map { URL(fileURLWithPath: $0).deletingLastPathComponent() } ?? steamapps.appendingPathComponent("common/\(g.installdir)")
+        let dir = g.exe.map { URL(fileURLWithPath: $0).deletingLastPathComponent() } ?? (g.library ?? steamapps).appendingPathComponent("common/\(g.installdir)")
         let args = [g.id]   // el runtime y los argumentos los decide jugar.sh (perfil del juego)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let fixed = fixSteamVRBindings(gameDir: dir)
@@ -1227,8 +1261,12 @@ final class AppModel: ObservableObject {
     func closeSteamVR() { run(L("Cerrando SteamVR"), "abrir_steamvr.sh", ["--cerrar"], exclusive: false) }
     /// Le pide al Steam de VRmin que instale SteamVR (si Steam está cerrado, lo abre primero)
     func installSteamVR() { run(L("Instalando SteamVR"), "instalar_steamvr.sh", exclusive: false) }
-    /// Le pide al Steam de VRmin que instale un juego (desde la Tienda)
-    func installGame(_ id: String, _ name: String) { run(L("Instalando %@", name), "instalar_juego.sh", [id, name], exclusive: false) }
+    /// Instalar un juego (desde la Tienda): primero se pregunta dónde (InstallWhereSheet)
+    func installGame(_ id: String, _ name: String) { installAsk = InstallAsk(id: id, name: name) }
+    /// Le pide al Steam de VRmin que lo instale en esa carpeta (una biblioteca de Steam, o una nueva que se suma)
+    func installGame(_ id: String, _ name: String, into folder: URL) {
+        run(L("Instalando %@", name), "instalar_juego.sh", [id, name, "install", folder.path], exclusive: false)
+    }
     /// Pausar, seguir o cancelar una descarga de Steam (Steam se reinicia de fondo: ver descarga.sh)
     func pauseDownload(_ d: SteamDownload) {
         run(d.paused ? L("Siguiendo la descarga de %@", d.name) : L("Pausando la descarga de %@", d.name), "descarga.sh", [d.id, d.paused ? "seguir" : "pausar"], exclusive: false)
@@ -1429,6 +1467,7 @@ struct ContentView: View {
         .sheet(isPresented: $showSettings) { SettingsView().environmentObject(m) }
         .sheet(item: $tut) { p in TutorialSheet(p: p) }
         .sheet(item: $gameAdv) { g in GameSettingsSheet(game: g).environmentObject(m) }
+        .sheet(item: $m.installAsk) { a in InstallWhereSheet(ask: a).environmentObject(m) }
         .onAppear {   // la bienvenida, la primera vez
             if Tutoriales.enabled("bienvenida"), let t = Tutoriales.find("bienvenida") {
                 UserDefaults.standard.set(true, forKey: "tutNo_bienvenida")   // (una sola vez; sigue en la Ayuda)
@@ -2007,6 +2046,51 @@ struct AdvancedBlock: View {
 }
 
 /// Ajustes de un solo juego (desde su menú en Juegos): calidad propia o la de todos, y rendimiento
+/// ¿Dónde instalar un juego? Las bibliotecas de Steam de VRmin, con lo que queda libre en cada disco, u otra carpeta
+/// (por ejemplo en un disco externo), que se suma como biblioteca de Steam
+struct InstallWhereSheet: View {
+    @EnvironmentObject var m: AppModel
+    @Environment(\.dismiss) private var dismiss
+    let ask: InstallAsk
+    private func free(_ u: URL) -> String {
+        guard let b = (try? u.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage
+        else { return "" }
+        return L("%@ libres", ByteCountFormatter.string(fromByteCount: b, countStyle: .file))
+    }
+    private func choose(_ folder: URL) { m.installGame(ask.id, ask.name, into: folder); dismiss() }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(L("¿Dónde instalar %@?", ask.name)).font(.system(size: 20, weight: .bold)).lineLimit(2)
+            Text(L("Si el juego es tuyo, Steam lo baja de fondo, sin mostrar su ventana.")).font(.callout).foregroundStyle(Theme.text2)
+            ForEach(Array(m.libraries.enumerated()), id: \.offset) { i, lib in
+                let root = lib.deletingLastPathComponent()
+                Button { choose(root) } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: i == 0 ? "laptopcomputer" : "externaldrive").frame(width: 22)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(i == 0 ? L("En esta Mac (la carpeta de Steam de VRmin)") : root.lastPathComponent).fontWeight(.semibold)
+                            Text(i == 0 ? free(lib) : "\(root.path) · \(free(lib))").font(.caption).foregroundStyle(Theme.text2).lineLimit(1)
+                        }
+                        Spacer()
+                    }.contentShape(Rectangle())
+                }.buttonStyle(Pill(primary: i == 0))
+            }
+            Button {
+                let p = NSOpenPanel()
+                p.title = L("Elegí dónde instalar %@", ask.name)
+                p.message = L("Una carpeta de la Mac o de un disco externo. Se suma como carpeta de juegos de Steam.")
+                p.prompt = L("Instalar acá")
+                p.canChooseDirectories = true; p.canChooseFiles = false; p.canCreateDirectories = true
+                p.allowsMultipleSelection = false
+                if p.runModal() == .OK, let u = p.url { choose(u) }
+            } label: { Label(L("Otra carpeta o disco externo…"), systemImage: "folder.badge.plus") }.buttonStyle(Pill(primary: false))
+            HStack { Spacer(); Button(L("Cancelar")) { dismiss() }.keyboardShortcut(.cancelAction) }
+        }
+        .padding(22).frame(width: 440)
+        .background(Theme.bg).foregroundStyle(Theme.text).tint(Theme.amber)
+    }
+}
+
 struct GameSettingsSheet: View {
     @EnvironmentObject var m: AppModel
     @Environment(\.dismiss) private var dismiss

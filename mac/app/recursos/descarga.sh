@@ -8,6 +8,8 @@ source "$(dirname "$0")/entorno.sh"
 cd "$P"
 ID="$1"; QUE="$2"
 [[ "$ID" =~ ^[0-9]+$ ]] || { say "Falta el número del juego." "The game's number is missing."; exit 1; }
+# (en la biblioteca de Steam donde se está bajando: la de VRmin u otra que se eligió al instalar)
+while IFS= read -r b; do [ -f "$b/appmanifest_$ID.acf" ] && { STEAMLIB="$b"; break; }; done < <(/usr/bin/python3 "$RES/vrjuegos.py" bibliotecas)
 ACF="$STEAMLIB/appmanifest_$ID.acf"
 [ -f "$ACF" ] || { say "Ese juego no se está bajando." "That game isn't downloading."; exit 1; }
 if ps -axo command= | grep -qi '[s]teamapps.common'; then
