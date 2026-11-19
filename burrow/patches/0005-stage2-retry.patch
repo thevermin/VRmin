@@ -1,0 +1,84 @@
+diff --git a/src/syscall/internal.h b/src/syscall/internal.h
+index 66a0c4e..1f2f4f1 100644
+--- a/src/syscall/internal.h
++++ b/src/syscall/internal.h
+@@ -203,6 +203,8 @@ extern pthread_mutex_t fd_lock; /* FD table */
+ 
+ /* mmap_lock (mmap/brk + page tables) is not recursive. */
+ void mmap_lock_acquire(void);
++/* Whether an IPA is in an HVF segment now (call with mmap_lock held) */
++bool hvf_ipa_mapped(const guest_t *g, uint64_t ipa);
+ void mmap_lock_release(void);
+ 
+ /* Whether the calling thread holds mmap_lock. */
+diff --git a/src/syscall/mem.c b/src/syscall/mem.c
+index d72bde2..ffea901 100644
+--- a/src/syscall/mem.c
++++ b/src/syscall/mem.c
+@@ -2168,6 +2168,15 @@ static int hvf_segment_find(const guest_t *g, uint64_t ipa)
+     return -1;
+ }
+ 
++/* Whether an IPA is in an HVF segment now. A sibling vCPU that took a stage-2
++ * abort while a segment split had its IPA unmapped retries when it is (see
++ * stage2_retry in proc.c). Call with mmap_lock held.
++ */
++bool hvf_ipa_mapped(const guest_t *g, uint64_t ipa)
++{
++    return hvf_segment_find(g, ipa) >= 0;
++}
++
+ /* Restore the slab backing for [ipa, ipa+len) in the host VA. Used to undo a
+  * previous file overlay. Maps shm_fd MAP_SHARED if the slab is shm-backed (so
+  * subsequent fork CoW snapshots see consistent content), otherwise
+diff --git a/src/syscall/proc.c b/src/syscall/proc.c
+index 19ae8d3..799765b 100644
+--- a/src/syscall/proc.c
++++ b/src/syscall/proc.c
+@@ -4223,6 +4223,31 @@ static bool syscall_return_epilogue(guest_t *g,
+     return running;
+ }
+ 
++/* A stage-2 abort (EC 0x20 or 0x24 reaching EL2) on an IPA that is mapped
++ * again: a sibling vCPU split the HVF segment holding it (hv_vm_unmap of the
++ * whole segment, then hv_vm_map of the pieces) while this one ran, and for that
++ * moment everything in the segment, the shim and the page tables included, was
++ * gone. Waiting on mmap_lock lets the split finish; then the instruction runs
++ * again. Bounded per IPA, so a real hole still ends in the crash report.
++ */
++static bool stage2_retry(guest_t *g, uint64_t ipa)
++{
++    static _Thread_local uint64_t last_ipa;
++    static _Thread_local int tries;
++    mmap_lock_acquire();
++    bool mapped = hvf_ipa_mapped(g, ipa);
++    mmap_lock_release();
++    if (ipa != last_ipa) {
++        last_ipa = ipa;
++        tries = 0;
++    }
++    if (mapped && tries < 64) {
++        tries++;
++        return true;
++    }
++    return false;
++}
++
+ static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
+                                                 hv_vcpu_t vcpu,
+                                                 const hv_vcpu_exit_t *vexit,
+@@ -4491,6 +4516,14 @@ static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
+         /* WFI/WFE has no host-side work in this userspace VM. */
+         if (verbose)
+             log_debug("%s: WFI/WFE trapped", prefix);
++    } else if ((ec == 0x20 || ec == 0x24) &&
++               stage2_retry(g, vexit->exception.physical_address)) {
++        /* Retried: see stage2_retry */
++        if (verbose)
++            log_debug("%s: stage-2 abort at IPA 0x%llx during a segment "
++                      "split, retrying",
++                      prefix,
++                      (unsigned long long) vexit->exception.physical_address);
+     } else {
+         /* Non-HVC exception at EL2 level */
+         log_error(
