@@ -38,4 +38,5 @@ for name in open(os.path.join(paq, 'lista')).read().split():
 EOF
 ln -sfn ../../Steam/linuxarm64 "$DIR/home/.steam/sdkarm64"
 ln -sfn ../../Steam "$DIR/home/.steam/steam"
+ln -sfn ../../Steam "$DIR/home/.steam/root"
 echo "Steam ARM64 listo en $DIR/Steam ($(du -sh "$DIR/Steam" | cut -f1))"

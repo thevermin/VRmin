@@ -1,0 +1,108 @@
+diff --git a/src/syscall/abi.h b/src/syscall/abi.h
+index 45eb389..00a5f2e 100644
+--- a/src/syscall/abi.h
++++ b/src/syscall/abi.h
+@@ -262,6 +262,7 @@
+ #define SYS_msgsnd 189
+ #define SYS_semget 190
+ #define SYS_semctl 191
++#define SYS_semtimedop 192
+ #define SYS_semop 193
+ #define SYS_shmget 194
+ #define SYS_shmctl 195
+diff --git a/src/syscall/dispatch.tbl b/src/syscall/dispatch.tbl
+index 77220ab..07b65b2 100644
+--- a/src/syscall/dispatch.tbl
++++ b/src/syscall/dispatch.tbl
+@@ -254,6 +254,7 @@ SYS_recvmmsg sc_recvmmsg 1
+ SYS_semget sc_semget 1
+ SYS_semctl sc_semctl 1
+ SYS_semop sc_semop 1
++SYS_semtimedop sc_semtimedop 1
+ SYS_shmget sc_shmget 1
+ SYS_shmctl sc_shmctl 1
+ SYS_shmat sc_shmat 1
+diff --git a/src/syscall/syscall.c b/src/syscall/syscall.c
+index ced9267..2020407 100644
+--- a/src/syscall/syscall.c
++++ b/src/syscall/syscall.c
+@@ -577,6 +577,7 @@ SC_LOCKED(sc_shmdt,   sys_shmdt(g, x0))
+ SC_FORWARD(sc_shmctl, sys_shmctl(g, (int) x0, (int) x1, x2))
+ SC_FORWARD(sc_semget, sys_semget(g, (int32_t) x0, (int) x1, (int) x2))
+ SC_FORWARD(sc_semop,  sys_semop(g, (int) x0, x1, (unsigned) x2))
++SC_FORWARD(sc_semtimedop, sys_semtimedop(g, (int) x0, x1, (unsigned) x2, x3))
+ SC_FORWARD(sc_semctl, sys_semctl(g, (int) x0, (int) x1, (int) x2, x3))
+ SC_FORWARD(sc_msgget, sys_msgget(g, (int32_t) x0, (int) x1))
+ SC_FORWARD(sc_msgsnd, sys_msgsnd(g, (int) x0, x1, x2, (int) x3))
+diff --git a/src/syscall/sysvipc.c b/src/syscall/sysvipc.c
+index 4c6c755..49be761 100644
+--- a/src/syscall/sysvipc.c
++++ b/src/syscall/sysvipc.c
+@@ -21,6 +21,7 @@
+ #include <sys/msg.h>
+ #include <sys/sem.h>
+ #include <sys/shm.h>
++#include <time.h>
+ 
+ #include "utils.h"
+ 
+@@ -523,7 +524,35 @@ static int64_t sysv_poll_errno(bool waited)
+     return (waited && errno == EINVAL) ? -LINUX_EIDRM : linux_errno();
+ }
+ 
++/* semop and semtimedop: deadline_ns is a CLOCK_MONOTONIC time to give up with EAGAIN at, or 0 for none */
++static int64_t semop_until(guest_t *g, int semid, uint64_t sops_gva, unsigned nsops, uint64_t deadline_ns);
++
+ int64_t sys_semop(guest_t *g, int semid, uint64_t sops_gva, unsigned nsops)
++{
++    return semop_until(g, semid, sops_gva, nsops, 0);
++}
++
++static uint64_t mono_ns(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
++}
++
++int64_t sys_semtimedop(guest_t *g, int semid, uint64_t sops_gva, unsigned nsops, uint64_t timeout_gva)
++{
++    if (!timeout_gva)
++        return semop_until(g, semid, sops_gva, nsops, 0);
++    struct { int64_t sec, nsec; } t;
++    if (guest_read(g, timeout_gva, &t, sizeof t) < 0)
++        return -LINUX_EFAULT;
++    if (t.sec < 0 || t.nsec < 0 || t.nsec >= 1000000000)
++        return -LINUX_EINVAL;
++    uint64_t deadline = mono_ns() + (uint64_t) t.sec * 1000000000ull + (uint64_t) t.nsec;
++    return semop_until(g, semid, sops_gva, nsops, deadline ? deadline : 1);
++}
++
++static int64_t semop_until(guest_t *g, int semid, uint64_t sops_gva, unsigned nsops, uint64_t deadline_ns)
+ {
+     if (nsops == 0 || nsops > 256)
+         return -LINUX_EINVAL;
+@@ -597,6 +626,11 @@ int64_t sys_semop(guest_t *g, int semid, uint64_t sops_gva, unsigned nsops)
+                 break;
+             }
+         }
++        /* semtimedop: its time is up (Linux says EAGAIN) */
++        if (deadline_ns && mono_ns() >= deadline_ns) {
++            rc = -LINUX_EAGAIN;
++            break;
++        }
+         rc = io_retry_backoff(&backoff);
+         if (rc < 0)
+             break;
+diff --git a/src/syscall/sysvipc.h b/src/syscall/sysvipc.h
+index bdeb9e4..aabe3b1 100644
+--- a/src/syscall/sysvipc.h
++++ b/src/syscall/sysvipc.h
+@@ -27,6 +27,7 @@ int64_t sys_shmctl(guest_t *g, int shmid, int cmd, uint64_t buf_gva);
+ 
+ int64_t sys_semget(guest_t *g, int32_t key, int nsems, int semflg);
+ int64_t sys_semop(guest_t *g, int semid, uint64_t sops_gva, unsigned nsops);
++int64_t sys_semtimedop(guest_t *g, int semid, uint64_t sops_gva, unsigned nsops, uint64_t timeout_gva);
+ int64_t sys_semctl(guest_t *g, int semid, int semnum, int cmd, uint64_t arg);
+ 
+ /* Message queue handlers. */
