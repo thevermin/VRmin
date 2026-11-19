@@ -34,7 +34,8 @@ grep -q 'TRIANGULO: TODO BIEN' triangulo.txt || r=1
 if [ -n "${ALYX:-}" ]; then
   bin="$ALYX/game/bin/linuxsteamrtarm64"
   conSteam=(--sysroot "$PWD/alyx-root")
-  [ -n "${STEAM:-}" ] && conSteam=(--sysroot "$PWD/steam-root" --env HOME="$STEAM/home" --env DISPLAY=127.0.0.1:0)
+  [ -n "${STEAM:-}" ] && conSteam=(--user "$(id -u):$(id -g)" --sysroot "$PWD/steam-root" --env HOME="$STEAM/home" \
+    --env DISPLAY=127.0.0.1:0)
   en_carpeta() { local d=$1; shift; (cd "$d" && "$@"); }
   corre alyx "" en_carpeta "$ALYX/game" "$PWD/$E" "${conSteam[@]}" \
     --env LD_PRELOAD=/usr/lib/burrow/libburrow_drm.so --env LD_LIBRARY_PATH="$bin:$ALYX/game/hlvr/bin/linuxsteamrtarm64" \

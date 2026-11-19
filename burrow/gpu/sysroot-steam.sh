@@ -17,7 +17,7 @@ pide="libGL.so.1 libEGL.so.1 libICE.so.6 libSM.so.6 libXcomposite.so.1 libXdamag
   libXrender.so.1 libatk-1.0.so.0 libatk-bridge-2.0.so.0 libatspi.so.0 libcairo.so.2 libcups.so.2 libgdk_pixbuf-2.0.so.0
   libgtk-x11-2.0.so.0 libgdk-x11-2.0.so.0 libibus-1.0.so.5 libnghttp2.so.14 libnm.so.0 libnspr4.so libnss3.so
   libnssutil3.so libsmime3.so libopenal.so.1 libpipewire-0.3.so.0 libssh2.so.1 libva.so.2 libvdpau.so.1 libpulse.so.0"
-todo="/usr/bin/Xvfb /usr/bin/x11vnc /usr/bin/xkbcomp /bin/dash"
+todo="/usr/bin/Xvfb /usr/bin/x11vnc /usr/bin/xkbcomp /bin/dash /usr/bin/sleep"
 for n in $pide; do
   f=$(ldconfig -p | awk -v n="$n" '$1 == n && /AArch64/ { print $NF; exit }')
   [ -n "$f" ] || { echo "::error::Falta $n"; exit 1; }
