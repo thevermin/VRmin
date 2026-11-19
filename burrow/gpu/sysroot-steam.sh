@@ -24,7 +24,8 @@ for n in $pide; do
   todo="$todo $f"
 done
 # (NSS abre sus módulos por su cuenta)
-todo="$todo $(ls /usr/lib/aarch64-linux-gnu/nss/*.so 2>/dev/null | tr '\n' ' ')"
+todo="$todo $(find /usr/lib/aarch64-linux-gnu -name 'libsoftokn3.so' -o -name 'libfreebl*.so' -o -name 'libnssckbi.so' \
+  -o -name 'libnssdbm3.so' | tr '\n' ' ')"
 done_=""
 while [ -n "$todo" ]; do
   next=""
