@@ -1332,10 +1332,21 @@ final class GameLink {
                     if wasSteamVR { sendSteamVR() }
                     Darwin.close(c)
                     print("[juego] Conexión con un juego cerrada (quedan: \(left))")
-                    if left == 0 { GameProfiles.shared.end() }
+                    if left == 0 { GameProfiles.shared.end(); hideSteamSoon() }
                 }
             }
         }
+    }
+
+    /// Sin juegos conectados (se cerró el juego, o SteamVR): Steam suele mostrar su ventana ahí, y con la Biblioteca de
+    /// VRmin se vuelve a esconder (esconder_steam.sh, de fondo)
+    private func hideSteamSoon() {
+        let script = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("esconder_steam.sh")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = [script.path]
+        p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        try? p.run()
     }
 
     /// Bytes que quedaron sin entregar a cada conexión (nunca esperamos a nadie).

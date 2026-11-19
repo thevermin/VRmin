@@ -263,10 +263,11 @@ cerrar_steamvr() {
   cerrar_steamvr_bien
 }
 
-# Con la Biblioteca de VRmin (sin «steam_ventana»), esconde la ventana de Steam si aparece en los próximos segundos
+# Con la Biblioteca de VRmin (sin «steam_ventana»), esconde la ventana de Steam si aparece en los próximos 30 segundos
+# (Steam la muestra un rato después de cerrarse el juego o SteamVR)
 esconder_steam() {
   [ -f "$P/steam_ventana" ] && return 0
-  local i; for i in 1 2 3; do bash "$RES/ocultar_steam.sh" > /dev/null 2>&1; sleep 4; done
+  local s; for s in 2 3 5 5 5 10; do sleep $s; bash "$RES/ocultar_steam.sh" > /dev/null 2>&1; done
 }
 
 # Cierra SteamVR cuando el juego se cierra (si no, sigue dibujando y calentando la Mac): espera a que aparezca algún
