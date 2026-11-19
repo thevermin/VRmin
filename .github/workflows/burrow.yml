@@ -31,6 +31,8 @@ jobs:
         run: bash burrow/gpu/sysroot-linux.sh "$PWD/out/gpu-root"
       - name: Half-Life Alyx test system (the GPU one plus what the game asks for and doesn't bring)
         run: bash burrow/gpu/sysroot-alyx.sh "$PWD/out/gpu-root" "$PWD/out/alyx-root"
+      - name: Steam test system (the Alyx one plus what Steam's ARM64 client asks for, and a virtual screen with VNC)
+        run: bash burrow/gpu/sysroot-steam.sh "$PWD/out/alyx-root" "$PWD/out/steam-root"
       - name: Drawing test (a triangle with Vulkan, checked here on Mesa's CPU driver)
         run: |
           set -e
@@ -90,7 +92,7 @@ jobs:
             install_name_tool -add_rpath @loader_path "$f" 2>/dev/null || true
             codesign -f -s - "$f"
           done
-          otool -L pkg/virgl-prueba pkg/lib/*.dylib | grep -v ':$' | sort -u && cp burrow/tests/probar.sh pkg/ && cp -R tests/. pkg/ && chmod +x pkg/elfuse pkg/probar.sh pkg/prueba-* pkg/busybox pkg/root/prueba pkg/root/hilos pkg/gpu-root/usr/bin/*
+          otool -L pkg/virgl-prueba pkg/lib/*.dylib | grep -v ':$' | sort -u && cp burrow/tests/probar.sh burrow/tests/alyx.sh burrow/tests/steam-arm64.sh burrow/tests/abrir-steam.sh pkg/ && cp -R tests/. pkg/ && chmod +x pkg/elfuse pkg/*.sh pkg/prueba-* pkg/busybox pkg/root/prueba pkg/root/hilos pkg/gpu-root/usr/bin/*
           tar -czf burrow-prueba.tar.gz -C pkg .
       - uses: actions/upload-artifact@v4
         with: { name: burrow-prueba, path: burrow-prueba.tar.gz, retention-days: 30 }

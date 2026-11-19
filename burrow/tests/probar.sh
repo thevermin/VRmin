@@ -28,13 +28,17 @@ grep -q 'Venus' vulkaninfo.txt && echo "(the Linux program sees the Mac's GPU)" 
 # Drawing with it: a triangle in an image, read back (triangulo.ppm)
 corre triangulo "" $E "${GPU[@]}" gpu-root/usr/bin/triangulo
 grep -q 'TRIANGULO: TODO BIEN' triangulo.txt || r=1
-# Half-Life: Alyx ARM64, si se le pasa su carpeta (la que baja alyx.sh, o el juego instalado): hasta dónde llega
+# Half-Life: Alyx ARM64, si se le pasa su carpeta (la que baja alyx.sh, o el juego instalado): hasta dónde llega.
+# Con STEAM=<carpeta de steam-arm64.sh> y ese Steam abierto (abrir-steam.sh), con Steam y su pantalla virtual.
+# (como su hlvr.sh: desde la carpeta «game»)
 if [ -n "${ALYX:-}" ]; then
   bin="$ALYX/game/bin/linuxsteamrtarm64"
+  conSteam=(--sysroot "$PWD/alyx-root")
+  [ -n "${STEAM:-}" ] && conSteam=(--sysroot "$PWD/steam-root" --env HOME="$STEAM/home" --env DISPLAY=127.0.0.1:0)
   en_carpeta() { local d=$1; shift; (cd "$d" && "$@"); }
-  corre alyx "" en_carpeta "$bin" "$PWD/$E" --sysroot "$PWD/alyx-root" --env LD_PRELOAD=/usr/lib/burrow/libburrow_drm.so \
-    --env LD_LIBRARY_PATH="$bin:$ALYX/game/hlvr/bin/linuxsteamrtarm64" --env SteamAppId=546560 \
-    "$bin/hlvr" -game hlvr -novr -vulkan -console -condebug
+  corre alyx "" en_carpeta "$ALYX/game" "$PWD/$E" "${conSteam[@]}" \
+    --env LD_PRELOAD=/usr/lib/burrow/libburrow_drm.so --env LD_LIBRARY_PATH="$bin:$ALYX/game/hlvr/bin/linuxsteamrtarm64" \
+    --env SteamAppId=546560 --env ENABLE_PATHMATCH=1 "$bin/hlvr" -game hlvr -novr -vulkan -console -condebug
   echo "(Alyx: alyx.txt y alyx.err)"
 fi
 echo
