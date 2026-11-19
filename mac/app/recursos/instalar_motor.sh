@@ -36,7 +36,17 @@ export WINEDEBUG=-all
 
 paso() { echo; say "==> $1" "==> ${2:-$1}"; }
 bajar() { # url archivo sha
-  curl -fL --progress-bar -o "$2" "$1"
+  # (si la conexión se corta o se queda casi quieta 30 s, sigue desde donde quedó: hasta 8 intentos)
+  local i
+  rm -f "$2"
+  for i in 1 2 3 4 5 6 7 8; do
+    curl -fL --progress-bar --connect-timeout 20 --speed-limit 10000 --speed-time 30 -C - -o "$2" "$1" && break
+    [ $i = 8 ] && { say "No se pudo bajar $(basename "$1"). Revisá la conexión y probá de nuevo." \
+                        "Couldn't download $(basename "$1"). Check the connection and try again."; exit 1; }
+    say "La descarga se trabó: sigo desde donde quedó (intento $((i + 1)) de 8)…" \
+        "The download stalled: resuming where it left off (attempt $((i + 1)) of 8)…"
+    sleep 3
+  done
   echo "$3  $2" | shasum -a 256 -c - || { rm -f "$2"; say "La descarga no coincide. Probá de nuevo." "The download doesn't match. Try again."; exit 1; }
 }
 
