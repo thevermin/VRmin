@@ -4,6 +4,7 @@
 # va acá: lo baja burrow/tests/steam-arm64.sh de los servidores de Valve.
 #   sysroot-steam.sh <carpeta de alyx-root> <carpeta nueva>
 set -euo pipefail
+trap 'echo "::error::sysroot-steam.sh: falló la línea $LINENO"' ERR
 alyx=$1 root=$2
 sudo apt-get install -y -qq dash xvfb x11vnc x11-xkb-utils xkb-data fonts-dejavu-core fontconfig-config ca-certificates \
   libgl1 libegl1 libice6 libsm6 libxcomposite1 libxdamage1 libxinerama1 libxtst6 libatk1.0-0t64 libatk-bridge2.0-0t64 \
