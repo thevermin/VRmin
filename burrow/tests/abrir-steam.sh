@@ -6,6 +6,16 @@ set -euo pipefail
 cd "$(dirname "$0")"
 S=$(cd "$1" && pwd)
 echo "Abriendo Steam bajo Burrow. En unos segundos: Finder › Ir › Conectarse al servidor › vnc://localhost:5901"
+# (los programas de Steam, ejecutables: si la carpeta se copió o se bajó de nuevo, pueden haber perdido el permiso)
+python3 -I - "$S/Steam" <<'EOF'
+import os, sys
+for d, _, fs in os.walk(sys.argv[1]):
+    for f in fs:
+        p = os.path.join(d, f)
+        if os.path.islink(p): continue
+        with open(p, 'rb') as h: cab = h.read(4)
+        if cab == b'\x7fELF' or cab[:2] == b'#!': os.chmod(p, 0o755)
+EOF
 # (con tu usuario de la Mac: los archivos de Steam son tuyos, y Burrow usa otro si no se le dice; Steam lo busca en
 #  /etc/passwd)
 grep -q ":$(id -u):" steam-root/etc/passwd || echo "steam:x:$(id -u):$(id -g)::$S/home:/bin/sh" >> steam-root/etc/passwd

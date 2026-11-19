@@ -42,8 +42,11 @@ jobs:
           glslangValidator -V --vn triangulo_frag -o "$RUNNER_TEMP/triangulo_frag.h" $t/triangulo.frag
           gcc -O2 -Wall -I"$RUNNER_TEMP" -o out/gpu-root/usr/bin/triangulo $t/triangulo.c -lvulkan
           (cd "$RUNNER_TEMP" && VK_ICD_FILENAMES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1) "$GITHUB_WORKSPACE/out/gpu-root/usr/bin/triangulo")
+      # (en un tar: los artefactos de GitHub no guardan los permisos, y los programas de los sistemas de prueba los
+      #  necesitan para poder abrirse unos a otros)
+      - run: tar -cf burrow-tests.tar -C out .
       - uses: actions/upload-artifact@v4
-        with: { name: burrow-tests, path: out, retention-days: 30 }
+        with: { name: burrow-tests, path: burrow-tests.tar, retention-days: 30 }
   mac:
     needs: linux
     runs-on: macos-15
@@ -64,7 +67,8 @@ jobs:
           grep -q 'VIRGL: TODO BIEN' virgl.txt && echo "::notice::GPU: virglrenderer + Venus + MoltenVK start on this Mac ($(grep capset virgl.txt))" \
             || echo "::warning::GPU: virglrenderer + Venus didn't start on this GitHub Mac (no real GPU?)"
       - uses: actions/download-artifact@v4
-        with: { name: burrow-tests, path: tests }
+        with: { name: burrow-tests, path: . }
+      - run: mkdir -p tests && tar -xf burrow-tests.tar -C tests
       - name: Run (if this Mac allows the Hypervisor framework)
         run: |
           chmod +x tests/prueba-* tests/root/prueba tests/root/hilos tests/busybox
