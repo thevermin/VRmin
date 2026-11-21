@@ -446,10 +446,11 @@ struct GameDetail: View {
                         .padding(.horizontal, 26).padding(.vertical, 18)
                     }
                 }
-                // (pegado a la izquierda: con el ancho fijo, cuando aparecía la barra de desplazamiento todo quedaba
-                // más ancho que lo visible y se corría a la izquierda y volvía, una y otra vez)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            // (sin barra de desplazamiento, que se desplaza igual: con el Mac en «mostrar siempre las barras», la barra
+            // aparecía y desaparecía, cada vez el contenido cambiaba de ancho y la página se corría a un lado y volvía)
+            .scrollIndicators(.never)
         }
         .background(Theme.bg)
         .onAppear {
