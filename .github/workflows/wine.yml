@@ -8,7 +8,7 @@ name: Wine con msync para VRmin
 # mismas opciones que la compilación de Gcenx; eso se reemplaza en el motor (el resto de Wine queda igual).
 # msync se activa con WINEMSYNC=1 (entorno.sh).
 # mac/wine/vulkan-metal.patch: VK_KHR_external_memory_win32 y VK_KHR_win32_keyed_mutex sobre las texturas de Metal de
-# MoltenVK (para que un juego Vulkan le pase sus imágenes a SteamVR real, que las comparte con DXMT): win32u y winemac.drv.
+# MoltenVK (para que un juego Vulkan le pase sus imágenes a SteamVR real, que las comparte con DXMT), en win32u.
 on:
   workflow_dispatch:
   push:
