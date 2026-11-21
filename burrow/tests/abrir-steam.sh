@@ -21,5 +21,17 @@ ln -sfn ../../Steam "$S/home/.steam/root"
 # (con tu usuario de la Mac: los archivos de Steam son tuyos, y Burrow usa otro si no se le dice; Steam lo busca en
 #  /etc/passwd)
 grep -q ":$(id -u):" steam-root/etc/passwd || echo "steam:x:$(id -u):$(id -g)::$S/home:/bin/sh" >> steam-root/etc/passwd
-./elfuse --user "$(id -u):$(id -g)" --sysroot "$PWD/steam-root" --env HOME="$S/home" --env LANG=C.UTF-8 --env LD_PRELOAD=/usr/lib/burrow/libburrow_drm.so \
-  /bin/dash /usr/bin/burrow-steam "$S/Steam" 2>&1 | tee steam.log
+abrir() {
+  ./elfuse "$@" --user "$(id -u):$(id -g)" --sysroot "$PWD/steam-root" --env HOME="$S/home" --env LANG=C.UTF-8 \
+    --env LD_PRELOAD=/usr/lib/burrow/libburrow_drm.so /bin/dash /usr/bin/burrow-steam "$S/Steam"
+}
+# (BURROW_VERBOSE=1: cada llamada al sistema de cada programa, solo en steam.log, para ver dónde se traba algo; se
+#  cierra sola a los 3 minutos)
+if [ -n "${BURROW_VERBOSE:-}" ]; then
+  echo "(registrando todo en steam.log: se cierra sola en 3 minutos)"
+  ( sleep 180; pkill -f elfuse ) &
+  abrir --verbose > steam.log 2>&1 || true
+  echo "Listo: $(du -h steam.log | cut -f1) de registro"
+else
+  abrir 2>&1 | tee steam.log
+fi
