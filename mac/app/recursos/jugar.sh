@@ -61,7 +61,7 @@ if [ "$LANZAR" = "directo" ] && [ -n "$EXE" ] && [ -f "$CARPETA/$EXE" ]; then
   say "Abriendo directo: $EXE" "Opening directly: $EXE" | tee -a "$LOG"
   case "$APPID" in p-*) ;; *) [ -f "$CARPETA/$(dirname "$EXE")/steam_appid.txt" ] || echo "$APPID" > "$CARPETA/$(dirname "$EXE")/steam_appid.txt" ;; esac
   if [ "$DIAGNOSTICO" = "1" ]; then
-    export WINEDEBUG=err+all,warn+module,+loaddll
+    export WINEDEBUG=err+all,warn+module,warn+vulkan,warn+seh,+loaddll
     export XR_LOADER_DEBUG=all
     say "Diagnóstico: WINEDEBUG=$WINEDEBUG XR_LOADER_DEBUG=all" "Diagnostics: WINEDEBUG=$WINEDEBUG XR_LOADER_DEBUG=all" | tee -a "$LOG"
   else
@@ -71,7 +71,11 @@ if [ "$LANZAR" = "directo" ] && [ -n "$EXE" ] && [ -f "$CARPETA/$EXE" ]; then
   # (SteamVR real: lo que Steam les pasa a los juegos que abre; así el juego sabe que es de Steam y no pide volver a
   #  abrirse por Steam, y SteamVR lo reconoce y le da sus controles. Con los otros runtimes, como antes)
   [ "$RUNTIME" = "steamvr" ] && export SteamAppId="$APPID" SteamGameId="$APPID"
-  for e in "${ENVS[@]}"; do export "$e"; echo "Variable: $e" >> "$LOG"; done
+  for e in "${ENVS[@]}"; do
+    # (con el diagnóstico, su WINEDEBUG gana: si no, el del perfil del juego lo apagaba y no quedaba nada)
+    [ "$DIAGNOSTICO" = "1" ] && case "$e" in WINEDEBUG=*) continue ;; esac
+    export "$e"; echo "Variable: $e" >> "$LOG"
+  done
   cd "$CARPETA/$(dirname "$EXE")"
   # (un .bat lo abre el cmd de Wine, desde su carpeta: así encuentra lo que llama con rutas relativas)
   case "$EXE" in
