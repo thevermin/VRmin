@@ -53,6 +53,29 @@ cp web/index.html "$R/web/"
 cp openxr/questvrbridge_openxr.dll openxr/questvrbridge_openxr.json "$R/openxr/"
 [ -f openxr/questvrbridge_openxr32.dll ] && cp openxr/questvrbridge_openxr32.dll openxr/questvrbridge_openxr32.json "$R/openxr/"
 mkdir -p "$R/steamvr" && cp -R steamvr/driver_vrmin "$R/steamvr/"
+# Python propio (python-build-standalone, licencia PSF): VRmin lo usa para su servidor y sus scripts. El de /usr/bin
+# pide instalar las herramientas de desarrollo de Apple, y nadie tendría que necesitarlas para jugar. Se baja una vez
+# (queda en ~/Library/Caches/VRmin) y se le sacan las partes que VRmin no usa (Tk, IDLE, pip, pruebas): unos 30 MB.
+PY_VER=3.12.12; PY_FECHA=20251014
+PY_SHA=84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf
+PY_TGZ="$HOME/Library/Caches/VRmin/python-$PY_VER-$PY_FECHA-arm64.tar.gz"
+mkdir -p "$(dirname "$PY_TGZ")"
+if [ "$(shasum -a 256 "$PY_TGZ" 2>/dev/null | cut -d' ' -f1)" != "$PY_SHA" ]; then
+  echo "   Bajando Python $PY_VER (una sola vez)..."
+  curl -fL --retry 4 -o "$PY_TGZ.parte" "https://github.com/astral-sh/python-build-standalone/releases/download/$PY_FECHA/cpython-$PY_VER%2B$PY_FECHA-aarch64-apple-darwin-install_only_stripped.tar.gz" \
+    && [ "$(shasum -a 256 "$PY_TGZ.parte" | cut -d' ' -f1)" = "$PY_SHA" ] && mv -f "$PY_TGZ.parte" "$PY_TGZ" \
+    || { rm -f "$PY_TGZ.parte"; echo ">>> No se pudo bajar Python (¿sin internet?). Probá de nuevo."; rm -rf "$NUEVA"; exit 1; }
+fi
+tar -xzf "$PY_TGZ" -C "$R" || { echo ">>> No se pudo descomprimir Python"; rm -rf "$NUEVA"; exit 1; }
+L="$R/python/lib/python3.12"
+rm -rf "${R:?}/python/include" "${R:?}/python/lib/pkgconfig" "${R:?}/python/lib/"{libtcl,libtk}* \
+  "${R:?}/python/lib/"{tcl,tk}* "${L:?}/"{test,idlelib,tkinter,turtledemo,ensurepip,lib2to3,site-packages,config-3.12-darwin} \
+  "${L:?}/lib-dynload/_tkinter"* "${R:?}/python/bin/"{idle3*,pip*,2to3*,python3*-config}
+find "${R:?}/python" -name __pycache__ -type d -prune -exec rm -rf {} +
+# (cada binario de Python con firma propia: la de la app no los cubre, están en Resources)
+find "$R/python" -type f \( -name '*.so' -o -name '*.dylib' -o -path '*/bin/python3.12' \) -exec codesign --force --sign - {} + \
+  || { echo "Falló la firma de Python"; exit 1; }
+"$R/python/bin/python3" -c 'import ssl, json, asyncio, uuid, urllib.request' || { echo ">>> El Python de la app no arranca"; rm -rf "$NUEVA"; exit 1; }
 mkdir -p "$R/opencomposite" && cp opencomposite/vrclient_x64.dll opencomposite/vrclient.dll opencomposite/README.md opencomposite/LICENSE-OpenComposite.txt "$R/opencomposite/"
 chmod +x "$R"/*.sh "$R/QuestRenderer"
 # Ícono (a partir de app/AppIcon.png)

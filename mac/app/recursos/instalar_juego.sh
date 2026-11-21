@@ -19,14 +19,14 @@ if [ "$QUE" = install ]; then
     if [ -f "$b/appmanifest_$ID.acf" ]; then
       say "$NOMBRE ya está en Steam (instalado o bajando)." "$NOMBRE is already in Steam (installed or downloading)."; exit 0
     fi
-  done < <(/usr/bin/python3 "$RES/vrjuegos.py" bibliotecas)
+  done < <("$PY" "$RES/vrjuegos.py" bibliotecas)
   # Dónde: la carpeta de Steam de VRmin, u otra que se elige en VRmin Host (los de GameHub no se tocan)
   LIB="$STEAMLIB"
   if [ -n "$DONDE" ]; then
     case "$DONDE" in *"/GameHub"|*"/GameHub/"*) say "Esa es la carpeta de GameHub: elegí otra." "That's GameHub's folder: choose another one."; exit 1;; esac
     [ -d "$DONDE" ] && [ -w "$DONDE" ] || { say "No se puede escribir en $DONDE." "Can't write to $DONDE."; exit 1; }
     LIB="$DONDE/steamapps"
-    if ! /usr/bin/python3 "$RES/vrjuegos.py" bibliotecas | grep -qixF "$LIB"; then
+    if ! "$PY" "$RES/vrjuegos.py" bibliotecas | grep -qixF "$LIB"; then
       # (Steam reescribe su lista de bibliotecas al cerrarse: se suma con Steam cerrado, y se abre de nuevo más abajo)
       if steam_abierto; then
         if ps -axo command= | grep -qi '[s]teamapps.common'; then
@@ -35,7 +35,7 @@ if [ "$QUE" = install ]; then
         fi
         bash "$RES/cerrar.sh" > /dev/null
       fi
-      /usr/bin/python3 "$RES/vrjuegos.py" agregar_biblioteca "$DONDE" || { say "No se pudo sumar $DONDE a Steam." "Couldn't add $DONDE to Steam."; exit 1; }
+      "$PY" "$RES/vrjuegos.py" agregar_biblioteca "$DONDE" || { say "No se pudo sumar $DONDE a Steam." "Couldn't add $DONDE to Steam."; exit 1; }
       say "$DONDE ahora es una carpeta de juegos de Steam." "$DONDE is now a Steam game folder."
     fi
   fi

@@ -52,7 +52,7 @@ microfono_wine() {
       "$WINE" reg add "$base\\devices\\1,$uid" /v guid /t REG_BINARY /d "$hex" /f >/dev/null 2>&1
     fi
     # bytes del GUID → {0.0.1.00000000}.{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX} (los tres primeros campos, al revés)
-    id="$(/usr/bin/python3 -c "import sys,uuid; print('{0.0.1.00000000}.{%s}' % str(uuid.UUID(bytes_le=bytes.fromhex(sys.argv[1]))).upper())" "$hex")"
+    id="$("$PY" -c "import sys,uuid; print('{0.0.1.00000000}.{%s}' % str(uuid.UUID(bytes_le=bytes.fromhex(sys.argv[1]))).upper())" "$hex")"
     "$WINE" reg add "$base" /v DefaultInput /t REG_SZ /d "$id" /f >/dev/null 2>&1
     "$WINE" reg add "$base" /v DefaultVoiceInput /t REG_SZ /d "$id" /f >/dev/null 2>&1
   fi
@@ -107,7 +107,7 @@ gpu_luid_dxmt() {
   local id
   id=$(/usr/sbin/ioreg -r -c IOAccelerator -d 1 -w0 2>/dev/null | grep -o 'id 0x[0-9a-fA-F]*' | head -1 | cut -c4-)
   [ -n "$id" ] || { echo "Copia directa: no pude leer el número de la GPU"; return 0; }
-  if /usr/bin/python3 - "$WINEPREFIX/system.reg" "$id" "$Q/luid.reg" <<'PY'
+  if "$PY" - "$WINEPREFIX/system.reg" "$id" "$Q/luid.reg" <<'PY'
 import re, struct, sys
 reg, idhex, out = sys.argv[1], sys.argv[2], sys.argv[3]
 quiero = ",".join("%02x" % b for b in struct.pack(">Q", int(idhex, 16)))   # LUID = registryID dado vuelta (como DXMT y MoltenVK)
@@ -162,7 +162,7 @@ ajustes_steamvr() {
   mkdir -p "$Q/openvr/config"
   # Lo nuestro se escribe siempre; lo demás que guarda SteamVR (como la resolución, en general o por juego) se conserva.
   # La resolución arranca en 25 % (SteamVR, en automático, elige casi el doble: no baja de lo de los primeros visores)
-  /usr/bin/python3 - "$Q/openvr/config/steamvr.vrsettings" <<'PY'
+  "$PY" - "$Q/openvr/config/steamvr.vrsettings" <<'PY'
 import json, sys
 f = sys.argv[1]
 try:
@@ -200,7 +200,7 @@ PY
   # La ventana de ajustes de SteamVR en el escritorio (que en VRmin no se usa) se crea al abrirla y no al arrancar,
   # oculta: es otro proceso de navegador de ~400 MB. Se revisa cada vez porque las actualizaciones de SteamVR lo vuelven
   # a poner
-  /usr/bin/python3 - "$STEAMLIB/common/SteamVR/resources/webhelperoverlays.json" <<'PY'
+  "$PY" - "$STEAMLIB/common/SteamVR/resources/webhelperoverlays.json" <<'PY'
 import json, sys
 f = sys.argv[1]
 try:

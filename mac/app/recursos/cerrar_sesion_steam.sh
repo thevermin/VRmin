@@ -10,7 +10,7 @@ bash "$RES/cerrar.sh" > /dev/null
 # (las cuentas recordadas, y las llaves de sesión: «ConnectCache» en config.vdf y local.vdf)
 rm -f "$STEAMDIR/config/loginusers.vdf"
 rm -f "$WINEPREFIX/drive_c/users/"*/AppData/Local/Steam/local.vdf
-/usr/bin/python3 - "$STEAMDIR/config/config.vdf" <<'PY'
+"$PY" - "$STEAMDIR/config/config.vdf" <<'PY'
 import re, sys
 p = sys.argv[1]
 try:

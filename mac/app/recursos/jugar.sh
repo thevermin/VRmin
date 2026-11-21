@@ -15,7 +15,7 @@ motor_listo || { say "Primero instalá el motor." "Install the engine first."; e
 # (los de fuera de Steam, «p-…», no lo necesitan)
 case "$APPID" in p-*) ;; *) steam_abierto || { say "Steam no está abierto. Abrilo y esperá a ver tu biblioteca." "Steam isn't open. Open it and wait until you see your library."; exit 1; } ;; esac
 
-PERFIL="$(/usr/bin/python3 "$RES/vrjuegos.py" resolver "$APPID")" || exit 1
+PERFIL="$("$PY" "$RES/vrjuegos.py" resolver "$APPID")" || exit 1
 eval "$PERFIL"
 
 mkdir -p "$P/logs/juegos"
@@ -50,7 +50,7 @@ if [ "$RUNTIME" = "steamvr" ]; then
 else cerrar_steamvr; fi
 # (OpenComposite: el grip de Touch como botón donde el juego lo usa para agarrar; OpenComposite busca esos controles en
 #  la carpeta desde donde se abre el juego)
-[ "$RUNTIME" = "openvr" ] && /usr/bin/python3 "$RES/vrjuegos.py" controles_oc "$CARPETA" "$CARPETA/$(dirname "${EXE:-.}")" 2>&1 | tee -a "$LOG"
+[ "$RUNTIME" = "openvr" ] && "$PY" "$RES/vrjuegos.py" controles_oc "$CARPETA" "$CARPETA/$(dirname "${EXE:-.}")" 2>&1 | tee -a "$LOG"
 ajustes_dll
 gpu_luid_dxmt 2>&1 | tee -a "$LOG"
 microfono_wine 2>&1 | tee -a "$LOG"
@@ -91,6 +91,6 @@ else
   "$WINE" "C:\\Program Files (x86)\\Steam\\steam.exe" -applaunch "$APPID" "${ARGS[@]}" "$@" >> "$P/logs/steam.log" 2>&1 &
 fi
 # (para el modo automático: si no llega ninguna imagen, la próxima vez se prueba el otro runtime)
-/usr/bin/python3 "$RES/vrjuegos.py" intento "$APPID" "$RUNTIME" > /dev/null 2>&1
+"$PY" "$RES/vrjuegos.py" intento "$APPID" "$RUNTIME" > /dev/null 2>&1
 sleep 3
 say "Registros: logs/juegos/$APPID.log · runtime: prefijo/drive_c/questvrbridge/questvrbridge_log.txt" "Logs: logs/juegos/$APPID.log · runtime: prefijo/drive_c/questvrbridge/questvrbridge_log.txt"

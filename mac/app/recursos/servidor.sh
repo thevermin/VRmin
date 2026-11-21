@@ -1,6 +1,10 @@
 #!/bin/bash
 # Servidor (página del Quest + video/sonido) y renderizador de QuestVRBridge.
 RES="$(cd "$(dirname "$0")" && pwd)"
+# (el Python de la app: el de /usr/bin pide las herramientas de Apple; ver entorno.sh)
+PY="$RES/python/bin/python3"; [ -x "$PY" ] || PY=/usr/bin/python3
+# (el Python de la app no trae certificados propios: usa los de macOS para HTTPS)
+export SSL_CERT_FILE="${SSL_CERT_FILE:-/etc/ssl/cert.pem}"
 DATA="${QVB_DATA:-$HOME/Library/Application Support/QuestVRBridge}"
 say() { if [ "$VRMIN_LANG" = es ]; then echo "$1"; else echo "${2:-$1}"; fi; }
 mkdir -p "$DATA"
@@ -18,7 +22,7 @@ fi
 export QVB_DATA="$DATA"
 export VR_EYE=${VR_EYE:-1024} VR_FPS=${VR_FPS:-90} VR_MBPS=${VR_MBPS:-70}
 # Puerto local entre el servidor y el renderizador: 9000, o uno libre si otro programa ya lo usa
-export RENDER_PORT=$(/usr/bin/python3 -c '
+export RENDER_PORT=$("$PY" -c '
 import socket
 s = socket.socket()
 try:
@@ -26,7 +30,7 @@ try:
 except OSError:
     s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])')
-/usr/bin/python3 "$RES/server.py" &
+"$PY" "$RES/server.py" &
 SERVER=$!
 trap 'kill $SERVER $RENDER 2>/dev/null; exit 0' INT TERM EXIT
 sleep 1

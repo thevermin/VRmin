@@ -3,6 +3,11 @@
 # P    = datos del usuario (motor, Windows, registros). Lo define la app con QVB_DATA.
 RES="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 P="${QVB_DATA:-$HOME/Library/Application Support/QuestVRBridge}"
+# PY = el Python que viene dentro de la app (el de /usr/bin pide instalar las herramientas de Apple, que nadie tendría
+#      que necesitar para jugar); el del sistema solo si falta (app armada sin él)
+PY="$RES/python/bin/python3"; [ -x "$PY" ] || PY=/usr/bin/python3
+# (el Python de la app no trae certificados propios: usa los de macOS para HTTPS)
+export SSL_CERT_FILE="${SSL_CERT_FILE:-/etc/ssl/cert.pem}"
 # Mensajes en el idioma de la app (VRMIN_LANG=es → español; si no, inglés): say "español" "english"
 say() { if [ "$VRMIN_LANG" = es ]; then echo "$1"; else echo "${2:-$1}"; fi; }
 mkdir -p "$P/logs"
@@ -59,7 +64,7 @@ ajustes_dll() {
   # (lo que le falta a Wine para el servicio de Steam: ver agregar_export.py; también después de reinstalar el motor)
   local a
   for a in i386 x86_64; do
-    /usr/bin/python3 "$RES/agregar_export.py" "$WINEDIR/lib/wine/$a-windows/gdi32.dll" \
+    "$PY" "$RES/agregar_export.py" "$WINEDIR/lib/wine/$a-windows/gdi32.dll" \
       D3DKMTSetProcessSchedulingPriorityClass=8 >/dev/null 2>&1
   done
   if [ ! -f "$WINEPREFIX/.steam_con_d3d11" ]; then

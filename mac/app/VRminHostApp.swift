@@ -1115,11 +1115,14 @@ final class AppModel: ObservableObject {
     // MARK: Runtime de VR por juego
     private func python(_ args: [String]) -> Data? {
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        // (el Python que viene en la app: el de /usr/bin pide instalar las herramientas de Apple)
+        let propio = res.appendingPathComponent("python/bin/python3")
+        p.executableURL = FileManager.default.isExecutableFile(atPath: propio.path) ? propio : URL(fileURLWithPath: "/usr/bin/python3")
         p.arguments = [res.appendingPathComponent("vrjuegos.py").path] + args
         var env = ProcessInfo.processInfo.environment
         env["QVB_DATA"] = data.path
         env["VRMIN_LANG"] = idioma()
+        if env["SSL_CERT_FILE"] == nil { env["SSL_CERT_FILE"] = "/etc/ssl/cert.pem" }   // (su Python no trae certificados)
         p.environment = env
         let out = Pipe()
         p.standardOutput = out

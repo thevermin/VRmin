@@ -16,7 +16,7 @@ cp "$C/questvrbridge/questvrbridge_log.txt" "$D/runtime_openxr.log" 2>/dev/null
 cp "$C/questvrbridge/questvrbridge_log_anterior.txt" "$D/runtime_openxr_anterior.log" 2>/dev/null
 cp "$P/logs/steam.log" "$D/steam.log" 2>/dev/null
 cp "$P/perfiles/$APPID.json" "$D/perfil.json" 2>/dev/null
-/usr/bin/python3 "$RES/vrjuegos.py" detectar "$APPID" > "$D/deteccion.json" 2>&1
+"$PY" "$RES/vrjuegos.py" detectar "$APPID" > "$D/deteccion.json" 2>&1
 # Registros recientes (180 minutos) de OpenComposite, SteamVR y del juego
 n=0
 while IFS= read -r -d '' f; do
