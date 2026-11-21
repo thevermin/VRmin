@@ -1,5 +1,19 @@
+diff --git a/src/syscall/linux-wire.h b/src/syscall/linux-wire.h
+index f445a7f..3909a7b 100644
+--- a/src/syscall/linux-wire.h
++++ b/src/syscall/linux-wire.h
+@@ -300,8 +300,7 @@ typedef struct {
+ /* _LINUX_CAPABILITY_VERSION_3, the only version elfuse's capget accepts (Linux
+  * still takes the two deprecated ones). A guest asking for another gets this
+  * one written back with EINVAL, which is how Linux tells it which version to
+- * retry with. sc_capset refuses every call with EPERM and never reads the
+- * header, so it has no use for this.
++ * retry with. sc_capset answers the same way.
+  */
+ #define LINUX_CAPABILITY_VERSION_3 0x20080522
+ #define LINUX_PR_SET_VMA 0x53564d41 /* "SVMA" */
 diff --git a/src/syscall/syscall.c b/src/syscall/syscall.c
-index 3ee5a42..67161cc 100644
+index 3ee5a42..77c6e63 100644
 --- a/src/syscall/syscall.c
 +++ b/src/syscall/syscall.c
 @@ -803,8 +803,6 @@ static int64_t sc_get_mempolicy(guest_t *g,
@@ -59,3 +73,22 @@ index 3ee5a42..67161cc 100644
  static int64_t sc_memfd_create(guest_t *g,
                                 uint64_t x0,
                                 uint64_t x1,
+@@ -2448,9 +2487,6 @@ static bool fast_scalar_syscall_result(int nr, uint64_t x0, int64_t *result)
+     case SYS_munlock:
+         *result = 0;
+         return true;
+-    case SYS_capset:
+-        *result = -LINUX_EPERM;
+-        return true;
+     case SYS_io_destroy:
+         *result = -LINUX_EINVAL;
+         return true;
+@@ -2853,7 +2889,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
+         if (nr == SYS_getpid || nr == SYS_getppid || nr == SYS_gettid ||
+             nr == SYS_getpgid || nr == SYS_getuid || nr == SYS_geteuid ||
+             nr == SYS_getgid || nr == SYS_getegid || nr == SYS_fadvise64 ||
+-            nr == SYS_mlock || nr == SYS_munlock || nr == SYS_capset ||
++            nr == SYS_mlock || nr == SYS_munlock ||
+             nr == SYS_io_destroy || nr == SYS_sethostname ||
+             nr == SYS_mincore) {
+             if (nr == SYS_getpgid)
