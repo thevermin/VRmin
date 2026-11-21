@@ -1,0 +1,110 @@
+diff --git a/src/runtime/futex.c b/src/runtime/futex.c
+index 9e338af..880e36a 100644
+--- a/src/runtime/futex.c
++++ b/src/runtime/futex.c
+@@ -68,10 +68,22 @@ static _Atomic int futex_interrupt_requested = 0;
+ #define FUTEX_WAKE_BITSET 10
+ 
+ /* Strips the FUTEX_PRIVATE_FLAG (0x80) and FUTEX_CLOCK_REALTIME bits so the
+- * dispatch switch sees only the base operation. Emulation doesn't differentiate
+- * private vs shared futexes (single-process guest).
++ * dispatch switch sees only the base operation. Wait queues are per elfuse
++ * process, so a shared (non-private) wait also polls its word: see
++ * FUTEX_SHARED_POLL_MS.
+  */
+ #define FUTEX_CMD_MASK 0x7F
++#define FUTEX_PRIVATE_FLAG 0x80
++
++/* A shared futex (no FUTEX_PRIVATE_FLAG) can sit in memory another process
++ * maps too: a MAP_SHARED file or /dev/shm, as Steam and its web helper use to
++ * talk. Every guest process is its own elfuse process with its own wait
++ * queues, so a FUTEX_WAKE from the other side never reaches this one. A shared
++ * wait therefore also re-reads its word every FUTEX_SHARED_POLL_MS and returns
++ * as woken once it moved: the waker always changes the word before waking, and
++ * futex callers re-check it after any return, so an early return is harmless.
++ */
++#define FUTEX_SHARED_POLL_MS 2
+ 
+ /* core/shim.S futex_wait_fast decodes the same three values as immediates,
+  * because assembly cannot see these defines. That leaves the shim serving a
+@@ -829,7 +841,8 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
+                                 uint32_t expected,
+                                 uint64_t timeout_gva,
+                                 uint32_t bitset,
+-                                int is_absolute)
++                                int is_absolute,
++                                bool shared)
+ {
+     if (bitset == 0)
+         return -LINUX_EINVAL;
+@@ -927,7 +940,19 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
+                 ret = -LINUX_ETIMEDOUT;
+                 break;
+             }
++            if (shared) {
++                struct timespec poll_ts;
++                timespec_deadline_in_ms(&poll_ts, FUTEX_SHARED_POLL_MS);
++                if (poll_ts.tv_sec < quantum.tv_sec ||
++                    (poll_ts.tv_sec == quantum.tv_sec &&
++                     poll_ts.tv_nsec < quantum.tv_nsec))
++                    quantum = poll_ts;
++            }
+             futex_park_wait(&waiter.cond, &b->lock, &quantum);
++            if (shared && !atomic_load_explicit(&waiter.woken,
++                                                memory_order_acquire) &&
++                futex_should_block(g, uaddr, expected) != 0)
++                break; /* moved by another process: woken */
+             if (thread_stop_requested() || futex_interrupt_consume()) {
+                 ret = -LINUX_EINTR;
+                 break;
+@@ -959,8 +984,12 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
+          * wait for the poll: its kick ends the sleep.
+          */
+         struct timespec poll_ts;
+-        timespec_deadline_in_ms(&poll_ts, 100);
++        timespec_deadline_in_ms(&poll_ts, shared ? FUTEX_SHARED_POLL_MS : 100);
+         futex_park_wait(&waiter.cond, &b->lock, &poll_ts);
++        if (shared &&
++            !atomic_load_explicit(&waiter.woken, memory_order_acquire) &&
++            futex_should_block(g, uaddr, expected) != 0)
++            break; /* moved by another process: woken */
+ 
+         if (thread_stop_requested() || futex_interrupt_consume()) {
+             ret = -LINUX_EINTR;
+@@ -1051,14 +1080,15 @@ static int64_t futex_wait(guest_t *g,
+                           uint32_t expected,
+                           uint64_t timeout_gva,
+                           uint32_t bitset,
+-                          int is_absolute)
++                          int is_absolute,
++                          bool shared)
+ {
+     unsigned idx = futex_hash(uaddr);
+     unsigned pub = idx;
+ 
+     shim_globals_futex_waiters_add(g, idx, +1);
+     int64_t rc = futex_wait_inner(&pub, g, uaddr, expected, timeout_gva, bitset,
+-                                  is_absolute);
++                                  is_absolute, shared);
+     shim_globals_futex_waiters_add(g, pub, -1);
+     return rc;
+ }
+@@ -1877,7 +1907,7 @@ int64_t sys_futex(guest_t *g,
+          * signal it could not claim. waiter.woken is what tells them apart.
+          */
+         return futex_wait(g, uaddr, val, timeout_gva, FUTEX_BITSET_MATCH_ANY,
+-                          /*is_absolute=*/0);
++                          /*is_absolute=*/0, !(op & FUTEX_PRIVATE_FLAG));
+ 
+     case FUTEX_WAKE:
+         return futex_wake(g, uaddr, val, FUTEX_BITSET_MATCH_ANY);
+@@ -1902,7 +1932,8 @@ int64_t sys_futex(guest_t *g,
+          * CLOCK_MONOTONIC, Linux's default for this operation
+          */
+         return futex_wait(g, uaddr, val, timeout_gva, val3,
+-                          /*is_absolute=*/(op & 0x100) ? 1 : 2);
++                          /*is_absolute=*/(op & 0x100) ? 1 : 2,
++                          !(op & FUTEX_PRIVATE_FLAG));
+ 
+     case FUTEX_WAKE_BITSET:
+         return futex_wake(g, uaddr, val, val3);
