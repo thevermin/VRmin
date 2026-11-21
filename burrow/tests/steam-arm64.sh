@@ -36,6 +36,10 @@ for name in open(os.path.join(paq, 'lista')).read().split():
                 # (los zip no guardan bien los permisos: programas y scripts, ejecutables)
                 os.chmod(ruta, 0o755 if datos[:4] == b'\x7fELF' or datos[:2] == b'#!' else 0o644)
 EOF
+# (como hace su instalador: el manifiesto de lo que se instaló. Sin él, Steam cree que le falta instalar esta misma
+#  versión y se queda bajándola en vez de abrir su ventana)
+mkdir -p "$DIR/Steam/package"
+cp "$DIR/.paquetes/manifiesto.vdf" "$DIR/Steam/package/steam_client_linuxarm64.installed"
 ln -sfn ../../Steam/linuxarm64 "$DIR/home/.steam/sdkarm64"
 ln -sfn ../../Steam "$DIR/home/.steam/steam"
 ln -sfn ../../Steam "$DIR/home/.steam/root"
