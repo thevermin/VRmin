@@ -167,18 +167,18 @@ struct GameCapsule: View {
     }
 }
 
-/// Elegir el .exe de un juego de fuera de Steam
+/// Elegir el .exe de un juego de fuera de Steam (o el .bat que lo abre, como los ports que traen uno)
 func pickLocalGame(_ m: AppModel) {
     let p = NSOpenPanel()
     p.title = L("Agregar un juego de fuera de Steam")
-    p.message = L("Elegí el .exe del juego (de Windows). El juego se queda donde está.")
+    p.message = L("Elegí el .exe del juego (de Windows), o el .bat que lo abre. El juego se queda donde está.")
     p.prompt = L("Agregar")
     p.allowedContentTypes = []
     p.allowsOtherFileTypes = true
     p.canChooseDirectories = false
     p.allowsMultipleSelection = false
     guard p.runModal() == .OK, let url = p.url else { return }
-    if url.pathExtension.lowercased() != "exe" { m.append(L("No se pudo agregar %@ (tiene que ser un .exe de Windows)", url.lastPathComponent)); return }
+    if !["exe", "bat"].contains(url.pathExtension.lowercased()) { m.append(L("No se pudo agregar %@ (tiene que ser un .exe o un .bat de Windows)", url.lastPathComponent)); return }
     m.addLocalGame(url)
 }
 
@@ -316,7 +316,7 @@ struct LibraryView: View {
             Button { pickLocalGame(m) } label: {
                 if small { Image(systemName: "plus") } else { Label(L("Agregar un juego"), systemImage: "plus") }
             }
-            .buttonStyle(Pill()).help(L("Un juego de fuera de Steam: elegís su .exe"))
+            .buttonStyle(Pill()).help(L("Un juego de fuera de Steam: elegís su .exe (o su .bat)"))
         }
         .padding(10)
         .frame(width: small ? 58 : 210)

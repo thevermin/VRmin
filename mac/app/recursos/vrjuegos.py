@@ -55,7 +55,7 @@ NOMBRES = {
 # Idioma de los mensajes: inglés (por defecto) o español; lo pasa VRmin Host en VRMIN_LANG
 IDIOMA = "es" if os.environ.get("VRMIN_LANG") == "es" else "en"
 EN = {
-    "No es un .exe: %s": "That isn't an .exe: %s",
+    "No es un .exe ni un .bat: %s": "That isn't an .exe or a .bat: %s",
     "Automático": "Automatic",
     "OpenVR (OpenComposite)": "OpenVR (OpenComposite)",
     "SteamVR real": "Real SteamVR",
@@ -601,8 +601,9 @@ def cmd_listar():
 
 def cmd_agregar(exe, nombre):
     exe = os.path.abspath(exe)
-    if not (os.path.isfile(exe) and exe.lower().endswith(".exe")):
-        sys.exit(T("No es un .exe: %s") % exe)
+    # (o un .bat que lo abre: algunos ports traen uno con lo que el juego necesita)
+    if not (os.path.isfile(exe) and exe.lower().endswith((".exe", ".bat"))):
+        sys.exit(T("No es un .exe ni un .bat: %s") % exe)
     datos = leer_json(PROPIOS, {})
     lista = datos.get("juegos", [])
     for j in lista:

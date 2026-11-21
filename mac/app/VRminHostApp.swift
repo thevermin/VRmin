@@ -1187,7 +1187,7 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             let ok = self.python(["agregar", exe.path, ""]) != nil
             DispatchQueue.main.async {
-                self.append(ok ? L("Juego agregado: %@", exe.lastPathComponent) : L("No se pudo agregar %@ (tiene que ser un .exe de Windows)", exe.lastPathComponent))
+                self.append(ok ? L("Juego agregado: %@", exe.lastPathComponent) : L("No se pudo agregar %@ (tiene que ser un .exe o un .bat de Windows)", exe.lastPathComponent))
                 self.refresh()
             }
         }

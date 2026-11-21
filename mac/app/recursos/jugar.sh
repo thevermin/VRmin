@@ -73,7 +73,11 @@ if [ "$LANZAR" = "directo" ] && [ -n "$EXE" ] && [ -f "$CARPETA/$EXE" ]; then
   [ "$RUNTIME" = "steamvr" ] && export SteamAppId="$APPID" SteamGameId="$APPID"
   for e in "${ENVS[@]}"; do export "$e"; echo "Variable: $e" >> "$LOG"; done
   cd "$CARPETA/$(dirname "$EXE")"
-  "$WINE" "$CARPETA/$EXE" "${ARGS[@]}" "$@" >> "$LOG" 2>&1 < /dev/null &
+  # (un .bat lo abre el cmd de Wine, desde su carpeta: así encuentra lo que llama con rutas relativas)
+  case "$EXE" in
+    *.[bB][aA][tT]) "$WINE" cmd /c "$(basename "$EXE")" "${ARGS[@]}" "$@" >> "$LOG" 2>&1 < /dev/null & ;;
+    *) "$WINE" "$CARPETA/$EXE" "${ARGS[@]}" "$@" >> "$LOG" 2>&1 < /dev/null & ;;
+  esac
   disown
 else
   [ "$LANZAR" = "directo" ] && say "No encontré el ejecutable ($EXE): lo abro por Steam" "Couldn't find the executable ($EXE): opening it through Steam" | tee -a "$LOG"
