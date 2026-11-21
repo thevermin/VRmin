@@ -446,7 +446,9 @@ struct GameDetail: View {
                         .padding(.horizontal, 26).padding(.vertical, 18)
                     }
                 }
-                .frame(width: geo.size.width)
+                // (pegado a la izquierda: con el ancho fijo, cuando aparecía la barra de desplazamiento todo quedaba
+                // más ancho que lo visible y se corría a la izquierda y volvía, una y otra vez)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .background(Theme.bg)
