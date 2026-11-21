@@ -1,0 +1,64 @@
+diff --git a/src/syscall/abi.h b/src/syscall/abi.h
+index 00a5f2e..382dfb1 100644
+--- a/src/syscall/abi.h
++++ b/src/syscall/abi.h
+@@ -186,6 +186,8 @@
+ #define SYS_madvise 233
+ #define SYS_wait4 260
+ #define SYS_prlimit64 261
++#define SYS_name_to_handle_at 264
++#define SYS_open_by_handle_at 265
+ #define SYS_syncfs 267
+ #define SYS_renameat2 276
+ #define SYS_getrandom 278
+diff --git a/src/syscall/dispatch.tbl b/src/syscall/dispatch.tbl
+index 07b65b2..740f545 100644
+--- a/src/syscall/dispatch.tbl
++++ b/src/syscall/dispatch.tbl
+@@ -193,6 +193,8 @@ SYS_sched_rr_get_interval sc_sched_rr_get_interval 0
+ SYS_set_tid_address sc_set_tid_address 0
+ SYS_capget sc_capget 1
+ SYS_capset sc_capset 0
++SYS_name_to_handle_at sc_name_to_handle_at 0
++SYS_open_by_handle_at sc_open_by_handle_at 0
+ SYS_personality sc_personality 0
+ SYS_prctl sc_prctl 1
+ 
+diff --git a/src/syscall/syscall.c b/src/syscall/syscall.c
+index 2020407..3ee5a42 100644
+--- a/src/syscall/syscall.c
++++ b/src/syscall/syscall.c
+@@ -806,7 +806,14 @@ static int64_t sc_get_mempolicy(guest_t *g,
+ /* capset: unprivileged process cannot set capabilities. */
+ SC_FORWARD(sc_capset, -LINUX_EPERM)
+ 
+-/* sched_setaffinity: accept masks that include CPU 0, reject empty masks. */
++/* name_to_handle_at / open_by_handle_at: no file handles here. EOPNOTSUPP is
++ * what Linux answers for a filesystem without them, so callers (libmount,
++ * glib, Steam) fall back to plain paths.
++ */
++SC_FORWARD(sc_name_to_handle_at, -LINUX_EOPNOTSUPP)
++SC_FORWARD(sc_open_by_handle_at, -LINUX_EOPNOTSUPP)
++
++/* sched_setaffinity: accept any mask with at least one CPU, reject empty ones. */
+ static int64_t sc_sched_setaffinity(guest_t *g,
+                                     uint64_t x0,
+                                     uint64_t x1,
+@@ -829,14 +836,15 @@ static int64_t sc_sched_setaffinity(guest_t *g,
+         return -LINUX_EINVAL;
+ 
+     /* Linux accepts short masks as long as at least one supplied bit is set.
+-     * elfuse only supports CPU 0, so require bit 0 in the first byte.
++     * Affinity is only a hint here: the host schedules the vCPU threads, so a
++     * mask without CPU 0 (taskset 0x7c, as Steam's web helper starts) is fine.
+      */
+     if (cpusetsize > sizeof(uint64_t))
+         cpusetsize = sizeof(uint64_t);
+     uint64_t mask = 0;
+     if (guest_read_small(g, mask_gva, &mask, cpusetsize) < 0)
+         return -LINUX_EFAULT;
+-    if (!(mask & 1))
++    if (!mask)
+         return -LINUX_EINVAL;
+     return 0;
+ }

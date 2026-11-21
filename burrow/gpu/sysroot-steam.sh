@@ -17,7 +17,9 @@ pide="libGL.so.1 libEGL.so.1 libICE.so.6 libSM.so.6 libXcomposite.so.1 libXdamag
   libXrender.so.1 libatk-1.0.so.0 libatk-bridge-2.0.so.0 libatspi.so.0 libcairo.so.2 libcups.so.2 libgdk_pixbuf-2.0.so.0
   libgtk-x11-2.0.so.0 libgdk-x11-2.0.so.0 libibus-1.0.so.5 libnghttp2.so.14 libnm.so.0 libnspr4.so libnss3.so
   libnssutil3.so libsmime3.so libopenal.so.1 libpipewire-0.3.so.0 libssh2.so.1 libva.so.2 libvdpau.so.1 libpulse.so.0"
-todo="/usr/bin/Xvfb /usr/bin/x11vnc /usr/bin/xkbcomp /bin/dash /bin/bash /usr/bin/sleep /usr/bin/taskset"
+todo="/usr/bin/Xvfb /usr/bin/x11vnc /usr/bin/xkbcomp /bin/dash /bin/bash /usr/bin/taskset"
+# (los scripts de Steam usan dirname, sleep, cat, readlink...: todo coreutils)
+todo="$todo $(dpkg -L coreutils | grep '^/usr/bin/' | tr '\n' ' ')"
 # (GLX: la ventana de Steam lo pide. Xvfb lo da con el dibujo por software de Mesa, y los programas lo abren con el
 #  proveedor de Mesa de libglvnd)
 todo="$todo $( (ls /usr/lib/aarch64-linux-gnu/dri/swrast_dri.so /usr/lib/aarch64-linux-gnu/libGLX_mesa.so.0 \
@@ -42,8 +44,8 @@ while [ -n "$todo" ]; do
   todo=$next
 done
 # Los datos que usan: teclados de X, letras, certificados
-for d in /usr/share/X11/xkb /usr/share/fonts/truetype/dejavu /etc/fonts /usr/share/X11/locale; do
-  mkdir -p "$root$(dirname "$d")"; cp -a "$d" "$root$d"
+for d in /usr/share/X11/xkb /usr/share/fonts/truetype/dejavu /etc/fonts /usr/share/fontconfig /usr/share/X11/locale; do
+  [ -e "$d" ] || continue; mkdir -p "$root$(dirname "$d")"; cp -a "$d" "$root$d"
 done
 mkdir -p "$root/etc/ssl/certs" "$root/bin" "$root/tmp"
 cp -L /etc/ssl/certs/ca-certificates.crt "$root/etc/ssl/certs/"
