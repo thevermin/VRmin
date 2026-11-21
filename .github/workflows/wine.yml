@@ -7,6 +7,8 @@ name: Wine con msync para VRmin
 # Se aplican todos los mac/wine/*.patch (por orden) y se compila solo lo que cambian (mac/wine/archivos.txt), con las
 # mismas opciones que la compilación de Gcenx; eso se reemplaza en el motor (el resto de Wine queda igual).
 # msync se activa con WINEMSYNC=1 (entorno.sh).
+# mac/wine/vulkan-metal.patch: VK_KHR_external_memory_win32 y VK_KHR_win32_keyed_mutex sobre las texturas de Metal de
+# MoltenVK (para que un juego Vulkan le pase sus imágenes a SteamVR real, que las comparte con DXMT): win32u y winemac.drv.
 on:
   workflow_dispatch:
   push:
@@ -47,6 +49,8 @@ jobs:
           G="gcenx/Wine Devel.app/Contents/Resources/wine"
           mkdir -p inotify/lib inotify/include/sys
           cp "$G/lib/libinotify.0.dylib" inotify/lib/ && ln -s libinotify.0.dylib inotify/lib/libinotify.dylib
+          # (MoltenVK de la de Gcenx, para que configure active Vulkan como en la suya: win32u y winemac.drv la cargan)
+          cp "$G/lib/libMoltenVK.dylib" inotify/lib/
           git clone -q --depth 1 https://github.com/libinotify-kqueue/libinotify-kqueue.git inotify/src
           cp inotify/src/sys/inotify.h inotify/include/sys/
           mkdir gcenx-orig   # (para comparar)
@@ -62,11 +66,15 @@ jobs:
             --without-freetype --without-gettext --without-gettextpo --without-gphoto --without-gnutls \
             --without-gssapi --without-gstreamer --without-krb5 --without-netapi --without-opencl \
             --without-opengl --without-oss --without-pcap --without-pcsclite --without-pulse --without-sane \
-            --without-sdl --without-udev --without-usb --without-v4l2 --without-vulkan \
+            --without-sdl --without-udev --without-usb --without-v4l2 \
             --without-wayland --without-x \
             CC="/usr/bin/clang -arch x86_64" CPPFLAGS="-I$I/include" LDFLAGS="-L$I/lib" > ../configure.log 2>&1 \
             || { tail -60 ../configure.log; exit 1; }
           grep -E "HAVE_SYS_INOTIFY_H|SONAME_|HAVE_LINUX_NTSYNC" include/config.h | head
+          # (Vulkan: el mismo nombre que en la de Gcenx, sin ruta; Wine la encuentra en su carpeta lib)
+          grep -q 'define SONAME_LIBVULKAN' include/config.h || { echo "::error::configure no encontró MoltenVK"; grep -i vulkan ../configure.log | tail; exit 1; }
+          sed -i '' 's|^#define SONAME_LIBVULKAN .*|#define SONAME_LIBVULKAN "libMoltenVK.dylib"|' include/config.h
+          grep SONAME_LIBVULKAN include/config.h
       - name: Compilar lo que cambian los parches
         working-directory: wine
         run: |
@@ -84,6 +92,8 @@ jobs:
             echo "solo en Gcenx:"; comm -23 a.txt b.txt; echo "solo en la nuestra:"; comm -13 a.txt b.txt
           done < archivos.txt
           strings -a wine/dlls/ntdll/ntdll.so | grep -q "WINEMSYNC" && echo "msync: sí"
+          strings -a wine/dlls/win32u/win32u.so | grep -qx "libMoltenVK.dylib" && strings -a wine/dlls/win32u/win32u.so | grep -q "DXMT_shared_resource_" \
+            && echo "Vulkan con texturas de DXMT: sí" || { echo "::error::win32u.so sin MoltenVK o sin el parche de Vulkan"; exit 1; }
       - name: Empaquetar
         run: |
           while read -r src dst; do mkdir -p "out/$(dirname "$dst")" && cp "wine/$src" "out/$dst"; done < archivos.txt

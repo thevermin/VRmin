@@ -1,0 +1,256 @@
+diff -ru a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
+--- a/dlls/win32u/d3dkmt.c	2026-11-21 07:05:49.207666360 +0000
++++ b/dlls/win32u/d3dkmt.c	2026-11-21 07:06:34.878750562 +0000
+@@ -1936,6 +1936,27 @@
+     return 0;
+ }
+ 
++/* VRmin: the private runtime data of a D3DKMT global or shared resource, as the driver that created it stored it
++ * (DXMT keeps the name of its Metal texture there). Returns its size, 0 if it can't be read. */
++UINT d3dkmt_get_resource_runtime( D3DKMT_HANDLE global, HANDLE shared, void *data, UINT size )
++{
++    struct d3dkmt_resource *resource = NULL;
++    UINT runtime_size = 0;
++    void *buffer;
++
++    if (d3dkmt_object_query( D3DKMT_RESOURCE, global, shared, &runtime_size ) || !runtime_size) return 0;
++    if (!(buffer = malloc( runtime_size ))) return 0;
++    if (d3dkmt_object_alloc( sizeof(*resource), D3DKMT_RESOURCE, (void **)&resource )) runtime_size = 0;
++    else
++    {
++        if (d3dkmt_object_open( &resource->obj, global, shared, buffer, &runtime_size )) runtime_size = 0;
++        d3dkmt_object_free( &resource->obj );
++    }
++    if (runtime_size) memcpy( data, buffer, min( size, runtime_size ) );
++    free( buffer );
++    return runtime_size;
++}
++
+ /* open a D3DKMT global or shared resource */
+ D3DKMT_HANDLE d3dkmt_open_resource( D3DKMT_HANDLE global, HANDLE shared, D3DKMT_HANDLE *mutex_local, D3DKMT_HANDLE *sync_local )
+ {
+diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+--- a/dlls/win32u/vulkan.c	2026-11-21 07:05:48.507666318 +0000
++++ b/dlls/win32u/vulkan.c	2026-11-21 07:06:54.368965166 +0000
+@@ -60,6 +60,74 @@
+ 
+ #define ROUND_SIZE(size, mask) ((((SIZE_T)(size) + (mask)) & ~(SIZE_T)(mask)))
+ 
++#ifdef __APPLE__
++#include <dlfcn.h>
++#include <mach/mach.h>
++extern kern_return_t bootstrap_look_up( mach_port_t bp, const char *name, mach_port_t *sp );
++
++/* VRmin: the Metal texture behind a Windows shared texture made by DXMT (D3D11 on Metal). DXMT shares a texture as
++ * a mach port registered with launchd under a name it keeps in the resource's runtime data; MoltenVK takes the
++ * texture itself (VK_EXT_external_memory_metal). This is how a Vulkan game hands its images to SteamVR, whose
++ * compositor uses D3D11. Returns a retained id<MTLTexture>, or NULL. */
++static void *import_metal_texture( D3DKMT_HANDLE global, HANDLE shared )
++{
++    static void *(*msg)(void);
++    static void *(*get_class)( const char * );
++    static void *(*sel)( const char * );
++    static void *device;
++    char runtime[256] = {0};
++    mach_port_t port = MACH_PORT_NULL;
++    void *handle, *texture = NULL;
++    UINT size;
++
++    if (!msg)
++    {
++        void *objc = dlopen( "/usr/lib/libobjc.A.dylib", RTLD_NOW );
++        void *metal = dlopen( "/System/Library/Frameworks/Metal.framework/Metal", RTLD_NOW );
++        void *(*create_device)(void) = metal ? dlsym( metal, "MTLCreateSystemDefaultDevice" ) : NULL;
++        if (!objc || !create_device) return NULL;
++        get_class = dlsym( objc, "objc_getClass" );
++        sel = dlsym( objc, "sel_registerName" );
++        if (!get_class || !sel || !(device = create_device())) return NULL;
++        msg = dlsym( objc, "objc_msgSend" );
++        if (!msg) return NULL;
++    }
++
++    size = d3dkmt_get_resource_runtime( global, shared, runtime, sizeof(runtime) - 1 );
++    if (size < 22 || strncmp( runtime, "DXMT_shared_resource_", 21 ))
++    {
++        FIXME( "Shared resource %#x/%p isn't a DXMT texture (runtime data size %#x)\n", global, shared, size );
++        return NULL;
++    }
++    runtime[53] = 0;
++    if (bootstrap_look_up( bootstrap_port, runtime, &port ) != KERN_SUCCESS || !port)
++    {
++        WARN( "No mach port named %s\n", debugstr_a(runtime) );
++        return NULL;
++    }
++    handle = ((void *(*)(void *, void *))msg)( get_class( "MTLSharedTextureHandle" ), sel( "alloc" ) );
++    if (handle) handle = ((void *(*)(void *, void *, mach_port_t))msg)( handle, sel( "initWithMachPort:" ), port );
++    if (handle)
++    {
++        texture = ((void *(*)(void *, void *, void *))msg)( device, sel( "newSharedTextureWithHandle:" ), handle );
++        ((void (*)(void *, void *))msg)( handle, sel( "release" ) );
++    }
++    TRACE( "DXMT texture %s -> %p\n", debugstr_a(runtime), texture );
++    return texture;
++}
++
++static void release_metal_texture( void *texture )
++{
++    void *objc = texture ? dlopen( "/usr/lib/libobjc.A.dylib", RTLD_NOW | RTLD_NOLOAD ) : NULL;
++    void *(*sel)( const char * ) = objc ? dlsym( objc, "sel_registerName" ) : NULL;
++    void (*msg)(void *, void *) = objc ? dlsym( objc, "objc_msgSend" ) : NULL;
++    if (sel && msg) msg( texture, sel( "release" ) );
++}
++#else
++static void *import_metal_texture( D3DKMT_HANDLE global, HANDLE shared ) { return NULL; }
++static void release_metal_texture( void *texture ) {}
++#endif
++
+ static BOOL use_external_memory(void)
+ {
+     return zero_bits != 0;
+@@ -129,6 +197,7 @@
+     D3DKMT_HANDLE mutex;
+     VkSemaphore semaphore;
+     UINT64 semaphore_value;
++    void *metal_texture;   /* VRmin: imported DXMT texture (id<MTLTexture>) */
+ };
+ 
+ static inline struct device_memory *device_memory_from_handle( VkDeviceMemory handle )
+@@ -260,6 +329,7 @@
+     driver_funcs->p_map_device_extensions( &extensions );
+     if (extensions.has_VK_KHR_external_memory_fd) return VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+     if (extensions.has_VK_EXT_external_memory_dma_buf) return VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++    if (extensions.has_VK_EXT_external_memory_metal) return VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
+     return 0;
+ }
+ 
+@@ -537,8 +607,10 @@
+         WARN( "Cannot export WOW64 memory without VK_EXT_map_memory_placed\n" );
+         extensions.has_VK_KHR_external_memory_win32 = 0;
+     }
++    /* (VRmin: over Metal textures the keyed mutex doesn't wait, like DXMT's own: one GPU, one order) */
+     extensions.has_VK_KHR_win32_keyed_mutex = extensions.has_VK_KHR_timeline_semaphore &&
+-                                              extensions.has_VK_KHR_external_semaphore_fd;
++                                              (extensions.has_VK_KHR_external_semaphore_fd ||
++                                               extensions.has_VK_EXT_external_memory_metal);
+ 
+     /* filter out unsupported client device extensions */
+ #define USE_VK_EXT(x) client_physical_device->extensions.has_ ## x = extensions.has_ ## x;
+@@ -680,8 +752,11 @@
+     if (device->extensions.has_VK_KHR_win32_keyed_mutex)
+     {
+         device->extensions.has_VK_KHR_timeline_semaphore = 1;
+-        device->extensions.has_VK_KHR_external_semaphore_fd = 1;
+-        device->extensions.has_VK_KHR_external_semaphore = 1;
++        if (get_host_external_semaphore_type())
++        {
++            device->extensions.has_VK_KHR_external_semaphore_fd = 1;
++            device->extensions.has_VK_KHR_external_semaphore = 1;
++        }
+     }
+ 
+     driver_funcs->p_map_device_extensions( &device->extensions );
+@@ -872,6 +947,8 @@
+     VkImportMemoryHostPointerInfoEXT host_pointer_info, *pointer_info = NULL;
+     VkExportMemoryWin32HandleInfoKHR export_win32 = {.dwAccess = GENERIC_ALL};
+     VkImportMemoryWin32HandleInfoKHR *import_win32 = NULL;
++    VkImportMemoryMetalHandleInfoEXT metal_info = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
++                                                   .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT};
+     VkDeviceMemory host_device_memory = VK_NULL_HANDLE;
+     VkExportMemoryAllocateInfo *export_info = NULL;
+     struct device_memory *memory;
+@@ -924,7 +1001,38 @@
+ 
+     if (!(memory = calloc( 1, sizeof(*memory) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+ 
+-    if (import_win32)
++    if (import_win32 && get_host_external_memory_type() == VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT)
++    {
++        HANDLE shared = NULL;
++        D3DKMT_HANDLE global = 0;
++
++        switch (import_win32->handleType)
++        {
++        case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT:
++        case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT:
++            memory->global = global = PtrToUlong( import_win32->handle );
++            break;
++        case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT:
++        case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT:
++            shared = import_win32->handle;
++            if (import_win32->name && !(shared = open_shared_resource_from_name( import_win32->name ))) break;
++            break;
++        default:
++            FIXME( "Unsupported handle type %#x\n", import_win32->handleType );
++            break;
++        }
++        if (global || shared) memory->metal_texture = import_metal_texture( global, shared );
++        if (shared && shared != import_win32->handle) NtClose( shared );
++        if (!memory->metal_texture)
++        {
++            res = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++            goto failed;
++        }
++        metal_info.handle = memory->metal_texture;
++        metal_info.pNext = alloc_info->pNext;
++        alloc_info->pNext = &metal_info;
++    }
++    else if (import_win32)
+     {
+         switch (import_win32->handleType)
+         {
+@@ -1020,6 +1128,7 @@
+     WARN( "Failed to allocate memory, res %d\n", res );
+     if (host_device_memory) device->p_vkFreeMemory( device->host.device, host_device_memory, NULL );
+     if (memory->semaphore) device->p_vkDestroySemaphore( device->host.device, memory->semaphore, NULL );
++    release_metal_texture( memory->metal_texture );
+     d3dkmt_destroy_resource( memory->local );
+     d3dkmt_destroy_mutex( memory->mutex );
+     d3dkmt_destroy_sync( memory->sync );
+@@ -1058,6 +1167,7 @@
+     }
+ 
+     if (memory->semaphore) device->p_vkDestroySemaphore( device->host.device, memory->semaphore, NULL );
++    release_metal_texture( memory->metal_texture );
+     if (memory->shared) NtClose( memory->shared );
+     d3dkmt_destroy_resource( memory->local );
+     d3dkmt_destroy_mutex( memory->mutex );
+@@ -2070,6 +2180,7 @@
+             .deviceIndex = 0,
+         };
+ 
++        if (!memory->semaphore) continue;   /* (VRmin: a Metal texture, no D3DKMT keyed mutex to wait on) */
+         if ((status = NtGdiDdDDIAcquireKeyedMutex( &acquire ))) goto error;
+         submit.value = memory->semaphore_value = acquire.FenceValue;
+         submits[count++] = submit;
+@@ -2125,6 +2236,7 @@
+             .deviceIndex = 0,
+         };
+ 
++        if (!memory->semaphore) continue;   /* (VRmin: a Metal texture, no D3DKMT keyed mutex to release) */
+         if ((status = NtGdiDdDDIReleaseKeyedMutex( &release ))) goto failed;
+         submit.value = memory->semaphore_value + 1;
+         submits[count++] = submit;
+diff -ru a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+--- a/dlls/win32u/win32u_private.h	2026-11-21 07:05:49.507666378 +0000
++++ b/dlls/win32u/win32u_private.h	2026-11-21 07:06:34.877970380 +0000
+@@ -219,6 +219,7 @@
+ 
+ extern D3DKMT_HANDLE d3dkmt_create_resource( int fd, D3DKMT_HANDLE *global );
+ extern D3DKMT_HANDLE d3dkmt_open_resource( D3DKMT_HANDLE global, HANDLE shared, D3DKMT_HANDLE *mutex_local, D3DKMT_HANDLE *sync_local );
++extern UINT d3dkmt_get_resource_runtime( D3DKMT_HANDLE global, HANDLE shared, void *data, UINT size );
+ extern NTSTATUS d3dkmt_destroy_resource( D3DKMT_HANDLE local );
+ 
+ extern D3DKMT_HANDLE d3dkmt_create_sync( int fd, D3DKMT_HANDLE *global );
+diff -ru a/dlls/winemac.drv/vulkan.c b/dlls/winemac.drv/vulkan.c
+--- a/dlls/winemac.drv/vulkan.c	2026-11-21 07:05:49.767155109 +0000
++++ b/dlls/winemac.drv/vulkan.c	2026-11-21 07:06:34.875952880 +0000
+@@ -115,6 +115,9 @@
+ 
+ static void macdrv_map_device_extensions(struct vulkan_device_extensions *extensions)
+ {
++    /* VRmin: Windows shared textures over MoltenVK's Metal textures (see win32u import_metal_texture) */
++    if (extensions->has_VK_KHR_external_memory_win32) extensions->has_VK_EXT_external_memory_metal = 1;
++    if (extensions->has_VK_EXT_external_memory_metal) extensions->has_VK_KHR_external_memory_win32 = 1;
+ }
+ 
+ static const struct vulkan_driver_funcs macdrv_vulkan_driver_funcs =

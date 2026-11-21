@@ -3,3 +3,5 @@
 # Un parche nuevo que cambia otra parte de Wine: agregar acá lo que cambia (y el .patch en esta carpeta; van por orden).
 server/wineserver bin/wineserver
 dlls/ntdll/ntdll.so lib/wine/x86_64-unix/ntdll.so
+dlls/win32u/win32u.so lib/wine/x86_64-unix/win32u.so
+dlls/winemac.drv/winemac.so lib/wine/x86_64-unix/winemac.so
