@@ -5,6 +5,8 @@
 #   burrow-steam <carpeta de Steam> [opciones de Steam]
 # (todo por TCP en la Mac, solo para esta Mac: la pantalla en el puerto 6000 y el VNC en el 5901)
 STEAM=$1; shift
+# (el candado de una pantalla anterior que no se cerró bien: con él Xvfb no arranca)
+rm -f /tmp/.X0-lock
 Xvfb :0 -screen 0 1280x800x24 -ac +extension GLX -listen tcp -nolisten unix -nolisten local > /tmp/xvfb.log 2>&1 &
 sleep 3
 export DISPLAY=127.0.0.1:0
