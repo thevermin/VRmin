@@ -113,7 +113,7 @@ SENALES = {
 # Mods de VR para juegos planos (dejan estos archivos en la carpeta del juego): al instalarlos, el juego pasa a ser de VR
 MODS_VR = {"awvr_readme.md": "openxr", "uninstall_alanwakevr.exe": "openxr"}   # Alan Wake VR (fholger)
 # (versión de lo que guarda la detección: al cambiar, los juegos se vuelven a detectar)
-DETECCION_V = 2
+DETECCION_V = 3
 EXE_DESCARTAR = re.compile(r"(crash|unins|setup|redist|vc_?redist|dxsetup|prereq|launcher_helper|easyanticheat|be?service|cefprocess|ue4prereq|ue5prereq)", re.I)
 
 
@@ -225,6 +225,23 @@ def a_windows(ruta_unix):
 
 
 # ---------------------------------------------------------------- detección
+def solo_vulkan(ruta):
+    """¿El ejecutable usa Vulkan y ningún DirectX? (busca los nombres de las DLL en el archivo, por partes)"""
+    vistos, cola = set(), b""
+    try:
+        with open(ruta, "rb") as f:
+            while True:
+                parte = f.read(8 << 20)
+                if not parte:
+                    break
+                t = (cola + parte).lower()
+                vistos |= {n for n in (b"vulkan-1.dll", b"d3d11.dll", b"d3d12.dll", b"dxgi.dll", b"d3d9.dll") if n in t}
+                cola = t[-16:]
+    except OSError:
+        return False
+    return vistos == {b"vulkan-1.dll"}
+
+
 def detectar(juego):
     raiz = juego["carpeta"]
     nombres, carpetas, exes, jsons = set(), set(), [], []
@@ -266,7 +283,7 @@ def detectar(juego):
         graficos.append("d3d12")
 
     # Ejecutable principal: el «-Shipping» de Unreal; si no, el más grande cerca de la raíz
-    exe = ""
+    exe, vk = "", False
     if exes:
         ship = [e for e in exes if e[0].lower().endswith("-win64-shipping.exe")]
         # (uno que se llame como la carpeta del juego: en The Lab, TheLab.exe y no SecretShop.exe, que es más grande)
@@ -274,6 +291,11 @@ def detectar(juego):
         mismo = [e for e in exes if clave(os.path.basename(e[0])[:-4]) == clave(os.path.basename(raiz))]
         elegido = ship[0] if ship else mismo[0] if mismo else sorted(exes, key=lambda e: (e[2] > 1, -e[1]))[0]
         exe = os.path.relpath(elegido[0], raiz)
+        # (los que dibujan solo con Vulkan, como DOOM VFR, sin traer vulkan-1.dll: su ejecutable lo pide y no nombra
+        #  ningún DirectX)
+        vk = solo_vulkan(elegido[0])
+        if vk and "vulkan" not in graficos:
+            graficos.append("vulkan")
 
     # Recomendación: lo más directo que el juego entienda
     if "openxr" in apis:
@@ -319,7 +341,7 @@ def detectar(juego):
     if not apis:
         sugerencias.append(T("No encontré archivos de VR conocidos: puede estar dentro del motor. Se prueba con OpenVR primero"))
 
-    return {"apis": apis, "motor": motor, "graficos": graficos, "exe": exe, "recomendado": rec, "controles": controles, "v": DETECCION_V,
+    return {"apis": apis, "motor": motor, "graficos": graficos, "exe": exe, "recomendado": rec, "controles": controles, "solo_vulkan": vk, "v": DETECCION_V,
             "sugerencias": sugerencias, "idioma": IDIOMA, "actualizado": juego.get("actualizado", ""), "fecha": int(time.time())}
 
 
@@ -464,7 +486,8 @@ def resolver_juego(juego, det=None):
         runtime = "openvr"
     # SteamVR real solo recibe imágenes de DirectX 11 dentro del Windows de VRmin: los juegos que dibujan con Vulkan
     # (Half-Life 2: VR Mod) le mandan imágenes que no puede abrir
-    if runtime == "steamvr" and any(str(a).lower() in ("-vulkan", "-force-vulkan") for a in list(inc.get("args", [])) + list(usr.get("args", []))):
+    if runtime == "steamvr" and (det.get("solo_vulkan")
+                                 or any(str(a).lower() in ("-vulkan", "-force-vulkan") for a in list(inc.get("args", [])) + list(usr.get("args", [])))):
         avisos.append(T("SteamVR real todavía no anda con juegos que usan Vulkan: se usa %s") % NOMBRES[inc.get("runtime") or "openvr"])
         runtime = inc.get("runtime") or "openvr"
     if os.environ.get("VRMIN_EN_LA_MAC"):   # («Jugar en la Mac»: esta vez sin VR, en una ventana de la Mac)
