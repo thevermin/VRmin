@@ -486,7 +486,9 @@ def resolver_juego(juego, det=None):
         runtime = "openvr"
     # SteamVR real solo recibe imágenes de DirectX 11 dentro del Windows de VRmin: los juegos que dibujan con Vulkan
     # (Half-Life 2: VR Mod) le mandan imágenes que no puede abrir
-    if runtime == "steamvr" and (det.get("solo_vulkan")
+    # (prueba: con el Wine que le pasa a SteamVR las imágenes de Vulkan, el archivo .probar_vulkan_steamvr en la carpeta
+    #  de VRmin deja usar SteamVR real igual)
+    if runtime == "steamvr" and not os.path.exists(os.path.join(DATOS, ".probar_vulkan_steamvr")) and (det.get("solo_vulkan")
                                  or any(str(a).lower() in ("-vulkan", "-force-vulkan") for a in list(inc.get("args", [])) + list(usr.get("args", [])))):
         avisos.append(T("SteamVR real todavía no anda con juegos que usan Vulkan: se usa %s") % NOMBRES[inc.get("runtime") or "openvr"])
         runtime = inc.get("runtime") or "openvr"
