@@ -1,0 +1,61 @@
+diff --git a/src/syscall/syscall.c b/src/syscall/syscall.c
+index 3ee5a42..67161cc 100644
+--- a/src/syscall/syscall.c
++++ b/src/syscall/syscall.c
+@@ -803,8 +803,6 @@ static int64_t sc_get_mempolicy(guest_t *g,
+     return 0;
+ }
+ 
+-/* capset: unprivileged process cannot set capabilities. */
+-SC_FORWARD(sc_capset, -LINUX_EPERM)
+ 
+ /* name_to_handle_at / open_by_handle_at: no file handles here. EOPNOTSUPP is
+  * what Linux answers for a filesystem without them, so callers (libmount,
+@@ -1863,6 +1861,47 @@ static int64_t sc_capget(guest_t *g,
+     return 0;
+ }
+ 
++/* capset: an unprivileged process has no capabilities, and Linux lets it set
++ * that same empty set (Chromium's zygote does it to drop capabilities, and
++ * aborts if it fails). Anything else is refused; fakeroot root may set any.
++ */
++static int64_t sc_capset(guest_t *g,
++                         uint64_t x0,
++                         uint64_t x1,
++                         uint64_t x2,
++                         uint64_t x3,
++                         uint64_t x4,
++                         uint64_t x5,
++                         bool verbose)
++{
++    (void) x2;
++    (void) x3;
++    (void) x4;
++    (void) x5;
++    (void) verbose;
++    if (!x0 || !x1)
++        return -LINUX_EFAULT;
++    uint32_t hdr[2];
++    if (guest_read_small(g, x0, hdr, sizeof(hdr)) < 0)
++        return -LINUX_EFAULT;
++    if (hdr[0] != LINUX_CAPABILITY_VERSION_3) {
++        hdr[0] = LINUX_CAPABILITY_VERSION_3;
++        guest_write_small(g, x0, hdr, sizeof(hdr));
++        return -LINUX_EINVAL;
++    }
++    if (hdr[1] != 0 && (int) hdr[1] != (int) proc_get_pid())
++        return -LINUX_EPERM;
++    uint32_t data[6];
++    if (guest_read_small(g, x1, data, sizeof(data)) < 0)
++        return -LINUX_EFAULT;
++    if (proc_fakeroot_enabled() && proc_get_euid() == 0)
++        return 0;
++    for (int i = 0; i < 6; i++)
++        if (data[i])
++            return -LINUX_EPERM;
++    return 0;
++}
++
+ static int64_t sc_memfd_create(guest_t *g,
+                                uint64_t x0,
+                                uint64_t x1,
