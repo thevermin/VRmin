@@ -69,7 +69,7 @@ fi
 tar -xzf "$PY_TGZ" -C "$R" || { echo ">>> No se pudo descomprimir Python"; rm -rf "$NUEVA"; exit 1; }
 L="$R/python/lib/python3.12"
 rm -rf "${R:?}/python/include" "${R:?}/python/lib/pkgconfig" "${R:?}/python/lib/"{libtcl,libtk}* \
-  "${R:?}/python/lib/"{tcl,tk}* "${L:?}/"{test,idlelib,tkinter,turtledemo,ensurepip,lib2to3,site-packages,config-3.12-darwin} \
+  "${R:?}/python/lib/"{tcl,tk,itcl,thread}* "${L:?}/"{test,idlelib,tkinter,turtledemo,ensurepip,lib2to3,site-packages,config-3.12-darwin} \
   "${L:?}/lib-dynload/_tkinter"* "${R:?}/python/bin/"{idle3*,pip*,2to3*,python3*-config}
 find "${R:?}/python" -name __pycache__ -type d -prune -exec rm -rf {} +
 # (cada binario de Python con firma propia: la de la app no los cubre, están en Resources)
