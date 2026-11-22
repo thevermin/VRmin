@@ -1189,6 +1189,7 @@ final class GameLink {
     private let shared: Shared
     /// El último cuadro mandado al visor: mientras el juego carga (no manda cuadros pero sigue conectado) se vuelve a
     /// mandar, así el visor muestra el juego quieto y no se va a la sala
+    private var pool: CVPixelBufferPool!
     private let holdLock = NSLock()
     private var holdPB: CVPixelBuffer?, holdPose: UInt32 = 0, holdAt: UInt64 = 0
     private func hold(_ pb: CVPixelBuffer, _ pose: UInt32) {
@@ -1199,6 +1200,15 @@ final class GameLink {
         self.encoder = encoder
         self.shared = shared
         Vigia.shared.onChange = { [weak self] in if let self { self.sendLine(Data(self.configLine.utf8)) } }
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: W,
+            kCVPixelBufferHeightKey as String: H,
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()]
+        var p: CVPixelBufferPool?
+        CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &p)
+        pool = p
     }
 
     func start(port: UInt16) {
