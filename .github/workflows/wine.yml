@@ -7,6 +7,7 @@ name: Wine con msync para VRmin
 # Se aplican todos los mac/wine/*.patch (por orden) y se compila solo lo que cambian (mac/wine/archivos.txt), con las
 # mismas opciones que la compilación de Gcenx; eso se reemplaza en el motor (el resto de Wine queda igual).
 # msync se activa con WINEMSYNC=1 (entorno.sh).
+# Sin -fvisibility=hidden, como la de Gcenx: DXMT y otros buscan funciones internas de win32u.so y winemac.so por nombre.
 # mac/wine/vulkan-metal.patch: VK_KHR_external_memory_win32 y VK_KHR_win32_keyed_mutex sobre las texturas de Metal de
 # MoltenVK (para que un juego Vulkan le pase sus imágenes a SteamVR real, que las comparte con DXMT), en win32u.
 on:
@@ -68,7 +69,8 @@ jobs:
             --without-opengl --without-oss --without-pcap --without-pcsclite --without-pulse --without-sane \
             --without-sdl --without-udev --without-usb --without-v4l2 \
             --without-wayland --without-x \
-            CC="/usr/bin/clang -arch x86_64" CPPFLAGS="-I$I/include" LDFLAGS="-L$I/lib" > ../configure.log 2>&1 \
+            CC="/usr/bin/clang -arch x86_64" CPPFLAGS="-I$I/include" LDFLAGS="-L$I/lib" \
+            ac_cv_cflags__fvisibility_hidden=no > ../configure.log 2>&1 \
             || { tail -60 ../configure.log; exit 1; }
           grep -E "HAVE_SYS_INOTIFY_H|SONAME_|HAVE_LINUX_NTSYNC" include/config.h | head
           # (Vulkan: el mismo nombre que en la de Gcenx, sin ruta; Wine la encuentra en su carpeta lib)
@@ -92,6 +94,9 @@ jobs:
             echo "solo en Gcenx:"; comm -23 a.txt b.txt; echo "solo en la nuestra:"; comm -13 a.txt b.txt
           done < archivos.txt
           strings -a wine/dlls/ntdll/ntdll.so | grep -q "WINEMSYNC" && echo "msync: sí"
+          # (con sus funciones internas a la vista, como la de Gcenx: DXMT busca add_window_client_surface por nombre)
+          nm -gU wine/dlls/win32u/win32u.so | grep -q ' _add_window_client_surface$' && echo "win32u.so: funciones internas a la vista, como la de Gcenx" \
+            || { echo "::error::win32u.so esconde sus funciones internas (DXMT no podría crear sus ventanas)"; exit 1; }
           strings -a wine/dlls/win32u/win32u.so | grep -qx "libMoltenVK.dylib" && strings -a wine/dlls/win32u/win32u.so | grep -q "DXMT_shared_resource_" \
             && echo "Vulkan con texturas de DXMT: sí" || { echo "::error::win32u.so sin MoltenVK o sin el parche de Vulkan"; exit 1; }
       - name: Empaquetar
