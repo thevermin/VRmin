@@ -648,7 +648,8 @@ final class AppModel: ObservableObject {
         let ahora = Date()
         let quedan = uninstalling.filter { e in mine[e.key] != nil && ahora.timeIntervalSince(e.value) < 120 }
         if quedan != uninstalling { uninstalling = quedan }
-        steamAccount = steamSavedAccount(steamapps.deletingLastPathComponent().appendingPathComponent("config/loginusers.vdf"))
+        steamAccount = steamSavedAccount(steamapps.deletingLastPathComponent().appendingPathComponent("config/loginusers.vdf"),
+                                         signedIn: steamRunning && steamSignedInNow(data.appendingPathComponent("prefijo/user.reg")))
         DispatchQueue.global(qos: .utility).async { [weak self] in   // (lee el tamaño de las carpetas: no en el hilo de la ventana)
             var dl = libs.flatMap { scanDownloads($0) }
             DispatchQueue.main.async {
@@ -1861,7 +1862,9 @@ struct ContentView: View {
                                         : L("Iniciá sesión en Steam para ver y bajar tus juegos."))
                         .font(.callout).fixedSize(horizontal: false, vertical: true)
                     Spacer()
-                    Button(m.steamRunning ? L("Mostrar Steam") : L("Iniciar sesión")) { m.showSteam() }
+                    Button(!m.steamRunning ? L("Iniciar sesión") : m.steamShown ? L("Ocultar Steam") : L("Mostrar Steam")) {
+                        if m.steamRunning && m.steamShown { m.hideSteam() } else { m.showSteam() }
+                    }
                     .buttonStyle(Pill(primary: true))
                 }
                 .padding(10)

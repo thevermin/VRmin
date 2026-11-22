@@ -53,7 +53,16 @@ func scanDownloads(_ steamapps: URL) -> [SteamDownload] {
 }
 
 /// La cuenta de Steam que entra sola (loginusers.vdf: la más reciente que guardó la sesión): su nombre visible
-func steamSavedAccount(_ loginusers: URL) -> String? {
+/// ¿Steam tiene una sesión iniciada ahora? (lo anota en el registro de Windows: ActiveProcess › ActiveUser, distinto de 0)
+func steamSignedInNow(_ userReg: URL) -> Bool {
+    guard let t = try? String(contentsOf: userReg, encoding: .utf8),
+          let r = t.range(of: "[Software\\\\Valve\\\\Steam\\\\ActiveProcess]") else { return false }
+    let block = t[r.upperBound...].prefix(4000).components(separatedBy: "\n\n").first ?? ""
+    guard let v = block.range(of: "\"ActiveUser\"=dword:([0-9a-fA-F]{8})", options: .regularExpression) else { return false }
+    return UInt32(block[v].suffix(8), radix: 16).map { $0 != 0 } ?? false
+}
+
+func steamSavedAccount(_ loginusers: URL, signedIn: Bool = false) -> String? {
     guard let t = try? String(contentsOf: loginusers, encoding: .utf8) else { return nil }
     // (un bloque por cuenta: "7656…" { "AccountName" "…" "PersonaName" "…" "RememberPassword" "1" "MostRecent" "1" })
     var best: String? = nil
@@ -63,7 +72,8 @@ func steamSavedAccount(_ loginusers: URL) -> String? {
             let m = block[r]; let parts = m.split(separator: "\"")
             return parts.count >= 3 ? String(parts[parts.count - 1]) : nil
         }
-        guard val("RememberPassword") == "1" || val("AllowAutoLogin") == "1" else { continue }
+        // (con la sesión iniciada ahora, vale la última cuenta aunque no se haya guardado la contraseña)
+        guard val("RememberPassword") == "1" || val("AllowAutoLogin") == "1" || (signedIn && val("MostRecent") == "1") else { continue }
         let name = val("PersonaName") ?? val("AccountName")
         if val("MostRecent") == "1" { return name }
         if best == nil { best = name }
