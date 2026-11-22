@@ -5,7 +5,7 @@ cd "$P"
 export WINEDEBUG=-all,err+module
 motor_listo || { say "Hay una versión nueva del motor: tocá «Instalar» en «Motor de juegos de Windows» (Steam y los juegos se conservan)." "There's a new engine version: press “Install” on “Windows games engine” (Steam and games are kept)."; exit 1; }
 [ -f "$STEAMDIR/steam.exe" ] || { say "Primero instalá Steam." "Install Steam first."; exit 1; }
-# (pidieron verla: que VRmin no la esconda sola por un rato; ver esconder_steam en runtime.sh)
+# (pidieron verla: VRmin no la esconde sola hasta «Ocultar Steam»; ver ocultar_steam.sh)
 [ "$1" = ventana ] && touch "$P/.steam_mostrada"
 if steam_abierto; then
   # Biblioteca de VRmin: ya está abierto de fondo y su ventana no se muestra (salvo que se pida con «ventana»)

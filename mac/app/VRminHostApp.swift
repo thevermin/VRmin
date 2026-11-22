@@ -437,7 +437,18 @@ final class AppModel: ObservableObject {
             }
         }
     }
-    func hideSteam() { run(L("Escondiendo Steam"), "ocultar_steam.sh", exclusive: false) }
+    /// «Mostrar Steam» deja su ventana a la vista (VRmin no la esconde sola) hasta «Ocultar Steam»
+    @Published var steamShown = false
+    func showSteam() {
+        FileManager.default.createFile(atPath: data.appendingPathComponent(".steam_mostrada").path, contents: nil)
+        steamShown = true
+        run(L("Mostrando Steam"), "abrir_steam.sh", ["ventana"], exclusive: false)
+    }
+    func hideSteam() {
+        try? FileManager.default.removeItem(at: data.appendingPathComponent(".steam_mostrada"))
+        steamShown = false
+        run(L("Escondiendo Steam"), "ocultar_steam.sh", exclusive: false)
+    }
     func signOutSteam() { run(L("Cerrando la sesión de Steam"), "cerrar_sesion_steam.sh") }
     func writeSteamFriendsFile() {
         let f = data.appendingPathComponent("steam_amigos")
@@ -719,6 +730,10 @@ final class AppModel: ObservableObject {
                 guard let self else { return }
                 if running && !self.steamRunning { self.steamSince = Date() }
                 self.steamRunning = running
+                // («Mostrar Steam» sigue valiendo mientras Steam esté abierto; al cerrarse, vuelve a esconderse solo)
+                let mostrada = self.data.appendingPathComponent(".steam_mostrada")
+                if !running { try? FileManager.default.removeItem(at: mostrada) }
+                self.steamShown = running && FileManager.default.fileExists(atPath: mostrada.path)
                 if !running { self.steamStuck = false; self.steamSince = .distantFuture; self.steamFriendsPending = false }
                 else if stuck && !self.steamStuck && Date().timeIntervalSince(self.steamSince) > 120 {
                     self.steamStuck = true
@@ -1846,9 +1861,7 @@ struct ContentView: View {
                                         : L("Iniciá sesión en Steam para ver y bajar tus juegos."))
                         .font(.callout).fixedSize(horizontal: false, vertical: true)
                     Spacer()
-                    Button(m.steamRunning ? L("Mostrar Steam") : L("Iniciar sesión")) {
-                        m.run(L("Abriendo Steam"), "abrir_steam.sh", ["ventana"], exclusive: false)
-                    }
+                    Button(m.steamRunning ? L("Mostrar Steam") : L("Iniciar sesión")) { m.showSteam() }
                     .buttonStyle(Pill(primary: true))
                 }
                 .padding(10)

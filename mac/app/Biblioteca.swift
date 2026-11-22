@@ -933,8 +933,11 @@ struct LibraryModePicker: View {
                     Text(L("Cuenta de Steam: %@", a)).font(.callout)
                     Spacer()
                     if m.steamRunning {
-                        Button(L("Mostrar Steam")) { m.run(L("Mostrando Steam"), "abrir_steam.sh", ["ventana"], exclusive: false) }.buttonStyle(Pill())
-                        Button(L("Ocultar Steam")) { m.hideSteam() }.buttonStyle(Pill()).help(L("Esconde la ventana de Steam; Steam sigue abierto de fondo"))
+                        if m.steamShown {
+                            Button(L("Ocultar Steam")) { m.hideSteam() }.buttonStyle(Pill()).help(L("Esconde la ventana de Steam; Steam sigue abierto de fondo"))
+                        } else {
+                            Button(L("Mostrar Steam")) { m.showSteam() }.buttonStyle(Pill())
+                        }
                     }
                     Button(L("Cerrar sesión")) { askSignOut = true }.buttonStyle(Pill()).disabled(m.busyTask != nil)
                 }
