@@ -31,7 +31,7 @@ diff -ru a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
  {
 diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
 --- a/dlls/win32u/vulkan.c	2026-11-21 07:05:48.507666318 +0000
-+++ b/dlls/win32u/vulkan.c	2026-11-22 19:23:26.796439933 +0000
++++ b/dlls/win32u/vulkan.c	2026-11-22 20:56:10.404347694 +0000
 @@ -46,6 +46,18 @@
  
  static const struct vulkan_driver_funcs *driver_funcs;
@@ -304,22 +304,35 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
          }
      }
  
-@@ -2070,6 +2193,7 @@
+@@ -2070,7 +2193,17 @@
              .deviceIndex = 0,
          };
  
+-        if ((status = NtGdiDdDDIAcquireKeyedMutex( &acquire ))) goto error;
 +        if (!memory->semaphore) continue;   /* (VRmin: a Metal texture, no D3DKMT keyed mutex to wait on) */
-         if ((status = NtGdiDdDDIAcquireKeyedMutex( &acquire ))) goto error;
++        if ((status = NtGdiDdDDIAcquireKeyedMutex( &acquire )))
++        {
++            /* VRmin: a keyed mutex that can't be taken mustn't drop the whole submit (SteamVR's eye images then never
++             * reach the headset): warn once and go on without it, like DXMT's own keyed mutex */
++            static int once;
++            if (!once++) WARN( "Failed to acquire keyed mutex 0x%s key 0x%s, status %#x: going on without it\n",
++                               wine_dbgstr_longlong( mutex_info->pAcquireSyncs[i] ),
++                               wine_dbgstr_longlong( mutex_info->pAcquireKeys[i] ), status );
++            continue;
++        }
          submit.value = memory->semaphore_value = acquire.FenceValue;
          submits[count++] = submit;
-@@ -2125,6 +2249,7 @@
+     }
+@@ -2125,7 +2258,8 @@
              .deviceIndex = 0,
          };
  
+-        if ((status = NtGdiDdDDIReleaseKeyedMutex( &release ))) goto failed;
 +        if (!memory->semaphore) continue;   /* (VRmin: a Metal texture, no D3DKMT keyed mutex to release) */
-         if ((status = NtGdiDdDDIReleaseKeyedMutex( &release ))) goto failed;
++        if ((status = NtGdiDdDDIReleaseKeyedMutex( &release ))) continue;   /* (VRmin: see acquire_keyed_mutexes) */
          submit.value = memory->semaphore_value + 1;
          submits[count++] = submit;
+     }
 diff -ru a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
 --- a/dlls/win32u/win32u_private.h	2026-11-21 07:05:49.507666378 +0000
 +++ b/dlls/win32u/win32u_private.h	2026-11-21 07:06:34.877970380 +0000
