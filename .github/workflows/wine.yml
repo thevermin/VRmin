@@ -69,7 +69,7 @@ jobs:
             --without-opengl --without-oss --without-pcap --without-pcsclite --without-pulse --without-sane \
             --without-sdl --without-udev --without-usb --without-v4l2 \
             --without-wayland --without-x \
-            CC="/usr/bin/clang -arch x86_64" CPPFLAGS="-I$I/include" LDFLAGS="-L$I/lib" \
+            CC="/usr/bin/clang -arch x86_64" CPPFLAGS="-I$I/include" LDFLAGS="-L$I/lib -Wl,-rpath,@loader_path/../../" \
             ac_cv_cflags__fvisibility_hidden=no > ../configure.log 2>&1 \
             || { tail -60 ../configure.log; exit 1; }
           grep -E "HAVE_SYS_INOTIFY_H|SONAME_|HAVE_LINUX_NTSYNC" include/config.h | head
@@ -94,6 +94,9 @@ jobs:
             echo "solo en Gcenx:"; comm -23 a.txt b.txt; echo "solo en la nuestra:"; comm -13 a.txt b.txt
           done < archivos.txt
           strings -a wine/dlls/ntdll/ntdll.so | grep -q "WINEMSYNC" && echo "msync: sí"
+          # (también busca en lib/, como la de Gcenx: ahí está libMoltenVK.dylib, que Vulkan carga por su nombre solo)
+          otool -l wine/dlls/win32u/win32u.so | grep -q 'path @loader_path/../../ ' && echo "win32u.so: busca en lib/ (MoltenVK)" \
+            || { echo "::error::win32u.so no busca en lib/: Vulkan no encontraría MoltenVK"; exit 1; }
           # (con sus funciones internas a la vista, como la de Gcenx: DXMT busca add_window_client_surface por nombre)
           nm -gU wine/dlls/win32u/win32u.so | grep -q ' _add_window_client_surface$' && echo "win32u.so: funciones internas a la vista, como la de Gcenx" \
             || { echo "::error::win32u.so esconde sus funciones internas (DXMT no podría crear sus ventanas)"; exit 1; }
