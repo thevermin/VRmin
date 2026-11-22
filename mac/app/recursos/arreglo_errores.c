@@ -96,9 +96,41 @@ static int32_t vrmin_create_device(void* gpu, const vk_device_info* ci, const vo
   if (f2) f2->features = antes;
   return r;
 }
+// VK_SUBOPTIMAL_KHR (la imagen de la ventana no tiene justo su tamaño: en la Mac pasa seguido) es un resultado de
+// éxito, pero algunos juegos lo toman como error y se cierran (DOOM VFR: «vkAcquireNextImageKHR failed with error
+// (VK_SUBOPTIMAL_KHR)»). Se les devuelve VK_SUCCESS: la imagen sirve igual.
+#define VK_SUBOPTIMAL 1000001003
+static int32_t (*mvk_acquire)(void*, void*, uint64_t, void*, void*, uint32_t*);
+static int32_t (*mvk_acquire2)(void*, const void*, uint32_t*);
+static int32_t (*mvk_present)(void*, const void*);
+static int32_t vrmin_acquire(void* d, void* sc, uint64_t t, void* sem, void* fence, uint32_t* i) {
+  int32_t r = mvk_acquire(d, sc, t, sem, fence, i); return r == VK_SUBOPTIMAL ? 0 : r;
+}
+static int32_t vrmin_acquire2(void* d, const void* info, uint32_t* i) {
+  int32_t r = mvk_acquire2(d, info, i); return r == VK_SUBOPTIMAL ? 0 : r;
+}
+static int32_t vrmin_present(void* q, const void* info) {
+  int32_t r = mvk_present(q, info); return r == VK_SUBOPTIMAL ? 0 : r;
+}
+static vk_fn vrmin_gdpa(void* device, const char* name);
+static vk_gipa mvk_gdpa;
+// Las funciones que VRmin cambia, por nombre (NULL: la de MoltenVK)
+static vk_fn propia(const char* name) {
+  if (!name) return NULL;
+  if (!strcmp(name, "vkCreateDevice") && mvk_create_device) return (vk_fn) vrmin_create_device;
+  if (!strcmp(name, "vkAcquireNextImageKHR") && mvk_acquire) return (vk_fn) vrmin_acquire;
+  if (!strcmp(name, "vkAcquireNextImage2KHR") && mvk_acquire2) return (vk_fn) vrmin_acquire2;
+  if (!strcmp(name, "vkQueuePresentKHR") && mvk_present) return (vk_fn) vrmin_present;
+  if (!strcmp(name, "vkGetDeviceProcAddr") && mvk_gdpa) return (vk_fn) vrmin_gdpa;
+  return NULL;
+}
+static vk_fn vrmin_gdpa(void* device, const char* name) {
+  vk_fn f = propia(name);
+  return f ? f : mvk_gdpa(device, name);
+}
 static vk_fn vrmin_gipa(void* instance, const char* name) {
-  if (name && !strcmp(name, "vkCreateDevice") && mvk_create_device) return (vk_fn) vrmin_create_device;
-  return mvk_gipa(instance, name);
+  vk_fn f = propia(name);
+  return f ? f : mvk_gipa(instance, name);
 }
 static void* vrmin_dlsym(void* handle, const char* name) {
   void* p = dlsym(handle, name);
@@ -108,9 +140,14 @@ static void* vrmin_dlsym(void* handle, const char* name) {
       mvk = handle; mvk_gipa = (vk_gipa) p;
       mvk_create_device = (int32_t (*)(void*, const vk_device_info*, const void*, void**)) dlsym(handle, "vkCreateDevice");
       mvk_get_features = (void (*)(void*, vk_features*)) dlsym(handle, "vkGetPhysicalDeviceFeatures");
+      mvk_acquire = (int32_t (*)(void*, void*, uint64_t, void*, void*, uint32_t*)) dlsym(handle, "vkAcquireNextImageKHR");
+      mvk_acquire2 = (int32_t (*)(void*, const void*, uint32_t*)) dlsym(handle, "vkAcquireNextImage2KHR");
+      mvk_present = (int32_t (*)(void*, const void*)) dlsym(handle, "vkQueuePresentKHR");
+      mvk_gdpa = (vk_gipa) dlsym(handle, "vkGetDeviceProcAddr");
     }
   }
   if (p && mvk && handle == mvk && name && !strcmp(name, "vkGetInstanceProcAddr")) return (void*) vrmin_gipa;
+  if (p && mvk && handle == mvk && name && !strcmp(name, "vkGetDeviceProcAddr") && mvk_gdpa) return (void*) vrmin_gdpa;
   return p;
 }
 DYLD_INTERPOSE(vrmin_dlsym, dlsym)
