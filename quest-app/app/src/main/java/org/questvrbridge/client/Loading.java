@@ -48,7 +48,7 @@ final class Loading {
     private String gameId = "", gameName = "", launchKey = "", dismissedId = "";
     private long dismissedAt = 0;
     private long since = 0;
-    private boolean macGame = false, inGame = false;
+    private boolean macGame = false, inGame = false, steamVR = false;
     private Context ctx;   // (el de la pantalla virtual del panel)
     private TextView name, status, tip, sub;
     private ImageView cover;
@@ -75,7 +75,8 @@ final class Loading {
         }
         if (phase == OPENING) {
             // (con SteamVR real se abre SteamVR antes que el juego: tarda más)
-            if (l != null && "steamvr".equals(l.optString("runtime")) && !g && sub != null)
+            if (l != null && "steamvr".equals(l.optString("runtime"))) steamVR = true;
+            if (steamVR && !g && sub != null)
                 sub.setText(I18n.t("Se está abriendo SteamVR: el juego va a tardar un poco más. Solo hay que esperar."));
             if (isFailure(st)) fail(st);
             else if (g) setStatus(I18n.t("Entrando en VR…"));
@@ -91,7 +92,11 @@ final class Loading {
     /** Empieza o termina el juego en el visor (ya se ve su imagen). */
     void onGameState(boolean on) {
         inGame = on;
-        if (on && phase != OFF) end();
+        if (!on || phase == OFF) return;
+        // (con SteamVR real la primera imagen es la de SteamVR, no la del juego: 5 s más de pantalla de carga, así
+        //  se ve menos SteamVR cargando)
+        if (steamVR) ui.postDelayed(() -> { if (inGame && phase == OPENING) end(); }, 5000);
+        else end();
     }
 
     private static boolean isFailure(String s) {
@@ -99,7 +104,7 @@ final class Loading {
     }
 
     private void begin(String id, String n) {
-        gameId = id; gameName = n; since = SystemClock.uptimeMillis();
+        gameId = id; gameName = n; since = SystemClock.uptimeMillis(); steamVR = false;
         if (phase == OFF) open();
         phase = OPENING;
         show(n, I18n.t("Abriendo el juego…"), true);

@@ -265,7 +265,8 @@ static std::atomic<float> g_cfgFovK{1.f};
 static std::atomic<unsigned> g_haptics{0};   // (vibrations sent to the Quest, for the log)
 // SteamVR's menu (dashboard): VRmin opens games straight from Wine, not from that menu, so it stays open over a game
 // that starts and you had to press «Resume». When a game starts sending frames, VRmin closes it once as the menu
-// button does (a short press of the left controller's system button), only while SteamVR says the menu is open.
+// button does (a short press of the left controller's system button). Without a game SteamVR always shows its menu,
+// and it doesn't tell drivers it opened then: it counts as open unless SteamVR said it closed after the game began.
 static std::atomic<bool> g_dashboard{false};
 static std::atomic<double> g_closeMenuFrom{0}, g_closeMenuUntil{0}, g_systemPressUntil{0};
 
@@ -983,7 +984,7 @@ public:
     sets.push_back(st);
     if (!st.compositor) {
       static uint32_t lastGame = 0;
-      if (pid != lastGame) { lastGame = pid; g_closeMenuFrom = now_s() + 1.5; g_closeMenuUntil = now_s() + 20; }
+      if (pid != lastGame) { lastGame = pid; g_dashboard = true; g_closeMenuFrom = now_s() + 3; g_closeMenuUntil = now_s() + 20; }
     }
     logf("Direct mode: textures for process %u%s: %ux%u, format %u, %u samples", pid, st.compositor ? " (SteamVR's)" : "", d.Width, d.Height,
          desc->nFormat, d.SampleDesc.Count);
@@ -1524,7 +1525,8 @@ public:
     }
     const double t = now_s();
     if (g_closeMenuFrom > 0 && t >= g_closeMenuFrom && t < g_closeMenuUntil && g_dashboard && t >= g_systemPressUntil + 1) {
-      g_closeMenuFrom = 0;   // (once per game)
+      // (and again if SteamVR opens it by itself while the game starts, within its first 20 s)
+      g_dashboard = false;
       g_systemPressUntil = t + 0.15;
       logf("The game started: closing SteamVR's menu (as «Resume»)");
     }
