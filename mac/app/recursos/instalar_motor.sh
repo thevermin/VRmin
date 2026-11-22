@@ -131,10 +131,15 @@ if [ "$(cat "$WINEDIR/.msync" 2>/dev/null)" != "$MSYNC_SHA" ]; then
   echo "$MSYNC_SHA" > "$WINEDIR/.msync"
 fi
 paso "Instalando DXMT dentro del motor" "Installing DXMT into the engine"
-for f in d3d11.dll dxgi.dll d3d10core.dll winemetal.dll; do
-  dst="$WINEDIR/lib/wine/x86_64-windows/$f"
-  [ -f "$dst" ] && [ ! -f "$dst.wine-original" ] && cp "$dst" "$dst.wine-original"
-  cp "$DXMT_DIR/x86_64-windows/$f" "$dst"
+# (y el de 32 bits: SteamVR, en un juego de 32 bits como Half-Life 2: VR Mod, abre su propio D3D11 en el juego, y
+#  con el D3D11 de 32 bits sin su winemetal.dll el juego se cerraba al iniciar VR)
+for arq in x86_64-windows i386-windows; do
+  [ -f "$DXMT_DIR/$arq/winemetal.dll" ] || continue
+  for f in d3d11.dll dxgi.dll d3d10core.dll winemetal.dll; do
+    dst="$WINEDIR/lib/wine/$arq/$f"
+    [ -f "$dst" ] && [ ! -f "$dst.wine-original" ] && cp "$dst" "$dst.wine-original"
+    cp "$DXMT_DIR/$arq/$f" "$dst"
+  done
 done
 cp "$DXMT_DIR/x86_64-unix/winemetal.so" "$WINEDIR/lib/wine/x86_64-unix/winemetal.so"
 rm -rf "$P/dxmt/vrmin-1"   # (el DXMT de VRmin 0.55 a 0.57)

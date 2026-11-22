@@ -1187,48 +1187,10 @@ final class GameLink {
     private func setAcceptStage(_ st: String) { acceptLock.lock(); acceptStage = st; acceptSince = DispatchTime.now().uptimeNanoseconds; acceptLock.unlock() }
     private let encoder: Encoder
     private let shared: Shared
-    private var pool: CVPixelBufferPool!
     /// El último cuadro mandado al visor: mientras el juego carga (no manda cuadros pero sigue conectado) se vuelve a
     /// mandar, así el visor muestra el juego quieto y no se va a la sala
     private let holdLock = NSLock()
     private var holdPB: CVPixelBuffer?, holdPose: UInt32 = 0, holdAt: UInt64 = 0
-    private var loadingPB: CVPixelBuffer?, loadingFor: UInt64 = 0
-    /// El cuadro dado, más oscuro y con «Cargando…» en el centro de cada ojo
-    private func loadingFrame(from src: CVPixelBuffer) -> CVPixelBuffer? {
-        var po: CVPixelBuffer?
-        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &po)
-        guard let dst = po else { return nil }
-        CVPixelBufferLockBaseAddress(src, .readOnly); CVPixelBufferLockBaseAddress(dst, [])
-        defer { CVPixelBufferUnlockBaseAddress(dst, []); CVPixelBufferUnlockBaseAddress(src, .readOnly) }
-        let w = CVPixelBufferGetWidth(dst), h = CVPixelBufferGetHeight(dst)
-        guard CVPixelBufferGetWidth(src) == w, CVPixelBufferGetHeight(src) == h,
-              let sb = CVPixelBufferGetBaseAddress(src), let db = CVPixelBufferGetBaseAddress(dst) else { return nil }
-        let sbpr = CVPixelBufferGetBytesPerRow(src), dbpr = CVPixelBufferGetBytesPerRow(dst)
-        for y in 0..<h { memcpy(db + y * dbpr, sb + y * sbpr, min(sbpr, dbpr)) }
-        guard let ctx = CGContext(data: db, width: w, height: h, bitsPerComponent: 8, bytesPerRow: dbpr, space: CGColorSpaceCreateDeviceRGB(),
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
-        ctx.setFillColor(CGColor(gray: 0, alpha: 0.55)); ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
-        // (con Core Text: este hilo no es el principal)
-        guard let font = CTFontCreateUIFontForLanguage(.emphasizedSystem, CGFloat(h) * 0.045, nil) else { return dst }
-        let attrs: [NSAttributedString.Key: Any] = [NSAttributedString.Key(kCTFontAttributeName as String): font,
-                                                    NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 1, alpha: 1)]
-        let line = CTLineCreateWithAttributedString(NSAttributedString(string: tr("Cargando…", "Loading…"), attributes: attrs))
-        let bounds = CTLineGetBoundsWithOptions(line, [])
-        // En cada ojo, donde se ve un punto a 3 m delante de la cabeza (no en el centro de la imagen: los ojos del Quest
-        // no miran al centro de su imagen)
-        let eyes = shared.pose?.eyes ?? []
-        for e in 0..<2 {
-            var u: CGFloat = 0.5, v: CGFloat = 0.5
-            if eyes.count == 2 {
-                let c = eyes[e].proj * simd_float4(e == 0 ? 0.032 : -0.032, 0, -3, 1)
-                if abs(c.w) > 1e-4 { u = CGFloat(min(max((c.x / c.w + 1) / 2, 0.1), 0.9)); v = CGFloat(min(max((c.y / c.w + 1) / 2, 0.1), 0.9)) }
-            }
-            let cx = CGFloat(w) * (CGFloat(e) * 0.5 + u * 0.5)
-            ctx.textPosition = CGPoint(x: cx - bounds.width / 2, y: CGFloat(h) * v - bounds.height / 2)
-            CTLineDraw(line, ctx)
-        }
-        return dst
-    }
     private func hold(_ pb: CVPixelBuffer, _ pose: UInt32) {
         holdLock.lock(); holdPB = pb; holdPose = pose; holdAt = DispatchTime.now().uptimeNanoseconds; holdLock.unlock()
     }
@@ -1237,15 +1199,6 @@ final class GameLink {
         self.encoder = encoder
         self.shared = shared
         Vigia.shared.onChange = { [weak self] in if let self { self.sendLine(Data(self.configLine.utf8)) } }
-        let attrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: W,
-            kCVPixelBufferHeightKey as String: H,
-            kCVPixelBufferMetalCompatibilityKey as String: true,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()]
-        var p: CVPixelBufferPool?
-        CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &p)
-        pool = p
     }
 
     func start(port: UInt16) {
@@ -1260,15 +1213,8 @@ final class GameLink {
                 let now = DispatchTime.now().uptimeNanoseconds, age = now - at
                 guard age > 300_000_000, age < 120_000_000_000, shared.beginFrame() else { continue }
                 shared.markGameFrame()
-                // (después de 3 s: una copia oscurecida con «Cargando…» en cada ojo, para que no parezca colgado; antes, el
-                // cuadro tal cual, así una traba corta del juego no se nota)
-                var show = pb
-                if age > 3_000_000_000 {
-                    if loadingFor != at { loadingPB = loadingFrame(from: pb); loadingFor = at }
-                    show = loadingPB ?? pb
-                }
                 let fn = shared.nextFrameNo(), enc = encoder
-                encodeQueue.async { enc.encode(show, frameNo: fn, poseId: pose, forceKey: false, start: now) }
+                encodeQueue.async { enc.encode(pb, frameNo: fn, poseId: pose, forceKey: false, start: now) }
             }
         }
         // Vigilante: cada 3 s avisa si el lector del juego quedó trabado en algún paso

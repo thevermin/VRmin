@@ -212,20 +212,6 @@ if w.get("preload"):
     w["preload"] = False
     json.dump(s, open(f, "w"), indent="\t")
 PY
-  # Al abrir un juego, el menú de SteamVR muestra un cartel con su portada y su nombre («A continuación»), que dentro de
-  # Wine sale sin letras: VRmin ya tiene su pantalla de carga en el Quest. Se apaga en su código (systemui.js); si una
-  # actualización de SteamVR lo cambia, no se toca nada
-  "$PY" - "$STEAMLIB/common/SteamVR/resources/webinterface/dashboard/systemui.js" <<'PY'
-import sys
-f = sys.argv[1]
-try:
-    s = open(f, encoding="utf-8").read()
-except Exception:
-    sys.exit(0)
-a = "show(e){this.cancelFadeOutTimers(),"
-if s.count(a) == 1 and "TransitionAppLabels" in s:
-    open(f, "w", encoding="utf-8").write(s.replace(a, "show(e){return;this.cancelFadeOutTimers(),"))
-PY
 }
 
 # SteamVR real, abierto antes que el juego y con el visor y los controles de VRmin ya agregados: si lo abre el juego,
