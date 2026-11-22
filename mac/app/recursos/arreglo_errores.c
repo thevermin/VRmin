@@ -134,10 +134,11 @@ static vk_fn vrmin_gipa(void* instance, const char* name) {
 }
 static void* vrmin_dlsym(void* handle, const char* name) {
   void* p = dlsym(handle, name);
-  if (p && name && !strcmp(name, "vkGetInstanceProcAddr") && !mvk) {
+  // (Wine pide primero vkGetDeviceProcAddr y después vkGetInstanceProcAddr: MoltenVK se reconoce con cualquiera)
+  if (p && name && (!strcmp(name, "vkGetInstanceProcAddr") || !strcmp(name, "vkGetDeviceProcAddr")) && !mvk) {
     Dl_info info;
     if (dladdr(p, &info) && info.dli_fname && strstr(info.dli_fname, "MoltenVK")) {
-      mvk = handle; mvk_gipa = (vk_gipa) p;
+      mvk = handle; mvk_gipa = (vk_gipa) dlsym(handle, "vkGetInstanceProcAddr");
       mvk_create_device = (int32_t (*)(void*, const vk_device_info*, const void*, void**)) dlsym(handle, "vkCreateDevice");
       mvk_get_features = (void (*)(void*, vk_features*)) dlsym(handle, "vkGetPhysicalDeviceFeatures");
       mvk_acquire = (int32_t (*)(void*, void*, uint64_t, void*, void*, uint32_t*)) dlsym(handle, "vkAcquireNextImageKHR");
