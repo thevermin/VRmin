@@ -31,7 +31,7 @@ diff -ru a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
  {
 diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
 --- a/dlls/win32u/vulkan.c	2026-11-21 07:05:48.507666318 +0000
-+++ b/dlls/win32u/vulkan.c	2026-11-21 07:29:20.958213736 +0000
++++ b/dlls/win32u/vulkan.c	2026-11-22 19:23:26.796439933 +0000
 @@ -46,6 +46,18 @@
  
  static const struct vulkan_driver_funcs *driver_funcs;
@@ -265,7 +265,46 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      if (memory->shared) NtClose( memory->shared );
      d3dkmt_destroy_resource( memory->local );
      d3dkmt_destroy_mutex( memory->mutex );
-@@ -2070,6 +2192,7 @@
+@@ -1907,9 +2029,10 @@
+     if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+         !extents_equals( &swapchain->extents, &client_rect ))
+     {
+-        WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
++        /* VRmin: Windows drivers don't say this, and some games close on it (DOOM VFR: «vkAcquireNextImageKHR
++         * failed with error (VK_SUBOPTIMAL_KHR)»); the image is fine, MoltenVK scales it to the window */
++        WARN( "Swapchain size %dx%d does not match client rect %s\n",
+               swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
+-        return VK_SUBOPTIMAL_KHR;
+     }
+ 
+     return res;
+@@ -1933,9 +2056,10 @@
+     if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+         !extents_equals( &swapchain->extents, &client_rect ))
+     {
+-        WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
++        /* VRmin: Windows drivers don't say this, and some games close on it (DOOM VFR: «vkAcquireNextImageKHR
++         * failed with error (VK_SUBOPTIMAL_KHR)»); the image is fine, MoltenVK scales it to the window */
++        WARN( "Swapchain size %dx%d does not match client rect %s\n",
+               swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
+-        return VK_SUBOPTIMAL_KHR;
+     }
+ 
+     return res;
+@@ -2001,10 +2125,9 @@
+             WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
+         else if (!extents_equals( &swapchain->extents, &client_rect ))
+         {
+-            WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
++            /* VRmin: no VK_SUBOPTIMAL_KHR for this (see win32u_vkAcquireNextImageKHR) */
++            WARN( "Swapchain size %dx%d does not match client rect %s\n",
+                   swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
+-            if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
+-            if (!res) res = VK_SUBOPTIMAL_KHR;
+         }
+     }
+ 
+@@ -2070,6 +2193,7 @@
              .deviceIndex = 0,
          };
  
@@ -273,7 +312,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
          if ((status = NtGdiDdDDIAcquireKeyedMutex( &acquire ))) goto error;
          submit.value = memory->semaphore_value = acquire.FenceValue;
          submits[count++] = submit;
-@@ -2125,6 +2248,7 @@
+@@ -2125,6 +2249,7 @@
              .deviceIndex = 0,
          };
  

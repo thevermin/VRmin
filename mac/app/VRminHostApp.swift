@@ -1692,7 +1692,8 @@ struct ContentView: View {
                         if m.steamStuck {
                             Button(L("Reiniciar Steam")) { m.restartSteam() }.buttonStyle(Pill(primary: true)).disabled(m.busyTask != nil)
                         }
-                        else { Button(L("Mostrar")) { m.run(L("Mostrando Steam"), "abrir_steam.sh", ["ventana"], exclusive: false) }.buttonStyle(Pill()) }
+                        else if m.steamShown { Button(L("Ocultar")) { m.hideSteam() }.buttonStyle(Pill()) }
+                        else { Button(L("Mostrar")) { m.showSteam() }.buttonStyle(Pill()) }
                         Button(L("Cerrar")) { m.closeAll() }.buttonStyle(Pill())
                     }
                 }

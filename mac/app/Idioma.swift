@@ -463,6 +463,7 @@ private let EN: [String: String] = [
     "También en el visor, con SteamVR. Usan casi un núcleo de la CPU mientras Steam está abierto, así que los juegos pueden andar más lento.": "Also in the headset, with SteamVR. They use almost a full CPU core while Steam is open, so games can run slower.",
     "Se aplica al reiniciar Steam (si hay un juego abierto, también se cierra).": "Takes effect when Steam restarts (an open game closes too).",
     "Mostrar": "Show",
+    "Ocultar": "Hide",
     "Mostrando Steam": "Showing Steam",
     "🔑 Un Quest quiere conectarse: escribí el código %@ en el Quest": "🔑 A Quest wants to connect: enter code %@ on the Quest",
     "✓ Quest emparejado: ya se puede conectar solo": "✓ Quest paired: it can now connect on its own",
