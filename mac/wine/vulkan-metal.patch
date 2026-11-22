@@ -31,7 +31,7 @@ diff -ru a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
  {
 diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
 --- a/dlls/win32u/vulkan.c	2026-11-21 07:05:48.507666318 +0000
-+++ b/dlls/win32u/vulkan.c	2026-11-22 20:56:10.404347694 +0000
++++ b/dlls/win32u/vulkan.c	2026-11-22 21:11:49.471947255 +0000
 @@ -46,6 +46,18 @@
  
  static const struct vulkan_driver_funcs *driver_funcs;
@@ -200,7 +200,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      device->extensions.has_VK_KHR_win32_keyed_mutex = 0;
      device->extensions.has_VK_KHR_external_memory_win32 = 0;
      device->extensions.has_VK_KHR_external_fence_win32 = 0;
-@@ -872,6 +959,8 @@
+@@ -872,8 +959,11 @@
      VkImportMemoryHostPointerInfoEXT host_pointer_info, *pointer_info = NULL;
      VkExportMemoryWin32HandleInfoKHR export_win32 = {.dwAccess = GENERIC_ALL};
      VkImportMemoryWin32HandleInfoKHR *import_win32 = NULL;
@@ -208,8 +208,22 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
 +                                                   .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT};
      VkDeviceMemory host_device_memory = VK_NULL_HANDLE;
      VkExportMemoryAllocateInfo *export_info = NULL;
++    VkImage dedicated_image = VK_NULL_HANDLE;
      struct device_memory *memory;
-@@ -924,7 +1013,38 @@
+     BOOL nt_shared = FALSE;
+     uint32_t mem_flags;
+@@ -908,7 +998,9 @@
+             *next = (*next)->pNext; next = &prev;
+             break;
+         case VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO: break;
+-        case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO: break;
++        case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO:
++            dedicated_image = ((VkMemoryDedicatedAllocateInfo *)*next)->image;
++            break;
+         case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_TENSOR_ARM: break;
+         case VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO: break;
+         case VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT: break;
+@@ -924,7 +1016,38 @@
  
      if (!(memory = calloc( 1, sizeof(*memory) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
  
@@ -249,7 +263,24 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      {
          switch (import_win32->handleType)
          {
-@@ -1020,6 +1140,7 @@
+@@ -982,6 +1105,16 @@
+ 
+     if ((res = device->p_vkAllocateMemory( device->host.device, alloc_info, NULL, &host_device_memory ))) goto failed;
+ 
++    /* VRmin: MoltenVK 1.4.1 keeps the image's own new texture instead of the imported one (initExternalMemory replaces
++     * it), so what the game draws never reaches the shared texture: give the image the imported texture itself */
++    if (memory->metal_texture && dedicated_image)
++    {
++        static VkResult (*set_texture)( VkImage, void * );
++        if (!set_texture) set_texture = dlsym( vulkan_handle, "vkSetMTLTextureMVK" );
++        if (!set_texture || set_texture( dedicated_image, memory->metal_texture ))
++            WARN( "Couldn't give image %s its shared Metal texture\n", wine_dbgstr_longlong( dedicated_image ) );
++    }
++
+     if (export_info)
+     {
+         if (!memory->local)
+@@ -1020,6 +1153,7 @@
      WARN( "Failed to allocate memory, res %d\n", res );
      if (host_device_memory) device->p_vkFreeMemory( device->host.device, host_device_memory, NULL );
      if (memory->semaphore) device->p_vkDestroySemaphore( device->host.device, memory->semaphore, NULL );
@@ -257,7 +288,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      d3dkmt_destroy_resource( memory->local );
      d3dkmt_destroy_mutex( memory->mutex );
      d3dkmt_destroy_sync( memory->sync );
-@@ -1058,6 +1179,7 @@
+@@ -1058,6 +1192,7 @@
      }
  
      if (memory->semaphore) device->p_vkDestroySemaphore( device->host.device, memory->semaphore, NULL );
@@ -265,7 +296,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      if (memory->shared) NtClose( memory->shared );
      d3dkmt_destroy_resource( memory->local );
      d3dkmt_destroy_mutex( memory->mutex );
-@@ -1907,9 +2029,10 @@
+@@ -1907,9 +2042,10 @@
      if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
          !extents_equals( &swapchain->extents, &client_rect ))
      {
@@ -278,7 +309,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      }
  
      return res;
-@@ -1933,9 +2056,10 @@
+@@ -1933,9 +2069,10 @@
      if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
          !extents_equals( &swapchain->extents, &client_rect ))
      {
@@ -291,7 +322,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      }
  
      return res;
-@@ -2001,10 +2125,9 @@
+@@ -2001,10 +2138,9 @@
              WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
          else if (!extents_equals( &swapchain->extents, &client_rect ))
          {
@@ -304,7 +335,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
          }
      }
  
-@@ -2070,7 +2193,17 @@
+@@ -2070,7 +2206,17 @@
              .deviceIndex = 0,
          };
  
@@ -323,7 +354,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
          submit.value = memory->semaphore_value = acquire.FenceValue;
          submits[count++] = submit;
      }
-@@ -2125,7 +2258,8 @@
+@@ -2125,7 +2271,8 @@
              .deviceIndex = 0,
          };
  
