@@ -1100,7 +1100,8 @@ final class GameProfiles {
         o["own"] = own
         if !current.isEmpty {
             let g = effective(current)
-            o["game"] = ["name": current, "scale": g.scale, "auto": g.auto, "fovk": g.fovk, "index": g.index, "vive": g.vive, "own": hasOwn(current)]
+            o["game"] = ["name": current, "scale": g.scale, "auto": g.auto, "fovk": g.fovk, "index": g.index, "vive": g.vive, "own": hasOwn(current),
+                         "steamvr": game.steamVROn]   // (con SteamVR real los controles los maneja SteamVR)
         }
         return o
     }
@@ -1164,6 +1165,7 @@ final class GameLink {
     var sendNative: (Data) -> Void = { _ in }
     /// La conexión del driver de SteamVR (-1: no hay): con SteamVR real el Quest muestra tus manos reales en el juego
     private var steamVRFd: Int32 = -1
+    var steamVROn: Bool { lock.lock(); defer { lock.unlock() }; return steamVRFd >= 0 }
     /// Le dice al Quest si el juego corre con SteamVR real (también cuando el Quest se vuelve a conectar)
     func sendSteamVR() {
         lock.lock(); let on = steamVRFd >= 0; lock.unlock()
@@ -3419,14 +3421,16 @@ final class Lobby {
         let q = launchingQ
         lock.unlock()
         if gameActive { return nil }
-        if let q { return ["id": q.id, "name": q.name, "t": q.t] }
+        // (lanzando.txt lo escribe jugar.sh: el juego, cuándo y con qué runtime)
         let path = dataDir + "/lanzando.txt"
-        guard !dataDir.isEmpty, let m = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date,
-              Date().timeIntervalSince(m) < 90, m > lastGameActive,
-              let txt = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
-        let f = txt.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\t")
+        var f: [String] = []
+        if !dataDir.isEmpty, let m = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date,
+           Date().timeIntervalSince(m) < 90, m > lastGameActive, let txt = try? String(contentsOfFile: path, encoding: .utf8) {
+            f = txt.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\t")
+        }
+        if let q { return ["id": q.id, "name": q.name, "t": q.t, "runtime": f.count >= 4 && f[0] == q.id ? f[3] : ""] }
         guard f.count >= 3 else { return nil }
-        return ["id": f[0], "name": f[1], "t": Int(f[2]) ?? 0]
+        return ["id": f[0], "name": f[1], "t": Int(f[2]) ?? 0, "runtime": f.count >= 4 ? f[3] : ""]
     }
 
     private func launch(_ g: GameEntry) {

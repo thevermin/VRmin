@@ -263,6 +263,11 @@ static std::atomic<int> g_cfgEyeW{0}, g_cfgEyeH{0}, g_cfgFps{0};
 static std::atomic<int> g_cfgNativeW{0}, g_cfgNativeH{0};   // (the Quest's own resolution per eye, from VRmin Host)
 static std::atomic<float> g_cfgFovK{1.f};
 static std::atomic<unsigned> g_haptics{0};   // (vibrations sent to the Quest, for the log)
+// SteamVR's menu (dashboard): VRmin opens games straight from Wine, not from that menu, so it stays open over a game
+// that starts and you had to press «Resume». When a game starts sending frames, VRmin closes it once as the menu
+// button does (a short press of the left controller's system button), only while SteamVR says the menu is open.
+static std::atomic<bool> g_dashboard{false};
+static std::atomic<double> g_closeMenuFrom{0}, g_closeMenuUntil{0}, g_systemPressUntil{0};
 
 static void parse_pose(const char *line) {
   const char *p = strstr(line, "\"xr\":");
@@ -976,6 +981,10 @@ public:
       st.handle[i] = out->rSharedTextureHandles[i] = (SharedTextureHandle_t)(uintptr_t)h;
     }
     sets.push_back(st);
+    if (!st.compositor) {
+      static uint32_t lastGame = 0;
+      if (pid != lastGame) { lastGame = pid; g_closeMenuFrom = now_s() + 1.5; g_closeMenuUntil = now_s() + 20; }
+    }
     logf("Direct mode: textures for process %u%s: %ux%u, format %u, %u samples", pid, st.compositor ? " (SteamVR's)" : "", d.Width, d.Height,
          desc->nFormat, d.SampleDesc.Count);
   }
@@ -1417,7 +1426,7 @@ public:
     in->UpdateBooleanComponent(lowerTouch, v[IN_ATOUCH] > 0.5f || v[IN_A] > 0.5f, 0);
     in->UpdateBooleanComponent(upper, v[IN_B] > 0.5f, 0);
     in->UpdateBooleanComponent(upperTouch, v[IN_BTOUCH] > 0.5f || v[IN_B] > 0.5f, 0);
-    if (left) in->UpdateBooleanComponent(system, v[IN_MENU] > 0.5f, 0);
+    if (left) in->UpdateBooleanComponent(system, v[IN_MENU] > 0.5f || now_s() < g_systemPressUntil, 0);
   }
 };
 
@@ -1510,6 +1519,14 @@ public:
           }
         continue;
       }
+      if (e.eventType == VREvent_DashboardActivated && !g_dashboard.exchange(true)) logf("SteamVR's menu opened");
+      if (e.eventType == VREvent_DashboardDeactivated && g_dashboard.exchange(false)) logf("SteamVR's menu closed");
+    }
+    const double t = now_s();
+    if (g_closeMenuFrom > 0 && t >= g_closeMenuFrom && t < g_closeMenuUntil && g_dashboard && t >= g_systemPressUntil + 1) {
+      g_closeMenuFrom = 0;   // (once per game)
+      g_systemPressUntil = t + 0.15;
+      logf("The game started: closing SteamVR's menu (as «Resume»)");
     }
   }
   bool ShouldBlockStandbyMode() override { return false; }

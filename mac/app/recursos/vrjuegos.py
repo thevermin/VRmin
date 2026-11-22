@@ -412,6 +412,15 @@ def steamvr_instalado():
     return os.path.isfile(os.path.join(STEAMAPPS, "common", "SteamVR", "bin", "win64", "vrserver.exe"))
 
 
+def vulkan_steamvr_listo():
+    # (el Wine de VRmin que le pasa a SteamVR las imágenes de Vulkan: abre las texturas compartidas de DXMT)
+    try:
+        with open(os.path.join(DATOS, "motor", "wswine.bundle", "lib", "wine", "x86_64-unix", "win32u.so"), "rb") as f:
+            return b"DXMT_shared_resource_" in f.read()
+    except OSError:
+        return False
+
+
 def opencomposite_instalado():
     return os.path.isfile(os.path.join(C, "questvrbridge", "opencomposite", "bin", "vrclient_x64.dll"))
 
@@ -484,11 +493,9 @@ def resolver_juego(juego, det=None):
         falta = T("el driver de VRmin para SteamVR") if steamvr_instalado() else T("SteamVR (instalalo desde Steam) y el driver de VRmin")
         avisos.append(T("SteamVR real: falta %s. Se usa OpenVR") % falta)
         runtime = "openvr"
-    # SteamVR real solo recibe imágenes de DirectX 11 dentro del Windows de VRmin: los juegos que dibujan con Vulkan
-    # (Half-Life 2: VR Mod) le mandan imágenes que no puede abrir
-    # (prueba: con el Wine que le pasa a SteamVR las imágenes de Vulkan, el archivo .probar_vulkan_steamvr en la carpeta
-    #  de VRmin deja usar SteamVR real igual)
-    if runtime == "steamvr" and not os.path.exists(os.path.join(DATOS, ".probar_vulkan_steamvr")) and (det.get("solo_vulkan")
+    # Los juegos que dibujan con Vulkan (DOOM VFR, Half-Life 2: VR Mod) le pasan sus imágenes a SteamVR real como
+    # texturas compartidas de Windows: hace falta el Wine de VRmin que las abre en Metal. Con un motor anterior, OpenVR.
+    if runtime == "steamvr" and not vulkan_steamvr_listo() and (det.get("solo_vulkan")
                                  or any(str(a).lower() in ("-vulkan", "-force-vulkan") for a in list(inc.get("args", [])) + list(usr.get("args", [])))):
         avisos.append(T("SteamVR real todavía no anda con juegos que usan Vulkan: se usa %s") % NOMBRES[inc.get("runtime") or "openvr"])
         runtime = inc.get("runtime") or "openvr"

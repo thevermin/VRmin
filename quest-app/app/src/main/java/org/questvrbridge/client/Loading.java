@@ -74,6 +74,9 @@ final class Loading {
             if (!key.equals(launchKey) && !dismissed) { launchKey = key; begin(l.optString("id"), l.optString("name")); }
         }
         if (phase == OPENING) {
+            // (con SteamVR real se abre SteamVR antes que el juego: tarda más)
+            if (l != null && "steamvr".equals(l.optString("runtime")) && !g && sub != null)
+                sub.setText(I18n.t("Se está abriendo SteamVR: el juego va a tardar un poco más. Solo hay que esperar."));
             if (isFailure(st)) fail(st);
             else if (g) setStatus(I18n.t("Entrando en VR…"));
             else if (!st.isEmpty()) setStatus(st);
