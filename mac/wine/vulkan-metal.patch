@@ -31,7 +31,7 @@ diff -ru a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
  {
 diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
 --- a/dlls/win32u/vulkan.c	2026-11-21 07:05:48.507666318 +0000
-+++ b/dlls/win32u/vulkan.c	2026-11-22 21:27:50.177287434 +0000
++++ b/dlls/win32u/vulkan.c	2026-11-22 23:42:13.740757553 +0000
 @@ -46,6 +46,18 @@
  
  static const struct vulkan_driver_funcs *driver_funcs;
@@ -168,13 +168,17 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      if (extensions.has_VK_KHR_external_fence_fd) return VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_FD_BIT;
      return 0;
  }
-@@ -531,14 +618,16 @@
+@@ -531,14 +618,19 @@
          else TRACE( "Using VK_EXT_external_memory_host for memory mapping with alignment: %u\n", physical_device->external_memory_align );
      }
  
 -    driver_funcs->p_map_device_extensions( &extensions );
+-    if (extensions.has_VK_KHR_external_memory_win32 && zero_bits && !physical_device->map_placed_align)
 +    map_device_extensions( &extensions );
-     if (extensions.has_VK_KHR_external_memory_win32 && zero_bits && !physical_device->map_placed_align)
++    /* (VRmin: shared textures over Metal are never mapped by the program, so 32-bit programs can share them too:
++     *  SteamVR needs it in a 32-bit Vulkan game, Half-Life 2: VR Mod) */
++    if (extensions.has_VK_KHR_external_memory_win32 && zero_bits && !physical_device->map_placed_align &&
++        !extensions.has_VK_EXT_external_memory_metal)
      {
          WARN( "Cannot export WOW64 memory without VK_EXT_map_memory_placed\n" );
          extensions.has_VK_KHR_external_memory_win32 = 0;
@@ -187,7 +191,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
  
      /* filter out unsupported client device extensions */
  #define USE_VK_EXT(x) client_physical_device->extensions.has_ ## x = extensions.has_ ## x;
-@@ -680,11 +769,14 @@
+@@ -680,11 +772,14 @@
      if (device->extensions.has_VK_KHR_win32_keyed_mutex)
      {
          device->extensions.has_VK_KHR_timeline_semaphore = 1;
@@ -205,7 +209,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      device->extensions.has_VK_KHR_win32_keyed_mutex = 0;
      device->extensions.has_VK_KHR_external_memory_win32 = 0;
      device->extensions.has_VK_KHR_external_fence_win32 = 0;
-@@ -872,8 +964,11 @@
+@@ -872,8 +967,11 @@
      VkImportMemoryHostPointerInfoEXT host_pointer_info, *pointer_info = NULL;
      VkExportMemoryWin32HandleInfoKHR export_win32 = {.dwAccess = GENERIC_ALL};
      VkImportMemoryWin32HandleInfoKHR *import_win32 = NULL;
@@ -217,7 +221,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      struct device_memory *memory;
      BOOL nt_shared = FALSE;
      uint32_t mem_flags;
-@@ -908,7 +1003,9 @@
+@@ -908,7 +1006,9 @@
              *next = (*next)->pNext; next = &prev;
              break;
          case VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO: break;
@@ -228,7 +232,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
          case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_TENSOR_ARM: break;
          case VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO: break;
          case VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT: break;
-@@ -924,8 +1021,40 @@
+@@ -924,8 +1024,40 @@
  
      if (!(memory = calloc( 1, sizeof(*memory) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
  
@@ -270,7 +274,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
          switch (import_win32->handleType)
          {
          case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT:
-@@ -982,8 +1111,21 @@
+@@ -982,8 +1114,21 @@
  
      if ((res = device->p_vkAllocateMemory( device->host.device, alloc_info, NULL, &host_device_memory ))) goto failed;
  
@@ -292,7 +296,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
          if (!memory->local)
          {
              VkMemoryGetFdInfoKHR get_fd_info = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = host_device_memory};
-@@ -1020,6 +1162,7 @@
+@@ -1020,6 +1165,7 @@
      WARN( "Failed to allocate memory, res %d\n", res );
      if (host_device_memory) device->p_vkFreeMemory( device->host.device, host_device_memory, NULL );
      if (memory->semaphore) device->p_vkDestroySemaphore( device->host.device, memory->semaphore, NULL );
@@ -300,7 +304,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      d3dkmt_destroy_resource( memory->local );
      d3dkmt_destroy_mutex( memory->mutex );
      d3dkmt_destroy_sync( memory->sync );
-@@ -1058,6 +1201,7 @@
+@@ -1058,6 +1204,7 @@
      }
  
      if (memory->semaphore) device->p_vkDestroySemaphore( device->host.device, memory->semaphore, NULL );
@@ -308,7 +312,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      if (memory->shared) NtClose( memory->shared );
      d3dkmt_destroy_resource( memory->local );
      d3dkmt_destroy_mutex( memory->mutex );
-@@ -1907,9 +2051,10 @@
+@@ -1907,9 +2054,10 @@
      if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
          !extents_equals( &swapchain->extents, &client_rect ))
      {
@@ -321,7 +325,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      }
  
      return res;
-@@ -1933,9 +2078,10 @@
+@@ -1933,9 +2081,10 @@
      if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
          !extents_equals( &swapchain->extents, &client_rect ))
      {
@@ -334,7 +338,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      }
  
      return res;
-@@ -2001,10 +2147,9 @@
+@@ -2001,10 +2150,9 @@
              WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
          else if (!extents_equals( &swapchain->extents, &client_rect ))
          {
@@ -347,7 +351,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
          }
      }
  
-@@ -2070,7 +2215,17 @@
+@@ -2070,7 +2218,17 @@
              .deviceIndex = 0,
          };
  
@@ -366,7 +370,7 @@ diff -ru a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
          submit.value = memory->semaphore_value = acquire.FenceValue;
          submits[count++] = submit;
      }
-@@ -2125,7 +2280,8 @@
+@@ -2125,7 +2283,8 @@
              .deviceIndex = 0,
          };
  
