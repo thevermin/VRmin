@@ -124,13 +124,25 @@ static vk_fn propia(const char* name) {
   if (!strcmp(name, "vkGetDeviceProcAddr") && mvk_gdpa) return (vk_fn) vrmin_gdpa;
   return NULL;
 }
+// Funciones de Vulkan 1.1 o más pedidas por su nombre sin «KHR» en un juego que creó Vulkan 1.0 (DOOM VFR): MoltenVK
+// no las da, Windows sí. SteamVR las pide así (vkGetPhysicalDeviceImageFormatProperties2) y sin ellas rechaza las
+// imágenes del juego («TextureUsesUnsupportedFormat»). Si falta, se da la de la extensión, que es la misma función.
+static vk_fn con_khr(vk_gipa gpa, void* obj, const char* name) {
+  char khr[128];
+  size_t n = name ? strlen(name) : 0;
+  if (!n || n + 4 > sizeof khr || strncmp(name, "vk", 2) || (n > 3 && !strcmp(name + n - 3, "KHR"))) return NULL;
+  memcpy(khr, name, n); memcpy(khr + n, "KHR", 4);
+  return gpa(obj, khr);
+}
 static vk_fn vrmin_gdpa(void* device, const char* name) {
   vk_fn f = propia(name);
-  return f ? f : mvk_gdpa(device, name);
+  if (!f) f = mvk_gdpa(device, name);
+  return f ? f : con_khr(mvk_gdpa, device, name);
 }
 static vk_fn vrmin_gipa(void* instance, const char* name) {
   vk_fn f = propia(name);
-  return f ? f : mvk_gipa(instance, name);
+  if (!f) f = mvk_gipa(instance, name);
+  return f ? f : con_khr(mvk_gipa, instance, name);
 }
 static void* vrmin_dlsym(void* handle, const char* name) {
   void* p = dlsym(handle, name);
