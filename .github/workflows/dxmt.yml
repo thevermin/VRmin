@@ -2,8 +2,7 @@ name: DXMT para VRmin
 
 # DXMT (DirectX 11 → Metal) compilado desde el código: por defecto, el oficial (3Shain/dxmt v0.80, la última versión
 # MIT: las siguientes son LGPL) con MSAA 8x → 4x (mac/dxmt/msaa-8x-to-4x.patch) y el arreglo de la ventana de Metal
-# para el Wine de Gcenx (vista-metal.patch). Con notpop/dxmt (el fork que se usaba antes) va fork-iomanip.patch en vez
-# de vista-metal.patch.
+# para el Wine de Gcenx (vista-metal.patch; notpop/dxmt, el fork que se usaba antes, no lo necesita).
 # Mismos pasos que el CI de DXMT. Deja un .tar.gz con la misma forma que el que instala instalar_motor.sh
 # (x86_64-windows/, i386-windows/, x86_64-unix/winemetal.so).
 on:
@@ -78,8 +77,8 @@ jobs:
         run: |
           git apply ../vrmin/mac/dxmt/msaa-8x-to-4x.patch
           git apply ../vrmin/mac/dxmt/shared-buffer-handle.patch   # (SteamVR's compositor)
-          if [ "$DXMT_REPO" = 3Shain/dxmt ]; then git apply ../vrmin/mac/dxmt/vista-metal.patch
-          else git apply ../vrmin/mac/dxmt/fork-iomanip.patch; fi   # (el fork no compila con el mingw de ahora sin esto)
+          if [ "$DXMT_REPO" = 3Shain/dxmt ]; then git apply ../vrmin/mac/dxmt/vista-metal.patch; fi
+          git apply ../vrmin/mac/dxmt/fork-iomanip.patch   # (no compila con el mingw de ahora sin esto)
           git apply ../vrmin/mac/dxmt/reshare-opened-textures.patch   # (los paneles del menú de SteamVR)
           git apply ../vrmin/mac/dxmt/keyed-mutex.patch   # (el proceso de la placa de video de Chromium)
           git apply ../vrmin/mac/dxmt/dxgi-usage.patch   # (ídem: ANGLE)
@@ -108,7 +107,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/pkg"
           test -f x86_64-unix/winemetal.so && test -f x86_64-windows/d3d11.dll && test -f x86_64-windows/winemetal.dll
           cp "$GITHUB_WORKSPACE/dxmt/LICENSE" LICENSE-DXMT.txt
-          echo "DXMT ${DXMT_REPO}@${DXMT_COMMIT} + VRmin mac/dxmt/msaa-8x-to-4x.patch + shared-buffer-handle.patch + reshare-opened-textures.patch + keyed-mutex.patch + dxgi-usage.patch + offscreen-swapchain.patch + child-window.patch$( [ "$DXMT_REPO" = 3Shain/dxmt ] && echo ' + vista-metal.patch')" > VERSION.txt
+          echo "DXMT ${DXMT_REPO}@${DXMT_COMMIT} + VRmin mac/dxmt/msaa-8x-to-4x.patch + shared-buffer-handle.patch + reshare-opened-textures.patch + keyed-mutex.patch + dxgi-usage.patch + offscreen-swapchain.patch + child-window.patch + fork-iomanip.patch$( [ "$DXMT_REPO" = 3Shain/dxmt ] && echo ' + vista-metal.patch')" > VERSION.txt
           tar -czf "$GITHUB_WORKSPACE/dxmt-vrmin.tar.gz" .
           cd "$GITHUB_WORKSPACE" && shasum -a 256 dxmt-vrmin.tar.gz | tee dxmt-vrmin.tar.gz.sha256
       - uses: actions/upload-artifact@v4
