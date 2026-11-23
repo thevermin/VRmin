@@ -1,8 +1,9 @@
 name: DXMT para VRmin
 
-# DXMT (DirectX 11 → Metal) compilado desde el código: por defecto, el de notpop/dxmt (rama debug/present-path-tracing,
-# la misma de la que sale el DXMT que instala instalar_motor.sh) con MSAA 8x → 4x (mac/dxmt/msaa-8x-to-4x.patch). Con
-# 3Shain/dxmt (el oficial) se aplica además el arreglo de la ventana de Metal para el Wine de Gcenx (vista-metal.patch).
+# DXMT (DirectX 11 → Metal) compilado desde el código: por defecto, el oficial (3Shain/dxmt v0.80, la última versión
+# MIT: las siguientes son LGPL) con MSAA 8x → 4x (mac/dxmt/msaa-8x-to-4x.patch) y el arreglo de la ventana de Metal
+# para el Wine de Gcenx (vista-metal.patch). Con notpop/dxmt (el fork que se usaba antes) va fork-iomanip.patch en vez
+# de vista-metal.patch.
 # Mismos pasos que el CI de DXMT. Deja un .tar.gz con la misma forma que el que instala instalar_motor.sh
 # (x86_64-windows/, i386-windows/, x86_64-unix/winemetal.so).
 on:
@@ -10,17 +11,17 @@ on:
     inputs:
       repo:
         description: Repositorio de DXMT
-        default: notpop/dxmt
+        default: 3Shain/dxmt
       commit:
         description: Commit
-        default: 924a607e3eee06fad5be6f176d8510bb08bc418d
+        default: 589adb780354b461645b29999cefaf533594ee99
   push:
     branches: [main]
     paths: ['mac/dxmt/**', '.github/workflows/dxmt.yml']
 
 env:
-  DXMT_REPO: ${{ inputs.repo || 'notpop/dxmt' }}
-  DXMT_COMMIT: ${{ inputs.commit || '924a607e3eee06fad5be6f176d8510bb08bc418d' }}
+  DXMT_REPO: ${{ inputs.repo || '3Shain/dxmt' }}
+  DXMT_COMMIT: ${{ inputs.commit || '589adb780354b461645b29999cefaf533594ee99' }}
   LLVM_VERSION: llvmorg-15.0.7
   WINE_VERSION: v8.16-3shain
   WINE_URL: https://github.com/3Shain/wine/releases/download/v8.16-3shain/wine.tar.gz
