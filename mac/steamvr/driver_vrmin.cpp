@@ -20,7 +20,9 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <string>
@@ -494,7 +496,13 @@ class FrameSender {
   ID3D11Device *dev = nullptr;
   ID3D11DeviceContext *ctx = nullptr;
   ID3D11DeviceContext3 *ctx3 = nullptr;   // (Flush1 with an event: set when the GPU finished the copy)
-  HANDLE copied = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  // The copies the GPU hasn't finished, in order: a thread tells VRmin Host about each one when its event is set, so
+  // SteamVR's compositor doesn't wait for the GPU in Present and PostPresent (waiting there, it missed frames:
+  // "WaitForAcquire timed out" in vrcompositor.txt). Without Flush1, finish() waits as before.
+  struct Copy { int slot; uint32_t pose, w, h, gen; };
+  std::deque<Copy> copies;
+  HANDLE doneEv[SLOTS] = {};
+  std::condition_variable wake;
   bool failed = false;   // (no D3D11 or no shared textures: frames aren't sent)
   // image connection
   SOCKET fs = INVALID_SOCKET;
@@ -610,6 +618,10 @@ private:
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx);
     if (FAILED(hr)) { logf("Frames: no D3D11 device (%lx)", (unsigned long)hr); return false; }
     if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext3), (void **)&ctx3))) ctx3 = nullptr;
+    if (ctx3) {
+      for (HANDLE &e : doneEv) e = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+      std::thread([this] { notify_loop(); }).detach();
+    }
     HMODULE gdi = LoadLibraryA("gdi32.dll");
     kmt_fn kOpenAd = (kmt_fn)GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid"), kCreate = (kmt_fn)GetProcAddress(gdi, "D3DKMTCreateDevice");
     kQuery = (kmt_fn)GetProcAddress(gdi, "D3DKMTQueryResourceInfo");
@@ -809,7 +821,7 @@ public:
     D3D11_TEXTURE2D_DESC sd = {};
     sd.Width = (box[0].right - box[0].left) * 2; sd.Height = box[0].bottom - box[0].top; sd.Format = fmt;
     if (!ready(sd)) return;
-    if (pending >= 0) finish();
+    if (!ctx3 && pending >= 0) finish();
     int slot = -1;
     for (int i = 0; i < SLOTS && slot < 0; i++) if (shm->state[i] == 0) slot = i;
     if (slot < 0) { dropped++; return; }   // (VRmin Host is still busy with the 3)
@@ -821,8 +833,14 @@ public:
     }
     draw_overlays(tex[slot], sd.Width / 2, sd.Height, over);
     ctx->End(query[slot]);
-    if (ctx3 && copied) { ResetEvent(copied); ctx3->Flush1(D3D11_CONTEXT_TYPE_ALL, copied); }
-    else ctx->Flush();
+    if (ctx3) {
+      ResetEvent(doneEv[slot]);
+      ctx3->Flush1(D3D11_CONTEXT_TYPE_ALL, doneEv[slot]);
+      copies.push_back({(int)slot, pose, sd.Width / 2, sd.Height, gen});
+      wake.notify_one();
+      return;
+    }
+    ctx->Flush();
     pending = slot;
     pendingPose = pose;
     pendingW = sd.Width / 2;
@@ -833,8 +851,6 @@ public:
   void finish() {
     if (pending < 0 || fs == INVALID_SOCKET) return;
     BOOL done = FALSE;
-    // (waits for the event instead of asking the GPU in a loop, which kept a CPU core busy in vrserver)
-    if (ctx3 && copied) WaitForSingleObject(copied, 20);
     for (double until = now_s() + 0.02; ctx->GetData(query[pending], &done, sizeof done, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK;) {
       if (now_s() > until) return;   // (checked again with the next frame)
       Sleep(1);
@@ -845,6 +861,26 @@ public:
     shm->state[slot] = 1;
     if (!notify(slot, pendingPose, pendingW, pendingH)) { shm->state[slot] = 0; close_connection("lost; trying again"); return; }
     sent++;
+  }
+
+  // (its thread) Tells VRmin Host about each copy when the GPU finished it; a copy whose connection or textures
+  // changed meanwhile, or that the GPU didn't finish in a second, frees its slot
+  void notify_loop() {
+    std::unique_lock<std::mutex> g(lock);
+    for (;;) {
+      wake.wait(g, [this] { return !copies.empty(); });
+      Copy c = copies.front();
+      g.unlock();
+      bool done = WaitForSingleObject(doneEv[c.slot], 1000) == WAIT_OBJECT_0;
+      g.lock();
+      copies.pop_front();
+      if (!shm) continue;
+      if (!done || stage != ON || c.gen != gen) { shm->state[c.slot] = 0; continue; }
+      MemoryBarrier();
+      shm->state[c.slot] = 1;
+      if (!notify(c.slot, c.pose, c.w, c.h)) { shm->state[c.slot] = 0; close_connection("lost; trying again"); continue; }
+      sent++;
+    }
   }
 };
 
@@ -1064,7 +1100,7 @@ public:
     // The Quest's rates, and that the rate can change with SteamVR open (when VRmin Host asks for another one)
     VRProperties()->SetBoolProperty(c, Prop_DisplaySupportsMultipleFramerates_Bool, true);
     VRProperties()->SetBoolProperty(c, Prop_DisplaySupportsRuntimeFramerateChange_Bool, true);
-    VRProperties()->SetProperty(c, Prop_DisplayAvailableFrameRates_Float_Array, (void *)RATES, sizeof RATES, k_unFloatPropertyTag);
+    set_rates(c);
     VRProperties()->SetFloatProperty(c, Prop_SecondsFromVsyncToPhotons_Float, 0.011f);
     VRProperties()->SetUint64Property(c, Prop_CurrentUniverseId_Uint64, UNIVERSE);
     VRProperties()->SetBoolProperty(c, Prop_IsOnDesktop_Bool, false);
@@ -1084,13 +1120,22 @@ public:
     logf("Headset activated (device %u): %ux%u per eye, %.0f Hz", id, EYE_W, EYE_H, HZ.load());
     return VRInitError_None;
   }
+  // The rates SteamVR accepts: the Quest's, and the current one if the Quest doesn't have it (half of one, for frame
+  // generation)
+  static void set_rates(PropertyContainerHandle_t c) {
+    std::vector<float> rates(std::begin(RATES), std::end(RATES));
+    if (std::find(rates.begin(), rates.end(), HZ.load()) == rates.end()) rates.insert(rates.begin(), HZ.load());
+    VRProperties()->SetProperty(c, Prop_DisplayAvailableFrameRates_Float_Array, rates.data(), (uint32_t)(rates.size() * sizeof(float)), k_unFloatPropertyTag);
+  }
   // VRmin Host asked for another rate (its quality settings, or frame generation: the game draws half the frames):
   // SteamVR switches to it without closing, and the frames go to VRmin Host at that rate
   void applyRate(int fps) {
     if (id == k_unTrackedDeviceIndexInvalid || fps <= 0 || (float)fps == HZ.load()) return;
     logf("Rate: %.0f Hz -> %d Hz (asked by VRmin Host)", HZ.load(), fps);
     HZ = (float)fps;
-    VRProperties()->SetFloatProperty(VRProperties()->TrackedDeviceToPropertyContainer(id), Prop_DisplayFrequency_Float, (float)fps);
+    PropertyContainerHandle_t c = VRProperties()->TrackedDeviceToPropertyContainer(id);
+    set_rates(c);
+    VRProperties()->SetFloatProperty(c, Prop_DisplayFrequency_Float, (float)fps);
   }
   void Deactivate() override { id = k_unTrackedDeviceIndexInvalid; }
   void EnterStandby() override {}
