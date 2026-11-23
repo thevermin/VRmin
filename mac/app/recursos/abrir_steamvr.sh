@@ -32,8 +32,6 @@ preparar_runtime steamvr || exit 1
 ajustes_dll
 gpu_luid_dxmt
 microfono_wine
-# (sin el cartel «Abriendo…» de jugar.sh: acá no hay un juego que esperar)
-rm -f "$Q/steamvr_abriendo.txt"
 # (si quedó abierto por un juego, el vigía de ese juego lo cerraría cuando el juego se cierre: ahora queda abierto)
 v="$(cat "$Q/.vigia_steamvr" 2>/dev/null)"; [ -n "$v" ] && kill "$v" 2>/dev/null; rm -f "$Q/.vigia_steamvr"
 ya=0; pgrep -f 'vrserver\.exe' >/dev/null && ya=1

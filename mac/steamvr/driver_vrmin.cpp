@@ -792,54 +792,9 @@ private:
     return false;
   }
 
-  // The «Opening …» sign: text drawn by Windows (GDI) on a dark band, made again when the text changes
-  ID3D11Texture2D *msgTex = nullptr;
-  std::wstring msgFor;
 
 public:
   std::mutex &mutex() { return lock; }
-  // (with mutex() held) A texture with the text, 1024x160, white on a translucent dark band
-  ID3D11Texture2D *message_texture(const std::wstring &text) {
-    if (msgTex && text == msgFor) return msgTex;
-    if (!device()) return nullptr;
-    if (msgTex) { msgTex->Release(); msgTex = nullptr; }
-    const int W = 1024, H = 160;
-    HDC dc = CreateCompatibleDC(nullptr);
-    BITMAPINFO bi = {};
-    bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    void *bits = nullptr;
-    HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!bm || !bits) { DeleteDC(dc); return nullptr; }
-    HGDIOBJ oldBm = SelectObject(dc, bm);
-    memset(bits, 0, (size_t)W * H * 4);
-    HFONT f = CreateFontW(-64, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
-    HGDIOBJ oldF = SelectObject(dc, f);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(255, 255, 255));
-    RECT r = {24, 0, W - 24, H};
-    DrawTextW(dc, text.c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-    GdiFlush();
-    // (white text over black: the text's brightness is how much of it there is)
-    uint8_t *p = (uint8_t *)bits;
-    for (int i = 0; i < W * H; i++, p += 4) {
-      uint8_t l = std::max(p[0], std::max(p[1], p[2]));
-      p[0] = p[1] = p[2] = l;
-      p[3] = (uint8_t)(150 + l * 105 / 255);
-    }
-    D3D11_TEXTURE2D_DESC d = {};
-    d.Width = W; d.Height = H; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA init = {bits, W * 4, 0};
-    if (FAILED(dev->CreateTexture2D(&d, &init, &msgTex))) msgTex = nullptr;
-    SelectObject(dc, oldF);
-    SelectObject(dc, oldBm);
-    DeleteObject(f);
-    DeleteObject(bm);
-    DeleteDC(dc);
-    msgFor = text;
-    return msgTex;
-  }
   // (with mutex() held) D3D11 device of the driver, made the first time
   ID3D11Device *device() {
     if (!dev && !failed && !init_device()) failed = true;
@@ -907,40 +862,6 @@ class VRminDirectMode : public IVRDriverDirectModeComponent {
   uint64_t presented = 0, lastPresented = 0, lastSent = 0, gameFrames = 0;
   double t0 = now_s(), lastLog = 0, presentSum = 0, overSum = 0;
 
-  // The text of C:\questvrbridge\steamvr_abriendo.txt (written by VRmin Host when it opens a game with SteamVR), read
-  // once a second, while it's less than 5 minutes old; once the game's image arrives it's removed
-  std::wstring openingText;
-  double openingReadAt = 0;
-  std::wstring opening_message(bool gameShown) {
-    const wchar_t *path = L"C:\\questvrbridge\\steamvr_abriendo.txt";
-    if (gameShown) {
-      if (!openingText.empty() || openingReadAt == 0) { DeleteFileW(path); openingText.clear(); }
-      openingReadAt = now_s();
-      return L"";
-    }
-    double t = now_s();
-    if (t - openingReadAt < 1) return openingText;
-    openingReadAt = t;
-    openingText.clear();
-    WIN32_FILE_ATTRIBUTE_DATA fa;
-    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fa)) return openingText;
-    FILETIME nowFt;
-    GetSystemTimeAsFileTime(&nowFt);
-    ULARGE_INTEGER a, b;
-    a.LowPart = fa.ftLastWriteTime.dwLowDateTime; a.HighPart = fa.ftLastWriteTime.dwHighDateTime;
-    b.LowPart = nowFt.dwLowDateTime; b.HighPart = nowFt.dwHighDateTime;
-    if (b.QuadPart < a.QuadPart || b.QuadPart - a.QuadPart > 300ull * 10000000ull) return openingText;
-    FILE *f = _wfopen(path, L"rb");
-    if (!f) return openingText;
-    char buf[512] = {};
-    size_t n = fread(buf, 1, sizeof buf - 1, f);
-    fclose(f);
-    while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
-    wchar_t w[512] = {};
-    MultiByteToWideChar(CP_UTF8, 0, buf, -1, w, 511);
-    openingText = w;
-    return openingText;
-  }
 
   Set *find(SharedTextureHandle_t h, int *i) {
     for (Set &st : sets)
@@ -1047,12 +968,6 @@ public:
     bool go = base >= 0;
     SubmitLayerPerEye_t use[2];
     std::vector<Overlay> over;
-    bool gameShown = false;
-    if (go) {
-      int i;
-      Set *st = find(now[base].eye[0].hTexture, &i);
-      gameShown = st && !st->compositor;
-    }
     if (go) {
       use[0] = now[base].eye[0];
       use[1] = now[base].eye[1];
@@ -1068,25 +983,6 @@ public:
           o.rect[e][0] = tb.uMin; o.rect[e][1] = tb.vMin; o.rect[e][2] = tb.uMax; o.rect[e][3] = tb.vMax;
         }
         if (ok) over.push_back(o);
-      }
-      // Without the game yet (SteamVR's room): «Opening …» in front, from the file VRmin Host writes when it opens one
-      std::wstring msg = opening_message(gameShown);
-      if (!msg.empty()) {
-        ID3D11Texture2D *mt = frames.message_texture(msg);
-        if (mt) {
-          Overlay o;
-          o.tex[0] = o.tex[1] = mt;
-          for (int e = 0; e < 2; e++) { o.rect[e][0] = 0; o.rect[e][1] = 0; o.rect[e][2] = 1; o.rect[e][3] = 1; }
-          // (straight ahead in each eye: the eyes' fields of view aren't centered, so the same place in both images
-          //  would be seen double; 1 x 0.16 in tangents, a little below the middle)
-          for (int e = 0; e < 2; e++) {
-            const float *f = FOV[e];   // left, right, «top» (lower edge), «bottom» (upper edge)
-            float w = 1.0f / (f[1] - f[0]), h = 0.16f / (f[3] - f[2]);
-            float cx = -f[0] / (f[1] - f[0]), cy = (f[3] + 0.15f) / (f[3] - f[2]);
-            o.dst[e][0] = cx - w / 2; o.dst[e][1] = cy - h / 2; o.dst[e][2] = w; o.dst[e][3] = h;
-          }
-          over.push_back(o);
-        }
       }
     }
     if (go) {
