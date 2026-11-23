@@ -8738,8 +8738,10 @@ static void renderFrame(App &app) {
     float reveal = revealAmount(app);
     const float cross = crossAmount(app);
     if (app.hasPassthrough) {
-        // El cuarto real hace falta durante la transición, y en la sala para ver tus manos reales
-        bool need = reveal < 1.f || (g_rh.ok && g_realHands && !showVideo && !g_camMode) || (g_env == 3 && !showVideo);
+        // El cuarto real hace falta durante la transición, y en la sala para ver tus manos reales (y en un juego, con
+        // «Manos reales en el juego», cuando la cámara de VRmin no da imágenes: las manos con el passthrough de Meta)
+        const bool gameHandsPt = g_inGameNow && g_gameHands && !g_camMode;
+        bool need = reveal < 1.f || (g_rh.ok && g_realHands && (!showVideo || gameHandsPt) && !g_camMode) || (g_env == 3 && !showVideo);
         if (need && !app.ptRunning && app.ptStart) { app.ptStart(app.pt); app.ptRunning = true; }
         if (!need && app.ptRunning && app.ptPause) { app.ptPause(app.pt); app.ptRunning = false; }
     }
@@ -9141,7 +9143,8 @@ static void renderFrame(App &app) {
     const bool useCam = g_camMode && !ptRoom;
     realHandsUpdate(app, fs.predictedDisplayTime, handsHere && valid && g_realHands, useCam, g_camT);
     XrCompositionLayerPassthroughFB ptHands{XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB};
-    if (g_rh.ok && g_realHands && showUi && app.ptRunning && !useCam && nLayers < MAXL - 1 &&
+    // (en un juego, con «Manos reales en el juego» y sin imágenes de la cámara de VRmin: encima del juego)
+    if (g_rh.ok && g_realHands && (showUi || (g_inGameNow && g_gameHands)) && app.ptRunning && !useCam && nLayers < MAXL - 1 &&
         (g_rh.h[0].handShown || g_rh.h[1].handShown || g_rh.h[0].ctlShown || g_rh.h[1].ctlShown || g_rh.h[0].cmShown || g_rh.h[1].cmShown)) {
         ptHands.layerHandle = g_rh.layer;
         ptHands.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
