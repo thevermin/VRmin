@@ -101,6 +101,19 @@ static void fingir_cadena(const void* next) {
   for (const vk_base* b = next; b; b = b->pNext)
     if (b->sType == VK_ROBUSTNESS2) { uint32_t* r = (uint32_t*) ((char*) b + 16); r[0] = 1; r[2] = 1; }
 }
+// robustness2 de mentira tiene un costo: con robustBufferAccess2 el DirectX 9 de DXVK sube a la GPU solo las
+// constantes que cambiaron y cuenta con que leer de más dé cero, y en Metal lo que hay más allá es basura (barras negras
+// que titilan, el menú que no se dibuja). DXVK lo apaga solo si el tamaño de sus constantes no es múltiplo de esta
+// alineación («Disabling robust constant buffer access because of alignment»): con 8 KB no lo es y las sube todas.
+#define VK_ROBUSTNESS2_PROPS 1000286001
+static void (*mvk_props2)(void*, void*);
+static void (*mvk_props2khr)(void*, void*);
+static void alinear_robustness2(const void* next) {
+  for (const vk_base* b = next; b; b = b->pNext)
+    if (b->sType == VK_ROBUSTNESS2_PROPS) { uint64_t* a = (uint64_t*) ((char*) b + 16); a[0] = a[1] = 8192; }
+}
+static void vrmin_props2(void* gpu, void* p) { mvk_props2(gpu, p); if (dxvk()) alinear_robustness2(((vk_base*) p)->pNext); }
+static void vrmin_props2khr(void* gpu, void* p) { mvk_props2khr(gpu, p); if (dxvk()) alinear_robustness2(((vk_base*) p)->pNext); }
 static void (*mvk_features2)(void*, vk_features2*);
 static void (*mvk_features2khr)(void*, vk_features2*);
 static int32_t (*mvk_enum_dev_ext)(void*, const char*, uint32_t*, void*);
@@ -527,6 +540,8 @@ static vk_fn propia(const char* name) {
     if (!strcmp(name, "vkGetPhysicalDeviceFeatures2") && mvk_features2) return (vk_fn) vrmin_features2;
     if (!strcmp(name, "vkGetPhysicalDeviceFeatures2KHR") && mvk_features2khr) return (vk_fn) vrmin_features2khr;
     if (!strcmp(name, "vkEnumerateDeviceExtensionProperties") && mvk_enum_dev_ext) return (vk_fn) vrmin_enum_dev_ext;
+    if (!strcmp(name, "vkGetPhysicalDeviceProperties2") && mvk_props2) return (vk_fn) vrmin_props2;
+    if (!strcmp(name, "vkGetPhysicalDeviceProperties2KHR") && mvk_props2khr) return (vk_fn) vrmin_props2khr;
     if (!strcmp(name, "vkAllocateCommandBuffers") && mvk_alloc_cbs) return (vk_fn) vrmin_alloc_cbs;
     if (!strcmp(name, "vkCmdBindVertexBuffers") && mvk_bind_vb) return (vk_fn) vrmin_bind_vb;
     if (!strcmp(name, "vkCmdBindVertexBuffers2") && mvk_bind_vb2) return (vk_fn) vrmin_bind_vb2;
@@ -573,6 +588,8 @@ static void* vrmin_dlsym(void* handle, const char* name) {
       mvk_create_pass = (int32_t (*)(void*, const void*, const void*, void*)) dlsym(handle, "vkCreateRenderPass");
       mvk_create_pass2 = (int32_t (*)(void*, const void*, const void*, void*)) dlsym(handle, "vkCreateRenderPass2");
       mvk_create_pass2khr = (int32_t (*)(void*, const void*, const void*, void*)) dlsym(handle, "vkCreateRenderPass2KHR");
+      mvk_props2 = (void (*)(void*, void*)) dlsym(handle, "vkGetPhysicalDeviceProperties2");
+      mvk_props2khr = (void (*)(void*, void*)) dlsym(handle, "vkGetPhysicalDeviceProperties2KHR");
       mvk_features2 = (void (*)(void*, vk_features2*)) dlsym(handle, "vkGetPhysicalDeviceFeatures2");
       mvk_features2khr = (void (*)(void*, vk_features2*)) dlsym(handle, "vkGetPhysicalDeviceFeatures2KHR");
       mvk_enum_dev_ext = (int32_t (*)(void*, const char*, uint32_t*, void*)) dlsym(handle, "vkEnumerateDeviceExtensionProperties");
