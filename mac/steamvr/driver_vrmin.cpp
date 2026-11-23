@@ -350,12 +350,11 @@ static void wait_display() {
     if (g_cfgFps && t.valid) break;
     Sleep(20);
   }
-  // The headset's resolution is VRmin's for the game being opened (its quality and the game's own settings in VRmin
-  // Host, as with OpenComposite), and SteamVR draws it at 100 % (runtime.sh): SteamVR's per-game resolution isn't used
-  // when a game is opened outside its own library, and its automatic one went to more than twice the pixels
+  // The headset's resolution is the Quest's own (as SteamVR's 100 % on Windows): SteamVR chooses how much of it the
+  // games draw (automatically, from how fast the GPU is, or with its resolution setting), and VRmin Host scales the
+  // image to the stream's size. Without the Quest's model, VRmin Host's resolution.
   if (g_cfgFps && g_cfgEyeW) { EYE_W = g_cfgEyeW; EYE_H = g_cfgEyeH; HZ = (float)g_cfgFps; }
-  // (VRmin's resolution for the game, with the shape of the Quest's screen)
-  if (g_cfgFps && g_cfgEyeW && g_cfgNativeW) EYE_H = (uint32_t)(EYE_W * (double)g_cfgNativeH / g_cfgNativeW / 8 + 0.5) * 8;
+  if (g_cfgFps && g_cfgNativeW) { EYE_W = g_cfgNativeW; EYE_H = g_cfgNativeH; }
   if (t.valid) {
     float k = g_cfgFovK;
     for (int e = 0; e < 2; e++) {

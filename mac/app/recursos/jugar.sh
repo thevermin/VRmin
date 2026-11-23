@@ -30,9 +30,8 @@ LOG="$P/logs/juegos/$APPID.log"
   [ ${#ARGS[@]} -gt 0 ] && say "Argumentos: ${ARGS[*]}" "Arguments: ${ARGS[*]}"
 } | tee -a "$LOG"
 # (para la pantalla de carga del visor: qué juego se está abriendo, aunque se abra desde VRmin Host, y con qué runtime:
-#  con SteamVR real avisa que tarda más) y su carpeta (con SteamVR real, VRmin Host le da al driver los ajustes de este
-#  juego: SteamVR arranca antes que él)
-printf '%s\t%s\t%s\t%s\t%s\n' "$APPID" "$NOMBRE" "$(date +%s)" "$RUNTIME" "$(basename "$CARPETA")" > "$P/lanzando.txt" 2>/dev/null
+#  con SteamVR real avisa que tarda más)
+printf '%s\t%s\t%s\t%s\n' "$APPID" "$NOMBRE" "$(date +%s)" "$RUNTIME" > "$P/lanzando.txt" 2>/dev/null
 
 # Ajustes vacíos (0 bytes): pasa si el juego se cerró a la fuerza mientras los guardaba, y algunos juegos (Beat Saber)
 # quedan en negro al leerlos. Se apartan (no se borran) para que el juego cree unos nuevos.

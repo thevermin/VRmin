@@ -1044,16 +1044,16 @@ final class GameProfiles {
     func hasOwn(_ key: String) -> Bool { lock.lock(); defer { lock.unlock() }; return !key.isEmpty && data[key] != nil }
     /// El juego que se abrió: por la carpeta de Steam (si se encuentra) o por el nombre que da el juego
     func begin(app: String) {
-        // (SteamVR real se abre antes que el juego: sus ajustes son los del juego que abrió jugar.sh, de lanzando.txt)
-        let key = (app == "SteamVR" ? GameProfiles.launchingFolder() : nil) ?? GameProfiles.steamFolder() ?? app
+        let key = GameProfiles.steamFolder() ?? app
         lock.lock(); current = key; autoN = 0; autoFps = 0; autoGame = 0; autoSince = Date().timeIntervalSince1970; lock.unlock()
         let e = effective(key)
         lock.lock(); activeK = e.fovk; lock.unlock()
         print("[juego] Ajustes de «\(key)»: escala \(Int(e.scale * 100)) %\(e.auto ? " (automática)" : ""), campo de visión \(Int(e.fovk * 100)) %\(e.index ? ", controles de Index" : "")\(e.vive ? ", controles de Vive" : "")")
     }
     /// La línea "config" para el runtime (con «pv»: son los ajustes de este juego). «nw»/«nh»: la resolución de la
-    /// pantalla del Quest por ojo, para el driver de SteamVR: con SteamVR real el juego dibuja a la resolución de VRmin
-    /// («eye», con la forma de la pantalla del Quest), igual que con OpenComposite
+    /// pantalla del Quest por ojo (la que recomienda su OpenXR), para el driver de SteamVR: con SteamVR real la resolución
+    /// del juego la elige SteamVR sobre esa base (su 100 % es el mismo que en Windows); la imagen que viaja al Quest
+    /// sigue siendo la de los ajustes del Host (el Host la escala)
     func configLine(fps: Int, hello: Bool) -> String {
         let e = effective(current)
         let eye = max(256, Int((Double(EYE) * e.scale * e.fovk / 8).rounded()) * 8)
@@ -1147,14 +1147,6 @@ final class GameProfiles {
         if changed { print("[juego] Escala automática de «\(key)»: \(Int((p.scale ?? 1) * 100)) % (se usa la próxima vez que lo abras)") }
     }
     /// La carpeta de Steam del juego que está corriendo (steamapps\common\<carpeta>)
-    /// La carpeta del juego que jugar.sh está abriendo (hace menos de 4 minutos), si la hay
-    static func launchingFolder() -> String? {
-        let path = "lanzando.txt"
-        guard let m = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date,
-              Date().timeIntervalSince(m) < 240, let txt = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
-        let f = txt.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\t")
-        return f.count >= 5 && !f[4].isEmpty ? f[4] : nil
-    }
     static func steamFolder() -> String? {
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/ps"); p.arguments = ["-axo", "command="]
         let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice

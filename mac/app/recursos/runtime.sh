@@ -153,7 +153,8 @@ ajustes_steamvr() {
   fi
   rm -f "$Q/.steam_sin_d3d11"
   mkdir -p "$Q/openvr/config"
-  # Lo nuestro se escribe siempre (también la resolución: 100 %, la de VRmin); lo demás que guarda SteamVR se conserva
+  # Lo nuestro se escribe siempre; lo demás que guarda SteamVR (como la resolución, en general o por juego) se conserva.
+  # La resolución arranca en 25 % (SteamVR, en automático, elige casi el doble: no baja de lo de los primeros visores)
   "$PY" - "$Q/openvr/config/steamvr.vrsettings" <<'PY'
 import json, sys
 f = sys.argv[1]
@@ -185,11 +186,8 @@ s.get("steamvr", {}).pop("allowDashboardAutoLaunchWithSteamVRHome", None)
 s.pop("VRWebHelper", None)
 for sec, v in fijo.items():
     s.setdefault(sec, {}).update(v)
-# (la resolución es la de VRmin para cada juego, que el driver le da a SteamVR como la del visor: SteamVR la dibuja al
-#  100 %. La suya por juego no se usaba: los juegos se abren fuera de su biblioteca)
-s["steamvr"].update({"supersampleManualOverride": True, "supersampleScale": 1.0})
-for sec in s.values():
-    if isinstance(sec, dict): sec.pop("resolutionScale", None)
+for k, v in {"supersampleManualOverride": True, "supersampleScale": 0.25}.items():
+    s["steamvr"].setdefault(k, v)
 json.dump(s, open(f, "w"), indent=3)
 PY
   # La ventana de ajustes de SteamVR en el escritorio (que en VRmin no se usa) se crea al abrirla y no al arrancar,
