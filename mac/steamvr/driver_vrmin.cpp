@@ -264,6 +264,7 @@ static uint32_t pose_for(const HmdMatrix34_t &m, double *dist) {
 static std::atomic<int> g_cfgEyeW{0}, g_cfgEyeH{0}, g_cfgFps{0};
 static std::atomic<int> g_cfgNativeW{0}, g_cfgNativeH{0};   // (the Quest's own resolution per eye, from VRmin Host)
 static std::atomic<float> g_cfgFovK{1.f};
+static char g_cfgCtl[16] = "quest2";   // (the Quest's controllers, from VRmin Host: quest2, plus or pro)
 static std::atomic<unsigned> g_haptics{0};   // (vibrations sent to the Quest, for the log)
 // SteamVR's menu (dashboard): VRmin opens games straight from Wine, not from that menu, so it stays open over a game
 // that starts and you had to press «Resume». When a game starts sending frames, VRmin closes it once as the menu
@@ -332,6 +333,10 @@ static void parse_config(const char *line) {
   if ((p = strstr(line, "\"eyeH\":")) && atoi(p + 7) >= 256 && atoi(p + 7) <= 4096) g_cfgEyeH = atoi(p + 7);
   if ((p = strstr(line, "\"fovk\":")) && atof(p + 7) >= 0.6 && atof(p + 7) <= 1.0) g_cfgFovK = (float)atof(p + 7);
   if ((p = strstr(line, "\"fps\":")) && atoi(p + 6) >= 30 && atoi(p + 6) <= 144) g_cfgFps = atoi(p + 6);
+  if ((p = strstr(line, "\"ctl\":\""))) {
+    const char *v = p + 7;
+    if (!strncmp(v, "plus\"", 5) || !strncmp(v, "pro\"", 4) || !strncmp(v, "quest2\"", 7)) { size_t n = strcspn(v, "\""); memcpy(g_cfgCtl, v, n); g_cfgCtl[n] = 0; }
+  }
   int nw = (p = strstr(line, "\"nw\":")) ? atoi(p + 5) : 0, nh = (p = strstr(line, "\"nh\":")) ? atoi(p + 5) : 0;
   if (nw >= 256 && nw <= 8192 && nh >= 256 && nh <= 8192) { g_cfgNativeW = nw; g_cfgNativeH = nh; }
 }
@@ -1261,7 +1266,10 @@ public:
     VRProperties()->SetBoolProperty(c, Prop_DeviceProvidesBatteryStatus_Bool, false);
     VRProperties()->SetStringProperty(c, Prop_ManufacturerName_String, "Oculus");
     VRProperties()->SetStringProperty(c, Prop_TrackingSystemName_String, "oculus");
-    VRProperties()->SetStringProperty(c, Prop_RenderModelName_String, left ? "oculus_quest2_controller_left" : "oculus_quest2_controller_right");
+    // (the same controllers as the Quest's, from SteamVR's own models: oculus_quest2/quest_plus/quest_pro_controller_*)
+    std::string model = std::string("oculus_") + (!strcmp(g_cfgCtl, "plus") ? "quest_plus" : !strcmp(g_cfgCtl, "pro") ? "quest_pro" : "quest2") +
+                        (left ? "_controller_left" : "_controller_right");
+    VRProperties()->SetStringProperty(c, Prop_RenderModelName_String, model.c_str());
     VRProperties()->SetStringProperty(c, Prop_ControllerType_String, "oculus_touch");
     VRProperties()->SetStringProperty(c, Prop_InputProfilePath_String, "{oculus}/input/touch_profile.json");
     VRProperties()->SetInt32Property(c, Prop_ControllerRoleHint_Int32, left ? TrackedControllerRole_LeftHand : TrackedControllerRole_RightHand);

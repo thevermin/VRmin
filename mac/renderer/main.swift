@@ -994,6 +994,14 @@ enum QuestModel {
         if n.contains("quest pro") { return (1800, 1920) }
         return nil
     }
+    /// Los controles del visor, para que SteamVR muestre los mismos: Touch Plus (Quest 3 y 3S), Touch Pro (Quest Pro)
+    /// o los de Quest 2 (sin saber cuál es)
+    static var controllers: String {
+        let n = name.lowercased()
+        if n.contains("quest 3") { return "plus" }
+        if n.contains("quest pro") { return "pro" }
+        return "quest2"
+    }
 }
 
 // MARK: - Ajustes avanzados por juego
@@ -1051,7 +1059,7 @@ final class GameProfiles {
         let eye = max(256, Int((Double(EYE) * e.scale * e.fovk / 8).rounded()) * 8)
         let native = QuestModel.nativeEye.map { ",\"nw\":\($0.w),\"nh\":\($0.h)" } ?? ""
         // «vg»: Modo Centinela (el runtime adelanta las poses al momento en que se ve el cuadro: no hay reproyección)
-        return "{\"type\":\"config\",\"eye\":\(eye),\"fps\":\(fps),\"fovk\":\(String(format: "%.3f", e.fovk)),\"index\":\(e.index ? 1 : 0),\"vive\":\(e.vive ? 1 : 0),\"vg\":\(Vigia.shared.on ? 1 : 0)\(native)\(hello ? ",\"pv\":1" : "")}"
+        return "{\"type\":\"config\",\"eye\":\(eye),\"fps\":\(fps),\"fovk\":\(String(format: "%.3f", e.fovk)),\"index\":\(e.index ? 1 : 0),\"vive\":\(e.vive ? 1 : 0),\"vg\":\(Vigia.shared.on ? 1 : 0)\(native),\"ctl\":\"\(QuestModel.controllers)\"\(hello ? ",\"pv\":1" : "")}"
     }
     /// Desde el Quest: cambiar lo de un juego ("game": el abierto; "key:<carpeta>": cualquiera) o lo de todos ("all"),
     /// o volver a lo de todos
