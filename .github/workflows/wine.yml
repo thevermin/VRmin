@@ -103,7 +103,15 @@ jobs:
             [ -f "$f" ] || { echo "(nuevo, no está en el de Gcenx)"; continue; }
             nm -gU "$f" 2>/dev/null | awk '{print $3}' | sort > a.txt; nm -gU "$n" 2>/dev/null | awk '{print $3}' | sort > b.txt
             echo "solo en Gcenx:"; comm -23 a.txt b.txt; echo "solo en la nuestra:"; comm -13 a.txt b.txt
+            # Las bibliotecas que usa (enlazadas o abiertas por su nombre, como FreeType o MoltenVK): ninguna de las de
+            # la de Gcenx puede faltar en la nuestra (una opción de configure distinta la apaga sin otro aviso)
+            libs() { { otool -L "$1" 2>/dev/null | tail -n +2 | awk '{print $1}'; strings -a "$1" | grep -oE '(lib[A-Za-z0-9_+.-]+\.dylib|[A-Za-z]+\.framework)'; } \
+                     | sed 's|.*/||' | sort -u; }
+            libs "$f" > la.txt; libs "$n" > lb.txt
+            falta=$(comm -23 la.txt lb.txt)
+            if [ -n "$falta" ]; then echo "::error::$dst no usa lo que usa la de Gcenx: $falta"; mal=1; fi
           done < archivos.txt
+          [ -z "${mal:-}" ] || exit 1
           strings -a wine/dlls/ntdll/ntdll.so | grep -q "WINEMSYNC" && echo "msync: sí"
           strings -a wine/dlls/win32u/win32u.so | grep -q "libfreetype.6.dylib" && echo "win32u.so: con FreeType (letras)" \
             || { echo "::error::win32u.so sin FreeType: no habría texto con fuentes TrueType"; exit 1; }

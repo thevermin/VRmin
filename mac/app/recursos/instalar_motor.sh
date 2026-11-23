@@ -142,7 +142,10 @@ for arq in x86_64-windows i386-windows; do
     cp "$DXMT_DIR/$arq/$f" "$dst"
   done
 done
-cp "$DXMT_DIR/x86_64-unix/winemetal.so" "$WINEDIR/lib/wine/x86_64-unix/winemetal.so"
+# (a un archivo nuevo y después en su lugar: copiado encima del que ya se usó, macOS lo rechaza al cargarlo y Wine no
+#  arranca; pasó con win32u.so)
+W="$WINEDIR/lib/wine/x86_64-unix/winemetal.so"
+cp "$DXMT_DIR/x86_64-unix/winemetal.so" "$W.nuevo" && mv -f "$W.nuevo" "$W"
 rm -rf "$P/dxmt/vrmin-1"   # (el DXMT de VRmin 0.55 a 0.57)
 
 if [ ! -f "$WINEPREFIX/system.reg" ]; then

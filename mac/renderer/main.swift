@@ -2307,7 +2307,7 @@ final class AudioTap {
         if !warnedSilent && now - silentSince > 20_000_000_000 {
             warnedSilent = true
             print("[audio] Llevo 20 s recibiendo silencio de Wine. Si el juego debería sonar: Ajustes del Sistema >"
-                  + " Privacidad y seguridad > Grabación de pantalla y audio del sistema > activá \"Terminal\" y reiniciá start.sh")
+                  + " Privacidad y seguridad > Grabación de pantalla y audio del sistema > activá \"VRmin Host\" y volvé a abrirlo")
         }
     }
 }

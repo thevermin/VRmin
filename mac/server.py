@@ -336,7 +336,7 @@ async def main():
     cdir = os.environ.get("QVB_DATA") or HERE   # la app guarda el certificado en su carpeta de datos
     cert, key = os.path.join(cdir, "cert.pem"), os.path.join(cdir, "key.pem")
     if not (os.path.isfile(cert) and os.path.isfile(key)):
-        sys.exit("Falta el certificado. Ejecutá: bash start.sh")
+        sys.exit("Falta el certificado: cerrá y volvé a abrir VRmin Host")
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
     # El puerto del navegador es opcional (la app del Quest no lo usa): si otro programa de la Mac ya lo ocupa, se sigue sin él

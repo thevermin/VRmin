@@ -118,7 +118,7 @@ enum LogEn {
         ("Modo Centinela: estado de la sesión del visor", "Sentinel Mode: headset session state"),
         ("Todavía no hay juegos: instalalos desde Steam", "No games yet: install them from Steam"),
         ("Mostrando el escritorio de la Mac en el visor", "Showing the Mac desktop in the headset"),
-        ("Falta el certificado. Ejecutá: bash start.sh", "The certificate is missing. Run: bash start.sh"),
+        ("Falta el certificado: cerrá y volvé a abrir VRmin Host", "The certificate is missing: quit and reopen VRmin Host"),
         ("ERROR: no se pudo crear el pool de imágenes", "ERROR: could not create the image pool"),
         ("Memoria compartida: CreateFileMapping falló", "Shared memory: CreateFileMapping failed"),
         ("Unity pidió D3D11CreateDevice: interceptado", "Unity asked for D3D11CreateDevice: intercepted"),
