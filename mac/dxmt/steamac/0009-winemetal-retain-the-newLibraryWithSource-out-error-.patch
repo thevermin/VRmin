@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 18:53:29 +0300
+Subject: [PATCH 09/27] winemetal: retain the newLibraryWithSource out-error
+ too
+
+Follow-up to the cherry-picked "winemetal: retain out-errors crossing the
+boundary" (utmapp/dxmt cc080d00): upstream added
+MTLDevice_newLibraryWithSource after that commit's base, and its out-error
+needs the same +1 handoff and Error::out_handle() slot, or every caller's
+WMT::Reference<WMT::Error> over-releases it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/winemetal/Metal.hpp             | 2 +-
+ src/winemetal/unix/winemetal_unix.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/winemetal/Metal.hpp b/src/winemetal/Metal.hpp
+index ef46ee055a35ccfd6957f1cfc694375db38572f3..8bbc2feb5c139524eb5339ea48f57553b1964be1 100644
+--- a/src/winemetal/Metal.hpp
++++ b/src/winemetal/Metal.hpp
+@@ -859,7 +859,7 @@ public:
+ 
+   Reference<Library>
+   newLibraryWithSource(std::string_view view, Error &error) {
+-    return Reference<Library>(MTLDevice_newLibraryWithSource(handle, view.data(), view.length(), &error.handle));
++    return Reference<Library>(MTLDevice_newLibraryWithSource(handle, view.data(), view.length(), error.out_handle()));
+   }
+ 
+   Reference<ComputePipelineState>
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index 54402998471f9ac7f85af9b0b25f37a2bd0b7c18..accd84e9ca2e3eae60c15d99234a60b6b5a57722 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -3184,7 +3184,7 @@ _MTLDevice_newLibraryWithSource(void *obj) {
+       [[NSString alloc] initWithBytes:params->source.ptr length:params->length encoding:NSASCIIStringEncoding];
+   NSError *err = NULL;
+   params->ret_library = (obj_handle_t)[device newLibraryWithSource:source options:nil error:&err];
+-  params->ret_error = (obj_handle_t)err;
++  params->ret_error = (obj_handle_t)[err retain]; /* out-errors are autoreleased; the win side owns the handle (WMT::Reference) */
+   [source release];
+   return STATUS_SUCCESS;
+ }

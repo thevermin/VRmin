@@ -1,0 +1,285 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jakey-Jakey <Jakey-Jakey@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 05:33:31 -0400
+Subject: [PATCH 23/27] feat(dxmt): use residency set instead of useResource
+
+(cherry picked from commit c4fe91ec765da5835845ed4b5aca1d055143d64e)
+---
+ src/dxmt/dxmt_allocation.cpp    |  7 ++++-
+ src/dxmt/dxmt_allocation.hpp    | 14 +++++++++
+ src/dxmt/dxmt_command_queue.cpp | 16 ++++++++++
+ src/dxmt/dxmt_command_queue.hpp |  1 +
+ src/dxmt/dxmt_context.hpp       | 32 +++++++++++++++++++
+ src/dxmt/dxmt_residency.hpp     | 55 +++++++++++++++++++++++++++++++++
+ src/dxmt/dxmt_texture.hpp       |  8 +++++
+ 7 files changed, 132 insertions(+), 1 deletion(-)
+
+diff --git a/src/dxmt/dxmt_allocation.cpp b/src/dxmt/dxmt_allocation.cpp
+index 036b76b51767c188d14c22a5eb59d2466f844b1a..bc7aa7d6c9c344b58a2a2908d0d1cf199ca298e9 100644
+--- a/src/dxmt/dxmt_allocation.cpp
++++ b/src/dxmt/dxmt_allocation.cpp
+@@ -31,8 +31,13 @@ Allocation::incRef() {
+ 
+ void
+ Allocation::decRef() {
+-  if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u)
++  if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u) {
++    // residency is set up by the encoder thread
++    std::atomic_thread_fence(std::memory_order_acquire);
++    if (residency_set_.ptr())
++      residency_set_->remove(residency_object_);
+     this->free();
++  }
+ };
+ 
+ AllocationRefTracking::AllocationRefTracking() {
+diff --git a/src/dxmt/dxmt_allocation.hpp b/src/dxmt/dxmt_allocation.hpp
+index 327946dcab5657e71e50498e3320d295f1c7001e..fbc9c7c52ca0bd0075b56a2e824d0fa5cbc4c022 100644
+--- a/src/dxmt/dxmt_allocation.hpp
++++ b/src/dxmt/dxmt_allocation.hpp
+@@ -18,6 +18,8 @@
+ 
+ #pragma once
+ 
++#include "dxmt_residency.hpp"
++#include "rc/util_rc_ptr.hpp"
+ #include <atomic>
+ #include <cstdint>
+ 
+@@ -37,11 +39,23 @@ public:
+     return false;
+   }
+ 
++  // only called by the encoder thread
++  void
++  useResidencySet(ResidencySetTracker *residency_set, WMT::Allocation object) {
++    if (residency_set_.ptr())
++      return;
++    residency_set->add(object);
++    residency_set_ = residency_set;
++    residency_object_ = object;
++  }
++
+ private:
+   virtual void free() = 0;
+ 
+   std::atomic<uint32_t> refcount_ = {0u};
+   uint64_t last_retained_seq_id = 0;
++  Rc<ResidencySetTracker> residency_set_;
++  WMT::Allocation residency_object_;
+ };
+ 
+ class AllocationRefTracking {
+diff --git a/src/dxmt/dxmt_command_queue.cpp b/src/dxmt/dxmt_command_queue.cpp
+index fc5e12fad824cf0c2c6d04652dc206d6bce4b040..3c668a6e68846142f4eb948d817f76af01f61c54 100644
+--- a/src/dxmt/dxmt_command_queue.cpp
++++ b/src/dxmt/dxmt_command_queue.cpp
+@@ -55,6 +55,20 @@ CommandQueue::CommandQueue(WMT::Device device) :
+     argument_encoding_ctx(*this, device, cmd_library),
+     initializer(device),
+     counter_pool(device) {
++  uint64_t os_major = 0, os_minor = 0, os_patch = 0;
++  WMTGetOSVersion(&os_major, &os_minor, &os_patch);
++  if (os_major >= 15 && env::getEnvVar("DXMT_RESIDENCY_SET") != "0") {
++    WMT::Reference<WMT::Error> err;
++    auto set = device.newResidencySet(0, err);
++    if (set != nullptr) {
++      commandQueue.addResidencySet(set);
++      residency_set = new ResidencySetTracker(std::move(set));
++      argument_encoding_ctx.setResidencySet(residency_set.ptr());
++    } else {
++      WARN("Failed to create MTLResidencySet: ", err.description().getUTF8String());
++    }
++  }
++
+   for (unsigned i = 0; i < kCommandChunkCount; i++) {
+     auto &chunk = chunks[i];
+     chunk.queue = this;
+@@ -169,6 +183,8 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
+     cmdbuf.encodeWaitForEvent(initializer.event(), chunk.resource_initializer_event_id);
+   }
+   chunk.encode(chunk.attached_cmdbuf, this->argument_encoding_ctx);
++  if (residency_set.ptr())
++    residency_set->commit();
+   cmdbuf.commit();
+ 
+   ready_for_commit.fetch_add(1, std::memory_order_release);
+diff --git a/src/dxmt/dxmt_command_queue.hpp b/src/dxmt/dxmt_command_queue.hpp
+index e109af7e267b4c7f7af821cba5a4b97d07a87c5c..4c29525b8d317b66e20a17bde6cac1b7d8dbedf5 100644
+--- a/src/dxmt/dxmt_command_queue.hpp
++++ b/src/dxmt/dxmt_command_queue.hpp
+@@ -176,6 +176,7 @@ private:
+   dxmt::thread finishThread;
+   WMT::Device device;
+   WMT::Reference<WMT::CommandQueue> commandQueue;
++  Rc<ResidencySetTracker> residency_set;
+ 
+   obj_handle_t shared_event_listener;
+   dxmt::thread event_listener_thread;
+diff --git a/src/dxmt/dxmt_context.hpp b/src/dxmt/dxmt_context.hpp
+index eabe87227bcfb9f604663f7277c7ac7d7707674f..5d2092fe37a76237a83bbcb543537b5a578dce23 100644
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -538,6 +538,28 @@ public:
+ 
+   void retainAllocation(Allocation* allocation);
+ 
++  void
++  setResidencySet(ResidencySetTracker *residency_set) {
++    residency_set_ = residency_set;
++  }
++
++  // returns false if the allocation still needs `useResource`
++  bool
++  makeResidentInSet(BufferAllocation *allocation) {
++    if (!residency_set_ || allocation->flags().test(BufferAllocationFlag::AllocatedOnHeap))
++      return false;
++    allocation->useResidencySet(residency_set_, allocation->buffer());
++    return true;
++  }
++
++  bool
++  makeResidentInSet(TextureAllocation *allocation) {
++    if (!residency_set_ || allocation->flags().test(TextureAllocationFlag::AllocatedOnHeap))
++      return false;
++    allocation->useResidencySet(residency_set_, allocation->residencyObject());
++    return true;
++  }
++
+   template <PipelineStage stage, PipelineKind kind>
+   void
+   makeResident(WMT::Resource resource, DXMT_RESOURCE_RESIDENCY requested) {
+@@ -558,6 +580,8 @@ public:
+   void
+   makeResident(Counter *counter) {
+     auto allocation = getCounterAllocation(counter)->buffer();
++    if (makeResidentInSet(allocation))
++      return;
+     uint64_t encoder_id = currentEncoder()->id;
+     DXMT_RESOURCE_RESIDENCY requested = GetResidencyMask<kind>(stage, true, true);
+     if (CheckResourceResidency(allocation->residencyState, encoder_id, requested)) {
+@@ -568,6 +592,8 @@ public:
+   void
+   makeResident(Buffer *buffer, bool read = true, bool write = false) {
+     auto allocation = buffer->current();
++    if (makeResidentInSet(allocation))
++      return;
+     uint64_t encoder_id = currentEncoder()->id;
+     DXMT_RESOURCE_RESIDENCY requested = GetResidencyMask<kind>(stage, read, write);
+     if (CheckResourceResidency(allocation->residencyState, encoder_id, requested)) {
+@@ -578,6 +604,8 @@ public:
+   void
+   makeResident(Buffer *buffer, uint64_t viewId, bool read = true, bool write = false) {
+     auto allocation = buffer->current();
++    if (makeResidentInSet(allocation))
++      return;
+     uint64_t encoder_id = currentEncoder()->id;
+     DXMT_RESOURCE_RESIDENCY requested = GetResidencyMask<kind>(stage, read, write);
+     if (CheckResourceResidency(buffer->residency(viewId, allocation), encoder_id, requested)) {
+@@ -588,6 +616,8 @@ public:
+   void
+   makeResident(Texture *texture, uint64_t viewId, bool read = true, bool write = false) {
+     auto allocation = texture->current();
++    if (makeResidentInSet(allocation))
++      return;
+     uint64_t encoder_id = currentEncoder()->id;
+     DXMT_RESOURCE_RESIDENCY requested = GetResidencyMask<kind>(stage, read, write);
+     auto &view = texture->view(viewId, allocation);
+@@ -927,6 +957,8 @@ private:
+   uint64_t intrapass_barrier_control_bits_ = 0;
+ 
+   CommandQueue& queue_;
++
++  ResidencySetTracker *residency_set_ = nullptr;
+ };
+ 
+ template <>
+diff --git a/src/dxmt/dxmt_residency.hpp b/src/dxmt/dxmt_residency.hpp
+index 6a3300043a977e67f7efe305771029801409aed4..c97d2bc0be48873d662a44e03dc07477bd926e97 100644
+--- a/src/dxmt/dxmt_residency.hpp
++++ b/src/dxmt/dxmt_residency.hpp
+@@ -1,10 +1,65 @@
+ #pragma once
+ #include "winemetal.h"
++#include "Metal.hpp"
++#include "thread.hpp"
++#include <atomic>
+ #include <cstdint>
++#include <mutex>
+ #include "ftl.hpp"
+ 
+ namespace dxmt {
+ 
++/**
++An `MTLResidencySet` attached to the command queue, which replaces per-encoder
++`useResource`. Allocations are added on first use, and committed right before
++the command buffer that uses them. Removal (once freed) is committed immediately.
++*/
++class ResidencySetTracker {
++public:
++  ResidencySetTracker(WMT::Reference<WMT::ResidencySet> &&set) : set_(std::move(set)) {}
++
++  void
++  incRef() {
++    refcount_.fetch_add(1u, std::memory_order_acquire);
++  }
++
++  void
++  decRef() {
++    if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u)
++      delete this;
++  }
++
++  void
++  add(WMT::Allocation allocation) {
++    std::lock_guard<dxmt::mutex> lock(mutex_);
++    set_.addAllocations(&allocation, 1);
++    dirty_ = true;
++  }
++
++  void
++  remove(WMT::Allocation allocation) {
++    std::lock_guard<dxmt::mutex> lock(mutex_);
++    set_.removeAllocations(&allocation, 1);
++    set_.commit();
++    dirty_ = false;
++  }
++
++  void
++  commit() {
++    std::lock_guard<dxmt::mutex> lock(mutex_);
++    if (!dirty_)
++      return;
++    set_.commit();
++    dirty_ = false;
++  }
++
++private:
++  std::atomic<uint32_t> refcount_ = {0u};
++  dxmt::mutex mutex_;
++  WMT::Reference<WMT::ResidencySet> set_;
++  bool dirty_ = false;
++};
++
+ enum DXMT_RESOURCE_RESIDENCY : uint32_t {
+   DXMT_RESOURCE_RESIDENCY_NULL = 0,
+   DXMT_RESOURCE_RESIDENCY_VERTEX_READ = 1 << 0,
+diff --git a/src/dxmt/dxmt_texture.hpp b/src/dxmt/dxmt_texture.hpp
+index ba5749912db7c46f0fd489459851c82e07db4de5..0a79bbd28bdee3750ee7aa516617adbdc8247ee8 100644
+--- a/src/dxmt/dxmt_texture.hpp
++++ b/src/dxmt/dxmt_texture.hpp
+@@ -145,6 +145,14 @@ public:
+     return flags_;
+   }
+ 
++  // a linear texture is created from a buffer, which is the actual allocation
++  WMT::Allocation
++  residencyObject() const {
++    if (buffer_ != nullptr)
++      return buffer_;
++    return obj_;
++  }
++
+   Texture *descriptor;
+   void *mappedMemory;
+   uint64_t gpuResourceID;

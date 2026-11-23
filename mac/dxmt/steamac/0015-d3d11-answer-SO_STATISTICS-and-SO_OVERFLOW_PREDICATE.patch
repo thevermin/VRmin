@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mybono <81219764+Mybono@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 20:50:10 +0300
+Subject: [PATCH 15/27] d3d11: answer SO_STATISTICS and SO_OVERFLOW_PREDICATE
+ queries with a dummy
+
+World of Tanks (Lesta client 1.45) creates a D3D11_QUERY_SO_STATISTICS query while it loads
+the first vehicle in the hangar. CreateQuery1 returned E_NOTIMPL for it and the game
+exited with code 1337 right away, before the model was drawn.
+
+Stream output cannot be implemented on Metal, so treat the two stream-output query types
+the way PIPELINE_STATISTICS is already treated: create a dummy query, accept Begin/End,
+and return zeroed data (no overflow) from GetData.
+
+Verified: with this change the game loads the vehicle, reaches the hangar and plays a
+battle (macOS 27, Apple M4 Pro, Wine 11, DXMT built from 7c8dee1 plus this commit).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+(cherry picked from commit 126b53f69122c35dac65eef999ee43ef2a700765)
+---
+ src/d3d11/d3d11_context_imm.cpp | 20 ++++++++++++++++++--
+ src/d3d11/d3d11_device.cpp      | 10 ++++++++++
+ 2 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index fbb59d8879a36f95351c3143da460233f47df518..0f4ffbd6dbc54575f0c789cf702859c441a8618d 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -328,7 +328,9 @@ public:
+         });
+       break;
+     }
+-    case D3D11_QUERY_PIPELINE_STATISTICS: {
++    case D3D11_QUERY_PIPELINE_STATISTICS:
++    case D3D11_QUERY_SO_STATISTICS:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE: {
+       // ignore
+       break;
+     }
+@@ -385,7 +387,9 @@ public:
+       promote_flush = true;
+       break;
+     }
+-    case D3D11_QUERY_PIPELINE_STATISTICS: {
++    case D3D11_QUERY_PIPELINE_STATISTICS:
++    case D3D11_QUERY_SO_STATISTICS:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE: {
+       // ignore
+       break;
+     }
+@@ -465,6 +469,18 @@ public:
+       }
+       return S_OK;
+     }
++    case D3D11_QUERY_SO_STATISTICS: {
++      if (pData) {
++        (*static_cast<D3D11_QUERY_DATA_SO_STATISTICS *>(pData)) = {};
++      }
++      return S_OK;
++    }
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE: {
++      if (pData) {
++        *static_cast<BOOL *>(pData) = FALSE;
++      }
++      return S_OK;
++    }
+     default:
+       ERR("Unknown query type ", desc.Query);
+       return E_FAIL;
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index ef1665652318ad976519a44f6aa04ecc8e7ee1bc..2817aeaaeb57ac43b1d97d99b1ee08dca6edb9ce 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -976,6 +976,16 @@ public:
+       *ppQuery = ref(new MTLD3D11DummyQuery<D3D11_QUERY_DATA_PIPELINE_STATISTICS>(this, pQueryDesc));
+       return S_OK;
+     }
++    // Stream-output queries cannot be implemented on Metal. The game created one while loading a
++    // vehicle in the hangar and exited when the call failed, so answer with a dummy like above.
++    case D3D11_QUERY_SO_STATISTICS: {
++      *ppQuery = ref(new MTLD3D11DummyQuery<D3D11_QUERY_DATA_SO_STATISTICS>(this, pQueryDesc));
++      return S_OK;
++    }
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE: {
++      *ppQuery = ref(new MTLD3D11DummyQuery<BOOL>(this, pQueryDesc));
++      return S_OK;
++    }
+     default:
+       ERR("CreateQuery1: query type not implemented: ", pQueryDesc->Query);
+       return E_NOTIMPL;

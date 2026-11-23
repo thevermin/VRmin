@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 19:07:54 +0300
+Subject: [PATCH 20/27] d3d11: submit the frame's commands before recording the
+ present
+
+The present is recorded into the same command chunk as the frame's last
+draws. Encoding that chunk acquires the next drawable, which waits for the
+display when both are in use, so the frame tail's command buffer is not
+committed until then and the GPU idles on work it already has. With
+d3d11.submitBeforePresent (default on) Present() flushes the context first
+(only if anything was recorded), and the present follows in a chunk of its
+own.
+
+Idea from willfaust/dxmt (ios-port) "submit the frame's last draws before
+recording the present"; implemented independently from its description,
+no code taken from that GPL-3.0 fork.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dxmt.conf                     |  6 ++++++
+ src/d3d11/d3d11_swapchain.cpp | 10 ++++++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/dxmt.conf b/dxmt.conf
+index 8851554abcea31a50360fcfa7f830ec58d50bbef..1b45d82e0e6e1fc22c7e9800f61a0b530513c7a2 100644
+--- a/dxmt.conf
++++ b/dxmt.conf
+@@ -121,3 +121,9 @@
+ #
+ # Supported values: 0 - 16
+ # dxgi.maxFrameLatency = 0
++
++# Commits the frame's recorded commands before the present is recorded, so the GPU starts on them
++# while the present waits for a drawable (the present then goes out in a command buffer of its own).
++#
++# Supported values: True, False
++# d3d11.submitBeforePresent = True
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index 86cf4666f1b64c252c73a06aebf8e716092981dc..4aba50eead22d9aa4b56df521a73f9f41d1dc3cd 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -147,6 +147,8 @@ public:
+                                  pDevice->GetDXMTDevice().queue().cmd_library,
+                                  scale_factor, desc_.SampleDesc.Count));
+ 
++    submit_before_present_ = Config::getInstance().getOption<bool>("d3d11.submitBeforePresent", true);
++
+     frame_latency = kSwapchainLatency;
+     present_semaphore_ = CreateSemaphore(nullptr, frame_latency,
+                                          DXGI_MAX_SWAP_CHAIN_BUFFERS, nullptr);
+@@ -759,6 +761,13 @@ public:
+ 
+     std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
+ 
++    /* Submit the frame's own commands first: the present is encoded on the queue's encoder thread and acquires
++       the next drawable there, which can wait for the display. In the same chunk, the frame's last draws would
++       wait for that drawable before their command buffer is committed. Flush() commits only if anything was
++       recorded since the last submission. */
++    if (submit_before_present_ && hr == S_OK)
++      device_context_->Flush();
++
+     device_context_->PrepareFlush();
+     if (hr == DXGI_STATUS_OCCLUDED) {
+       // flush commands without presenting
+@@ -1066,6 +1075,7 @@ private:
+   WMT::Object native_view_;
+   WMT::MetalLayer layer_weak_;
+   ULONG presentation_count_;
++  bool submit_before_present_ = true;
+   DXGI_SWAP_CHAIN_DESC1 desc_;
+   DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc_;
+   D3D11_TEXTURE2D_DESC1 backbuffer_desc_;

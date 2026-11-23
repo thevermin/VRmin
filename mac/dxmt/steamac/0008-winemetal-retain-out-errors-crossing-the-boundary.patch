@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: osy <osy@turing.llc>
+Date: Fri, 17 Jul 2026 10:17:06 -0700
+Subject: [PATCH 08/27] winemetal: retain out-errors crossing the boundary
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Out-NSError handles (newRenderPipelineState & co.) were returned
+autoreleased while every caller stores them in an owning
+WMT::Reference<WMT::Error> — the eventual release over-released the
+object and crashed the worker in the thread's autorelease-pool drain at
+device teardown (~task_scheduler), whenever any PSO had failed in that
+process.  Retain them before returning the handle (9 sites).  The
+win-side wrappers hand the slot out through Error::out_handle(), which
+releases whatever a previous call left there — a retry reusing one
+Reference<Error> would otherwise leak the first error.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+(cherry picked from commit cc080d0020ab34e9fdd49a0a836aed2eb5728c34)
+---
+ src/winemetal/Metal.hpp             | 38 +++++++++++++++++++----------
+ src/winemetal/unix/winemetal_unix.c | 18 +++++++-------
+ 2 files changed, 34 insertions(+), 22 deletions(-)
+
+diff --git a/src/winemetal/Metal.hpp b/src/winemetal/Metal.hpp
+index 8224a0c2fe5a0168d8ffc1c583ae0c032908363d..ef46ee055a35ccfd6957f1cfc694375db38572f3 100644
+--- a/src/winemetal/Metal.hpp
++++ b/src/winemetal/Metal.hpp
+@@ -167,6 +167,18 @@ Object::description() {
+ 
+ class Error : public Object {
+ public:
++  /* Out-error slot for the creation wrappers: the callee retains the
++   * error before writing the handle back, so drop whatever a previous
++   * call left here first — a retry reusing one Reference<Error> would
++   * otherwise leak it. */
++  obj_handle_t *
++  out_handle() {
++    if (handle) {
++      NSObject_release(handle);
++      handle = 0;
++    }
++    return &handle;
++  }
+ };
+ 
+ class DispatchData : public Object {
+@@ -750,7 +762,7 @@ public:
+       const char *name, const WMTFunctionConstant *constants, uint32_t num_constants, Error &error
+   ) {
+     return Reference<Function>(
+-        MTLLibrary_newFunctionWithConstants(handle, name, constants, num_constants, &error.handle)
++        MTLLibrary_newFunctionWithConstants(handle, name, constants, num_constants, error.out_handle())
+     );
+   }
+ };
+@@ -759,7 +771,7 @@ class BinaryArchive : public Object {
+ public:
+   void
+   serialize(const char *url, Error &error) {
+-    MTLBinaryArchive_serialize(handle, url, &error.handle);
++    MTLBinaryArchive_serialize(handle, url, error.out_handle());
+   }
+ };
+ 
+@@ -827,7 +839,7 @@ public:
+   Reference<Library>
+   newLibrary(const void *bytecode, uint64_t bytecode_length, Error &error) {
+     auto data = DispatchData_alloc_init((uint64_t)bytecode, bytecode_length);
+-    auto ret = Reference<Library>(MTLDevice_newLibrary(handle, data, &error.handle));
++    auto ret = Reference<Library>(MTLDevice_newLibrary(handle, data, error.out_handle()));
+     NSObject_release(data);
+     return ret;
+   }
+@@ -835,14 +847,14 @@ public:
+   Reference<Library>
+   newLibraryFromNativeBuffer(uint64_t bytecode, uint64_t bytecode_length, Error &error) {
+     auto data = DispatchData_alloc_init(bytecode, bytecode_length);
+-    auto ret = Reference<Library>(MTLDevice_newLibrary(handle, data, &error.handle));
++    auto ret = Reference<Library>(MTLDevice_newLibrary(handle, data, error.out_handle()));
+     NSObject_release(data);
+     return ret;
+   }
+ 
+   Reference<Library>
+   newLibrary(DispatchData data, Error &error) {
+-    return Reference<Library>(MTLDevice_newLibrary(handle, data, &error.handle));
++    return Reference<Library>(MTLDevice_newLibrary(handle, data, error.out_handle()));
+   }
+ 
+   Reference<Library>
+@@ -861,7 +873,7 @@ public:
+     info.num_binary_archives_for_lookup = 0;
+     info.fail_on_binary_archive_miss = false;
+     info.support_indirect_command_buffers = false;
+-    return Reference<ComputePipelineState>(MTLDevice_newComputePipelineState(handle, &info, &error.handle));
++    return Reference<ComputePipelineState>(MTLDevice_newComputePipelineState(handle, &info, error.out_handle()));
+   }
+ 
+   Reference<ComputePipelineState>
+@@ -875,27 +887,27 @@ public:
+     info.num_binary_archives_for_lookup = 0;
+     info.fail_on_binary_archive_miss = false;
+     info.support_indirect_command_buffers = false;
+-    return Reference<ComputePipelineState>(MTLDevice_newComputePipelineState(handle, &info, &error.handle));
++    return Reference<ComputePipelineState>(MTLDevice_newComputePipelineState(handle, &info, error.out_handle()));
+   }
+ 
+   Reference<RenderPipelineState>
+   newRenderPipelineState(const WMTRenderPipelineInfo &info, Error &error) {
+-    return Reference<RenderPipelineState>(MTLDevice_newRenderPipelineState(handle, &info, &error.handle));
++    return Reference<RenderPipelineState>(MTLDevice_newRenderPipelineState(handle, &info, error.out_handle()));
+   }
+ 
+   Reference<ComputePipelineState>
+   newComputePipelineState(const WMTComputePipelineInfo &info, Error &error) {
+-    return Reference<ComputePipelineState>(MTLDevice_newComputePipelineState(handle, &info, &error.handle));
++    return Reference<ComputePipelineState>(MTLDevice_newComputePipelineState(handle, &info, error.out_handle()));
+   }
+ 
+   Reference<RenderPipelineState>
+   newRenderPipelineState(const WMTMeshRenderPipelineInfo &info, Error &error) {
+-    return Reference<RenderPipelineState>(MTLDevice_newMeshRenderPipelineState(handle, &info, &error.handle));
++    return Reference<RenderPipelineState>(MTLDevice_newMeshRenderPipelineState(handle, &info, error.out_handle()));
+   }
+ 
+   Reference<RenderPipelineState>
+   newRenderPipelineState(const WMTTileRenderPipelineInfo &info, Error &error) {
+-    return Reference<RenderPipelineState>(MTLDevice_newTileRenderPipelineState(handle, &info, &error.handle));
++    return Reference<RenderPipelineState>(MTLDevice_newTileRenderPipelineState(handle, &info, error.out_handle()));
+   }
+ 
+   Reference<Fence>
+@@ -910,7 +922,7 @@ public:
+ 
+   Reference<ResidencySet>
+   newResidencySet(uint64_t init_capacity, Error &error) {
+-    return Reference<ResidencySet>(MTLDevice_newResidencySet(handle, init_capacity, &error.handle));
++    return Reference<ResidencySet>(MTLDevice_newResidencySet(handle, init_capacity, error.out_handle()));
+   }
+ 
+   Reference<Heap>
+@@ -965,7 +977,7 @@ public:
+ 
+   Reference<BinaryArchive>
+   newBinaryArchive(const char *url, Error &error) {
+-    return Reference<BinaryArchive>(MTLDevice_newBinaryArchive(handle, url, &error.handle));
++    return Reference<BinaryArchive>(MTLDevice_newBinaryArchive(handle, url, error.out_handle()));
+   }
+ 
+   bool
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index 9e5f77a6f7c7bdcda0ade377d98831dbf597fd7e..54402998471f9ac7f85af9b0b25f37a2bd0b7c18 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -340,7 +340,7 @@ _MTLDevice_newLibrary(void *obj) {
+   id<MTLDevice> device = (id<MTLDevice>)params->device;
+   NSError *err = NULL;
+   params->ret_library = (obj_handle_t)[device newLibraryWithData:(dispatch_data_t)params->data error:&err];
+-  params->ret_error = (obj_handle_t)err;
++  params->ret_error = (obj_handle_t)[err retain]; /* out-errors are autoreleased; the win side owns the handle (WMT::Reference) */
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -389,7 +389,7 @@ _MTLDevice_newComputePipelineState(void *obj) {
+       info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
+   params->ret_pso =
+       (obj_handle_t)[device newComputePipelineStateWithDescriptor:descriptor options:options reflection:nil error:&err];
+-  params->ret_error = (obj_handle_t)err;
++  params->ret_error = (obj_handle_t)[err retain]; /* out-errors are autoreleased; the win side owns the handle (WMT::Reference) */
+   if (!err && info->binary_archive_for_serialization) {
+     [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addComputePipelineFunctionsWithDescriptor:descriptor
+                                                                                                       error:&err];
+@@ -574,7 +574,7 @@ _MTLDevice_newRenderPipelineState(void *obj) {
+                                                                                               options:options
+                                                                                            reflection:nil
+                                                                                                 error:&err];
+-  params->ret_error = (obj_handle_t)err;
++  params->ret_error = (obj_handle_t)[err retain]; /* out-errors are autoreleased; the win side owns the handle (WMT::Reference) */
+   if (!err && info->binary_archive_for_serialization) {
+     [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addRenderPipelineFunctionsWithDescriptor:descriptor
+                                                                                                      error:&err];
+@@ -645,7 +645,7 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
+                                                                                                   options:options
+                                                                                                reflection:nil
+                                                                                                     error:&err];
+-  params->ret_error = (obj_handle_t)err;
++  params->ret_error = (obj_handle_t)[err retain]; /* out-errors are autoreleased; the win side owns the handle (WMT::Reference) */
+ #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+   if (@available(macOS 15, *)) {
+     if (!err && info->binary_archive_for_serialization) {
+@@ -2492,7 +2492,7 @@ _MTLLibrary_newFunctionWithConstants(void *obj) {
+     [values setConstantValue:constants[i].data.ptr type:(MTLDataType)constants[i].type atIndex:constants[i].index];
+ 
+   params->ret = (obj_handle_t)[library newFunctionWithName:name constantValues:values error:&err];
+-  params->ret_error = (obj_handle_t)err;
++  params->ret_error = (obj_handle_t)[err retain]; /* out-errors are autoreleased; the win side owns the handle (WMT::Reference) */
+   [name release];
+   [values release];
+   return STATUS_SUCCESS;
+@@ -2720,7 +2720,7 @@ _MTLDevice_newBinaryArchive(void *obj) {
+   }
+   NSError *err = NULL;
+   params->ret_archive = (obj_handle_t)[(id<MTLDevice>)params->device newBinaryArchiveWithDescriptor:desc error:&err];
+-  params->ret_error = (obj_handle_t)err;
++  params->ret_error = (obj_handle_t)[err retain]; /* out-errors are autoreleased; the win side owns the handle (WMT::Reference) */
+   [desc release];
+   if (url)
+     [url release];
+@@ -2736,7 +2736,7 @@ _MTLBinaryArchive_serialize(void *obj) {
+   NSURL *url = [[NSURL alloc] initFileURLWithPath:path_str];
+   NSError *err = NULL;
+   [(id<MTLBinaryArchive>)params->archive serializeToURL:url error:&err];
+-  params->ret_error = (obj_handle_t)err;
++  params->ret_error = (obj_handle_t)[err retain]; /* out-errors are autoreleased; the win side owns the handle (WMT::Reference) */
+   [url release];
+   [path_str release];
+   return STATUS_SUCCESS;
+@@ -2984,7 +2984,7 @@ _MTLDevice_newTileRenderPipelineState(void *obj) {
+                                                                                                   options:options
+                                                                                                reflection:nil
+                                                                                                     error:&err];
+-  params->ret_error = (obj_handle_t)err;
++  params->ret_error = (obj_handle_t)[err retain]; /* out-errors are autoreleased; the win side owns the handle (WMT::Reference) */
+ #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+   if (@available(macOS 15, *)) {
+     if (!err && info->binary_archive_for_serialization) {
+@@ -3005,7 +3005,7 @@ _MTLDevice_newResidencySet(void *obj) {
+   MTLResidencySetDescriptor *descriptor = [[MTLResidencySetDescriptor alloc] init];
+   descriptor.initialCapacity = params->init_capacity;
+   params->ret_set = (obj_handle_t)[(id<MTLDevice>)params->device newResidencySetWithDescriptor:descriptor error:&err];
+-  params->ret_error = (obj_handle_t)err;
++  params->ret_error = (obj_handle_t)[err retain]; /* out-errors are autoreleased; the win side owns the handle (WMT::Reference) */
+   [descriptor release];
+   return STATUS_SUCCESS;
+ }

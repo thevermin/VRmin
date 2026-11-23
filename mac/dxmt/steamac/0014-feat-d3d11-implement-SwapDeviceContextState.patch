@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hanzpo <hanznathanpo@gmail.com>
+Date: Fri, 2 Oct 2026 22:00:11 -0400
+Subject: [PATCH 14/27] feat(d3d11): implement SwapDeviceContextState
+
+Wine's d2d1 wraps every primitive it draws in a pair of
+SwapDeviceContextState calls. The method was a stub, so D2D rendering on
+top of DXMT clobbered the application's pipeline state and drew nothing.
+
+Store a full D3D11ContextState in each ID3DDeviceContextState object. On swap,
+end the current pass, move the live state into the outgoing object, load the
+incoming one and replay its bindings into the encoder. The context starts with
+an implicit state object that holds its initial state.
+
+(cherry picked from commit 7b22c83d3d36446921101d5191ae0986773c520c)
+---
+ src/d3d11/d3d11_context_impl.cpp  | 32 ++++++++++++++++++++++++++++++-
+ src/d3d11/d3d11_context_state.hpp |  9 ++++++++-
+ 2 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index 18bcbcad31b6059a9bc9cd7334233fcf41b97ac1..ce268c297860193c26d44714e4d7f09a0cd684e3 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -1921,7 +1921,35 @@ public:
+   void
+   STDMETHODCALLTYPE
+   SwapDeviceContextState(ID3DDeviceContextState *pState, ID3DDeviceContextState **ppPreviousState) override {
+-    UNIMPLEMENTED("SwapDeviceContextState");
++    std::lock_guard<mutex_t> lock(mutex);
++
++    if (ppPreviousState)
++      *ppPreviousState = nullptr;
++
++    if (!pState)
++      return;
++
++    // the context starts out with an implicit state object holding its current state
++    if (!active_context_state_)
++      active_context_state_ = new MTLD3D11DeviceContextState(device);
++
++    if (ppPreviousState)
++      *ppPreviousState = ref(active_context_state_.ptr());
++
++    auto next = static_cast<MTLD3D11DeviceContextState *>(pState);
++    if (next == active_context_state_.ptr())
++      return;
++
++    // end the current pass while state_ still describes it
++    ResetEncodingContextState();
++
++    // binding sets are move-only; moving marks every bound slot dirty, and pipeline state is rebuilt on the next
++    // draw/dispatch. the incoming object's copy is left stale while it is active (see MTLD3D11DeviceContextState)
++    active_context_state_->state = std::move(state_);
++    state_ = std::move(next->state);
++    active_context_state_ = next;
++
++    RestoreEncodingContextState();
+   }
+ 
+   void
+@@ -5198,6 +5226,8 @@ public:
+ 
+ protected:
+   D3D11ContextState state_;
++  // private reference: a public one would keep the device alive
++  Com<MTLD3D11DeviceContextState, false> active_context_state_;
+   D3D11UserDefinedAnnotation annotation_;
+   MTLD3D11ContextExt<ContextInternalState> ext_;
+   uint64_t max_object_threadgroups_;
+diff --git a/src/d3d11/d3d11_context_state.hpp b/src/d3d11/d3d11_context_state.hpp
+index 8198b4361cb74f03488936fa5e8d7770364a0886..3a16d574b8be5a945d1ca542f32596d8e97aa639 100644
+--- a/src/d3d11/d3d11_context_state.hpp
++++ b/src/d3d11/d3d11_context_state.hpp
+@@ -182,7 +182,12 @@ struct D3D11ContextState {
+   BOOL predicate_value = FALSE;
+ };
+ 
+-// TODO: implement it properly
++/**
++Holds a complete pipeline state for ID3D11DeviceContext1::SwapDeviceContextState.
++
++A newly created state object holds the default (cleared) pipeline state. While a state object is active on a
++context its `state` is stale; the context writes its live state back into it when another one is swapped in.
++*/
+ class MTLD3D11DeviceContextState
+     : public MTLD3D11DeviceChild<ID3DDeviceContextState> {
+ 
+@@ -192,6 +197,8 @@ public:
+ 
+   ~MTLD3D11DeviceContextState() {}
+ 
++  D3D11ContextState state = {};
++
+   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) {
+     if (ppvObject == nullptr)
+       return E_POINTER;

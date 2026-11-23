@@ -1,8 +1,8 @@
 diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
-index 82914a5..11397e0 100644
+index c0e670d..ef4ff6c 100644
 --- a/src/d3d11/d3d11_resource.hpp
 +++ b/src/d3d11/d3d11_resource.hpp
-@@ -12,6 +12,7 @@
+@@ -16,6 +16,7 @@
  #include "../d3d10/d3d10_buffer.hpp"
  #include "../d3d10/d3d10_texture.hpp"
  #include "../d3d10/d3d10_view.hpp"
@@ -10,24 +10,24 @@ index 82914a5..11397e0 100644
  #include <memory>
  #include <type_traits>
  #include <random>
-@@ -26,6 +27,69 @@ DEFINE_COM_INTERFACE("9a6f6549-d4b1-45ea-8794-8503d190d3d1",
+@@ -30,6 +31,69 @@ DEFINE_COM_INTERFACE("9a6f6549-d4b1-45ea-8794-8503d190d3d1",
  
  namespace dxmt {
  
-+/* IDXGIKeyedMutex for resources created SHARED_KEYEDMUTEX or SHARED_NTHANDLE
++/* IDXGIKeyedMutex for resources created SHARED_NTHANDLE without SHARED_KEYEDMUTEX
 + * (Chromium's GPU process asks for it on the images it shares, and crashes
-+ * without it). The acquire and release don't wait: within one Metal device
-+ * the GPU work of the processes sharing the resource isn't reordered by the
-+ * key. Resources created only SHARED (SteamVR's compositor and drivers) still
-+ * have none.
++ * without it; those created SHARED_KEYEDMUTEX have DXMT's own). The acquire
++ * and release don't wait: within one Metal device the GPU work of the
++ * processes sharing the resource isn't reordered by the key. Resources created
++ * only SHARED (SteamVR's compositor and drivers) still have none.
 + */
-+class MTLDXGIKeyedMutex final : public IDXGIKeyedMutex {
++class MTLDXGIKeyedMutexNoWait final : public IDXGIKeyedMutex {
 +  std::atomic<ULONG> refs_{1};
 +  ID3D11Resource *resource_;
 +
 +public:
-+  MTLDXGIKeyedMutex(ID3D11Resource *resource) : resource_(resource) { resource_->AddRef(); }
-+  ~MTLDXGIKeyedMutex() { resource_->Release(); }
++  MTLDXGIKeyedMutexNoWait(ID3D11Resource *resource) : resource_(resource) { resource_->AddRef(); }
++  ~MTLDXGIKeyedMutexNoWait() { resource_->Release(); }
 +
 +  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
 +    if (!ppvObject)
@@ -80,17 +80,19 @@ index 82914a5..11397e0 100644
  template <typename RESOURCE_DESC>
  void UpgradeResourceDescription(const RESOURCE_DESC *pSrc, RESOURCE_DESC &dst) {
    dst = *pSrc;
-@@ -238,6 +302,13 @@ public:
-       return S_OK;
+@@ -308,8 +372,13 @@ public:
      }
  
-+    if (riid == __uuidof(IDXGIKeyedMutex) &&
-+        (desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE))) {
-+      *ppvObject = static_cast<IDXGIKeyedMutex *>(new MTLDXGIKeyedMutex(ref_and_cast<D3D11ResourceCommon>(this)));
-+      static_cast<D3D11ResourceCommon *>(this)->Release();   // (the mutex object holds its own reference)
-+      return S_OK;
-+    }
-+
-     if (logQueryInterfaceError(__uuidof(typename tag::COM), riid)) {
-       WARN("D3D11Resource(", tag::debug_name ,"): Unknown interface query ", str::format(riid));
+     if (riid == __uuidof(IDXGIKeyedMutex)) {
+-      if (!(this->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
+-        return E_NOINTERFACE;
++      if (!(this->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) {
++        if (!(this->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE))
++          return E_NOINTERFACE;
++        *ppvObject = static_cast<IDXGIKeyedMutex *>(new MTLDXGIKeyedMutexNoWait(ref_and_cast<D3D11ResourceCommon>(this)));
++        static_cast<D3D11ResourceCommon *>(this)->Release();   // (the mutex object holds its own reference)
++        return S_OK;
++      }
+       *ppvObject = ref(&keyed_mutex);
+       return S_OK;
      }

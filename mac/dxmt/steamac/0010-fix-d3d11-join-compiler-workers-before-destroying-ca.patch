@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SteveTanSaMa <1519364926@qq.com>
+Date: Fri, 9 Oct 2026 17:19:32 +0800
+Subject: [PATCH 10/27] fix(d3d11): join compiler workers before destroying
+ cached tasks
+
+(cherry picked from commit def87758c04e635f4cad90d0dda1defa91bc7661)
+---
+ src/d3d11/d3d11_pipeline_cache.cpp      |  8 +++-
+ src/dxmt/dxmt_tasks.hpp                 | 17 +++++++-
+ tests/regression/meson.build            |  7 +++
+ tests/regression/scheduler_lifetime.cpp | 58 +++++++++++++++++++++++++
+ 4 files changed, 88 insertions(+), 2 deletions(-)
+ create mode 100644 tests/regression/meson.build
+ create mode 100644 tests/regression/scheduler_lifetime.cpp
+
+diff --git a/src/d3d11/d3d11_pipeline_cache.cpp b/src/d3d11/d3d11_pipeline_cache.cpp
+index ec17d048caefd096fa2aae51fb749123c4c9306f..74417f6998979dd534bd8da275250f570bfcbb14 100644
+--- a/src/d3d11/d3d11_pipeline_cache.cpp
++++ b/src/d3d11/d3d11_pipeline_cache.cpp
+@@ -448,6 +448,12 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+   }
+ 
+ public:
++  ~PipelineCache() override {
++    // Members are destroyed in reverse declaration order. Join workers while
++    // shader variants, pipelines and their dependencies are still alive.
++    scheduler_.shutdown();
++  }
++
+   PipelineCache(MTLD3D11Device *pDevice) :
+       scache_(ShaderCache::getInstance(pDevice->GetDXMTDevice().metalVersion())),
+       device(pDevice),
+@@ -460,4 +466,4 @@ InitializePipelineCache(MTLD3D11Device *device) {
+   return std::make_unique<PipelineCache>(device);
+ }
+ 
+-}; // namespace dxmt
+\ No newline at end of file
++}; // namespace dxmt
+diff --git a/src/dxmt/dxmt_tasks.hpp b/src/dxmt/dxmt_tasks.hpp
+index 6762d4775871a6e23f9a2842003174455849c257..78f3cd6051abaffbb6c21055e2b43de03564f19b 100644
+--- a/src/dxmt/dxmt_tasks.hpp
++++ b/src/dxmt/dxmt_tasks.hpp
+@@ -20,6 +20,9 @@ public:
+ 
+   task_scheduler();
+   ~task_scheduler();
++  // Called by the owner before destroying the objects referenced by tasks.
++  // Queued work may be abandoned; running work is joined before returning.
++  void shutdown();
+ 
+   uint64_t
+   get_running_threads() {
+@@ -56,7 +59,14 @@ template <typename Task> task_scheduler<Task>::task_scheduler() {
+ }
+ 
+ template <typename Task> task_scheduler<Task>::~task_scheduler() {
+-  destroyed.store(true);
++  shutdown();
++}
++
++template <typename Task> void task_scheduler<Task>::shutdown() {
++  {
++    std::lock_guard<dxmt::mutex> lock(worker_mutex_);
++    destroyed.store(true);
++  }
+   worker_cond_.notify_all();
+ 
+   for (auto &worker : workers_) {
+@@ -84,6 +94,9 @@ task_scheduler<Task>::worker_func() {
+         });
+       }
+ 
++      if (destroyed.load())
++        break;
++
+       if (!task_continuation_queue_.empty()) {
+         task = task_continuation_queue_.front();
+         task_continuation_queue_.pop();
+@@ -133,6 +146,8 @@ template <typename Task>
+ void
+ task_scheduler<Task>::submit(Task task) {
+   std::unique_lock<dxmt::mutex> lock(worker_mutex_);
++  if (destroyed.load())
++    return;
+   task_queue_.push(task);
+ 
+   if (running.load(std::memory_order_relaxed) == threads && threads < max_threads) {
+diff --git a/tests/regression/meson.build b/tests/regression/meson.build
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6f225616c3dffb0a5a1c1765184577098d9d5a9
+--- /dev/null
++++ b/tests/regression/meson.build
+@@ -0,0 +1,7 @@
++project('dxmt-regression', 'cpp', default_options: ['cpp_std=c++20', 'warning_level=2'])
++
++inc = include_directories('../../src/util', '../../src/winemetal',
++                          '../../include/native/windows', '../../include/native/directx')
++threads = dependency('threads')
++test('scheduler-lifetime', executable('scheduler-lifetime', 'scheduler_lifetime.cpp',
++     include_directories: inc, dependencies: threads), timeout: 30)
+diff --git a/tests/regression/scheduler_lifetime.cpp b/tests/regression/scheduler_lifetime.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..503fcf966d51f74631ab06f7ccaaeadd0794f220
+--- /dev/null
++++ b/tests/regression/scheduler_lifetime.cpp
+@@ -0,0 +1,58 @@
++#include "../../src/dxmt/dxmt_tasks.hpp"
++#include <cassert>
++#include <future>
++#include <memory>
++
++// Native Win32 compatibility helpers only need this logging entry point.
++void dxmt::Logger::warn(const std::string &) {}
++
++struct Task {
++  std::promise<void> entered;
++  std::shared_future<void> release;
++  std::atomic_bool done = false;
++  std::atomic_bool &completed;
++  std::atomic_bool &destroyed;
++  ~Task() { destroyed = true; }
++};
++
++template <> struct dxmt::task_trait<Task *> {
++  Task *run_task(Task *task) {
++    task->entered.set_value();
++    task->release.wait();
++    assert(!task->destroyed.load());
++    task->completed = true;
++    return task;
++  }
++  bool get_done(Task *task) { return task->done; }
++  void set_done(Task *task) { task->done = true; }
++};
++
++int main() {
++  for (int iteration = 0; iteration < 50; ++iteration) {
++    std::promise<void> release;
++    std::atomic_bool completed = false, destroyed = false;
++    // Match PipelineCache: the scheduler precedes its task-owning storage.
++    struct Owner {
++      dxmt::task_scheduler<Task *> scheduler;
++      std::unique_ptr<Task> task;
++      ~Owner() { scheduler.shutdown(); }
++    };
++    auto owner = std::make_unique<Owner>();
++    owner->task = std::unique_ptr<Task>(new Task{{}, release.get_future().share(), false, completed, destroyed});
++    auto entered = owner->task->entered.get_future();
++    owner->scheduler.submit(owner->task.get());
++    assert(entered.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
++    auto destroying = std::async(std::launch::async, [&] { owner.reset(); });
++    assert(destroying.wait_for(std::chrono::milliseconds(10)) == std::future_status::timeout);
++    assert(!destroyed);
++    release.set_value();
++    assert(destroying.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
++    destroying.get();
++    assert(completed && destroyed);
++  }
++  // Also cover sleeping workers, repeated shutdown, and late submissions.
++  dxmt::task_scheduler<Task *> idle;
++  idle.shutdown();
++  idle.shutdown();
++  idle.submit(nullptr);
++}

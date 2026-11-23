@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 22:05:24 +0300
+Subject: [PATCH 24/27] STEAMAC-README: what this branch is, adopted commits,
+ measurements, review ledger
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ STEAMAC-README.md | 156 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 156 insertions(+)
+ create mode 100644 STEAMAC-README.md
+
+diff --git a/STEAMAC-README.md b/STEAMAC-README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2177d4aca3e80ec6accb07ce89c32e03baa77da
+--- /dev/null
++++ b/STEAMAC-README.md
+@@ -0,0 +1,156 @@
++# StonkGuy/dxmt, branch `steamac`
++
++Downstream DXMT for [steamac](https://github.com/StonkGuy/steamac)'s DXMT graphics path: Direct3D 10/11 (and
++12) games under Proton in an ARM64 Linux VM on a Mac, with DXMT's Metal calls remoted to the macOS host by
++steamac's `wmtr` transport. The branch is upstream `3Shain/dxmt` `main` plus the commits below, one commit per
++change. Commits adopted from other DXMT forks are cherry-picked with `git cherry-pick -x`, so each keeps its
++original author and names its source commit; a follow-up commit of ours adapts it where needed.
++
++* Base: 3Shain/dxmt `e94c312` (2026-10-09).
++* steamac pins a commit of this branch (`host/dxmt/pin.env`) and ships it as generated patches
++  (`scripts/export-dxmt-patches.sh`); there are no tags or releases here.
++* Licence: LGPL-2.1-or-later, as upstream (`COPYING.LIB`, `LICENSE`). Nothing from GPL-only forks is included;
++  two ideas seen in a GPL-3.0 fork were implemented independently from their description (marked below).
++* **Policy: nothing from this branch is submitted to 3Shain/dxmt.** DXMT does not accept AI-assisted
++  contributions, and parts of this branch were written with AI assistance. Bug reports about this branch are
++  welcome as issues on this repository.
++
++## Tests
++
++* `tests/regression/` (from SteveTanSaMa/DXMT, host-run, no GPU window):
++  `meson setup build-regress tests/regression && meson test -C build-regress` (scheduler lifetime, Reference
++  ownership, shader bitcode cleanup). All three fail to build on upstream `main`, pass here.
++* steamac `wmtr/`: `make test` (loopback incl. out-error ownership), `make test-linux` (guest client),
++  `wmtr/tests/d3d11bench.cpp` and `d3d12bench.cpp` (A/B benchmarks in the VM),
++  `wmtr/tests/dxmt_member_order_check.py`.
++* Upstream's `tests/dx11` are interactive windowed samples, not automated.
++
++## Commits on top of upstream
++
++| # | commit | author | origin | what |
++|---|---|---|---|---|
++| 1 | build: prebuilt_metal_dir and build_unixlib options | StonkGuy | steamac | build without the Xcode Metal toolchain; PE-only cross build |
++| 2 | dxmt: staging blocks write where newBuffer says the contents are | StonkGuy | steamac | needed by wmtr's shared memory |
++| 3 | dxmt: dxgi.maxFrameLatency config option | StonkGuy | steamac | as in DXVK |
++| 4 | dxmt: complete an occlusion query that ends in a draw-less chunk | David Grinberg | utmapp/dxmt 75628987 | GetData never completed |
++| 5 | d3d11: UpdateSubresource into STAGING buffers and textures | osy | utmapp/dxmt 917b721c | aborted before |
++| 6 | winemetal: skip compute dispatches encoded without a pipeline state | Holly Hamilton | hollyhamilton/dxmt 44bf134b | |
++| 7 | d3d11,dxmt,winemetal: drop draws and dispatches whose pipeline failed to compile | Holly Hamilton | hollyhamilton/dxmt 717f7822 | conflict resolved for upstream's tessellation cases |
++| 8 | winemetal: retain out-errors crossing the boundary | osy | utmapp/dxmt cc080d00 | over-release of NSError; also needed by wmtr |
++| 9 | winemetal: retain the newLibraryWithSource out-error too | StonkGuy | adaptation of 8 | call added upstream after 8's base |
++| 10 | fix(d3d11): join compiler workers before destroying cached tasks | SteveTanSaMa | SteveTanSaMa/DXMT def87758 | + regression test |
++| 11 | fix(winemetal): preserve ownership during reference assignment | SteveTanSaMa | SteveTanSaMa/DXMT 8b3a6d08 | + regression test |
++| 12 | fix(d3d11): release compiled bitcode on all shader failure paths | SteveTanSaMa | SteveTanSaMa/DXMT 4689d1bb | + regression test |
++| 13 | feat(d3d11): expose IDXGISurface on single-subresource 2D textures | hanzpo | hanzpo/dxmt 1b1aa5b5 | Direct2D interop |
++| 14 | feat(d3d11): implement SwapDeviceContextState | hanzpo | hanzpo/dxmt 7b22c83d | aborted before (Direct2D) |
++| 15 | d3d11: answer SO_STATISTICS and SO_OVERFLOW_PREDICATE queries with a dummy | Mybono | Mybono/dxmt 126b53f6 | CreateQuery failed (World of Tanks) |
++| 16 | feat(dxgi): add dxgi.customVideoMemory option to cap reported VRAM | NerRobDog | NerRobDog/dxmt dbcc2318 | off by default |
++| 17 | d3d11: give airconv the integer render-target formats of a pixel pipeline | StonkGuy | steamac | instead of utmapp a2eff1bf/b2252bb7, using upstream's existing pixel_formats |
++| 18 | airconv,d3d11: bounds-clamp buffer atomics (airconv part) | Holly Hamilton | hollyhamilton/dxmt 69695f43 | airconv half only, AIRCONV_VERSION 27 |
++| 19 | fix(dxmt): reserve command slots before publishing chunks | 时雨 | gamesir-labs/dxmt a350b20 | chunk counter race |
++| 20 | d3d11: submit the frame's commands before recording the present | StonkGuy | idea seen in willfaust/dxmt (GPL-3.0), own implementation | `d3d11.submitBeforePresent`, PERF |
++| 21 | d3d11: d3d11.cpuCachedDynamicResources option | StonkGuy | idea seen in willfaust/dxmt (GPL-3.0), own implementation | PERF |
++| 22 | perf(airconv): keep small dynamically indexed temp arrays in registers | hanzpo | hanzpo/dxmt 48259b2c | AIRCONV_VERSION 28, PERF |
++| 23 | feat(dxmt): use residency set instead of useResource | Jakey-Jakey | Jakey-Jakey/dxmt c4fe91ec | `DXMT_RESIDENCY_SET=0` disables, PERF |
++
++PERF rows: kept or dropped on the measurement in "Performance" below.
++
++## Performance
++
++Measured in the steamac VM (M2, guest under FEX, wmtr transport, app-19e), d3d11bench through Proton, 12 s runs,
++variants interleaved, 4 rounds; the variant switches off one change at a time (the default build has all of
++them). fps mean (min-max):
++
++| config | all on | `d3d11.submitBeforePresent=False` | `DXMT_RESIDENCY_SET=0` | `d3d11.cpuCachedDynamicResources=True` |
++|---|---|---|---|---|
++| CPU-bound, 60000 draws, no fill | 79.3 (74.0-81.8) | 81.4 (79.8-82.1) | 80.3 (79.2-80.9) | 81.4 (80.9-82.2) |
++| GPU-bound, 200 draws, 12 fill passes | 40.2 (40.2-40.3) | 40.0 (39.7-40.3) | 40.0 (39.8-40.2) | 40.1 (39.9-40.2) |
++
++All differences are inside the run-to-run spread: the three changes are neutral on this load and stay (the cached
++mapping stays opt-in). hanzpo 48259b2c is measured with `d3d11bench --indexed 1` against a host library built
++without it: 51.5 fps median with it (9 runs, 35.6-51.7; the low ones in the first rounds after boot) vs 21.2-26.3 fps (4 runs) without, about 2.2x on that shader; kept. D3D12 (d3d12bench, same VM): 2000 draws + 4 fill passes 85.3 fps; ExecuteIndirect faults the GPU, as with DXMT outside the VM.
++
++
++## Review ledger
++
++Every commit ahead of upstream in the active forks was reviewed (2026-10-11). Maintenance: last push, and
++whether the fork tracks upstream. Verdicts: adopted (row above), rejected (reason).
++
++### Forks
++
++| fork | last push | tracks upstream | note |
++|---|---|---|---|
++| utmapp/dxmt | 2026-10-10 | 168 behind, re-syncs by hand | UTM native embedding; best tested |
++| SteveTanSaMa/DXMT | 2026-10-10 | 0 behind | MiPlay; small lifetime fixes with tests |
++| hanzpo/dxmt | 2026-10-03 | 15 behind | small, focused |
++| Jakey-Jakey/dxmt | 2026-10-01 | 15 behind | one commit |
++| Mybono/dxmt | 2026-10-05 | 18 behind, CI checks rebase on upstream | |
++| NerRobDog/dxmt | 2026-09-23 | 63 behind | |
++| hollyhamilton/dxmt | 2026-09-06 | 262 behind (stale) | Intel/AMD Mac fixes |
++| gamesir-labs/dxmt | 2026-08-13 | rewritten history, last sync before Aug 2026 | GameHub: own D3D12/D3D9/Metal 4 |
++| gauthierpiarrette, EricSpencer00, VitekCZE, dacevedo12, cashcon57, mozin751, mkhoatd, sse2, YupItzAfi, qRoC, monofunc, marzent, JuneStepp, open-sources-port, oscarbg, sunshinewithmoonlight, LeaveNhA | various | mostly behind | see below |
++| willfaust/dxmt | 2026-10-06 | 345 behind | additions GPL-3.0: code not read or used |
++
++### Per commit
++
++**utmapp/dxmt**
++- 75628987 occlusion query in a draw-less chunk: adopted (#4); smaller than gamesir f2e6993/4253efe's version of the same fix, same finish-thread ordering.
++- 917b721c UpdateSubresource into STAGING: adopted (#5); its native-suite test needs utmapp's native build, not carried.
++- cc080d00 retain out-errors: adopted (#8, #9); retaining on the unix side is the only correct fix across a serialised boundary (SteveTanSaMa 8c111da7 retains after the call returns).
++- c719d4c3 skip nil-pipeline draws: rejected; hollyhamilton 717f7822 + 44bf134b cover render and compute (this one render only).
++- b2252bb7, a2eff1bf integer-RTV PSO retry / typed outputs: rejected in favour of #17 (upstream 8d8afb09 already types outputs from pixel_formats; d3d11 passed zeros). a2eff1bf would also change airconv_public.h.
++- 1d239b9c BC emulation, 822ae637 pre-3.1 AIR, 8a2d534a Metal 3.0 target, be80e14c deployment floor: rejected (no benefit on an M2 / macOS 27 host).
++- 6fee0a60, 8edbec63, b601860c, bcdcf6da, 70aa109c, f05e963e, 2a2eca8f, accc881a, 20d9679a: rejected (native/iOS embedding, App Sandbox, its native test suite).
++
++**SteveTanSaMa/DXMT**
++- def87758, 8b3a6d08, 4689d1bb: adopted (#10-#12) with their regression tests.
++- 8c111da7 NSError retain in C++ wrappers: rejected (superseded by #8; retaining after return is too late when the call crosses wmtr). Its compile-worker autorelease pools would add two round trips per pipeline compile under wmtr.
++- 2e87d697, 91a67dbf, d3206306, 7b0c6d78 Metal/AIR cache isolation and bootstrap: rejected (MiPlay launcher specifics; steamac sets its cache path itself).
++- 41d4cb87, 55d9c791, 51f9dc30, ba8e175c, fcce15df, 32672313, da047dc4, e071d24a, 05833a54: rejected (their build/release, game smoke runners, docs).
++
++**hollyhamilton/dxmt**
++- 44bf134b, 717f7822: adopted (#6, #7).
++- 69695f43: airconv buffer-atomic bounds check adopted (#18); GS payload slack (non-Apple GPUs) and compile-gate routing dropped.
++- 5675c273 compile gate (cap 4 concurrent Metal compiles, retry): rejected; works around MTLCompilerService crashes on AMD Macs, and the cap would serialise pipeline compiles (more hitches) on Apple GPUs.
++- 8c79383d missing header: already upstream. 3cdc6b8c CI: rejected.
++
++**hanzpo/dxmt**
++- 1b1aa5b5, 7b22c83d: adopted (#13, #14); most complete of five forks' versions (gauthierpiarrette 7421db20/04e84ac6, EricSpencer00 03605356/58ff5f96, VitekCZE/WIndFate 3498fd44/dd8c2d19): tracks the active state object, ends the pass before swapping, Map forwards with Windows' single-subresource rule.
++- 48259b2c temp arrays in registers: PERF (#22).
++- a2f7929c keep render pass across state swaps: rejected (only Direct2D-style swap loops benefit; no workload to measure).
++- 2bbac86a, d7c0f3d8, c7f4b3de, a4fe1a91 diagnostics/live flags: rejected (debug tooling).
++
++**Jakey-Jakey/dxmt**: c4fe91ec residency set: PERF (#23).
++
++**Mybono/dxmt**: 126b53f6 adopted (#15). df01dbbe, 792d2927 CI: rejected.
++
++**NerRobDog/dxmt**
++- dbcc2318 dxgi.customVideoMemory: adopted (#16), off by default.
++- ad95248b, a3b44706, 41a90a00, 82858922, 68f423f4 (+ merge e9d202d9) releaseShaderIR: rejected for now (5-commit series, opt-in memory saving with no observed memory pressure here; revisit if guest memory becomes the limit).
++- 9cfc88a1, 8a9f4b74 frame CSV log: rejected (steamac measures frames on the host). Docs/CI/funding commits: rejected.
++
++**gamesir-labs/dxmt** (dev-main; 2153 commits ahead, 1093 patch-equivalent to upstream after their history rewrite)
++- a350b20 command-slot reservation: adopted (#19).
++- f2e6993 empty-chunk occlusion: rejected (same fix as #4). 4253efe 64-bit occlusion sums: rejected (D3D9-motivated; no D3D10/11 consumer exceeds 2^32 samples in one query).
++- 0ff0b5c keep an unabsorbed clear: rejected; a matched attachment already set to Clear carries a later clear of the same view (encoders are folded back to front), which supersedes this one, so dropping it is correct and the change only adds a pass.
++- 9c6da09 typed-buffer UAV atomics as texture ops: rejected (D3D11 allows typed UAV atomics only on R32 formats, where the buffer path addresses the same memory; no reproducer).
++- f854c31 cull distances emitted as clip distances: rejected (wrong semantics: clips pixels a cull distance keeps).
++- 3748e0e multithreaded encoding hardening: rejected (predates upstream's own d3d11_device_mutex rework acda4f94/0b639908/e94c312 in the base; reintroduces try_lock).
++- 0fc3402 UDEC3, ae5ee33 DEC3N: rejected (D3D9 vertex formats; no D3D11 consumer).
++- 95863fa raw-load guard, cf67ae7 ICB fallback, 173ce5f malformed bytecode, 1c0a171 sm51 cbuffers, 60276e4/d16c766 varying types, 7ee66d0, 7fdb43b, c47bb96, a85eb6f: rejected (already guarded upstream, D3D12/SM5.1-driven, or no consumer shown).
++- b5cbc7e/0be4c65/547d701/3170d03/e682da4/c65f2d7/a17b253 encoder merging and fence-dependency series: rejected; tryMergeComputeEncoders comes from 1a71f719 ("perf(d3d12): reduce FH4 command overhead", 950 lines, changes winemetal.h and winemetal4), so none of them applies without the Metal 4 backend. Upstream already merges compatible render passes.
++- 65376e1, 1d2a83f, b3f5a59, 59256fe: rejected (need new winemetal calls / winemetal4 or are entangled with D3D12).
++- Groups: ~533 D3D12/DXIL, 37 D3D9, 20 winemetal4 (Metal 4), 47 apitrace, 312 tests/CI/docs/BC/iOS: not adopted (see steamac's Metal 4 / D3D9 study).
++
++**Other forks**
++- gauthierpiarrette 7421db20, 04e84ac6, 96cdcf27; EricSpencer00 03605356, 58ff5f96; VitekCZE dd8c2d19, 3498fd44: rejected (hanzpo's versions taken).
++- gauthierpiarrette e1fdeb3b cross-process swapchain; EricSpencer00 5ce690e0, 20e1a9af, 20da198f, 1db0e891, 0289c8a2, d8581465, 97880b1c, cdca65f2: rejected (cross-process presentation/GDI for a different embedding; no consumer here).
++- VitekCZE 44b740fc GetDC via staging readback: rejected (built on WIndFate's surface; GDI interop has no consumer here).
++- dacevedo12 fe69cd39 D3D9 frontend (+ tests/CI/docs): see the D3D9 study; not adopted.
++- cashcon57 (early gamesir snapshot): superseded by gamesir-labs.
++- mozin751 persistent PSO cache via binary archives (22 commits): rejected (stale, 337 behind; DXMT has its own shader cache).
++- mkhoatd shared resources (Jeonghyeon Kim): superseded (upstream implements shared resources).
++- sse2 14eda343 back buffer SRV only on request: rejected (upstream sets it deliberately; games bind the back buffer without the flag). sse2 SDL2/native commits: rejected.
++- qRoC b6b5b851 operand index representation mask: rejected (matches Microsoft's reference header; the 64-bit index forms are never emitted by fxc).
++- YupItzAfi 5285a71e MetalFX SDK guard: rejected (old-SDK build fix). monofunc fb416ddd Metal interop for OpenXR: rejected (no consumer). Jakey-Jakey/Mybono CI, marzent native-dll/CI, JuneStepp/oscarbg/sunshinewithmoonlight/LeaveNhA CI, open-sources-port sync: rejected (CI/merges only).
++- willfaust/dxmt: GPL-3.0 additions, code not read. Two ideas from its description were implemented independently (#20, #21).

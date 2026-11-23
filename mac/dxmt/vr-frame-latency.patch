@@ -1,0 +1,75 @@
+diff --git a/src/d3d11/d3d11_context_def.cpp b/src/d3d11/d3d11_context_def.cpp
+index fd9b905..e9f8bdc 100644
+--- a/src/d3d11/d3d11_context_def.cpp
++++ b/src/d3d11/d3d11_context_def.cpp
+@@ -440,6 +440,8 @@ public:
+     return E_NOTIMPL;
+   };
+ 
++  void LimitFrameLatencyForExport() override {}
++
+   void Commit() override{
+       // nop
+   };
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 0ce6a9a..97d4fed 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -523,6 +523,15 @@ public:
+     InvalidateCurrentPass(true);
+   }
+ 
++  void
++  LimitFrameLatencyForExport() override {
++    std::lock_guard<d3d11_device_mutex> lock(mutex);
++    if (export_max_frame_latency_) {
++      cmd_queue.LimitMaxLatency(export_max_frame_latency_);
++      export_max_frame_latency_ = 0;
++    }
++  }
++
+   HRESULT
+   FlushForExport(UINT64 *pSharedEvent, UINT64 *pSignalValue) override {
+     if (!pSharedEvent || !pSignalValue)
+diff --git a/src/d3d11/d3d11_device.hpp b/src/d3d11/d3d11_device.hpp
+index b929270..15bfbac 100644
+--- a/src/d3d11/d3d11_device.hpp
++++ b/src/d3d11/d3d11_device.hpp
+@@ -22,6 +22,9 @@ DEFINE_COM_INTERFACE("3a3f085a-d0fe-4324-b0ae-fe04de18571c",
+   virtual HRESULT ReleaseSync(ID3D11Resource *pResource, UINT64 Key) = 0;
+   /* commit pending work; *pSharedEvent reaches *pSignalValue when everything submitted so far completed */
+   virtual HRESULT FlushForExport(UINT64 *pSharedEvent, UINT64 *pSignalValue) = 0;
++  /* VRmin: a texture of this device is shared with another process (a VR compositor takes the frames): bound the
++     frame queue as an export does (d3d11.exportMaxFrameLatency) */
++  virtual void LimitFrameLatencyForExport() = 0;
+ };
+ 
+ namespace dxmt {
+diff --git a/src/d3d11/d3d11_texture_device.cpp b/src/d3d11/d3d11_texture_device.cpp
+index 5488588..70f1a11 100644
+--- a/src/d3d11/d3d11_texture_device.cpp
++++ b/src/d3d11/d3d11_texture_device.cpp
+@@ -310,6 +310,7 @@ public:
+     }
+ 
+     *pSharedHandle = reinterpret_cast<HANDLE>(global_kmt_);
++    this->m_parent->GetImmediateContextPrivate()->LimitFrameLatencyForExport();   // (VRmin: shared with another process)
+     return S_OK;
+   }
+ 
+@@ -317,6 +318,7 @@ public:
+   CreateSharedHandle(const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName, HANDLE *pNTHandle)
+       override {
+     InitReturnPtr(pNTHandle);
++    this->m_parent->GetImmediateContextPrivate()->LimitFrameLatencyForExport();   // (VRmin: shared with another process)
+     if (!local_kmt_ && imported_nt_ && !pName) {
+       if (!DuplicateHandle(GetCurrentProcess(), imported_nt_, GetCurrentProcess(), pNTHandle, 0, FALSE,
+                            DUPLICATE_SAME_ACCESS))
+@@ -547,6 +549,7 @@ ImportSharedTextureInternal(
+   if (NtHandle)
+     DuplicateHandle(GetCurrentProcess(), NtHandle, GetCurrentProcess(), &nt, 0, FALSE, DUPLICATE_SAME_ACCESS);
+   device_texture->SetImportedHandles(GlobalHandle, nt);
++  pDevice->GetImmediateContextPrivate()->LimitFrameLatencyForExport();   // (VRmin: a texture of another process)
+   return device_texture->QueryInterface(riid, ppTexture);
+ }
+ 

@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SteveTanSaMa <1519364926@qq.com>
+Date: Fri, 9 Oct 2026 17:20:43 +0800
+Subject: [PATCH 11/27] fix(winemetal): preserve ownership during reference
+ assignment
+
+(cherry picked from commit 8b3a6d08ccdf3ad343739b0833918899df7a3a8f)
+---
+ src/winemetal/Metal.hpp                  | 17 ++++---
+ tests/regression/meson.build             |  2 +
+ tests/regression/reference_ownership.cpp | 58 ++++++++++++++++++++++++
+ 3 files changed, 68 insertions(+), 9 deletions(-)
+ create mode 100644 tests/regression/reference_ownership.cpp
+
+diff --git a/src/winemetal/Metal.hpp b/src/winemetal/Metal.hpp
+index 8bbc2feb5c139524eb5339ea48f57553b1964be1..57cc35c0a2fc1ed34324759cf0254a3b348cfb62 100644
+--- a/src/winemetal/Metal.hpp
++++ b/src/winemetal/Metal.hpp
+@@ -69,7 +69,7 @@ public:
+     this->handle = copy.handle;
+     this->retain();
+   }
+-  Reference(Reference &&move) {
++  Reference(Reference &&move) noexcept {
+     this->handle = move.handle;
+     move.handle = NULL_OBJECT_HANDLE;
+   }
+@@ -83,22 +83,21 @@ public:
+ 
+   Reference &
+   operator=(const Reference &copy) {
+-    if (this->handle != NULL_OBJECT_HANDLE)
+-      this->release();
+-    this->handle = copy.handle;
+-    this->retain();
+-    return *this;
++    return operator=(static_cast<Class>(copy));
+   }
+   Reference &
+   operator=(Class non_retained) {
++    // The borrowed input may alias our last owning reference.
++    non_retained.retain();
+     if (this->handle != NULL_OBJECT_HANDLE)
+       this->release();
+     this->handle = non_retained.handle;
+-    this->retain();
+     return *this;
+   }
+   Reference &
+-  operator=(Reference &&move) {
++  operator=(Reference &&move) noexcept {
++    if (this == &move)
++      return *this;
+     if (this->handle != NULL_OBJECT_HANDLE)
+       this->release();
+     this->handle = move.handle;
+@@ -1240,4 +1239,4 @@ InitializeTileRenderPipelineInfo(WMTTileRenderPipelineInfo &info) {
+   info.fail_on_binary_archive_miss = false;
+ }
+ 
+-} // namespace WMT
+\ No newline at end of file
++} // namespace WMT
+diff --git a/tests/regression/meson.build b/tests/regression/meson.build
+index e6f225616c3dffb0a5a1c1765184577098d9d5a9..5d65562c0d187efdfcfdb4493bf4fe50beab6ba8 100644
+--- a/tests/regression/meson.build
++++ b/tests/regression/meson.build
+@@ -5,3 +5,5 @@ inc = include_directories('../../src/util', '../../src/winemetal',
+ threads = dependency('threads')
+ test('scheduler-lifetime', executable('scheduler-lifetime', 'scheduler_lifetime.cpp',
+      include_directories: inc, dependencies: threads), timeout: 30)
++test('reference-ownership', executable('reference-ownership', 'reference_ownership.cpp',
++     include_directories: inc))
+diff --git a/tests/regression/reference_ownership.cpp b/tests/regression/reference_ownership.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..358f062c54202b85bb9a52f4814a89ebb7d9642c
+--- /dev/null
++++ b/tests/regression/reference_ownership.cpp
+@@ -0,0 +1,58 @@
++#include "Metal.hpp"
++#include <cassert>
++#include <unordered_map>
++#include <utility>
++
++static std::unordered_map<obj_handle_t, unsigned> refs;
++static unsigned releases = 0;
++extern "C" void NSObject_retain(obj_handle_t handle) {
++  if (!handle) return;
++  auto iter = refs.find(handle);
++  // A retain after the final release is a use-after-free, even if handle values match.
++  assert(iter != refs.end());
++  ++iter->second;
++}
++extern "C" void NSObject_release(obj_handle_t handle) {
++  if (!handle) return;
++  auto iter = refs.find(handle);
++  assert(iter != refs.end() && iter->second);
++  ++releases;
++  if (!--iter->second) refs.erase(iter);
++}
++static obj_handle_t make_object() {
++  static obj_handle_t next = 1;
++  refs.emplace(next, 1);
++  return next++;
++}
++
++int main() {
++  static_assert(std::is_nothrow_move_constructible_v<WMT::Reference<WMT::Object>>);
++  static_assert(std::is_nothrow_move_assignable_v<WMT::Reference<WMT::Object>>);
++  {
++    WMT::Reference<WMT::Object> value(make_object());
++    auto original = value.handle;
++    auto &alias = value;
++    value = alias;
++    assert(value.handle == original && refs.at(original) == 1);
++    value = WMT::Object{original};
++    assert(refs.at(original) == 1);
++    value = std::move(alias);
++    assert(value.handle == original && refs.at(original) == 1);
++    WMT::Reference<WMT::Object> copy(value);
++    assert(refs.at(original) == 2);
++    value = std::move(copy); // two owners of the same handle
++    assert(!copy && refs.at(original) == 1);
++    WMT::Reference<WMT::Object> moved(std::move(value));
++    assert(!value && moved.handle == original);
++    WMT::Reference<WMT::Object> replacement(make_object());
++    auto other = replacement.handle;
++    replacement = std::move(moved);
++    assert(!moved && !refs.contains(other));
++    replacement = nullptr;
++    assert(!replacement && !refs.contains(original));
++    WMT::Reference<WMT::Object> empty;
++    empty = replacement;
++    empty = std::move(replacement);
++  }
++  assert(refs.empty() && releases > 0);
++}

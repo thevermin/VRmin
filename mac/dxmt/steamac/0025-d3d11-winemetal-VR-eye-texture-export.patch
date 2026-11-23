@@ -1,0 +1,277 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 21:11:54 +0300
+Subject: [PATCH 25/27] d3d11, winemetal: VR eye-texture export
+
+IMTLD3D11ExportableTexture (private, Texture2D resources) returns the
+winemetal handle of the resource's MTLTexture and the immediate
+context's shared event and value that cover all work submitted so far
+(flushes the context). WMTVRSubmit (unix call 146) hands one frame's
+eye textures plus pose/FOV to a remoting executor that has a VR host;
+the plain unix side returns STATUS_NOT_SUPPORTED.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d11/d3d11_context_def.cpp     |  4 +++
+ src/d3d11/d3d11_context_imm.cpp     | 14 ++++++++++
+ src/d3d11/d3d11_device.hpp          |  2 ++
+ src/d3d11/d3d11_interfaces.hpp      | 12 ++++++++
+ src/d3d11/d3d11_resource.hpp        | 43 +++++++++++++++++++++++++++++
+ src/winemetal/unix/winemetal_unix.c |  8 ++++++
+ src/winemetal/winemetal.h           | 25 +++++++++++++++++
+ src/winemetal/winemetal_thunks.c    |  7 +++++
+ src/winemetal/winemetal_thunks.h    |  4 +++
+ 9 files changed, 119 insertions(+)
+
+diff --git a/src/d3d11/d3d11_context_def.cpp b/src/d3d11/d3d11_context_def.cpp
+index 554912dccd5d86ea0e1e219058e9f4035b1f4060..fd9b905418cbc6c17fe6b276461eb19c800275db 100644
+--- a/src/d3d11/d3d11_context_def.cpp
++++ b/src/d3d11/d3d11_context_def.cpp
+@@ -436,6 +436,10 @@ public:
+       // nop
+   };
+ 
++  HRESULT FlushForExport(UINT64 *pSharedEvent, UINT64 *pSignalValue) override {
++    return E_NOTIMPL;
++  };
++
+   void Commit() override{
+       // nop
+   };
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 0f4ffbd6dbc54575f0c789cf702859c441a8618d..3ff3fe6361df90e909c30bb5fb1fa555ac4ccf50 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -519,6 +519,20 @@ public:
+     InvalidateCurrentPass(true);
+   }
+ 
++  HRESULT
++  FlushForExport(UINT64 *pSharedEvent, UINT64 *pSignalValue) override {
++    if (!pSharedEvent || !pSignalValue)
++      return E_POINTER;
++    std::lock_guard<d3d11_device_mutex> lock(mutex);
++    if (ctx_state.has_dirty_op_since_last_event || promote_flush) {
++      InvalidateCurrentPass(true);
++      Commit();
++    }
++    *pSharedEvent = cmd_queue.event.handle;
++    *pSignalValue = cmd_queue.GetCurrentEventSeqId();
++    return S_OK;
++  }
++
+   void
+   STDMETHODCALLTYPE
+   ExecuteCommandList(ID3D11CommandList *pCommandList, BOOL RestoreContextState) override {
+diff --git a/src/d3d11/d3d11_device.hpp b/src/d3d11/d3d11_device.hpp
+index 1ef2faa047d6ca18d3044da940e26b03d4916193..b9292707720485cd9e536bcfe0bc6839a8ab202e 100644
+--- a/src/d3d11/d3d11_device.hpp
++++ b/src/d3d11/d3d11_device.hpp
+@@ -20,6 +20,8 @@ DEFINE_COM_INTERFACE("3a3f085a-d0fe-4324-b0ae-fe04de18571c",
+   virtual void SOGetTargetsWithOffsets(UINT NumBuffers, REFIID riid, void ** ppSOTargets, UINT *pOffsets) = 0;
+   virtual HRESULT AcquireSync(ID3D11Resource *pResource, UINT64 Key, DWORD dwMilliseconds) = 0;
+   virtual HRESULT ReleaseSync(ID3D11Resource *pResource, UINT64 Key) = 0;
++  /* commit pending work; *pSharedEvent reaches *pSignalValue when everything submitted so far completed */
++  virtual HRESULT FlushForExport(UINT64 *pSharedEvent, UINT64 *pSignalValue) = 0;
+ };
+ 
+ namespace dxmt {
+diff --git a/src/d3d11/d3d11_interfaces.hpp b/src/d3d11/d3d11_interfaces.hpp
+index ff4bb2bd0f46d615c5b43041b6f678fd97ac9535..661c2049b620680afe82bf273e8f066b888aa3d4 100644
+--- a/src/d3d11/d3d11_interfaces.hpp
++++ b/src/d3d11/d3d11_interfaces.hpp
+@@ -43,3 +43,15 @@ DEFINE_COM_INTERFACE("efc77ae6-2179-4c0a-b844-7661ca0dcde7", IMTLD3D11DeviceExt)
+     : public IUnknown {
+   virtual void STDMETHODCALLTYPE SetShaderExtensionSlot(UINT Slot) = 0;
+ };
++
++/* Export of a texture's Metal object to an out-of-process consumer (VR compositor). The handles are winemetal
++   object handles (obj_handle_t) as seen by the unix side, i.e. MTLTexture / MTLSharedEvent ids that the
++   winemetal unix implementation (or a remoting executor) can resolve. Not a D3D11 API. */
++DEFINE_COM_INTERFACE("ad6245d1-3a11-4dd6-87b7-7a58048b55d3", IMTLD3D11ExportableTexture)
++    : public IUnknown {
++  /* Flushes the immediate context. On success *pTexture is the MTLTexture of the resource's current
++     allocation, and all work submitted so far (including every write to this texture) has completed once
++     the MTLSharedEvent *pSharedEvent reaches *pSignalValue. The handles stay valid while the resource lives
++     and is not renamed (render targets are never renamed). */
++  virtual HRESULT STDMETHODCALLTYPE GetMetalTexture(UINT64 *pTexture, UINT64 *pSharedEvent, UINT64 *pSignalValue) = 0;
++};
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index 2147deaefc7f8b8adcddb192bc4ee91731fd64ed..c0e670d0d416631e8ee983fb6d02d5ffeee477d9 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -9,6 +9,7 @@
+ #include "com/com_pointer.hpp"
+ #include "com/com_guid.hpp"
+ #include "d3d11_view.hpp"
++#include "d3d11_interfaces.hpp"
+ #include "dxgi_resource.hpp"
+ #include "d3d11_dxgi_surface.hpp"
+ #include "log/log.hpp"
+@@ -194,6 +195,38 @@ GetTexture(ID3D11Resource *pResource) {
+   return static_cast<D3D11ResourceCommon *>(pResource)->texture();
+ }
+ 
++/* IMTLD3D11ExportableTexture, aggregated into a texture resource (same lifetime rules as MTLDXGIResource) */
++template <typename IResource>
++class MTLD3D11ExportableTexture : public IMTLD3D11ExportableTexture {
++public:
++  MTLD3D11ExportableTexture(IResource *pResource, IMTLD3D11DeviceContext *pContext)
++      : resource_(pResource), context_(pContext) {}
++
++  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) final {
++    return resource_->QueryInterface(riid, ppvObject);
++  }
++  ULONG STDMETHODCALLTYPE AddRef() final { return resource_->AddRef(); }
++  ULONG STDMETHODCALLTYPE Release() final { return resource_->Release(); }
++
++  HRESULT STDMETHODCALLTYPE
++  GetMetalTexture(UINT64 *pTexture, UINT64 *pSharedEvent, UINT64 *pSignalValue) final {
++    if (!pTexture)
++      return E_POINTER;
++    auto &texture = resource_->texture();
++    if (!texture || !texture->current())
++      return E_FAIL;
++    HRESULT hr = context_->FlushForExport(pSharedEvent, pSignalValue);
++    if (FAILED(hr))
++      return hr;
++    *pTexture = texture->current()->texture().handle;
++    return S_OK;
++  }
++
++private:
++  IResource *resource_; // aggregated, no extra reference
++  IMTLD3D11DeviceContext *context_;
++};
++
+ template <typename tag, typename... Base>
+ class TResourceBase : public MTLD3D11DeviceChild<D3D11ResourceCommon, Base...> {
+ public:
+@@ -203,6 +236,7 @@ public:
+       dxgi_resource(this),
+       dxgi_surface(this),
+       keyed_mutex(this, device->GetImmediateContextPrivate()),
++      exportable(this, device->GetImmediateContextPrivate()),
+       d3d10(reinterpret_cast<tag::COM *>(this), device->GetImmediateContextPrivate()) {
+     // D3D11ResourceCommonß::bind_flags_
+     this->bind_flags_ = desc.BindFlags;
+@@ -265,6 +299,14 @@ public:
+       return E_NOINTERFACE;
+     }
+ 
++    if (riid == __uuidof(IMTLD3D11ExportableTexture)) {
++      if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
++        *ppvObject = ref(&exportable);
++        return S_OK;
++      }
++      return E_NOINTERFACE;
++    }
++
+     if (riid == __uuidof(IDXGIKeyedMutex)) {
+       if (!(this->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
+         return E_NOINTERFACE;
+@@ -343,6 +385,7 @@ protected:
+   MTLDXGIResource<TResourceBase<tag, Base...>> dxgi_resource;
+   MTLDXGISurface<TResourceBase<tag, Base...>> dxgi_surface;
+   MTLDXGIKeyedMutex<TResourceBase<tag, Base...>, IMTLD3D11DeviceContext> keyed_mutex;
++  MTLD3D11ExportableTexture<TResourceBase<tag, Base...>> exportable;
+   tag::D3D10_IMPL d3d10;
+ };
+ 
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index accd84e9ca2e3eae60c15d99234a60b6b5a57722..9be8312c941efa8213c65dd93dca3c209693af69 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -3189,6 +3189,12 @@ _MTLDevice_newLibraryWithSource(void *obj) {
+   return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS
++_WMTVRSubmit(void *obj) {
++  /* only a remoting executor with a VR host implements the export */
++  return 0xC00000BB; /* STATUS_NOT_SUPPORTED */
++}
++
+ static NTSTATUS
+ _MTLTexture_getBytes(void *obj) {
+   struct unixcall_mtltexture_replaceregion *params = obj;
+@@ -3361,6 +3367,7 @@ const void *__wine_unix_call_funcs[] = {
+     &_MTLDevice_newIndirectCommandBuffer,
+     &_MTLDevice_newLibraryWithSource,
+     &_MTLTexture_getBytes,
++    &_WMTVRSubmit,
+ };
+ 
+ #ifndef DXMT_NATIVE
+@@ -3511,5 +3518,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
+     &_MTLDevice_newIndirectCommandBuffer,
+     &_MTLDevice_newLibraryWithSource,
+     &_MTLTexture_getBytes,
++    &_WMTVRSubmit,
+ };
+ #endif
+diff --git a/src/winemetal/winemetal.h b/src/winemetal/winemetal.h
+index 97fffc7454cdcae87ea8494c49280b44dd7e67ab..7684f41af3b5ab6556eb50bed9ac338212c9fc16 100644
+--- a/src/winemetal/winemetal.h
++++ b/src/winemetal/winemetal.h
+@@ -2148,4 +2148,29 @@ WINEMETAL_API void MTLTexture_getBytes(
+     struct WMTMemoryPointer data, uint64_t bytes_per_row, uint64_t bytes_per_image
+ );
+ 
++/* VR frame export (steamac VR): the eye textures of one frame are handed to the host's VR compositor.
++   Implemented only by a remoting executor that has a VR host attached (steamac wmtr); the plain
++   winemetal unix side returns STATUS_NOT_SUPPORTED (returned as uint32_t). Times are host CLOCK_UPTIME_RAW nanoseconds. */
++#define WMTVR_EYE_FLIP_Y 1u /* source rows are bottom-up */
++#define WMTVR_EYE_SRGB 2u   /* data is gamma encoded (sRGB view of a UNORM texture) */
++
++struct WMTVREye {
++  obj_handle_t texture; /* MTLTexture (IMTLD3D11ExportableTexture::GetMetalTexture) */
++  uint32_t x, y, w, h;  /* sub-rect in texels; w == 0 means the whole texture */
++  uint32_t flags;       /* WMTVR_EYE_* */
++  uint32_t slice;       /* array slice (single-pass stereo array textures) */
++};
++
++struct WMTVRSubmitInfo {
++  uint64_t frame_id;
++  uint64_t display_time; /* predicted display time the frame was rendered for */
++  struct WMTVREye eye[2];
++  float pose[2][7]; /* per eye: orientation x,y,z,w then position x,y,z (stage space) */
++  float fov[2][4];  /* per eye: left, right, up, down in radians (left/down negative) */
++  obj_handle_t wait_event; /* MTLSharedEvent; the export waits until it reaches wait_value (0: no wait) */
++  uint64_t wait_value;
++};
++
++WINEMETAL_API uint32_t WMTVRSubmit(const struct WMTVRSubmitInfo *info);
++
+ #endif
+\ No newline at end of file
+diff --git a/src/winemetal/winemetal_thunks.c b/src/winemetal/winemetal_thunks.c
+index 42286c95ae045d983770220cd04ebe3c00a9c812..2340e177da2dfbd87062f6ad68fe991ecd6fe257 100644
+--- a/src/winemetal/winemetal_thunks.c
++++ b/src/winemetal/winemetal_thunks.c
+@@ -1331,3 +1331,10 @@ MTLTexture_getBytes(
+   params.bytes_per_image = bytes_per_image;
+   UNIX_CALL(145, &params);
+ }
++
++WINEMETAL_API uint32_t
++WMTVRSubmit(const struct WMTVRSubmitInfo *info) {
++  struct unixcall_wmtvr_submit params;
++  params.info = *info;
++  return WINE_UNIX_CALL(146, &params);
++}
+diff --git a/src/winemetal/winemetal_thunks.h b/src/winemetal/winemetal_thunks.h
+index 37645c959f8316d46510eb79c39f24b21ba5fb5b..d39e57fac23c18d05ca71a498c2ffd1c881698ef 100644
+--- a/src/winemetal/winemetal_thunks.h
++++ b/src/winemetal/winemetal_thunks.h
+@@ -435,6 +435,10 @@ struct unixcall_mtldevice_newicb {
+   obj_handle_t ret;
+ };
+ 
++struct unixcall_wmtvr_submit {
++  struct WMTVRSubmitInfo info;
++};
++
+ #pragma pack(pop)
+ 
+ #endif

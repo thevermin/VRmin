@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: osy <osy@turing.llc>
+Date: Fri, 9 Oct 2026 22:20:44 -0700
+Subject: [PATCH 05/27] d3d11: UpdateSubresource into STAGING buffers and
+ textures
+
+MSDN excludes only IMMUTABLE and DYNAMIC resources as UpdateSubresource
+destinations, so a STAGING destination is legal, but both the buffer and
+the texture path hit UNIMPLEMENTED and aborted the process.  An embedder
+that delivers a STAGING texture's initial data as an update after the
+create (Neptune does) takes this path for every such texture: GravityMark
+D3D11 aborted 1.6 s into startup.
+
+Copy the source rows into an upload allocation and blit them into the
+staging buffer, tracked like any other copy into staging so a later Map
+waits for it.  Texture rows follow the staging layout: block rows for BC
+formats (also under BC emulation), the box origin in blocks.
+
+d3d11_test staging_update writes a buffer (full + box), an RGBA8 2D
+texture (padded source pitch, a boxed mip), a BC1 block box and a 3D
+texture, and reads each back with Map(READ): aborts before, 14/14 after,
+also with DXMT_FORCE_BC_EMULATION=1; 177/177 overall.  GravityMark D3D11
+on Neptune's DXMT backend now runs to completion (200k asteroids, 9340 @
+55.9 fps) where it aborted; Fire Strike GT1 unchanged (48.37/48.43/48.34).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 917b721c0f915c6524b416169fdce4427a39524f)
+
+[steamac: utmapp's tests/native/d3d11_test.cpp case is not carried (that suite needs utmapp's native build); covered by steamac wmtr/tests/d3d11test staging_update]
+---
+ src/d3d11/d3d11_context_impl.cpp | 58 ++++++++++++++++++++++++++++----
+ 1 file changed, 51 insertions(+), 7 deletions(-)
+
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index c3db7c2ed08aa7d6225e271c3c096cef44734347..6a5bafbaeb4fd99adba3dee4d651988e3166e2a1 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -1235,11 +1235,25 @@ public:
+         }
+       }
+       if (auto staging = GetStagingResource(pDstResource, DstSubresource); unlikely(staging)) {
+-        // Per MSDN: The CPU copies data from memory to a subresource created in non-mappable memory.
+-        // Also MSDN: A resource cannot be used as a destination if: the resource is created with immutable or
+-        // dynamic usage.
+-        // So it's legal?
+-        UNIMPLEMENTED("update buffer: staging");
++        /* MSDN excludes only IMMUTABLE and DYNAMIC destinations, so a STAGING
++         * one is legal; order the write with the rest of the GPU timeline by
++         * blitting it into the staging buffer, like a copy into staging */
++        auto [upload, upload_offset] = AllocateStagingBuffer(copy_len, 16);
++        upload.updateContents(upload_offset, pSrcData, copy_len);
++        SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
++        UseCopyDestination(staging);
++        EmitOP([upload, upload_offset, dst_ = std::move(staging), copy_offset,
++                copy_len](ArgumentEncodingContext &enc) {
++          auto [dst, dst_offset] = enc.access(dst_->buffer(), copy_offset, copy_len, ResourceAccess::Write);
++          auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
++          cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
++          cmd.copy_length = copy_len;
++          cmd.src = upload;
++          cmd.src_offset = upload_offset;
++          cmd.dst = dst->buffer();
++          cmd.dst_offset = copy_offset + dst_offset;
++        });
++        promote_flush = true;
+       } else if (auto bindable = GetResourceCommon(pDstResource)) {
+         auto [staging_buffer, offset] = AllocateStagingBuffer(copy_len, 16);
+         staging_buffer.updateContents(offset, pSrcData, copy_len);
+@@ -4251,8 +4265,38 @@ public:
+         cmd_cptex.origin = cmd.DstOrigin;
+       });
+     } else if (auto staging_dst = GetStagingResource(cmd.pDst, cmd.DstSubresource)) {
+-      // staging: ...
+-      UNIMPLEMENTED("update texture: staging");
++      /* A STAGING texture is a buffer in D3D's own layout (block rows for BC,
++       * also under BC emulation): pack the rows, then blit each one to its
++       * place, ordered like any other copy into staging */
++      const uint32_t row_bytes = cmd.EffectiveBytesPerRow, rows = cmd.EffectiveRows, depth = cmd.DstSize.depth;
++      const bool bc = cmd.DstFormat.Flag & MTL_DXGI_FORMAT_BC;
++      const uint32_t dst_x = (bc ? cmd.DstOrigin.x >> 2 : cmd.DstOrigin.x) * cmd.DstFormat.BytesPerTexel;
++      const uint32_t dst_y = bc ? cmd.DstOrigin.y >> 2 : cmd.DstOrigin.y;
++      auto [upload, upload_offset] = AllocateStagingBuffer(row_bytes * rows * depth, 16);
++      for (uint32_t z = 0; z < depth; z++)
++        for (uint32_t row = 0; row < rows; row++)
++          upload.updateContents(
++              upload_offset + (z * rows + row) * row_bytes,
++              (const char *)pSrcData + z * SrcDepthPitch + row * SrcRowPitch, row_bytes
++          );
++      SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
++      UseCopyDestination(staging_dst);
++      EmitOP([upload, upload_offset, dst_ = std::move(staging_dst), row_bytes, rows, depth, dst_x, dst_y,
++              dst_z = cmd.DstOrigin.z](ArgumentEncodingContext &enc) {
++        auto [dst, dst_sub_offset] = enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
++        for (uint32_t z = 0; z < depth; z++) {
++          for (uint32_t row = 0; row < rows; row++) {
++            auto &cp = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
++            cp.type = WMTBlitCommandCopyFromBufferToBuffer;
++            cp.copy_length = row_bytes;
++            cp.src = upload;
++            cp.src_offset = upload_offset + (z * rows + row) * row_bytes;
++            cp.dst = dst->buffer();
++            cp.dst_offset = dst_sub_offset + (dst_z + z) * dst_->bytesPerImage + (dst_y + row) * dst_->bytesPerRow + dst_x;
++          }
++        }
++      });
++      promote_flush = true;
+     } else {
+       UNREACHABLE
+     }

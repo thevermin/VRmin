@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hanzpo <hanznathanpo@gmail.com>
+Date: Fri, 2 Oct 2026 22:00:07 -0400
+Subject: [PATCH 13/27] feat(d3d11): expose IDXGISurface on single-subresource
+ 2D textures
+
+Direct2D interop (CreateDxgiSurfaceRenderTarget, CreateBitmapFromDxgiSurface)
+queries a texture or swapchain back buffer for IDXGISurface. Previously the
+query failed with E_NOINTERFACE, so applications that use D2D on top of D3D11,
+such as Falcon BMS, abort during startup.
+
+Add an aggregated MTLDXGISurface (IDXGISurface2) and return it for 2D textures
+with exactly one subresource, matching Windows behavior. Map/Unmap forward to
+the immediate context; GDI interop (GetDC) is not supported.
+
+(cherry picked from commit 1b1aa5b54435d8f7b3ab440600aebefd4d69a589)
+---
+ src/d3d11/d3d11_dxgi_surface.hpp | 165 +++++++++++++++++++++++++++++++
+ src/d3d11/d3d11_resource.hpp     |  14 +++
+ 2 files changed, 179 insertions(+)
+ create mode 100644 src/d3d11/d3d11_dxgi_surface.hpp
+
+diff --git a/src/d3d11/d3d11_dxgi_surface.hpp b/src/d3d11/d3d11_dxgi_surface.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..652388400da9b61be3daf85f546f54ecd8b708d9
+--- /dev/null
++++ b/src/d3d11/d3d11_dxgi_surface.hpp
+@@ -0,0 +1,165 @@
++#pragma once
++
++/* header only: use it as an aggregated object, like MTLDXGIResource */
++
++#include "d3d11_1.h"
++#include "dxgi1_2.h"
++#include "com/com_pointer.hpp"
++#include "log/log.hpp"
++
++namespace dxmt {
++
++/**
++IDXGISurface view of a single-subresource 2D texture.
++
++Direct2D interop (ID2D1Factory::CreateDxgiSurfaceRenderTarget, ID2D1DeviceContext::CreateBitmapFromDxgiSurface)
++obtains one of these by querying a texture (or a swapchain back buffer) for IDXGISurface.
++*/
++template <typename IResource> class MTLDXGISurface : public IDXGISurface2 {
++public:
++  MTLDXGISurface(IResource *pResource) : resource_(pResource) {}
++  ~MTLDXGISurface() {}
++
++  HRESULT STDMETHODCALLTYPE
++  QueryInterface(REFIID riid, void **ppvObject) final {
++    return resource_->QueryInterface(riid, ppvObject);
++  }
++
++  ULONG STDMETHODCALLTYPE
++  AddRef() final {
++    return resource_->AddRef();
++  }
++
++  ULONG STDMETHODCALLTYPE
++  Release() final {
++    return resource_->Release();
++  }
++
++  HRESULT
++  STDMETHODCALLTYPE
++  SetPrivateData(REFGUID guid, UINT data_size, const void *data) final {
++    return resource_->SetPrivateData(guid, data_size, data);
++  }
++
++  HRESULT
++  STDMETHODCALLTYPE
++  SetPrivateDataInterface(REFGUID guid, const IUnknown *object) final {
++    return resource_->SetPrivateDataInterface(guid, object);
++  }
++
++  HRESULT
++  STDMETHODCALLTYPE
++  GetPrivateData(REFGUID guid, UINT *data_size, void *data) final {
++    return resource_->GetPrivateData(guid, data_size, data);
++  }
++
++  HRESULT
++  STDMETHODCALLTYPE
++  GetParent(REFIID riid, void **parent) final {
++    return GetDevice(riid, parent);
++  }
++
++  HRESULT
++  STDMETHODCALLTYPE
++  GetDevice(REFIID riid, void **ppDevice) final {
++    return resource_->GetDeviceInterface(riid, ppDevice);
++  }
++
++  HRESULT
++  STDMETHODCALLTYPE
++  GetDesc(DXGI_SURFACE_DESC *pDesc) final {
++    if (!pDesc)
++      return E_INVALIDARG;
++
++    Com<ID3D11Texture2D> texture;
++    if (FAILED(resource_->QueryInterface(IID_PPV_ARGS(&texture))))
++      return E_FAIL;
++
++    D3D11_TEXTURE2D_DESC desc;
++    texture->GetDesc(&desc);
++    pDesc->Width = desc.Width;
++    pDesc->Height = desc.Height;
++    pDesc->Format = desc.Format;
++    pDesc->SampleDesc = desc.SampleDesc;
++    return S_OK;
++  }
++
++  HRESULT
++  STDMETHODCALLTYPE
++  Map(DXGI_MAPPED_RECT *pLockedRect, UINT MapFlags) final {
++    if (!pLockedRect)
++      return E_INVALIDARG;
++
++    D3D11_MAP map_type;
++    if ((MapFlags & DXGI_MAP_READ) && (MapFlags & DXGI_MAP_WRITE))
++      map_type = D3D11_MAP_READ_WRITE;
++    else if (MapFlags & DXGI_MAP_DISCARD)
++      map_type = D3D11_MAP_WRITE_DISCARD;
++    else if (MapFlags & DXGI_MAP_WRITE)
++      map_type = D3D11_MAP_WRITE;
++    else if (MapFlags & DXGI_MAP_READ)
++      map_type = D3D11_MAP_READ;
++    else
++      return E_INVALIDARG;
++
++    Com<ID3D11DeviceContext> context;
++    if (FAILED(GetImmediateContext(&context)))
++      return E_FAIL;
++
++    D3D11_MAPPED_SUBRESOURCE mapped;
++    HRESULT hr = context->Map(resource_, 0, map_type, 0, &mapped);
++    if (FAILED(hr))
++      return hr;
++    pLockedRect->Pitch = mapped.RowPitch;
++    pLockedRect->pBits = reinterpret_cast<BYTE *>(mapped.pData);
++    return S_OK;
++  }
++
++  HRESULT
++  STDMETHODCALLTYPE
++  Unmap() final {
++    Com<ID3D11DeviceContext> context;
++    if (FAILED(GetImmediateContext(&context)))
++      return E_FAIL;
++    context->Unmap(resource_, 0);
++    return S_OK;
++  }
++
++  HRESULT
++  STDMETHODCALLTYPE
++  GetDC(BOOL Discard, HDC *phdc) final {
++    ERR_ONCE("DXGISurface::GetDC: GDI interop not supported");
++    if (phdc)
++      *phdc = nullptr;
++    return DXGI_ERROR_INVALID_CALL;
++  }
++
++  HRESULT
++  STDMETHODCALLTYPE
++  ReleaseDC(RECT *pDirtyRect) final {
++    return DXGI_ERROR_INVALID_CALL;
++  }
++
++  HRESULT
++  STDMETHODCALLTYPE
++  GetResource(REFIID riid, void **ppParentResource, UINT *pSubresourceIndex) final {
++    if (pSubresourceIndex)
++      *pSubresourceIndex = 0;
++    return resource_->QueryInterface(riid, ppParentResource);
++  }
++
++private:
++  HRESULT
++  GetImmediateContext(ID3D11DeviceContext **ppContext) {
++    Com<ID3D11Device> device;
++    HRESULT hr = resource_->GetDeviceInterface(IID_PPV_ARGS(&device));
++    if (FAILED(hr))
++      return hr;
++    device->GetImmediateContext(ppContext);
++    return S_OK;
++  }
++
++  IResource *resource_; // since it's aggregated, no extra reference is needed
++};
++
++} // namespace dxmt
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index f5602e7484b58585a79a09587e336864dfc83848..6b547f2a080011c85fe792125fc69b0ca393f956 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -9,6 +9,7 @@
+ #include "com/com_guid.hpp"
+ #include "d3d11_view.hpp"
+ #include "dxgi_resource.hpp"
++#include "d3d11_dxgi_surface.hpp"
+ #include "log/log.hpp"
+ #include "../d3d10/d3d10_buffer.hpp"
+ #include "../d3d10/d3d10_texture.hpp"
+@@ -192,6 +193,7 @@ public:
+       MTLD3D11DeviceChild<D3D11ResourceCommon, Base...>(device),
+       desc(desc),
+       dxgi_resource(this),
++      dxgi_surface(this),
+       keyed_mutex(this, device->GetImmediateContextPrivate()),
+       d3d10(reinterpret_cast<tag::COM *>(this), device->GetImmediateContextPrivate()) {
+     // D3D11ResourceCommonß::bind_flags_
+@@ -244,6 +246,17 @@ public:
+       return S_OK;
+     }
+   
++    if (riid == __uuidof(IDXGISurface) || riid == __uuidof(IDXGISurface1) || riid == __uuidof(IDXGISurface2)) {
++      // only a texture with exactly one subresource can be viewed as a surface
++      if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
++        if (this->desc.MipLevels == 1 && this->desc.ArraySize == 1) {
++          *ppvObject = ref(&dxgi_surface);
++          return S_OK;
++        }
++      }
++      return E_NOINTERFACE;
++    }
++
+     if (riid == __uuidof(IDXGIKeyedMutex)) {
+       if (!(this->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
+         return E_NOINTERFACE;
+@@ -320,6 +333,7 @@ public:
+ protected:
+   tag::DESC1 desc;
+   MTLDXGIResource<TResourceBase<tag, Base...>> dxgi_resource;
++  MTLDXGISurface<TResourceBase<tag, Base...>> dxgi_surface;
+   MTLDXGIKeyedMutex<TResourceBase<tag, Base...>, IMTLD3D11DeviceContext> keyed_mutex;
+   tag::D3D10_IMPL d3d10;
+ };

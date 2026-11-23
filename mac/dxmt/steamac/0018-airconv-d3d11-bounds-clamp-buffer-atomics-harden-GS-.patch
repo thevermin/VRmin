@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Holly Hamilton <hollyvhamilton@gmail.com>
+Date: Thu, 27 Aug 2026 16:58:03 -0400
+Subject: [PATCH 18/27] airconv,d3d11: bounds-clamp buffer atomics; harden GS
+ mesh pipeline on non-Apple GPUs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Raw/structured buffer atomics (InstAtomicBinOp, InstAtomicImmCmpExchange)
+were the only buffer access path emitting an unclamped GEP: loads and
+stores all route through CreateGEPInt32WithBoundCheck, and the
+AtomicBufferResourceHandle overload of that helper already existed but was
+never called. UE5 titles lean heavily on InterlockedAdd/CompareExchange
+against structured/byte-address UAVs (GPU culling, compaction counters,
+Niagara), so an out-of-range index became a wild atomic RMW straight to
+device memory. Observed on an Intel iMac (AMD Radeon Pro 5300,
+experimental non-Apple GPU path) as a kernel gpuRestart with a GPU
+page-table fault (VMPT) that froze the machine; Apple-GPU unified memory
+appears more forgiving of the same overrun. Route both atomic sites
+through the existing bounds check.
+
+Also extend the tessellation pipeline's AMDGPU payload over-reservation
+hack to the geometry-shader mesh pipeline, which hardcodes a 16256-byte
+payload with no non-Apple slack — the GS emulation writes up to
+32 threads x max_output_register x 16 bytes, which exceeds that budget at
+the architectural maximum register count.
+
+Route the GS and tessellation mesh-PSO compiles through the compile gate
+introduced previously, covering all Metal pipeline compile sites.
+
+Bump AIRCONV_VERSION: atomic codegen changed, cached AIR must invalidate.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+(cherry picked from commit 69695f43be7738c0cb3d341dcd9ac81eef84b1f4, airconv part only)
+[steamac: only the buffer-atomic bounds check is taken. The GS mesh payload
+slack is for non-Apple GPUs and the compile-gate routing needs 5675c273
+(not adopted); both are dropped. Upstream's cache version now follows
+AIRCONV_VERSION, so that is bumped 26 -> 27 instead of the fork's
+kDXMTShaderCacheVersion.]
+---
+ src/airconv/airconv_public.h           | 2 +-
+ src/airconv/nt/dxbc_converter_base.cpp | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/airconv/airconv_public.h b/src/airconv/airconv_public.h
+index e167ae4403e543940d04439ea74cb17859aa3f8d..671641423281f990f2af64d7f73119dd757bb891 100644
+--- a/src/airconv/airconv_public.h
++++ b/src/airconv/airconv_public.h
+@@ -5,7 +5,7 @@
+ #ifndef __AIRCONV_H
+ #define __AIRCONV_H
+ 
+-#define AIRCONV_VERSION 26
++#define AIRCONV_VERSION 27
+ 
+ #ifdef __cplusplus
+ #include <string>
+diff --git a/src/airconv/nt/dxbc_converter_base.cpp b/src/airconv/nt/dxbc_converter_base.cpp
+index 58a101c011ae83af7e5186790f323aabba32ed93..051d82b9d3e39ed04863e1eebf21e1dc1020a6f2 100644
+--- a/src/airconv/nt/dxbc_converter_base.cpp
++++ b/src/airconv/nt/dxbc_converter_base.cpp
+@@ -2421,7 +2421,7 @@ Converter::operator()(const InstAtomicBinOp &atomic) {
+ 
+   if (Buf) {
+     auto IntPtrOffset = LoadAtomicOpAddress(Buf.getValue(), atomic.dst_address);
+-    auto Ptr = ir.CreateGEP(ir.getInt32Ty(), Buf->Pointer, {IntPtrOffset});
++    auto Ptr = CreateGEPInt32WithBoundCheck(Buf.getValue(), IntPtrOffset);
+     auto Value = air.CreateAtomicRMW(Op, Ptr, LoadOperand(atomic.src, kMaskComponentX));
+     StoreOperand(atomic.dst_original, Value);
+     return;
+@@ -2480,7 +2480,7 @@ Converter::operator()(const InstAtomicImmCmpExchange &atomic) {
+ 
+   if (Buf) {
+     auto IntPtrOffset = LoadAtomicOpAddress(Buf.getValue(), atomic.dst_address);
+-    auto Ptr = ir.CreateGEP(ir.getInt32Ty(), Buf->Pointer, {IntPtrOffset});
++    auto Ptr = CreateGEPInt32WithBoundCheck(Buf.getValue(), IntPtrOffset);
+     auto Value = ir.CreateAtomicCmpXchg(
+         Ptr, LoadOperand(atomic.src0, kMaskComponentX), LoadOperand(atomic.src1, kMaskComponentX), {},
+         AtomicOrdering::Monotonic, AtomicOrdering::Monotonic

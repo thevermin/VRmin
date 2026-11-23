@@ -1,0 +1,269 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Holly Hamilton <hollyvhamilton@gmail.com>
+Date: Sun, 6 Sep 2026 18:51:15 -0400
+Subject: [PATCH 07/27] d3d11,dxmt,winemetal: drop draws and dispatches whose
+ pipeline failed to compile
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When pipeline creation fails, the encode callbacks returned early without
+encoding SetPSO — but the draws/dispatches queued for that pipeline were
+still encoded, so they ran on whatever pipeline the encoder had bound
+before, with the failed pipeline's bindings. A compute dispatch on the
+wrong kernel produced a GPU fault on every subsequent frame
+(MTLCommandBufferErrorDomain "Internal Error") until Metal asserted.
+The earlier zero-threadgroup guard only covered an encoder that never had
+a pipeline at all.
+
+Encode the null pipeline explicitly instead: winemetal clears its
+pipeline-valid state (zero threadgroup size on compute encoders, a
+pso_valid flag on render encoders) and skips draws and dispatches until a
+real pipeline is set. The tile-barrier recovery now restores last_pso
+even when it is null so the draws after a barrier stay dropped too.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+(cherry picked from commit 717f7822a13a7ad4c2b0aa32acf2a93a025dcca0)
+---
+ src/d3d11/d3d11_context_impl.cpp    | 16 +++++------
+ src/dxmt/dxmt_command.cpp           | 11 ++++----
+ src/winemetal/unix/winemetal_unix.c | 41 +++++++++++++++++++++++++++++
+ 3 files changed, 54 insertions(+), 14 deletions(-)
+
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index 6a5bafbaeb4fd99adba3dee4d651988e3166e2a1..18bcbcad31b6059a9bc9cd7334233fcf41b97ac1 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -4781,8 +4781,9 @@ public:
+       pso->GetPipeline(&GraphicsPipeline); // may block
+       enc.tess_num_output_control_point_element = GraphicsPipeline.NumControlPointOutputElement;
+       enc.tess_threads_per_patch = GraphicsPipeline.ThreadsPerPatch;
+-      if (!GraphicsPipeline.PipelineState)
+-        return;
++      /* A null pipeline (compilation failed) is encoded anyway: it tells
++       * winemetal to drop the draws queued for it rather than run them with
++       * whatever pipeline the encoder had bound before. */
+       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setpso>();
+       cmd.type = WMTRenderCommandSetPSO;
+       cmd.pso = GraphicsPipeline.PipelineState;
+@@ -4827,8 +4828,6 @@ public:
+       render_encoder->use_geometry = 1;
+       MTL_COMPILED_GRAPHICS_PIPELINE GraphicsPipeline{};
+       pso->GetPipeline(&GraphicsPipeline); // may block
+-      if (!GraphicsPipeline.PipelineState)
+-        return;
+       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setpso>();
+       cmd.type = WMTRenderCommandSetPSO;
+       cmd.pso = GraphicsPipeline.PipelineState;
+@@ -4883,8 +4882,6 @@ public:
+     EmitST([pso = std::move(pipeline)](ArgumentEncodingContext& enc) {
+       MTL_COMPILED_GRAPHICS_PIPELINE GraphicsPipeline{};
+       pso->GetPipeline(&GraphicsPipeline); // may block
+-      if (!GraphicsPipeline.PipelineState)
+-        return;
+       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setpso>();
+       cmd.type = WMTRenderCommandSetPSO;
+       cmd.pso = GraphicsPipeline.PipelineState;
+@@ -5043,12 +5040,13 @@ public:
+                ArgumentEncodingContext &enc) {
+       MTL_COMPILED_COMPUTE_PIPELINE ComputePipeline;
+       pso->GetPipeline(&ComputePipeline); // may block
+-      if (!ComputePipeline.PipelineState)
+-        return;
++      /* A null pipeline (compilation failed) is encoded anyway, with a zero
++       * threadgroup size: winemetal then drops the dispatches queued for it
++       * instead of running them on whatever kernel was bound before. */
+       auto &cmd = enc.encodeComputeCommand<wmtcmd_compute_setpso>();
+       cmd.type = WMTComputeCommandSetPSO;
+       cmd.pso = ComputePipeline.PipelineState;
+-      cmd.threadgroup_size = tg_size;
++      cmd.threadgroup_size = ComputePipeline.PipelineState ? tg_size : WMTSize{0, 0, 0};
+     });
+ 
+     cmdbuf_state = CommandBufferState::ComputePipelineReady;
+diff --git a/src/dxmt/dxmt_command.cpp b/src/dxmt/dxmt_command.cpp
+index 6498ae14df5982a232fc3b37149ba7794ee6fea1..19bb2ed4138dccf7cf3f52a9eba98d1ed4171b09 100644
+--- a/src/dxmt/dxmt_command.cpp
++++ b/src/dxmt/dxmt_command.cpp
+@@ -406,11 +406,12 @@ TileBarrierContext::dispatch() {
+     cmd_dispatch.width = kBarrierTileSize;
+     cmd_dispatch.height = kBarrierTileSize;
+ 
+-    if (auto pso_recover = ctx_.currentRenderEncoder()->last_pso) {
+-      auto &cmd_recover = ctx_.encodeRenderCommand<wmtcmd_render_setpso>();
+-      cmd_recover.type = WMTRenderCommandSetPSO;
+-      cmd_recover.pso = pso_recover;
+-    }
++    /* Restore the pipeline the encoder had before the barrier. last_pso is
++     * null when that pipeline failed to compile; restoring "null" keeps the
++     * following draws dropped instead of running on the tile pipeline. */
++    auto &cmd_recover = ctx_.encodeRenderCommand<wmtcmd_render_setpso>();
++    cmd_recover.type = WMTRenderCommandSetPSO;
++    cmd_recover.pso = ctx_.currentRenderEncoder()->last_pso;
+   }
+ }
+ 
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index 84abec298a031d04916b769b85c76a5aab4e59fe..9e5f77a6f7c7bdcda0ade377d98831dbf597fd7e 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -835,6 +835,13 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
+     }
+     case WMTComputeCommandSetPSO: {
+       struct wmtcmd_compute_setpso *body = (struct wmtcmd_compute_setpso *)next;
++      /* A null pipeline means creation failed: leave the encoder's pipeline
++       * as is (Metal rejects a nil state) and zero the threadgroup size so
++       * the dispatches below are dropped until a real pipeline is set. */
++      if (!body->pso) {
++        threadgroup_size = MTLSizeMake(0, 0, 0);
++        break;
++      }
+       [encoder setComputePipelineState:(id<MTLComputePipelineState>)body->pso];
+       threadgroup_size.width = body->threadgroup_size.width;
+       threadgroup_size.height = body->threadgroup_size.height;
+@@ -899,6 +906,9 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+   struct unixcall_generic_obj_cmd_noret *params = obj;
+   const struct wmtcmd_base *next = params->cmd_head.ptr;
+   id<MTLRenderCommandEncoder> encoder = (id<MTLRenderCommandEncoder>)params->encoder;
++  /* Cleared by a null SetPSO (pipeline creation failed) so the draws queued
++   * for that pipeline are dropped rather than run on the previous one. */
++  bool pso_valid = true;
+   while (next) {
+     switch ((enum WMTRenderCommandType)next->type) {
+     default:
+@@ -984,6 +994,9 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+     }
+     case WMTRenderCommandSetPSO: {
+       struct wmtcmd_render_setpso *body = (struct wmtcmd_render_setpso *)next;
++      pso_valid = body->pso != 0;
++      if (!pso_valid)
++        break;
+       [encoder setRenderPipelineState:(id<MTLRenderPipelineState>)body->pso];
+       break;
+     }
+@@ -1020,6 +1033,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       break;
+     }
+     case WMTRenderCommandDraw: {
++      if (!pso_valid)
++        break;
+       struct wmtcmd_render_draw *body = (struct wmtcmd_render_draw *)next;
+       [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
+                   vertexStart:body->vertex_start
+@@ -1029,6 +1044,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       break;
+     }
+     case WMTRenderCommandDrawIndexed: {
++      if (!pso_valid)
++        break;
+       struct wmtcmd_render_draw_indexed *body = (struct wmtcmd_render_draw_indexed *)next;
+       [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
+                           indexCount:body->index_count
+@@ -1041,6 +1058,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       break;
+     }
+     case WMTRenderCommandDrawIndirect: {
++      if (!pso_valid)
++        break;
+       struct wmtcmd_render_draw_indirect *body = (struct wmtcmd_render_draw_indirect *)next;
+       [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
+                 indirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
+@@ -1048,6 +1067,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       break;
+     }
+     case WMTRenderCommandDrawIndexedIndirect: {
++      if (!pso_valid)
++        break;
+       struct wmtcmd_render_draw_indexed_indirect *body = (struct wmtcmd_render_draw_indexed_indirect *)next;
+       [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
+                            indexType:(MTLIndexType)body->index_type
+@@ -1058,6 +1079,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       break;
+     }
+     case WMTRenderCommandDrawMeshThreadgroups: {
++      if (!pso_valid)
++        break;
+       struct wmtcmd_render_draw_meshthreadgroups *body = (struct wmtcmd_render_draw_meshthreadgroups *)next;
+       [encoder drawMeshThreadgroups:MTLSizeMake(
+                                         body->threadgroup_per_grid.width, body->threadgroup_per_grid.height,
+@@ -1074,6 +1097,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       break;
+     }
+     case WMTRenderCommandDrawMeshThreadgroupsIndirect: {
++      if (!pso_valid)
++        break;
+       struct wmtcmd_render_draw_meshthreadgroups_indirect *body =
+           (struct wmtcmd_render_draw_meshthreadgroups_indirect *)next;
+       [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
+@@ -1098,6 +1123,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       break;
+     }
+     case WMTRenderCommandDXMTGeometryDraw: {
++      if (!pso_valid)
++        break;
+       struct wmtcmd_render_dxmt_geometry_draw *body = (struct wmtcmd_render_dxmt_geometry_draw *)next;
+       [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
+       [encoder drawMeshThreadgroups:MTLSizeMake(body->warp_count, body->instance_count, 1)
+@@ -1106,6 +1133,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       break;
+     }
+     case WMTRenderCommandDXMTGeometryDrawIndexed: {
++      if (!pso_valid)
++        break;
+       struct wmtcmd_render_dxmt_geometry_draw_indexed *body = (struct wmtcmd_render_dxmt_geometry_draw_indexed *)next;
+       [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
+                         offset:body->index_buffer_offset
+@@ -1117,6 +1146,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       break;
+     }
+     case WMTRenderCommandDXMTGeometryDrawIndirect: {
++      if (!pso_valid)
++        break;
+       struct wmtcmd_render_dxmt_geometry_draw_indirect *body = (struct wmtcmd_render_dxmt_geometry_draw_indirect *)next;
+       [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
+                         offset:body->indirect_args_offset
+@@ -1131,6 +1162,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       break;
+     }
+     case WMTRenderCommandDXMTGeometryDrawIndexedIndirect: {
++      if (!pso_valid)
++        break;
+       struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *body =
+           (struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *)next;
+       [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
+@@ -1149,6 +1182,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       break;
+     }
+     case WMTRenderCommandDXMTTessellationMeshDraw: {
++      if (!pso_valid)
++        break;
+       struct wmtcmd_render_dxmt_tessellation_mesh_draw *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw *)next;
+       [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
+       [encoder drawMeshThreadgroups:MTLSizeMake(body->patch_per_mesh_instance, body->instance_count, 1)
+@@ -1157,6 +1192,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       break;
+     }
+     case WMTRenderCommandDXMTTessellationMeshDrawIndexed: {
++      if (!pso_valid)
++        break;
+       struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *body =
+           (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *)next;
+       [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
+@@ -1170,6 +1207,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+     }
+ 
+     case WMTRenderCommandDXMTTessellationMeshDrawIndirect: {
++      if (!pso_valid)
++        break;
+       struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *)next;
+       [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
+                         offset:body->indirect_args_offset
+@@ -1184,6 +1223,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       break;
+     }
+     case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect: {
++      if (!pso_valid)
++        break;
+       struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *body =
+           (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *)next;
+       [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer

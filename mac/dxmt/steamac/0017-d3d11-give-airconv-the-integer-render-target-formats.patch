@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 18:57:34 +0300
+Subject: [PATCH 17/27] d3d11: give airconv the integer render-target formats
+ of a pixel pipeline
+
+A pixel shader that writes a float-declared output to a Uint/Sint render
+target (undefined in D3D11; hardware reinterprets the bits) makes Metal
+reject the whole render pipeline (float4 output vs. an integer
+attachment), so every draw with it is lost. airconv already declares an
+output with the attachment's component type when
+SM50_SHADER_PSO_PIXEL_SHADER_DATA::pixel_formats names the format
+(upstream 8d8afb09, used by d3d12), but d3d11 always passed zeros.
+
+Carry the format of each integer render target in ShaderVariantPixel and
+pass it through. Non-integer targets stay 0 and the array only enters the
+variant digest when an integer target is present, so pipelines without
+one keep their variants and cached shaders.
+
+Same problem as utmapp/dxmt a2eff1bf and b2252bb7 (osy), solved with
+the mechanism upstream already has instead of a parallel uint/sint mask
+in airconv_public.h.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d11/d3d11_pipeline.cpp    | 12 ++++++++----
+ src/d3d11/d3d11_pipeline_gs.cpp | 12 ++++++++----
+ src/d3d11/d3d11_pipeline_ts.cpp | 12 ++++++++----
+ src/d3d11/d3d11_shader.cpp      |  6 +++++-
+ src/d3d11/d3d11_shader.hpp      |  7 ++++++-
+ 5 files changed, 35 insertions(+), 14 deletions(-)
+
+diff --git a/src/d3d11/d3d11_pipeline.cpp b/src/d3d11/d3d11_pipeline.cpp
+index 8ea32beb4753aee421140ccf4a8215de2d3ea1d8..8e1522bdbf21e1922cd0b0a294d841a7a04a77f0 100644
+--- a/src/d3d11/d3d11_pipeline.cpp
++++ b/src/d3d11/d3d11_pipeline.cpp
+@@ -20,8 +20,11 @@ public:
+         RasterizationEnabled(pDesc->RasterizationEnabled),
+         SampleCount(pDesc->SampleCount) {
+     uint32_t unorm_output_reg_mask = 0;
++    ShaderVariantPixel ps_variant{};
+     for (unsigned i = 0; i < num_rtvs; i++) {
+       rtv_formats[i] = pDesc->ColorAttachmentFormats[i];
++      if (IsIntegerFormat(pDesc->ColorAttachmentFormats[i]))
++        ps_variant.integer_rt_formats[i] = pDesc->ColorAttachmentFormats[i];
+       unorm_output_reg_mask |= (uint32_t(IsUnorm8RenderTargetFormat(pDesc->ColorAttachmentFormats[i])) << i);
+     }
+ 
+@@ -35,10 +38,11 @@ public:
+     }
+ 
+     if (pDesc->PixelShader) {
+-      PixelShader = pDesc->PixelShader->get_shader(ShaderVariantPixel{
+-          pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
+-          depth_stencil_format == WMTPixelFormatInvalid,
+-          unorm_output_reg_mask});
++      ps_variant.sample_mask = pDesc->SampleMask;
++      ps_variant.dual_source_blending = pDesc->BlendState->IsDualSourceBlending();
++      ps_variant.disable_depth_output = depth_stencil_format == WMTPixelFormatInvalid;
++      ps_variant.unorm_output_reg_mask = unorm_output_reg_mask;
++      PixelShader = pDesc->PixelShader->get_shader(ps_variant);
+       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
+     } else {
+       PixelShader = nullptr;
+diff --git a/src/d3d11/d3d11_pipeline_gs.cpp b/src/d3d11/d3d11_pipeline_gs.cpp
+index efa605e26df8df7776cae71effe9c174633d864a..4fa7b5c1f960ca1f26f402cb425757db5e4b8e9b 100644
+--- a/src/d3d11/d3d11_pipeline_gs.cpp
++++ b/src/d3d11/d3d11_pipeline_gs.cpp
+@@ -37,8 +37,11 @@ public:
+     if (pDesc->RasterizationEnabled && !pDesc->PixelShader)
+       num_rtvs = 0;
+     uint32_t unorm_output_reg_mask = 0;
++    ShaderVariantPixel ps_variant{};
+     for (unsigned i = 0; i < num_rtvs; i++) {
+       rtv_formats[i] = pDesc->ColorAttachmentFormats[i];
++      if (IsIntegerFormat(pDesc->ColorAttachmentFormats[i]))
++        ps_variant.integer_rt_formats[i] = pDesc->ColorAttachmentFormats[i];
+       unorm_output_reg_mask |= (uint32_t(IsUnorm8RenderTargetFormat(
+                                     pDesc->ColorAttachmentFormats[i]))
+                                 << i);
+@@ -51,10 +54,11 @@ public:
+       ShaderVariantGeometry{pDesc->VertexShader, pDesc->GSStripTopology});
+    
+     if (pDesc->PixelShader) {
+-      PixelShader = pDesc->PixelShader->get_shader(ShaderVariantPixel{
+-          pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
+-          depth_stencil_format == WMTPixelFormatInvalid,
+-          unorm_output_reg_mask});
++      ps_variant.sample_mask = pDesc->SampleMask;
++      ps_variant.dual_source_blending = pDesc->BlendState->IsDualSourceBlending();
++      ps_variant.disable_depth_output = depth_stencil_format == WMTPixelFormatInvalid;
++      ps_variant.unorm_output_reg_mask = unorm_output_reg_mask;
++      PixelShader = pDesc->PixelShader->get_shader(ps_variant);
+       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
+     } else {
+       PixelShader = nullptr;
+diff --git a/src/d3d11/d3d11_pipeline_ts.cpp b/src/d3d11/d3d11_pipeline_ts.cpp
+index 8b7f1f33be40a85b9dcb7ced913a99e56c709415..784fa445fcefaba5fc66d2b764f0405dee2b7fcf 100644
+--- a/src/d3d11/d3d11_pipeline_ts.cpp
++++ b/src/d3d11/d3d11_pipeline_ts.cpp
+@@ -41,8 +41,11 @@ public:
+     if (pDesc->RasterizationEnabled && !pDesc->PixelShader)
+       num_rtvs = 0;
+     uint32_t unorm_output_reg_mask = 0;
++    ShaderVariantPixel ps_variant{};
+     for (unsigned i = 0; i < num_rtvs; i++) {
+       rtv_formats[i] = pDesc->ColorAttachmentFormats[i];
++      if (IsIntegerFormat(pDesc->ColorAttachmentFormats[i]))
++        ps_variant.integer_rt_formats[i] = pDesc->ColorAttachmentFormats[i];
+       unorm_output_reg_mask |= (uint32_t(IsUnorm8RenderTargetFormat(
+                                     pDesc->ColorAttachmentFormats[i]))
+                                 << i);
+@@ -79,10 +82,11 @@ public:
+             pDesc->HullShader, pDesc->GSPassthrough,
+             max_potential_factor, !pDesc->RasterizationEnabled});
+     if (pDesc->PixelShader) {
+-      PixelShader = pDesc->PixelShader->get_shader(ShaderVariantPixel{
+-          pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
+-          depth_stencil_format == WMTPixelFormatInvalid,
+-          unorm_output_reg_mask});
++      ps_variant.sample_mask = pDesc->SampleMask;
++      ps_variant.dual_source_blending = pDesc->BlendState->IsDualSourceBlending();
++      ps_variant.disable_depth_output = depth_stencil_format == WMTPixelFormatInvalid;
++      ps_variant.unorm_output_reg_mask = unorm_output_reg_mask;
++      PixelShader = pDesc->PixelShader->get_shader(ps_variant);
+       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
+     } else {
+       PixelShader = nullptr;
+diff --git a/src/d3d11/d3d11_shader.cpp b/src/d3d11/d3d11_shader.cpp
+index 92e699f40d9f911797a118fb082378663ee10653..17057f1b340fffba145627642e0adab36edbbaeb 100644
+--- a/src/d3d11/d3d11_shader.cpp
++++ b/src/d3d11/d3d11_shader.cpp
+@@ -174,6 +174,10 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+   h.update(variant.unorm_output_reg_mask);
+   h.update(variant.dual_source_blending);
+   h.update(variant.disable_depth_output);
++  /* only pipelines with an integer render target hash it: other variants keep their digest */
++  if (std::any_of(std::begin(variant.integer_rt_formats), std::end(variant.integer_rt_formats),
++                  [](uint32_t format) { return format != 0; }))
++    h.update(variant.integer_rt_formats);
+   auto variant_digest = h.final();
+   std::string func_name = "ps_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
+ 
+@@ -185,7 +189,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+     data.dual_source_blending = variant.dual_source_blending;
+     data.disable_depth_output = variant.disable_depth_output;
+     data.unorm_output_reg_mask = variant.unorm_output_reg_mask;
+-    memset(data.pixel_formats, 0, sizeof(data.pixel_formats));
++    memcpy(data.pixel_formats, variant.integer_rt_formats, sizeof(data.pixel_formats));
+ 
+     sm50_bitcode_t compile_result = nullptr;
+     sm50_error_t sm50_err = nullptr;
+diff --git a/src/d3d11/d3d11_shader.hpp b/src/d3d11/d3d11_shader.hpp
+index fd31bd92a908a02e5885b4b63d5cb2fe5c933748..30cccd9806408d6b5410922196cbc836b19ebfc3 100644
+--- a/src/d3d11/d3d11_shader.hpp
++++ b/src/d3d11/d3d11_shader.hpp
+@@ -104,11 +104,16 @@ struct ShaderVariantPixel {
+   bool dual_source_blending;
+   bool disable_depth_output;
+   uint32_t unorm_output_reg_mask;
++  /* MTLPixelFormat of each integer (Uint/Sint) render target, 0 for any other format: airconv then
++     declares that output with the attachment's component type (SM50_SHADER_PSO_PIXEL_SHADER_DATA::
++     pixel_formats). Non-integer targets stay 0 so they do not multiply the variants. */
++  uint32_t integer_rt_formats[8] = {};
+   bool operator==(const this_type &rhs) const {
+     return sample_mask == rhs.sample_mask &&
+            dual_source_blending == rhs.dual_source_blending &&
+            disable_depth_output == rhs.disable_depth_output &&
+-           unorm_output_reg_mask == rhs.unorm_output_reg_mask;
++           unorm_output_reg_mask == rhs.unorm_output_reg_mask &&
++           !memcmp(integer_rt_formats, rhs.integer_rt_formats, sizeof(integer_rt_formats));
+   }
+ };
+ 

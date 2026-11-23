@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SteveTanSaMa <1519364926@qq.com>
+Date: Fri, 9 Oct 2026 17:23:29 +0800
+Subject: [PATCH 12/27] fix(d3d11): release compiled bitcode on all shader
+ failure paths
+
+(cherry picked from commit 4689d1bb90ed552ef454f1b3cab561ad201f7f17)
+[steamac: error-ownership.mm test entry dropped from the meson hunk; it belongs to SteveTanSaMa 8c111da7, not adopted]
+---
+ src/d3d11/d3d11_shader.cpp                  |  8 ++++---
+ src/d3d11/d3d11_shader_bitcode.hpp          | 23 ++++++++++++++++++
+ tests/regression/meson.build                |  2 ++
+ tests/regression/shader_bitcode_cleanup.cpp | 26 +++++++++++++++++++++
+ 4 files changed, 56 insertions(+), 3 deletions(-)
+ create mode 100644 src/d3d11/d3d11_shader_bitcode.hpp
+ create mode 100644 tests/regression/shader_bitcode_cleanup.cpp
+
+diff --git a/src/d3d11/d3d11_shader.cpp b/src/d3d11/d3d11_shader.cpp
+index e11d16c7b8b188a41c31678810e4d6f3b79e1535..92e699f40d9f911797a118fb082378663ee10653 100644
+--- a/src/d3d11/d3d11_shader.cpp
++++ b/src/d3d11/d3d11_shader.cpp
+@@ -1,4 +1,5 @@
+ #include "d3d11_shader.hpp"
++#include "d3d11_shader_bitcode.hpp"
+ #include "Metal.hpp"
+ #include "airconv_public.h"
+ #include "config/config.hpp"
+@@ -77,11 +78,13 @@ public:
+       if (!compile_result)
+         return this;
+ 
++      CompiledBitcode owned_bitcode(compile_result);
++
+       SM50GetCompiledBitcode(compile_result, &bitcode);
+       lib_data = WMT::MakeDispatchData(bitcode.Data, bitcode.Size);
+       auto library = device_->GetMTLDevice().newLibrary(lib_data, err);
+ 
+-      if (err) {
++      if (err || !library) {
+         ERR("Failed to create MTLLibrary: ", err.description().getUTF8String());
+         shader_->dump();
+         return this;
+@@ -89,7 +92,6 @@ public:
+ 
+       shader_->update_cached_variant(variant_digest_, lib_data);
+ 
+-      SM50DestroyBitcode(compile_result);
+       function_ = library.newFunction(func_name.c_str());
+ 
+       if (function_ == nullptr) {
+@@ -442,4 +444,4 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+       pDevice, shader, std::move(proc), func_name, variant_digest);
+ }
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/d3d11/d3d11_shader_bitcode.hpp b/src/d3d11/d3d11_shader_bitcode.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..4e836845496e3b3bd2ac92891e13a0cce94990e0
+--- /dev/null
++++ b/src/d3d11/d3d11_shader_bitcode.hpp
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include "airconv_public.h"
++
++namespace dxmt {
++
++// sm50_bitcode_t is a pointer on 64-bit and a pointer wrapper on WoW64.
++// Keep the owner in that representation rather than converting to void*.
++class CompiledBitcode {
++public:
++  explicit CompiledBitcode(sm50_bitcode_t bitcode) : bitcode_(bitcode) {}
++  CompiledBitcode(const CompiledBitcode &) = delete;
++  CompiledBitcode &operator=(const CompiledBitcode &) = delete;
++  ~CompiledBitcode() {
++    if (bitcode_)
++      SM50DestroyBitcode(bitcode_);
++  }
++
++private:
++  sm50_bitcode_t bitcode_;
++};
++
++} // namespace dxmt
+diff --git a/tests/regression/meson.build b/tests/regression/meson.build
+index 5d65562c0d187efdfcfdb4493bf4fe50beab6ba8..07be3cd63f1de132c7f31df0ff7391c60e2816cb 100644
+--- a/tests/regression/meson.build
++++ b/tests/regression/meson.build
+@@ -7,3 +7,5 @@ test('scheduler-lifetime', executable('scheduler-lifetime', 'scheduler_lifetime.
+      include_directories: inc, dependencies: threads), timeout: 30)
+ test('reference-ownership', executable('reference-ownership', 'reference_ownership.cpp',
+      include_directories: inc))
++test('shader-bitcode-cleanup', executable('shader-bitcode-cleanup', 'shader_bitcode_cleanup.cpp',
++     include_directories: [inc, include_directories('../../src/airconv')]))
+diff --git a/tests/regression/shader_bitcode_cleanup.cpp b/tests/regression/shader_bitcode_cleanup.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6c1f20c788dba117c84a9a3032fa9875da1a6b0
+--- /dev/null
++++ b/tests/regression/shader_bitcode_cleanup.cpp
+@@ -0,0 +1,26 @@
++#include "../../src/d3d11/d3d11_shader_bitcode.hpp"
++#include <cassert>
++#include <stdexcept>
++
++static unsigned destroyed = 0;
++extern "C" void SM50DestroyBitcode(sm50_bitcode_t bitcode) {
++  ++destroyed;
++  delete static_cast<int *>(bitcode);
++}
++static void compile(bool library_failed, bool throw_on_cache_write) {
++  auto bitcode = new int(42);
++  dxmt::CompiledBitcode owned(bitcode);
++  if (library_failed) return;
++  if (throw_on_cache_write) throw std::runtime_error("cache write");
++}
++int main() {
++  static_assert(!std::is_copy_constructible_v<dxmt::CompiledBitcode>);
++  compile(true, false);
++  assert(destroyed == 1);
++  compile(false, false);
++  assert(destroyed == 2);
++  try { compile(false, true); } catch (const std::runtime_error &) {}
++  assert(destroyed == 3);
++  { dxmt::CompiledBitcode empty(nullptr); }
++  assert(destroyed == 3);
++}

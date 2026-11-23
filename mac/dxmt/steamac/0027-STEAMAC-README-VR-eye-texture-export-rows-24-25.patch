@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 21:41:07 +0300
+Subject: [PATCH 27/27] STEAMAC-README: VR eye-texture export rows (24, 25)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ STEAMAC-README.md | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/STEAMAC-README.md b/STEAMAC-README.md
+index f2177d4aca3e80ec6accb07ce89c32e03baa77da..251c2a043400aa117def45c46f0a64e581588c83 100644
+--- a/STEAMAC-README.md
++++ b/STEAMAC-README.md
+@@ -52,6 +52,8 @@ original author and names its source commit; a follow-up commit of ours adapts i
+ | 21 | d3d11: d3d11.cpuCachedDynamicResources option | StonkGuy | idea seen in willfaust/dxmt (GPL-3.0), own implementation | PERF |
+ | 22 | perf(airconv): keep small dynamically indexed temp arrays in registers | hanzpo | hanzpo/dxmt 48259b2c | AIRCONV_VERSION 28, PERF |
+ | 23 | feat(dxmt): use residency set instead of useResource | Jakey-Jakey | Jakey-Jakey/dxmt c4fe91ec | `DXMT_RESIDENCY_SET=0` disables, PERF |
++| 24 | d3d11, winemetal: VR eye-texture export | StonkGuy | steamac (vr-export 507834a) | steamac VR: eye textures to the Mac's VR host (WMTVRSubmit); unused without a VR runtime |
++| 25 | d3d11: bound the frame queue once frames are exported | StonkGuy | steamac (vr-export 6b9fb22) | only after the first export |
+ 
+ PERF rows: kept or dropped on the measurement in "Performance" below.
+ 

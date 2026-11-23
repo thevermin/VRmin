@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Grinberg <green.grinya@gmail.com>
+Date: Tue, 6 Oct 2026 18:54:12 -0700
+Subject: [PATCH 04/27] dxmt: complete an occlusion query that ends in a
+ draw-less chunk
+
+A query can span command chunks and end in one that recorded no
+visibility-result samples.  That chunk created no readback, so the
+query's issued sequence id never advanced and GetData returned S_FALSE
+forever.  Create the readback whenever a pending query ends in the chunk
+and let a zero-sample issue just advance the sequence id.
+
+Probe (Neptune guest on the DXMT backend): Begin(OCCLUSION); Draw;
+Flush; End polled GetData for 5 s (3221 polls) without completing; now
+S_OK with 4096 samples on the second poll.  The control without the
+mid-query Flush was already correct (4096 samples).
+
+From varmint patches/dxmt/0004.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 756289873e6f3eafc5352f1f44f106694c462047)
+---
+ src/dxmt/dxmt_context.cpp         | 15 +++++++++++++--
+ src/dxmt/dxmt_occlusion_query.hpp | 17 +++++++++++++++--
+ 2 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index 7b29f1e4132c800d693659f076802b4bda02c968..0cb604e00fe49f7a718b01b0c2627a0d57126ee5 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -896,11 +896,22 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+ 
+   QueryReadbacks readbacks{};
+ 
+-  if (auto count = vro_state_.reset()) {
++  const auto visibility_count = vro_state_.reset();
++
++  bool has_ending_visibility_query = false;
++  for (const auto &query : pending_queries_) {
++    if (query->queryEndAt() == seqId) {
++      has_ending_visibility_query = true;
++      break;
++    }
++  }
++
++  if (visibility_count || has_ending_visibility_query) {
+     readbacks.visibility = std::make_unique<VisibilityResultReadback>(
+-        device_, seqId, count, pending_queries_
++        device_, seqId, visibility_count, pending_queries_
+     );
+   }
++
+   std::erase_if(pending_queries_, [=](auto &query) -> bool { return query->queryEndAt() == seqId; });
+ 
+   readbacks.timestamp = timestamp_state_.flush(cmdbuf);
+diff --git a/src/dxmt/dxmt_occlusion_query.hpp b/src/dxmt/dxmt_occlusion_query.hpp
+index 56e9e768e9d70356c9ffb7fac0859b47e9b07d81..a7ba78af8a79ecc52d3e6abab1d5796ee22a76c5 100644
+--- a/src/dxmt/dxmt_occlusion_query.hpp
++++ b/src/dxmt/dxmt_occlusion_query.hpp
+@@ -117,6 +117,17 @@ public:
+   issue(uint64_t seqId, uint64_t const *readbackBuffer, unsigned numResults) {
+     assert(seqId >= seq_id_begin);
+     assert(seqId <= seq_id_end);
++
++    /*
++     * A query may span multiple command chunks and end in a chunk with
++     * no visibility-result samples. The completion-only chunk must still
++     * advance seq_id_issued once that command buffer has completed.
++     */
++    if (numResults == 0) {
++      seq_id_issued = seqId;
++      return;
++    }
++
+     uint64_t const *start = seqId == seq_id_begin ? readbackBuffer + occlusion_counter_begin : readbackBuffer;
+     uint64_t const *end = seqId == seq_id_end ? readbackBuffer + occlusion_counter_end : readbackBuffer + numResults;
+     assert(start <= end);
+@@ -167,10 +178,12 @@ public:
+         visibility_result_heap_info.options = WMTResourceHazardTrackingModeUntracked;
+         visibility_result_heap_info.memory.set(nullptr);
+ #ifdef __i386__
+-        visibility_result_heap_info.memory.set(wsi::aligned_malloc(num_results * sizeof(uint64_t), DXMT_PAGE_SIZE));
++        if (num_results)
++          visibility_result_heap_info.memory.set(wsi::aligned_malloc(num_results * sizeof(uint64_t), DXMT_PAGE_SIZE));
+ #endif
+         visibility_result_heap_info.length = num_results * sizeof(uint64_t);
+-        visibility_result_heap = device.newBuffer(visibility_result_heap_info);
++        if (num_results)
++          visibility_result_heap = device.newBuffer(visibility_result_heap_info);
+       }
+   ~VisibilityResultReadback() {
+     for (auto query : queries) {

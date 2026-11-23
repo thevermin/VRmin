@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Holly Hamilton <hollyvhamilton@gmail.com>
+Date: Thu, 27 Aug 2026 19:57:51 -0400
+Subject: [PATCH 06/27] winemetal: skip compute dispatches encoded without a
+ pipeline state
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When compute pipeline creation fails (e.g. MTLCompilerService dying under
+compile load), the encode stream still carries the dispatch commands that
+were queued for it, but SetPSO was never encoded — so threadgroup_size
+stays zero and dispatching is a fatal Metal API violation, killing the
+process long after the original, already-logged failure.
+
+Skip dispatches while no pipeline has been set on the encoder: the title
+loses one compute pass (visual glitch at worst) instead of crashing.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+(cherry picked from commit 44bf134b794a55295f9239d5b4d9d04cea7f7d21)
+---
+ src/winemetal/unix/winemetal_unix.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index 3327b2902a9598d612cfa8b2a776f84f3b669265..84abec298a031d04916b769b85c76a5aab4e59fe 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -806,18 +806,28 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
+       break;
+     case WMTComputeCommandDispatch: {
+       struct wmtcmd_compute_dispatch *body = (struct wmtcmd_compute_dispatch *)next;
++      /* threadgroup_size is only set by SetPSO. If pipeline creation failed
++       * (e.g. the Metal compiler service died), SetPSO was never encoded and
++       * dispatching with a zero threadgroup size is a fatal API violation.
++       * Skip the dispatch: one compute pass drops instead of the process. */
++      if (threadgroup_size.width == 0)
++        break;
+       [encoder dispatchThreadgroups:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
+               threadsPerThreadgroup:threadgroup_size];
+       break;
+     }
+     case WMTComputeCommandDispatchThreads: {
+       struct wmtcmd_compute_dispatch *body = (struct wmtcmd_compute_dispatch *)next;
++      if (threadgroup_size.width == 0)
++        break;
+       [encoder dispatchThreads:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
+           threadsPerThreadgroup:threadgroup_size];
+       break;
+     }
+     case WMTComputeCommandDispatchIndirect: {
+       struct wmtcmd_compute_dispatch_indirect *body = (struct wmtcmd_compute_dispatch_indirect *)next;
++      if (threadgroup_size.width == 0)
++        break;
+       [encoder dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
+                                  indirectBufferOffset:body->indirect_args_offset
+                                 threadsPerThreadgroup:threadgroup_size];

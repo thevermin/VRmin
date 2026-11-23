@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=97=B6=E9=9B=A8?= <270598250@qq.com>
+Date: Thu, 21 May 2026 18:13:27 +0800
+Subject: [PATCH 19/27] fix(dxmt): reserve command slots before publishing
+ chunks
+
+(cherry picked from commit a350b20e51d8dd23d8244451f482151b146877a1)
+---
+ src/dxmt/dxmt_command_queue.cpp | 25 ++++++++++++++++++-------
+ 1 file changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/src/dxmt/dxmt_command_queue.cpp b/src/dxmt/dxmt_command_queue.cpp
+index 89ffc37830eab80227689691a43cad9235537dba..fc5e12fad824cf0c2c6d04652dc206d6bce4b040 100644
+--- a/src/dxmt/dxmt_command_queue.cpp
++++ b/src/dxmt/dxmt_command_queue.cpp
+@@ -92,24 +92,35 @@ CommandQueue::~CommandQueue() {
+ 
+ void
+ CommandQueue::CommitCurrentChunk() {
++  auto& statistics = CurrentFrameStatistics();
++#if ASYNC_ENCODING
++  auto t0 = clock::now();
++  for (;;) {
++    auto ongoing = chunk_ongoing.load(std::memory_order_acquire);
++    while (ongoing >= kCommandChunkCount - 1) {
++      chunk_ongoing.wait(ongoing, std::memory_order_acquire);
++      ongoing = chunk_ongoing.load(std::memory_order_acquire);
++    }
++    if (chunk_ongoing.compare_exchange_weak(
++            ongoing, ongoing + 1, std::memory_order_acq_rel,
++            std::memory_order_acquire))
++      break;
++  }
++  auto t1 = clock::now();
++  statistics.commit_interval += (t1 - t0);
++#endif
++
+   auto chunk_id = ready_for_encode.load(std::memory_order_relaxed);
+   auto &chunk = chunks[chunk_id % kCommandChunkCount];
+   chunk.chunk_id = chunk_id;
+   chunk.chunk_event_id = GetNextEventSeqId();
+   chunk.frame_ = frame_count;
+   chunk.resource_initializer_event_id = initializer.flushToWait();
+-  auto& statistics = CurrentFrameStatistics();
+   statistics.command_buffer_count++;
+ #if ASYNC_ENCODING
+   ready_for_encode.fetch_add(1, std::memory_order_release);
+   ready_for_encode.notify_one();
+ 
+-  auto t0 = clock::now();
+-  chunk_ongoing.wait(kCommandChunkCount - 1, std::memory_order_acquire);
+-  chunk_ongoing.fetch_add(1, std::memory_order_relaxed);
+-  auto t1 = clock::now();
+-  statistics.commit_interval += (t1 - t0);
+-
+ #else
+   CommitChunkInternal(chunk, ready_for_encode.fetch_add(1, std::memory_order_relaxed));
+ #endif

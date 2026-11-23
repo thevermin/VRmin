@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 19:08:18 +0300
+Subject: [PATCH 21/27] d3d11: d3d11.cpuCachedDynamicResources option
+
+DYNAMIC buffers and textures are allocated write-combined. The CPU only
+writes them, but some titles also read back what they wrote (partial
+updates of a mapped constant block), which is slow on write-combined
+memory. The option (default off) allocates them CPU-cached instead.
+
+Idea from willfaust/dxmt (ios-port) "map CPU-written resources cached
+rather than write-combined"; implemented independently from its
+description, no code taken from that GPL-3.0 fork.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dxmt.conf                           | 5 +++++
+ src/d3d11/d3d11_buffer.cpp          | 2 +-
+ src/d3d11/d3d11_resource.hpp        | 8 ++++++++
+ src/d3d11/d3d11_texture_dynamic.cpp | 4 +++-
+ src/d3d11/d3d11_texture_linear.cpp  | 2 +-
+ 5 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/dxmt.conf b/dxmt.conf
+index 1b45d82e0e6e1fc22c7e9800f61a0b530513c7a2..b9f0a05643b34d130f8392f07b4c2edca2e5d947 100644
+--- a/dxmt.conf
++++ b/dxmt.conf
+@@ -127,3 +127,8 @@
+ #
+ # Supported values: True, False
+ # d3d11.submitBeforePresent = True
++
++# Allocates DYNAMIC buffers and textures CPU-cached instead of write-combined.
++#
++# Supported values: True, False
++# d3d11.cpuCachedDynamicResources = False
+diff --git a/src/d3d11/d3d11_buffer.cpp b/src/d3d11/d3d11_buffer.cpp
+index c354db3515083a0a849af9749214154cbe574222..9c355d10bca5f151ee3664f918f914b72a224e54 100644
+--- a/src/d3d11/d3d11_buffer.cpp
++++ b/src/d3d11/d3d11_buffer.cpp
+@@ -84,7 +84,7 @@ public:
+       TResourceBase<tag_buffer>(*pDesc, device) {
+     buffer_ = new Buffer(pDesc->ByteWidth, device->GetMTLDevice());
+     Flags<BufferAllocationFlag> flags;
+-    if (!m_parent->IsTraced() && pDesc->Usage == D3D11_USAGE_DYNAMIC)
++    if (!m_parent->IsTraced() && pDesc->Usage == D3D11_USAGE_DYNAMIC && !CpuCachedDynamicResources())
+       flags.set(BufferAllocationFlag::CpuWriteCombined);
+     // if (pDesc->Usage != D3D11_USAGE_DEFAULT)
+     if (pDesc->Usage == D3D11_USAGE_IMMUTABLE)
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index 6b547f2a080011c85fe792125fc69b0ca393f956..2147deaefc7f8b8adcddb192bc4ee91731fd64ed 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -1,4 +1,5 @@
+ #pragma once
++#include "config/config.hpp"
+ #include "dxmt_buffer.hpp"
+ #include "dxmt_dynamic.hpp"
+ #include "dxmt_staging.hpp"
+@@ -160,6 +161,13 @@ struct D3D11ResourceCommon : ID3D11Resource {
+   }
+ };
+ 
++/* d3d11.cpuCachedDynamicResources: DYNAMIC buffers and textures are allocated CPU-cached instead of
++   write-combined (MTLCPUCacheModeWriteCombined) */
++inline bool CpuCachedDynamicResources() {
++  static const bool cached = Config::getInstance().getOption<bool>("d3d11.cpuCachedDynamicResources", false);
++  return cached;
++}
++
+ inline D3D11ResourceCommon* GetResourceCommon(ID3D11Resource *pResource) {
+   return static_cast<D3D11ResourceCommon *>(pResource);
+ }
+diff --git a/src/d3d11/d3d11_texture_dynamic.cpp b/src/d3d11/d3d11_texture_dynamic.cpp
+index da9a7cc9aced43706318e94c38884859aee3390e..d08f5bed91ded137f5fdc6c7553382e02ce05b58 100644
+--- a/src/d3d11/d3d11_texture_dynamic.cpp
++++ b/src/d3d11/d3d11_texture_dynamic.cpp
+@@ -117,7 +117,9 @@ HRESULT CreateDynamicTextureInternal(MTLD3D11Device *pDevice,
+       return E_FAIL;
+     }
+     Flags<BufferAllocationFlag> buffer_flags;
+-    buffer_flags.set(BufferAllocationFlag::CpuWriteCombined, BufferAllocationFlag::SuballocateFromOnePage);
++    buffer_flags.set(BufferAllocationFlag::SuballocateFromOnePage);
++    if (!CpuCachedDynamicResources())
++      buffer_flags.set(BufferAllocationFlag::CpuWriteCombined);
+ #ifdef __i386__
+     buffer_flags.set(BufferAllocationFlag::CpuPlaced);
+ #endif
+diff --git a/src/d3d11/d3d11_texture_linear.cpp b/src/d3d11/d3d11_texture_linear.cpp
+index e250d6e0541b549c77405c5a2dcce65b32a7577a..0d152c510964f7b9250ff2770463a636a036b4e0 100644
+--- a/src/d3d11/d3d11_texture_linear.cpp
++++ b/src/d3d11/d3d11_texture_linear.cpp
+@@ -48,7 +48,7 @@ TDynamicLinearTexture(
+     this->texture_ = new Texture(bytes_per_image, bytes_per_row, descriptor, device->GetMTLDevice());
+     Flags<TextureAllocationFlag> flags;
+     flags.set(TextureAllocationFlag::ShaderReadonly);
+-    if (!this->m_parent->IsTraced() && pDesc->Usage == D3D11_USAGE_DYNAMIC)
++    if (!this->m_parent->IsTraced() && pDesc->Usage == D3D11_USAGE_DYNAMIC && !CpuCachedDynamicResources())
+       flags.set(TextureAllocationFlag::CpuWriteCombined);
+     // if (pDesc->Usage != D3D11_USAGE_DEFAULT)
+     if (pDesc->Usage == D3D11_USAGE_IMMUTABLE)

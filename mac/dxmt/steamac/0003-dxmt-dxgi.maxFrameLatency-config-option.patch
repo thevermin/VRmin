@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 00:08:47 +0300
+Subject: [PATCH 03/27] dxmt: dxgi.maxFrameLatency config option
+
+The command queue lets the CPU run up to three frames ahead of the GPU,
+and only IDXGIDevice1::SetMaximumFrameLatency could change that. The
+option (as in DXVK) sets it for a game without code changes and wins
+over the application's call; SetMaximumFrameLatency(0) now restores the
+default instead of disabling the wait, values above 16 are rejected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dxmt.conf                  |  6 ++++++
+ src/d3d11/d3d11_device.cpp | 14 +++++++++++++-
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/dxmt.conf b/dxmt.conf
+index f283aa4c0241b086d388d0045bd617a20c7fedfc..1e7f20000a709144938e8136cb371d19335f93ce 100644
+--- a/dxmt.conf
++++ b/dxmt.conf
+@@ -104,3 +104,9 @@
+ # Supported values: Any integer between 4 and 64
+ 
+ # d3d11.maxTessFactor = 64
++
++# Frames the CPU may queue ahead of the GPU (as in DXVK). Lower values reduce input latency at some cost in
++# throughput; 0 keeps the default (3) and lets the application set it.
++#
++# Supported values: 0 - 16
++# dxgi.maxFrameLatency = 0
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 62efc674808a4a453401288fb9a6d5f89d916e19..ef1665652318ad976519a44f6aa04ecc8e7ee1bc 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -1,4 +1,5 @@
+ #include "com/com_guid.hpp"
++#include "config/config.hpp"
+ #include "d3d11_fence.hpp"
+ #include "d3d11_input_layout.hpp"
+ #include "d3d11_interfaces.hpp"
+@@ -1148,6 +1149,11 @@ public:
+       else
+         local_kmt_ = create.hDevice;
+     }
++    // dxgi.maxFrameLatency (as in DXVK): frames the CPU may run ahead of the GPU; overrides the default (3) and
++    // the application's IDXGIDevice1::SetMaximumFrameLatency. 0 = not set.
++    max_frame_latency_ = Config::getInstance().getOption<int>("dxgi.maxFrameLatency", 0);
++    if (max_frame_latency_ > 0)
++      cmd_queue_.SetMaxLatency(max_frame_latency_);
+   }
+ 
+   ~MTLD3D11DXGIDevice() {
+@@ -1258,7 +1264,11 @@ public:
+   }
+ 
+   HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT MaxLatency) override {
+-    cmd_queue_.SetMaxLatency(MaxLatency);
++    if (max_frame_latency_ > 0)
++      return S_OK; /* the configured value wins */
++    if (MaxLatency > 16)
++      return DXGI_ERROR_INVALID_CALL;
++    cmd_queue_.SetMaxLatency(MaxLatency ? MaxLatency : 3); /* 0 restores the default, as in D3D */
+     return S_OK;
+   }
+ 
+@@ -1309,6 +1319,8 @@ private:
+   D3DKMT_HANDLE local_kmt_ = 0;
+   std::unique_ptr<Device> device;
+   CommandQueue &cmd_queue_;
++  /* dxgi.maxFrameLatency, 0 = not configured */
++  int max_frame_latency_ = 0;
+   MTLD3D11DeviceImpl d3d11_device_;
+ };
+ 

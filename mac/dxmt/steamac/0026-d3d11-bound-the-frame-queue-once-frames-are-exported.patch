@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 19:12:12 +0300
+Subject: [PATCH 26/27] d3d11: bound the frame queue once frames are exported
+
+An exported eye texture (IMTLD3D11ExportableTexture) is taken by its
+consumer only when the frame's rendering completed. With the default
+frame latency of 3 a GPU-bound application queues three frames, so each
+exported frame waits for two older ones: on a d3d11bench --vr run the
+VR compositor got frames 85-95 ms after submit and dropped a third of
+them. From the first export on the immediate context now bounds the
+queue to d3d11.exportMaxFrameLatency (default 1; 0 = leave it). The
+application's SetMaximumFrameLatency can lower it, not raise it; a
+configured dxgi.maxFrameLatency wins. Applications that never export
+are unchanged.
+
+Measured (M2, d3d11bench --vr 1024 under FEX/Proton/wmtr, GPU-bound):
+submit->copied p50 95.6 -> 34.0 ms, VR frames 28.1 -> 36.7 fps, dropped
+303 -> 20 per 32 s; flat present rate unchanged (37.8 / 37.3 fps).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dxmt.conf                       |  8 ++++++++
+ src/d3d11/d3d11_context_imm.cpp | 12 ++++++++++++
+ src/dxmt/dxmt_command_queue.hpp | 10 +++++++++-
+ 3 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/dxmt.conf b/dxmt.conf
+index b9f0a05643b34d130f8392f07b4c2edca2e5d947..7375cd14801d0d9fd35ee8b4c9b38184b90d9d92 100644
+--- a/dxmt.conf
++++ b/dxmt.conf
+@@ -122,6 +122,14 @@
+ # Supported values: 0 - 16
+ # dxgi.maxFrameLatency = 0
+ 
++# Upper bound of the frame queue once the application exports frames to an out-of-process consumer
++# (IMTLD3D11ExportableTexture, VR eye textures): such a frame is taken when its rendering has completed,
++# and frames queued ahead of the GPU only add latency. 0 leaves the queue as it is. Not used when
++# dxgi.maxFrameLatency is set.
++#
++# Supported values: 0 - 16
++# d3d11.exportMaxFrameLatency = 1
++
+ # Commits the frame's recorded commands before the present is recorded, so the GPU starts on them
+ # while the present waits for a drawable (the present then goes out in a command buffer of its own).
+ #
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 3ff3fe6361df90e909c30bb5fb1fa555ac4ccf50..0ce6a9a3606bf81505a34b1f21c4afeaaabbef8f 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -1,3 +1,4 @@
++#include <algorithm>
+ #include "config/config.hpp"
+ #include "d3d11_fence.hpp"
+ #include "d3d11_private.h"
+@@ -78,6 +79,9 @@ public:
+       ctx_state({cmd_queue}),
+       d3dmt_(this, mutex) {
+         ignore_map_flag_no_wait_ = Config::getInstance().getOption<bool>("d3d11.ignoreMapFlagNoWait", false);
++        /* a configured dxgi.maxFrameLatency wins over the export's own bound */
++        if (Config::getInstance().getOption<int>("dxgi.maxFrameLatency", 0) <= 0)
++          export_max_frame_latency_ = std::clamp(Config::getInstance().getOption<int>("d3d11.exportMaxFrameLatency", 1), 0, 16);
+       }
+ 
+   HRESULT
+@@ -528,6 +532,13 @@ public:
+       InvalidateCurrentPass(true);
+       Commit();
+     }
++    /* An exported frame is taken by its consumer when its rendering has completed. Frames the CPU queues ahead of
++       the GPU only age in that queue (and keep the consumer's images waiting), so from the first export on the
++       queue is bounded; the application's SetMaximumFrameLatency can lower it further, not raise it. */
++    if (export_max_frame_latency_) {
++      cmd_queue.LimitMaxLatency(export_max_frame_latency_);
++      export_max_frame_latency_ = 0;
++    }
+     *pSharedEvent = cmd_queue.event.handle;
+     *pSignalValue = cmd_queue.GetCurrentEventSeqId();
+     return S_OK;
+@@ -695,6 +706,7 @@ private:
+   std::atomic<uint32_t> refcount = 0;
+   D3D11Multithread d3dmt_;
+   bool ignore_map_flag_no_wait_;
++  uint32_t export_max_frame_latency_ = 0;
+ };
+ 
+ std::unique_ptr<MTLD3D11DeviceContextBase>
+diff --git a/src/dxmt/dxmt_command_queue.hpp b/src/dxmt/dxmt_command_queue.hpp
+index 4c29525b8d317b66e20a17bde6cac1b7d8dbedf5..222ddf6e489b2c094fc53c511a585f22191f2350 100644
+--- a/src/dxmt/dxmt_command_queue.hpp
++++ b/src/dxmt/dxmt_command_queue.hpp
+@@ -33,6 +33,7 @@
+ #include "log/log.hpp"
+ #include "thread.hpp"
+ #include "util_cpu_fence.hpp"
++#include <algorithm>
+ #include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+@@ -171,6 +172,7 @@ private:
+   uint64_t encoder_seq = 1;
+   uint64_t frame_count = 0;
+   uint32_t max_latency_ = 3;
++  uint32_t max_latency_limit_ = 0;
+ 
+   dxmt::thread encodeThread;
+   dxmt::thread finishThread;
+@@ -275,7 +277,13 @@ public:
+ 
+   uint32_t GetMaxLatency() { return max_latency_; }
+ 
+-  void SetMaxLatency(uint32_t value) { max_latency_ = value; };
++  void SetMaxLatency(uint32_t value) { max_latency_ = max_latency_limit_ ? std::min(value, max_latency_limit_) : value; };
++
++  /* an upper bound that later SetMaxLatency calls keep; 0 removes it */
++  void LimitMaxLatency(uint32_t limit) {
++    max_latency_limit_ = limit;
++    SetMaxLatency(max_latency_);
++  };
+ 
+   void
+   WaitCPUFence(uint64_t seq) {
