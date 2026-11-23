@@ -83,8 +83,11 @@ jobs:
           grep -q 'define SONAME_LIBVULKAN' include/config.h || { echo "::error::configure no encontró MoltenVK"; grep -i vulkan ../configure.log | tail; exit 1; }
           sed -i '' 's|^#define SONAME_LIBVULKAN .*|#define SONAME_LIBVULKAN "libMoltenVK.dylib"|' include/config.h
           grep SONAME_LIBVULKAN include/config.h
-          grep -q 'define SONAME_LIBFREETYPE "libfreetype.6.dylib"' include/config.h \
+          # (FreeType: también por el nombre de la de Gcenx, que está en lib/)
+          grep -q 'define SONAME_LIBFREETYPE' include/config.h \
             || { echo "::error::configure no encontró FreeType"; grep -i freetype ../configure.log | tail; exit 1; }
+          sed -i '' 's|^#define SONAME_LIBFREETYPE .*|#define SONAME_LIBFREETYPE "libfreetype.6.dylib"|' include/config.h
+          grep SONAME_LIBFREETYPE include/config.h
       - name: Compilar lo que cambian los parches
         working-directory: wine
         run: |
