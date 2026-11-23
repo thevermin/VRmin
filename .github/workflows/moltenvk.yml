@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: vrmin
-      - name: Xcode (el más nuevo que haya: los geometry shaders usan mesh shaders de Metal)
+      - name: "Xcode (el más nuevo que haya: los geometry shaders usan mesh shaders de Metal)"
         run: |
           x=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
           echo "Xcode: $x"; sudo xcode-select -s "$x"; xcodebuild -version; xcrun --find metal
