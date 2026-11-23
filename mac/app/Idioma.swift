@@ -460,6 +460,8 @@ private let EN: [String: String] = [
     "Se trabó · reinicialo": "Frozen · restart it",
     "Reiniciar Steam": "Restart Steam",
     "Amigos y chat de Steam": "Steam friends and chat",
+    "SteamVR elige la resolución": "SteamVR chooses the resolution",
+    "Con SteamVR real, la resolución de los juegos la elige SteamVR (en su menú: Ajustes › Video) en vez de VRmin. Vale desde el próximo juego.": "With real SteamVR, SteamVR chooses the games' resolution (in its menu: Settings › Video) instead of VRmin. Applies from the next game.",
     "También en el visor, con SteamVR. Usan casi un núcleo de la CPU mientras Steam está abierto, así que los juegos pueden andar más lento.": "Also in the headset, with SteamVR. They use almost a full CPU core while Steam is open, so games can run slower.",
     "Se aplica al reiniciar Steam (si hay un juego abierto, también se cierra).": "Takes effect when Steam restarts (an open game closes too).",
     "Mostrar": "Show",

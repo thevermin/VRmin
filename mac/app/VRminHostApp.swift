@@ -450,6 +450,15 @@ final class AppModel: ObservableObject {
         run(L("Escondiendo Steam"), "ocultar_steam.sh", exclusive: false)
     }
     func signOutSteam() { run(L("Cerrando la sesión de Steam"), "cerrar_sesion_steam.sh") }
+    /// Con SteamVR real, la resolución de los juegos la elige SteamVR (su ajuste de resolución) en vez de VRmin (su
+    /// calidad y los ajustes de cada juego). jugar.sh y el renderizador leen el archivo «steamvr_resolucion»; vale la
+    /// próxima vez que se abre un juego con SteamVR
+    @Published var steamVRResolution: Bool = UserDefaults.standard.bool(forKey: "steamVRResolution") {
+        didSet { UserDefaults.standard.set(steamVRResolution, forKey: "steamVRResolution"); writeSteamVRResolutionFile() } }
+    func writeSteamVRResolutionFile() {
+        let f = data.appendingPathComponent("steamvr_resolucion")
+        if steamVRResolution { try? "1".write(to: f, atomically: true, encoding: .utf8) } else { try? FileManager.default.removeItem(at: f) }
+    }
     func writeSteamFriendsFile() {
         let f = data.appendingPathComponent("steam_amigos")
         if steamFriends { try? "1".write(to: f, atomically: true, encoding: .utf8) } else { try? FileManager.default.removeItem(at: f) }
@@ -590,6 +599,7 @@ final class AppModel: ObservableObject {
         UserDefaults.standard.set(data.path, forKey: "dataDir")
         writeSteamFriendsFile()
         writeSteamWindowFile()
+        writeSteamVRResolutionFile()
         if !fm.fileExists(atPath: res.appendingPathComponent("servidor.sh").path) {
             append(L("ATENCIÓN: faltan archivos dentro de la app (%@). Volvé a crearla con crear_app.sh", res.path))
         }
@@ -2316,6 +2326,9 @@ struct SettingsView: View {
                         Button(L("Reiniciar Steam")) { m.restartSteam() }.buttonStyle(Pill()).disabled(m.busyTask != nil)
                     }
                 }
+                Toggle(L("SteamVR elige la resolución"), isOn: $m.steamVRResolution).toggleStyle(.switch)
+                Text(L("Con SteamVR real, la resolución de los juegos la elige SteamVR (en su menú: Ajustes › Video) en vez de VRmin. Vale desde el próximo juego."))
+                    .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(L("Reinstalar todo")).font(.callout)

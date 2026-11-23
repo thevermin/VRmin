@@ -264,6 +264,7 @@ static uint32_t pose_for(const HmdMatrix34_t &m, double *dist) {
 static std::atomic<int> g_cfgEyeW{0}, g_cfgEyeH{0}, g_cfgFps{0};
 static std::atomic<int> g_cfgNativeW{0}, g_cfgNativeH{0};   // (the Quest's own resolution per eye, from VRmin Host)
 static std::atomic<float> g_cfgFovK{1.f};
+static std::atomic<bool> g_cfgSteamVRRes{false};   // (VRmin Host: «SteamVR chooses the resolution»)
 static char g_cfgCtl[16] = "quest2";   // (the Quest's controllers, from VRmin Host: quest2, plus or pro)
 static std::atomic<unsigned> g_haptics{0};   // (vibrations sent to the Quest, for the log)
 // SteamVR's menu (dashboard): VRmin opens games straight from Wine, not from that menu, so it stays open over a game
@@ -333,6 +334,7 @@ static void parse_config(const char *line) {
   if ((p = strstr(line, "\"eyeH\":")) && atoi(p + 7) >= 256 && atoi(p + 7) <= 4096) g_cfgEyeH = atoi(p + 7);
   if ((p = strstr(line, "\"fovk\":")) && atof(p + 7) >= 0.6 && atof(p + 7) <= 1.0) g_cfgFovK = (float)atof(p + 7);
   if ((p = strstr(line, "\"fps\":")) && atoi(p + 6) >= 30 && atoi(p + 6) <= 144) g_cfgFps = atoi(p + 6);
+  if ((p = strstr(line, "\"sres\":"))) g_cfgSteamVRRes = atoi(p + 7) == 1;
   if ((p = strstr(line, "\"ctl\":\""))) {
     const char *v = p + 7;
     if (!strncmp(v, "plus\"", 5) || !strncmp(v, "pro\"", 4) || !strncmp(v, "quest2\"", 7)) { size_t n = strcspn(v, "\""); memcpy(g_cfgCtl, v, n); g_cfgCtl[n] = 0; }
@@ -350,11 +352,16 @@ static void wait_display() {
     if (g_cfgFps && t.valid) break;
     Sleep(20);
   }
-  // The headset's resolution is the Quest's own (as SteamVR's 100 % on Windows): SteamVR chooses how much of it the
-  // games draw (automatically, from how fast the GPU is, or with its resolution setting), and VRmin Host scales the
-  // image to the stream's size. Without the Quest's model, VRmin Host's resolution.
+  // The headset's resolution is VRmin's for the game being opened (its quality and the game's own settings in VRmin
+  // Host, as with OpenComposite), with the shape of the Quest's screen, and SteamVR draws it at 100 % (runtime.sh):
+  // SteamVR's per-game resolution isn't used when a game is opened outside its own library, and its automatic one
+  // doesn't go below the first headsets' (more than twice the pixels on a Mac). With «SteamVR chooses the resolution»
+  // in VRmin Host, the Quest's own (as SteamVR's 100 % on Windows) and SteamVR's resolution setting.
   if (g_cfgFps && g_cfgEyeW) { EYE_W = g_cfgEyeW; EYE_H = g_cfgEyeH; HZ = (float)g_cfgFps; }
-  if (g_cfgFps && g_cfgNativeW) { EYE_W = g_cfgNativeW; EYE_H = g_cfgNativeH; }
+  if (g_cfgFps && g_cfgNativeW) {
+    if (g_cfgSteamVRRes) { EYE_W = g_cfgNativeW; EYE_H = g_cfgNativeH; }
+    else if (g_cfgEyeW) EYE_H = (uint32_t)(EYE_W * (double)g_cfgNativeH / g_cfgNativeW / 8 + 0.5) * 8;
+  }
   if (t.valid) {
     float k = g_cfgFovK;
     for (int e = 0; e < 2; e++) {
