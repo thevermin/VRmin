@@ -80,6 +80,172 @@ static int recortar(vk_features* pedido, const vk_features* hay) {
     }
   return n;
 }
+static vk_gipa mvk_gdpa;
+// --- DXVK sobre MoltenVK (solo con VRMIN_DXVK=1, desde el perfil del juego)
+// DXVK 2.x (DirectX 9/10/11 sobre Vulkan: Half-Life 2: VR Mod trae el suyo) se niega a arrancar si la GPU no ofrece
+// cosas que las de Apple no tienen: geometry shaders, cull distance, robustness2 (robustBufferAccess2 y
+// nullDescriptor) y VK_KHR_pipeline_library. Con DirectX 9 no usa geometry shaders ni bibliotecas de pipelines (sin
+// graphicsPipelineLibrary), MoltenVK ya acepta descriptores vacíos (los pone en nil) y cull distance se saca de los
+// shaders (arriba). Así que se le dice que están, y al crear el dispositivo se piden solo las que MoltenVK tiene. Lo
+// único que MoltenVK no aguanta vacío son los vertex buffers: van a uno de ceros del mismo dispositivo.
+static int dxvk_modo = -1;
+static int dxvk(void) { if (dxvk_modo < 0) dxvk_modo = getenv("VRMIN_DXVK") && *getenv("VRMIN_DXVK") == '1'; return dxvk_modo; }
+#define VK_ROBUSTNESS2 1000286000
+#define VK_FEATURES2 1000059000
+static int idx_feature(const char* n) { for (int i = 0; i < 55; i++) if (!strcmp(vk_nombres[i], n)) return i; return -1; }
+static void fingir_core(vk_features* f) {
+  f->f[idx_feature("geometryShader")] = 1;
+  f->f[idx_feature("shaderCullDistance")] = 1;
+}
+static void fingir_cadena(const void* next) {
+  for (const vk_base* b = next; b; b = b->pNext)
+    if (b->sType == VK_ROBUSTNESS2) { uint32_t* r = (uint32_t*) ((char*) b + 16); r[0] = 1; r[2] = 1; }
+}
+static void (*mvk_features2)(void*, vk_features2*);
+static void (*mvk_features2khr)(void*, vk_features2*);
+static int32_t (*mvk_enum_dev_ext)(void*, const char*, uint32_t*, void*);
+static void vrmin_get_features(void* gpu, vk_features* f) { mvk_get_features(gpu, f); if (dxvk()) fingir_core(f); }
+static void vrmin_features2(void* gpu, vk_features2* f) {
+  mvk_features2(gpu, f); if (dxvk()) { fingir_core(&f->features); fingir_cadena(f->pNext); }
+}
+static void vrmin_features2khr(void* gpu, vk_features2* f) {
+  mvk_features2khr(gpu, f); if (dxvk()) { fingir_core(&f->features); fingir_cadena(f->pNext); }
+}
+typedef struct { char name[256]; uint32_t spec; } vk_ext_props;
+static const char* const ext_fingidas[] = {"VK_KHR_pipeline_library"};
+#define N_FINGIDAS (sizeof ext_fingidas / sizeof *ext_fingidas)
+// Las extensiones de MoltenVK; «tiene[i]» dice si MoltenVK ya trae ext_fingidas[i]. Devuelve cuántas (o -1)
+static int ext_reales(void* gpu, vk_ext_props** lista, int* tiene) {
+  uint32_t n = 0;
+  if (mvk_enum_dev_ext(gpu, NULL, &n, NULL)) return -1;
+  *lista = calloc(n + N_FINGIDAS, sizeof **lista);
+  if (!*lista || mvk_enum_dev_ext(gpu, NULL, &n, *lista) < 0) return -1;
+  for (size_t i = 0; i < N_FINGIDAS; i++) {
+    tiene[i] = 0;
+    for (uint32_t j = 0; j < n; j++) if (!strcmp((*lista)[j].name, ext_fingidas[i])) tiene[i] = 1;
+  }
+  return (int) n;
+}
+static int32_t vrmin_enum_dev_ext(void* gpu, const char* layer, uint32_t* count, void* props) {
+  if (!dxvk() || layer) return mvk_enum_dev_ext(gpu, layer, count, props);
+  vk_ext_props* lista; int tiene[N_FINGIDAS];
+  int n = ext_reales(gpu, &lista, tiene);
+  if (n < 0) { free(lista); return mvk_enum_dev_ext(gpu, layer, count, props); }
+  for (size_t i = 0; i < N_FINGIDAS; i++)
+    if (!tiene[i]) { snprintf(lista[n].name, sizeof lista[n].name, "%s", ext_fingidas[i]); lista[n++].spec = 1; }
+  int32_t r = 0;
+  if (!props) *count = (uint32_t) n;
+  else {
+    uint32_t c = *count < (uint32_t) n ? *count : (uint32_t) n;
+    memcpy(props, lista, c * sizeof *lista);
+    if (c < (uint32_t) n) r = 5;   // VK_INCOMPLETE
+    *count = c;
+  }
+  free(lista);
+  return r;
+}
+// Al crear el dispositivo: sin las extensiones fingidas que MoltenVK no tiene y sin las funciones de robustness2
+static int sin_fingidas(void* gpu, vk_device_info* copia, const char*** nuevas) {
+  vk_ext_props* lista = NULL; int tiene[N_FINGIDAS];
+  int n = ext_reales(gpu, &lista, tiene); free(lista);
+  if (n < 0 || !copia->extCount) return 0;
+  *nuevas = malloc(copia->extCount * sizeof **nuevas);
+  if (!*nuevas) return 0;
+  uint32_t k = 0;
+  for (uint32_t i = 0; i < copia->extCount; i++) {
+    int sacar = 0;
+    for (size_t j = 0; j < N_FINGIDAS; j++) if (!tiene[j] && !strcmp(copia->exts[i], ext_fingidas[j])) sacar = 1;
+    if (!sacar) (*nuevas)[k++] = copia->exts[i];
+  }
+  copia->exts = *nuevas; copia->extCount = k;
+  return 1;
+}
+// Vertex buffers vacíos: cada command buffer se anota con su dispositivo, y cada dispositivo tiene uno de ceros
+static int32_t (*mvk_alloc_cbs)(void*, const void*, void**);
+static void (*mvk_bind_vb)(void*, uint32_t, uint32_t, const uint64_t*, const uint64_t*);
+static void (*mvk_bind_vb2)(void*, uint32_t, uint32_t, const uint64_t*, const uint64_t*, const uint64_t*, const uint64_t*);
+static void (*mvk_bind_vb2ext)(void*, uint32_t, uint32_t, const uint64_t*, const uint64_t*, const uint64_t*, const uint64_t*);
+#define N_CB 8192
+static struct { void* cb; void* dev; } cb_dev[N_CB];
+static struct { void* dev; uint64_t buf; } ceros[8];
+static pthread_mutex_t cb_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct { int32_t sType; const void* pNext; void* pool; int32_t level; uint32_t count; } vk_cb_info;
+static int32_t vrmin_alloc_cbs(void* dev, const void* info, void** cbs) {
+  int32_t r = mvk_alloc_cbs(dev, info, cbs);
+  if (r || !info) return r;
+  pthread_mutex_lock(&cb_lock);
+  for (uint32_t i = 0; i < ((const vk_cb_info*) info)->count; i++) {
+    size_t h = ((uintptr_t) cbs[i] >> 4) % N_CB;
+    for (size_t k = 0; k < N_CB; k++, h = (h + 1) % N_CB)
+      if (!cb_dev[h].cb || cb_dev[h].cb == cbs[i]) { cb_dev[h].cb = cbs[i]; cb_dev[h].dev = dev; break; }
+  }
+  pthread_mutex_unlock(&cb_lock);
+  return r;
+}
+static uint64_t ceros_de(void* cb) {
+  void* dev = NULL; uint64_t b = 0;
+  pthread_mutex_lock(&cb_lock);
+  size_t h = ((uintptr_t) cb >> 4) % N_CB;
+  for (size_t k = 0; k < N_CB && cb_dev[h].cb; k++, h = (h + 1) % N_CB)
+    if (cb_dev[h].cb == cb) { dev = cb_dev[h].dev; break; }
+  for (int i = 0; dev && i < 8; i++) if (ceros[i].dev == dev) b = ceros[i].buf;
+  pthread_mutex_unlock(&cb_lock);
+  return b;
+}
+// (el de ceros: 64 KB en memoria que la CPU ve, puesto en cero)
+typedef struct { int32_t sType; const void* pNext; uint32_t flags; uint64_t size; uint32_t usage; int32_t sharing; uint32_t nq; const uint32_t* q; } vk_buffer_info;
+typedef struct { uint64_t size, align; uint32_t bits; } vk_mem_req;
+typedef struct { int32_t sType; const void* pNext; uint64_t size; uint32_t type; } vk_alloc_info;
+typedef struct { uint32_t count; struct { uint32_t flags, heap; } types[32]; uint32_t heaps; struct { uint64_t size; uint32_t flags; } h[16]; } vk_mem_props;
+static void crear_ceros(void* gpu, void* dev) {
+  int32_t (*cb_)(void*, const void*, const void*, uint64_t*) = (void*) mvk_gdpa(dev, "vkCreateBuffer");
+  void (*req)(void*, uint64_t, vk_mem_req*) = (void*) mvk_gdpa(dev, "vkGetBufferMemoryRequirements");
+  int32_t (*alloc)(void*, const void*, const void*, uint64_t*) = (void*) mvk_gdpa(dev, "vkAllocateMemory");
+  int32_t (*bind)(void*, uint64_t, uint64_t, uint64_t) = (void*) mvk_gdpa(dev, "vkBindBufferMemory");
+  int32_t (*map)(void*, uint64_t, uint64_t, uint64_t, uint32_t, void**) = (void*) mvk_gdpa(dev, "vkMapMemory");
+  void (*props)(void*, vk_mem_props*) = (void*) mvk_gipa(NULL, "vkGetPhysicalDeviceMemoryProperties");
+  if (!props) props = (void*) dlsym(mvk, "vkGetPhysicalDeviceMemoryProperties");
+  if (!cb_ || !req || !alloc || !bind || !map || !props) return;
+  vk_buffer_info bi = {12, NULL, 0, 65536, 0x80 | 0x2, 0, 0, NULL};   // VERTEX_BUFFER | TRANSFER_DST
+  uint64_t buf = 0, mem = 0; vk_mem_req mr; vk_mem_props mp; memset(&mp, 0, sizeof mp);
+  if (cb_(dev, &bi, NULL, &buf)) return;
+  req(dev, buf, &mr); props(gpu, &mp);
+  uint32_t tipo = 32;
+  for (uint32_t i = 0; i < mp.count && i < 32; i++)
+    if ((mr.bits & (1u << i)) && (mp.types[i].flags & 0x6) == 0x6) { tipo = i; break; }   // HOST_VISIBLE | COHERENT
+  if (tipo == 32) return;
+  vk_alloc_info ai = {5, NULL, mr.size, tipo};
+  void* p = NULL;
+  if (alloc(dev, &ai, NULL, &mem) || bind(dev, buf, mem, 0) || map(dev, mem, 0, mr.size, 0, &p) || !p) return;
+  memset(p, 0, mr.size);
+  pthread_mutex_lock(&cb_lock);
+  for (int i = 0; i < 8; i++) if (!ceros[i].dev) { ceros[i].dev = dev; ceros[i].buf = buf; break; }
+  pthread_mutex_unlock(&cb_lock);
+}
+#define CON_CEROS(cb, n, bufs) \
+  uint64_t copia_vb[64]; const uint64_t* usar = bufs; \
+  if (bufs && n <= 64) { \
+    int vacio = 0; for (uint32_t i = 0; i < n; i++) if (!bufs[i]) vacio = 1; \
+    uint64_t z = vacio ? ceros_de(cb) : 0; \
+    if (z) { for (uint32_t i = 0; i < n; i++) copia_vb[i] = bufs[i] ? bufs[i] : z; usar = copia_vb; } \
+  }
+static void vrmin_bind_vb(void* cb, uint32_t first, uint32_t n, const uint64_t* bufs, const uint64_t* offs) {
+  CON_CEROS(cb, n, bufs); mvk_bind_vb(cb, first, n, usar, offs);
+}
+static void vrmin_bind_vb2(void* cb, uint32_t first, uint32_t n, const uint64_t* bufs, const uint64_t* offs, const uint64_t* sizes, const uint64_t* strides) {
+  CON_CEROS(cb, n, bufs);
+  // (el tamaño de un vacío es 0 o VK_WHOLE_SIZE: con el de ceros se usa entero)
+  uint64_t tam[64];
+  if (usar != bufs && sizes) { for (uint32_t i = 0; i < n; i++) tam[i] = bufs[i] ? sizes[i] : ~0ull; sizes = tam; }
+  mvk_bind_vb2(cb, first, n, usar, offs, sizes, strides);
+}
+static void vrmin_bind_vb2ext(void* cb, uint32_t first, uint32_t n, const uint64_t* bufs, const uint64_t* offs, const uint64_t* sizes, const uint64_t* strides) {
+  CON_CEROS(cb, n, bufs);
+  uint64_t tam[64];
+  if (usar != bufs && sizes) { for (uint32_t i = 0; i < n; i++) tam[i] = bufs[i] ? sizes[i] : ~0ull; sizes = tam; }
+  mvk_bind_vb2ext(cb, first, n, usar, offs, sizes, strides);
+}
+// --- fin DXVK
 static int32_t vrmin_create_device(void* gpu, const vk_device_info* ci, const void* alloc, void** dev) {
   if (!ci || !mvk_get_features) return mvk_create_device(gpu, ci, alloc, dev);
   vk_features hay; memset(&hay, 0, sizeof hay);
@@ -92,8 +258,18 @@ static int32_t vrmin_create_device(void* gpu, const vk_device_info* ci, const vo
   for (const vk_base* b = ci->pNext; b; b = b->pNext)
     if (b->sType == 1000059000) { f2 = (vk_features2*) b; break; }
   if (f2) { antes = f2->features; recortar(&f2->features, &hay); }
+  // (con DXVK: sin lo fingido; robustness2 se deja en cero y vuelve como estaba)
+  const char** exts = NULL; uint32_t* rob = NULL; uint32_t rob_antes[3];
+  if (dxvk()) {
+    sin_fingidas(gpu, &copia, &exts);
+    for (const vk_base* b = ci->pNext; b; b = b->pNext)
+      if (b->sType == VK_ROBUSTNESS2) { rob = (uint32_t*) ((char*) b + 16); memcpy(rob_antes, rob, sizeof rob_antes); rob[0] = rob[2] = 0; }
+  }
   int32_t r = mvk_create_device(gpu, &copia, alloc, dev);
   if (f2) f2->features = antes;
+  if (rob) memcpy(rob, rob_antes, sizeof rob_antes);
+  free(exts);
+  if (!r && dxvk() && dev && *dev) crear_ceros(gpu, *dev);
   return r;
 }
 // VK_SUBOPTIMAL_KHR (la imagen de la ventana no tiene justo su tamaño: en la Mac pasa seguido) es un resultado de
@@ -332,7 +508,6 @@ static int32_t vrmin_create_pass2khr(void* d, const void* info, const void* allo
   return crear_pass(mvk_create_pass2khr, 80, 56, 20, d, info, alloc, rp);
 }
 static vk_fn vrmin_gdpa(void* device, const char* name);
-static vk_gipa mvk_gdpa;
 // Las funciones que VRmin cambia, por nombre (NULL: la de MoltenVK)
 static vk_fn propia(const char* name) {
   if (!name) return NULL;
@@ -347,6 +522,16 @@ static vk_fn propia(const char* name) {
   if (!strcmp(name, "vkCreateRenderPass") && mvk_create_pass) return (vk_fn) vrmin_create_pass;
   if (!strcmp(name, "vkCreateRenderPass2") && mvk_create_pass2) return (vk_fn) vrmin_create_pass2;
   if (!strcmp(name, "vkCreateRenderPass2KHR") && mvk_create_pass2khr) return (vk_fn) vrmin_create_pass2khr;
+  if (dxvk()) {
+    if (!strcmp(name, "vkGetPhysicalDeviceFeatures") && mvk_get_features) return (vk_fn) vrmin_get_features;
+    if (!strcmp(name, "vkGetPhysicalDeviceFeatures2") && mvk_features2) return (vk_fn) vrmin_features2;
+    if (!strcmp(name, "vkGetPhysicalDeviceFeatures2KHR") && mvk_features2khr) return (vk_fn) vrmin_features2khr;
+    if (!strcmp(name, "vkEnumerateDeviceExtensionProperties") && mvk_enum_dev_ext) return (vk_fn) vrmin_enum_dev_ext;
+    if (!strcmp(name, "vkAllocateCommandBuffers") && mvk_alloc_cbs) return (vk_fn) vrmin_alloc_cbs;
+    if (!strcmp(name, "vkCmdBindVertexBuffers") && mvk_bind_vb) return (vk_fn) vrmin_bind_vb;
+    if (!strcmp(name, "vkCmdBindVertexBuffers2") && mvk_bind_vb2) return (vk_fn) vrmin_bind_vb2;
+    if (!strcmp(name, "vkCmdBindVertexBuffers2EXT") && mvk_bind_vb2ext) return (vk_fn) vrmin_bind_vb2ext;
+  }
   return NULL;
 }
 // Funciones de Vulkan 1.1 o más pedidas por su nombre sin «KHR» en un juego que creó Vulkan 1.0 (DOOM VFR): MoltenVK
@@ -388,6 +573,13 @@ static void* vrmin_dlsym(void* handle, const char* name) {
       mvk_create_pass = (int32_t (*)(void*, const void*, const void*, void*)) dlsym(handle, "vkCreateRenderPass");
       mvk_create_pass2 = (int32_t (*)(void*, const void*, const void*, void*)) dlsym(handle, "vkCreateRenderPass2");
       mvk_create_pass2khr = (int32_t (*)(void*, const void*, const void*, void*)) dlsym(handle, "vkCreateRenderPass2KHR");
+      mvk_features2 = (void (*)(void*, vk_features2*)) dlsym(handle, "vkGetPhysicalDeviceFeatures2");
+      mvk_features2khr = (void (*)(void*, vk_features2*)) dlsym(handle, "vkGetPhysicalDeviceFeatures2KHR");
+      mvk_enum_dev_ext = (int32_t (*)(void*, const char*, uint32_t*, void*)) dlsym(handle, "vkEnumerateDeviceExtensionProperties");
+      mvk_alloc_cbs = (int32_t (*)(void*, const void*, void**)) dlsym(handle, "vkAllocateCommandBuffers");
+      mvk_bind_vb = (void (*)(void*, uint32_t, uint32_t, const uint64_t*, const uint64_t*)) dlsym(handle, "vkCmdBindVertexBuffers");
+      mvk_bind_vb2 = (void (*)(void*, uint32_t, uint32_t, const uint64_t*, const uint64_t*, const uint64_t*, const uint64_t*)) dlsym(handle, "vkCmdBindVertexBuffers2");
+      mvk_bind_vb2ext = (void (*)(void*, uint32_t, uint32_t, const uint64_t*, const uint64_t*, const uint64_t*, const uint64_t*)) dlsym(handle, "vkCmdBindVertexBuffers2EXT");
     }
   }
   if (p && mvk && handle == mvk && name && !strcmp(name, "vkGetInstanceProcAddr")) return (void*) vrmin_gipa;
