@@ -731,8 +731,9 @@ struct StoreItem: Identifiable, Decodable {
     let id: Int; let name: String; let tiny_image: String?; let price: Price?
 }
 
-/// Los juegos de VR de tu cuenta que no están instalados (para la Tienda, como en GameHub): los de la configuración de
-/// tus cuentas de Steam, y si son de VR según la tienda (se pregunta de a uno, despacio, y se guarda en tienda_cache.json)
+/// Los juegos de VR de tu cuenta que no están instalados (para la Tienda, como en GameHub): los de tu biblioteca de Steam
+/// (appcache/librarycache tiene una carpeta por cada uno, jugado o no; la configuración de tus cuentas solo tiene los que
+/// abriste en esta compu), y si son de VR según la tienda (se pregunta de a uno, despacio, y se guarda en tienda_cache.json)
 final class AccountGames: ObservableObject {
     static let shared = AccountGames()
     struct Info: Codable { let n: String; let vr: Bool; var game: Bool? = nil }   // (game false: no es un juego: programas, demos, contenido)
@@ -747,6 +748,10 @@ final class AccountGames: ObservableObject {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             var ids = Set<String>()
+            let lib = steamDir.appendingPathComponent("appcache/librarycache")
+            for a in (try? FileManager.default.contentsOfDirectory(atPath: lib.path)) ?? [] where !a.isEmpty && a.allSatisfy(\.isNumber) {
+                ids.insert(a)
+            }
             let ud = steamDir.appendingPathComponent("userdata")
             for u in (try? FileManager.default.contentsOfDirectory(atPath: ud.path)) ?? [] {
                 guard let t = try? String(contentsOf: ud.appendingPathComponent("\(u)/config/localconfig.vdf"), encoding: .utf8),

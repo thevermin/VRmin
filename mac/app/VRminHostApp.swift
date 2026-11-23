@@ -2408,7 +2408,8 @@ struct VRminHostApp: App {
     @StateObject private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup("VRmin Host") {
+        // (una sola ventana: con WindowGroup macOS a veces abría dos iguales, al volver a abrir la app o con ⌘N)
+        Window("VRmin Host", id: "main") {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 820, minHeight: 640)
