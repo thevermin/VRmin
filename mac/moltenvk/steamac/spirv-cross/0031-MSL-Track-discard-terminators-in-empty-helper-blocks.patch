@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000031 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Tue, 6 Oct 2026 20:10:00 +0300
+Subject: [PATCH 31/31] MSL: Track discard terminators in empty helper blocks
+
+STEAMAC-1Q: a fragment helper containing only OpKill in its conditional
+block emitted gl_HelperInvocation = true, discard_fragment() without a
+helper-invocation argument. The parser stores OpKill as a block terminator,
+not an instruction. Global argument extraction checked that terminator
+inside the instruction loop, so an empty block never added the implicit
+variable. Inspect it once per block, just like EmitMeshTasks, and preserve
+normal transitive forwarding through callers.
+---
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -3610,16 +3610,17 @@
+ 			}
+ 
+-			if (needs_manual_helper_invocation_updates() && b.terminator == SPIRBlock::Kill &&
+-			    needs_helper_invocation)
+-				added_arg_ids.insert(builtin_helper_invocation_id);
+-
+ 			// TODO: Add all other operations which can affect memory.
+ 			// We should consider a more unified system here to reduce boiler-plate.
+ 			// This kind of analysis is done in several places ...
+ 		}
+ 
++		// OpKill is a terminator, so its block may contain no instructions.
++		if (needs_manual_helper_invocation_updates() && b.terminator == SPIRBlock::Kill &&
++		    needs_helper_invocation)
++			added_arg_ids.insert(builtin_helper_invocation_id);
++
+ 		if (b.terminator == SPIRBlock::EmitMeshTasks && builtin_task_grid_id != 0)
+ 			added_arg_ids.insert(builtin_task_grid_id);
+ 	}
+ 
+ 	function_global_vars[func_id] = added_arg_ids;

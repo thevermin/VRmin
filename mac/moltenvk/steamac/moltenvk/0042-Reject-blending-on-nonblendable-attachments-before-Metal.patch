@@ -1,0 +1,43 @@
+From: steamac <steamac@localhost>
+Subject: [PATCH] Reject blending on nonblendable attachments before Metal
+
+STEAMAC-3A and STEAMAC-X abort in validateWithDevice:5101 because
+blending is enabled for MTLPixelFormatR32Uint. Patches 0037-0040 only
+change shader interfaces and do not cover attachment blend state.
+Reject invalid Vulkan blend state with VK_ERROR_INITIALIZATION_FAILED
+and never hand the invalid descriptor to Metal. Cover ordinary and mesh
+pipelines through their shared attachment setup.
+
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1092,6 +1092,7 @@
+ // Either returns an existing pipeline state or compiles a new one.
+ id<MTLRenderPipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLRenderPipelineDescriptor* plDesc,
+ 																	 id<MTLRenderPipelineState>& plState) {
++	if (getConfigurationResult() != VK_SUCCESS) { _hasValidMTLPipelineStates = false; return nil; }
+ 	if ( !plState ) {
+ 		MVKRenderPipelineCompiler* plc = new MVKRenderPipelineCompiler(this);
+ 		plState = plc->newMTLRenderPipelineState(plDesc);	// retained
+@@ -1105,6 +1106,7 @@
+ // Either returns an existing pipeline state or compiles a new one.
+ id<MTLRenderPipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLMeshRenderPipelineDescriptor* plDesc,
+ 																	 id<MTLRenderPipelineState>& plState) {
++	if (getConfigurationResult() != VK_SUCCESS) { _hasValidMTLPipelineStates = false; return nil; }
+ 	if ( !plState ) {
+ 		MVKRenderPipelineCompiler* plc = new MVKRenderPipelineCompiler(this);
+ 		plState = plc->newMTLRenderPipelineState(plDesc);    // retained
+@@ -2602,6 +2604,14 @@
+             // The pixel format will be MTLPixelFormatInvalid in that case, and
+             // Metal asserts if we turn on blending with that pixel format.
+             if (mtlPixFmt) {
++				// Vulkan forbids blending without COLOR_ATTACHMENT_BLEND format support.
++				// Reject it before Metal's unconditional descriptor validation aborts the process.
++				if (pCA->blendEnable && !mvkIsAnyFlagEnabled(getPixelFormats()->getCapabilities(mtlPixFmt), kMVKMTLFmtCapsBlend)) {
++					setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
++						"Color attachment %u enables blending for non-blendable format %s.", caIdx,
++						mvkVkFormatName(pRendInfo->pColorAttachmentFormats[caIdx])));
++					return;
++				}
+                 colorDesc.blendingEnabled = pCA->blendEnable;
+                 colorDesc.rgbBlendOperation = mvkMTLBlendOperationFromVkBlendOp(pCA->colorBlendOp);
+                 colorDesc.sourceRGBBlendFactor = mvkMTLBlendFactorFromVkBlendFactor(pCA->srcColorBlendFactor);

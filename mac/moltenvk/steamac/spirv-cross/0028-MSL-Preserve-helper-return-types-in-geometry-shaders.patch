@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000028 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Tue, 6 Oct 2026 18:00:00 +0300
+Subject: [PATCH 28/28] MSL: Preserve helper return types in geometry shaders
+
+STEAMAC-1B, STEAMAC-1D: DXVK 2.7's dxbc-spirv compiler emits dot-product
+and conversion helper functions. The fork's func_type_decl() forced every
+function in a geometry module to return void, not just the geometry entry
+point, so Metal rejected dp3_f32, dp4_f32, dp2_f32, f32_to_f16 and
+cvt_f32_u32 (void functions returning values).
+
+Only the geometry entry point returns void (its outputs go through the
+mesh stream). Ordinary helpers, including helpers that emit vertices and
+therefore receive the mesh stream, keep their SPIR-V return types.
+---
+ spirv_msl.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -16545,6 +16545,6 @@ string CompilerMSL::func_type_decl(SPIRType &type)
+ {
+ 	auto &execution = get_entry_point();
+-	if (execution.model == ExecutionModelGeometry)
++	if (processing_entry_point && execution.model == ExecutionModelGeometry)
+ 		return "void";
+ 
+ 	// The regular function return type. If not processing the entry point function, that's all we need
+-- 
+2.50.1

@@ -1,0 +1,195 @@
+From 5ce287c42ec4d305c48480534c7551a314352ee5 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 21:16:40 +0300
+Subject: [PATCH 03/17] MSL: Fix arrays of Y'CbCr combined image-samplers with
+ argument buffers
+
+gamescope declares 'uniform sampler2D s_ycbcr_samplers[16]' with immutable
+Y'CbCr (NV12) samplers and passes elements of it, as well as elements of a
+regular sampler2D array, to the same helper function. With argument buffers
+and pad_argument_buffer_resources this failed in several ways:
+
+- Plane N of an arrayed multiplanar image was placed at msl_texture + N, inside
+  the plane-0 array. Planes are now laid out as one texture array per plane:
+  msl_texture + N * array size (the binding count when the app supplies it).
+  This is the layout MoltenVK uses (Tex2SampSoA/Tex3SampSoA).
+- Plane expressions were built by appending the suffix to the whole image
+  expression (s[i]Plane1 instead of sPlane1[i]); add to_plane_expression().
+- Passing an array element to a function did not find the array's constexpr
+  sampler, so neither the plane arguments nor spvDynamicImageSampler were used.
+  Look the constexpr sampler up through the backing variable.
+- A constexpr sampler of an array is a single sampler; global-alias function
+  parameters declared it as array<sampler, N>&.
+- Padding an unused multiplanar binding padded only one plane, and the later
+  plane slots had no argument-buffer index to look up ('Argument buffer
+  resource base type could not be determined'). Pad textures up to the
+  sampler slot and resolve indexes inside a combined image-sampler's texture
+  range to that binding.
+- spvDynamicImageSampler::gather() passed a run-time component to
+  texture2d::gather(), which Metal requires to be a compile-time constant.
+---
+ spirv_msl.cpp | 79 +++++++++++++++++++++++++++++++++++++++++++++++----
+ spirv_msl.hpp |  1 +
+ 2 files changed, 74 insertions(+), 6 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index a73e8ba2..b300ae34 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -8890,7 +8890,16 @@ void CompilerMSL::emit_custom_functions()
+ 			if (msl_options.swizzle_texture_samples)
+ 				statement("return spvGatherSwizzle(plane0, samp, swizzle, c, coord, offset);");
+ 			else
+-				statement("return plane0.gather(samp, coord, offset, c);");
++			{
++				// Metal requires the gather component to be a compile-time constant.
++				statement("switch (c)");
++				begin_scope();
++				statement("case component::x: return plane0.gather(samp, coord, offset, component::x);");
++				statement("case component::y: return plane0.gather(samp, coord, offset, component::y);");
++				statement("case component::z: return plane0.gather(samp, coord, offset, component::z);");
++				statement("default: return plane0.gather(samp, coord, offset, component::w);");
++				end_scope();
++			}
+ 			end_scope();
+ 			end_scope_decl();
+ 			statement("");
+@@ -13427,7 +13436,12 @@ void CompilerMSL::emit_function_prototype(SPIRFunction &func, const Bitset &)
+ 			// Manufacture automatic sampler arg for SampledImage texture
+ 			if (arg_type.image.dim != DimBuffer)
+ 			{
+-				if (arg_type.array.empty() || (var ? is_var_runtime_size_array(*var) : is_runtime_size_array(arg_type)))
++				// A constexpr sampler is a single sampler even for an array of combined image-samplers.
++				if (find_constexpr_sampler(name_id))
++				{
++					decl += join(", sampler ", to_sampler_expression(name_id));
++				}
++				else if (arg_type.array.empty() || (var ? is_var_runtime_size_array(*var) : is_runtime_size_array(arg_type)))
+ 				{
+ 					decl += join(", ", sampler_type(arg_type, arg.id, false), " ", to_sampler_expression(name_id));
+ 				}
+@@ -13679,7 +13693,7 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
+ 			// Multiplanar images need two or three textures.
+ 			farg_str += to_expression(img);
+ 			for (uint32_t i = 1; i < constexpr_sampler->planes; i++)
+-				farg_str += join(", ", to_expression(img), plane_name_suffix, i);
++				farg_str += join(", ", to_plane_expression(to_expression(img), i));
+ 		}
+ 		else if ((!constexpr_sampler || !constexpr_sampler->ycbcr_conversion_enable) &&
+ 		         msl_options.swizzle_texture_samples && args.base.is_gather)
+@@ -14496,6 +14510,12 @@ string CompilerMSL::to_func_call_arg(const SPIRFunction::Parameter &arg, uint32_
+ 	if (!arg_is_dynamic_img_sampler)
+ 	{
+ 		auto *constexpr_sampler = find_constexpr_sampler(var_id ? var_id : id);
++		// An element of an array of combined image-samplers is not a variable itself;
++		// its constexpr sampler (if any) belongs to the backing array variable.
++		if (!constexpr_sampler && type.basetype == SPIRType::SampledImage)
++			if (auto *backing_var = maybe_get_backing_variable(id))
++				constexpr_sampler = find_constexpr_sampler(backing_var->basevariable ? backing_var->basevariable :
++				                                                                       VariableID(backing_var->self));
+ 		if (type.basetype == SPIRType::SampledImage)
+ 		{
+ 			// Manufacture automatic plane args for multiplanar texture
+@@ -14512,7 +14532,7 @@ string CompilerMSL::to_func_call_arg(const SPIRFunction::Parameter &arg, uint32_
+ 					add_spv_func_and_recompile(SPVFuncImplDynamicImageSampler);
+ 			}
+ 			for (uint32_t i = 1; i < planes; i++)
+-				arg_str += join(", ", CompilerGLSL::to_func_call_arg(arg, id), plane_name_suffix, i);
++				arg_str += join(", ", to_plane_expression(CompilerGLSL::to_func_call_arg(arg, id), i));
+ 			// Manufacture automatic sampler arg if the arg is a SampledImage texture.
+ 			if (type.image.dim != DimBuffer)
+ 				arg_str += ", " + to_sampler_expression(var_id ? var_id : id);
+@@ -14627,6 +14647,18 @@ string CompilerMSL::to_sampler_expression(uint32_t id)
+ 		return img_expr.substr(0, index) + sampler_name_suffix + img_expr.substr(index);
+ }
+ 
++// Returns the expression for the given plane of a multiplanar image expression.
++// Planes are declared as separate (array) variables named with the plane suffix,
++// so the suffix goes before any array subscript.
++string CompilerMSL::to_plane_expression(const string &img_expr, uint32_t plane)
++{
++	auto index = img_expr.find_first_of('[');
++	if (index == string::npos)
++		return join(img_expr, plane_name_suffix, plane);
++	else
++		return join(img_expr.substr(0, index), plane_name_suffix, plane, img_expr.substr(index));
++}
++
+ string CompilerMSL::to_swizzle_expression(uint32_t id)
+ {
+ 	auto *combined = maybe_get<SPIRCombinedImageSampler>(id);
+@@ -17624,8 +17656,25 @@ uint32_t CompilerMSL::get_metal_resource_index(SPIRVariable &var, SPIRType::Base
+ 		switch (basetype)
+ 		{
+ 		case SPIRType::Image:
+-			set_extended_decoration(var.self, resource_decoration, remap.first.msl_texture + plane);
+-			return remap.first.msl_texture + plane;
++		{
++			// Planes of an arrayed multiplanar (Y'CbCr) image are laid out as one array of
++			// textures per plane, so plane N of element 0 follows all elements of plane N-1.
++			uint32_t plane_stride = 1;
++			if (plane)
++			{
++				if (remap.first.count)
++					plane_stride = remap.first.count;
++				else
++				{
++					auto &data_type = get_variable_data_type(var);
++					for (uint32_t i = 0; i < uint32_t(data_type.array.size()); i++)
++						if (data_type.array_size_literal[i] && data_type.array[i])
++							plane_stride *= data_type.array[i];
++				}
++			}
++			set_extended_decoration(var.self, resource_decoration, remap.first.msl_texture + plane * plane_stride);
++			return remap.first.msl_texture + plane * plane_stride;
++		}
+ 		case SPIRType::Sampler:
+ 			set_extended_decoration(var.self, resource_decoration, remap.first.msl_sampler);
+ 			return remap.first.msl_sampler;
+@@ -21816,6 +21865,14 @@ void CompilerMSL::analyze_argument_buffers()
+ 					case SPIRType::SampledImage:
+ 						if (next_arg_buff_index == rez_bind.msl_sampler)
+ 							add_argument_buffer_padding_sampler_type(buffer_type, member_index, next_arg_buff_index, rez_bind);
++						else if (rez_bind.msl_texture <= next_arg_buff_index && next_arg_buff_index < rez_bind.msl_sampler)
++						{
++							// The texture slots run up to the sampler slots. For multiplanar (Y'CbCr)
++							// images this covers one texture array per plane, not just rez_bind.count.
++							auto tex_bind = rez_bind;
++							tex_bind.count = rez_bind.msl_sampler - next_arg_buff_index;
++							add_argument_buffer_padding_image_type(buffer_type, member_index, next_arg_buff_index, tex_bind);
++						}
+ 						else
+ 							add_argument_buffer_padding_image_type(buffer_type, member_index, next_arg_buff_index, rez_bind);
+ 						break;
+@@ -22019,6 +22076,16 @@ const MSLResourceBinding &CompilerMSL::get_argument_buffer_resource(uint32_t des
+ 		if (bind_itr != end(resource_bindings))
+ 			return bind_itr->second.first;
+ 	}
++
++	// Multiplanar (Y'CbCr) combined image-samplers occupy one texture array per plane
++	// before their sampler slots, so later planes have no index of their own.
++	for (auto &rb : resource_bindings)
++	{
++		auto &b = rb.second.first;
++		if (b.stage == stage && b.desc_set == desc_set && b.basetype == SPIRType::SampledImage &&
++		    b.msl_texture <= arg_idx && arg_idx < b.msl_sampler)
++			return b;
++	}
+ 	SPIRV_CROSS_THROW("Argument buffer resource base type could not be determined. When padding argument buffer "
+ 	                  "elements, all descriptor set resources must be supplied with a base type by the app.");
+ }
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index f68896bf..9d2e50b6 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -1163,6 +1163,7 @@ protected:
+ 	std::string append_member_name(const std::string &qualifier, const SPIRType &type, uint32_t index);
+ 	std::string ensure_valid_name(std::string name, std::string pfx);
+ 	std::string to_sampler_expression(uint32_t id);
++	std::string to_plane_expression(const std::string &img_expr, uint32_t plane);
+ 	std::string to_swizzle_expression(uint32_t id);
+ 	std::string to_texture_offset_expression(uint32_t id);
+ 	std::string to_buffer_size_expression(uint32_t id);
+-- 
+2.50.1 (Apple Git-155)
+

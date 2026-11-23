@@ -1,0 +1,100 @@
+From 7aa669ebb0a2216711ff97567d377663d7f382e4 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Tue, 6 Oct 2026 12:00:00 +0300
+Subject: [PATCH 25/25] MSL: Flatten array and matrix outputs of geometry
+ shaders emulated with mesh shaders
+
+Mesh pipelines keep stage I/O composites whole (vertex outputs and geometry inputs go through buffers), but a
+geometry shader's outputs are members of the mesh vertex type, which Metal rejects when they are arrays ("invalid
+type 'main0_out' for mesh vertex type": a float4[2] TEXCOORD output of Stellar Blade's cube map geometry shader).
+User outputs of geometry shaders are flattened like vertex shader outputs (one member per element, at consecutive
+locations, matching the fragment shader's flattened inputs), and the copies into the stage-out struct run before
+every emitted vertex instead of when the shader returns.
+---
+ spirv_msl.cpp | 25 ++++++++++++++++++++++---
+ spirv_msl.hpp |  3 +++
+ 2 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 45b039a..71aa06b 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -4441,7 +4441,8 @@ void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage
+ 				break;
+ 
+ 			case StorageClassOutput:
+-				entry_func.fixup_hooks_out.push_back([=, &var]() {
++			{
++				auto hook = [=, &var]() {
+ 					if (padded_output)
+ 					{
+ 						auto &padded_type = this->get<SPIRType>(type_id);
+@@ -4455,8 +4456,14 @@ void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage
+ 						          "];");
+ 					else
+ 						statement(ib_var_ref, ".", mbr_name, " = ", to_name(var.self), "[", i, "];");
+-				});
++				};
++				// A geometry shader's outputs go out with each emitted vertex.
++				if (get_execution_model() == ExecutionModelGeometry)
++					geometry_vertex_output_hooks.push_back(hook);
++				else
++					entry_func.fixup_hooks_out.push_back(hook);
+ 				break;
++			}
+ 
+ 			default:
+ 				break;
+@@ -5349,7 +5356,12 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
+ 				is_builtin = false;
+ 
+ 			// MSL does not allow matrices or arrays in input or output variables, so need to handle it specially.
+-			if (!msl_options.for_mesh_pipeline && (!is_builtin || attribute_load_store) && storage_is_stage_io && is_composite_type)
++			// Mesh pipelines keep composites whole (stage I/O goes through buffers), except the user outputs of a
++			// geometry shader: they are mesh vertex members, which cannot be arrays or matrices either.
++			bool mesh_vertex_user_output = msl_options.for_mesh_pipeline && get_execution_model() == ExecutionModelGeometry &&
++			                               storage == StorageClassOutput && !is_builtin_variable(var);
++			if ((!msl_options.for_mesh_pipeline || mesh_vertex_user_output) && (!is_builtin || attribute_load_store) &&
++			    storage_is_stage_io && is_composite_type)
+ 			{
+ 				add_composite_variable_to_interface_block(storage, ib_var_ref, ib_type, var, meta);
+ 			}
+@@ -12350,6 +12362,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 	case OpEmitVertex:
+ 	{
+ 		add_spv_func_and_recompile(SPVFuncImplEmitVertex);
++		for (auto &hook : geometry_vertex_output_hooks)
++			hook();
+ 		statement("meshStream.EmitVertex();");
+ 		break;
+ 	}
+@@ -12370,7 +12384,12 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 		if (!stream)
+ 			SPIRV_CROSS_THROW("Geometry shader vertex stream must be a constant.");
+ 		if (stream->scalar() == 0)
++		{
++			if (opcode == OpEmitStreamVertex)
++				for (auto &hook : geometry_vertex_output_hooks)
++					hook();
+ 			statement(opcode == OpEmitStreamVertex ? "meshStream.EmitVertex();" : "meshStream.EndPrimitive();");
++		}
+ 		break;
+ 	}
+ 
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 07f17cd..0042030 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -1481,6 +1481,9 @@ protected:
+ 	uint32_t pending_robust_buffer_atomic_result_id = 0;
+ 
+ 	SmallVector<uint32_t> buffer_aliases_discrete;
++	// Geometry shaders (mesh emulation): copies of flattened output composites into the stage-out struct, run before
++	// every emitted vertex (the mesh stream emits the struct; fixup_hooks_out only run when the shader returns).
++	SmallVector<std::function<void()>> geometry_vertex_output_hooks;
+ 	// Variables that share an argument buffer binding with another variable (the declared one and its aliases):
+ 	// none of them is __restrict, so the aliases' casts keep the qualifiers of the declared member.
+ 	std::unordered_set<uint32_t> argument_buffer_overlapping_vars;
+-- 
+2.50.1 (Apple Git-155)
+

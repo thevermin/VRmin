@@ -1,0 +1,80 @@
+From ca92e708a40b04ebaf93123d91455309e875c078 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Mon, 5 Oct 2026 11:09:15 +0300
+Subject: [PATCH 23/25] Treat VK_NULL_HANDLE descriptor set layouts as empty
+ sets in pipeline layouts
+
+VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT (VK_EXT_graphics_pipeline_library) allows
+VK_NULL_HANDLE in VkPipelineLayoutCreateInfo::pSetLayouts, and guest drivers send such layouts
+through Venus although MoltenVK does not advertise the extension. MVKPipelineLayout::Create
+dereferenced the null set layout: SIGSEGV at address 0x104 (MVKDescriptorSetLayout::_argBufMode)
+on the virglrenderer ring thread, which killed the VM (Proton games on Apple M5). Failing the creation
+would not help either: Venus creates pipeline layouts asynchronously and every later use of a
+failed layout kills the guest context.
+
+Replace null set layouts with one empty descriptor set layout, which the pipeline layout retains
+like the others.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 27 ++++++++++++++++-----
+ 1 file changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index e74b9ad..ece63d0 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -351,6 +351,20 @@ static bool isWriteable(VkDescriptorType type) {
+ 		device
+ 	);
+ 
++	// VK_NULL_HANDLE set layouts are legal with VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT (graphics
++	// pipeline libraries), and guest drivers send them through Venus even though MoltenVK does not advertise
++	// that extension. Such a set is empty: use one empty set layout for all of them.
++	MVKDescriptorSetLayout* emptyLayout = nullptr;
++	for (auto& dsl : ret->_descriptorSetLayouts) {
++		if (dsl) { continue; }
++		if ( !emptyLayout ) {
++			VkDescriptorSetLayoutCreateInfo emptyInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
++			emptyLayout = MVKDescriptorSetLayout::Create(device, &emptyInfo);
++		}
++		dsl = emptyLayout;
++	}
++	auto setLayouts = ret->getDescriptorSetLayouts();
++
+ 	for (const VkPushConstantRange& range : MVKArrayRef(pCreateInfo->pPushConstantRanges, pCreateInfo->pushConstantRangeCount)) {
+ 		ret->_pushConstantStages |= range.stageFlags;
+ 		ret->_pushConstantsLength = std::max(ret->_pushConstantsLength, range.offset + range.size);
+@@ -369,7 +383,7 @@ static bool isWriteable(VkDescriptorType type) {
+ 	//   - Descriptor set content
+ 
+ 	// If we are using Metal argument buffers, consume a fixed number of buffer indices for the Metal argument buffers themselves.
+-	for (const MVKDescriptorSetLayout* layout : layouts) {
++	for (const MVKDescriptorSetLayout* layout : setLayouts) {
+ 		if (layout->argBufMode() != MVKArgumentBufferMode::Off) {
+ 			ret->_mtlResourceCounts.addArgumentBuffers(kMVKMaxDescriptorSetCount);
+ 			break;
+@@ -382,16 +396,17 @@ static bool isWriteable(VkDescriptorType type) {
+ 			++ret->_mtlResourceCounts.stages[stage].bufferIndex;
+ 	}
+ 
+-	for (size_t i = 0; i < layouts.size(); i++) {
+-		layouts[i]->retain();
++	for (size_t i = 0; i < setLayouts.size(); i++) {
++		setLayouts[i]->retain();
+ 		ret->_resourceIndexOffsets[i] = ret->_mtlResourceCounts;
+-		MVKShaderResourceBinding count = layouts[i]->totalResourceCount();
+-		if (layouts[i]->argBufMode() != MVKArgumentBufferMode::Off)
++		MVKShaderResourceBinding count = setLayouts[i]->totalResourceCount();
++		if (setLayouts[i]->argBufMode() != MVKArgumentBufferMode::Off)
+ 			count.clearArgumentBufferResources();
+ 		ret->_mtlResourceCounts += count;
+-		if (layouts[i]->isPushDescriptorSetLayout())
++		if (setLayouts[i]->isPushDescriptorSetLayout())
+ 			ret->_pushDescriptor = i;
+ 	}
++	if (emptyLayout) { emptyLayout->release(); }	// Each null set retained it above.
+ 
+ 	return ret;
+ }
+-- 
+2.50.1 (Apple Git-155)
+

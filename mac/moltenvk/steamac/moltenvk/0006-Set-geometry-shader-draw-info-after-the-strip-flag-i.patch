@@ -1,0 +1,59 @@
+From 29e7394eb389d24dea849904cd50dcf0485835e9 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 22:01:11 +0300
+Subject: [PATCH 06/22] Set geometry-shader draw info after the strip flag is
+ known
+
+The mesh-shader geometry draw path passed DrawInfo to the object stage with
+setObjectBytes before setting DrawInfo::topoStrip. setObjectBytes copies the
+bytes, so the object stage always saw topoStrip = 0 and assembled strip draws
+as lists. Set the bytes after all fields are filled in, for indexed and
+non-indexed draws.
+---
+ MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index 3ec3e425..c9b85264 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -370,8 +370,6 @@
+                 } else if (pipeline->isGeometryPipeline()) {
+ 					DrawInfo drawInfo = {};
+ 
+-					[cmdEncoder->_mtlRenderEncoder setObjectBytes: &drawInfo length: sizeof(drawInfo) atIndex: pipeline->getDrawInfoBufferIndex()];
+-
+ 					auto primitiveType = cmdEncoder->getMtlGraphics().getPrimitiveType();
+ 					int threadCount = 0;
+ 					if (primitiveType == MTLPrimitiveTypePoint) {
+@@ -393,6 +391,9 @@
+ 					if (_firstVertex) reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "First vertex not supported yet.");
+ 					if (_firstInstance) reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "First instance not supported yet.");
+ 
++					// setObjectBytes copies the struct, so set it once all fields (topoStrip) are known.
++					[cmdEncoder->_mtlRenderEncoder setObjectBytes: &drawInfo length: sizeof(drawInfo) atIndex: pipeline->getDrawInfoBufferIndex()];
++
+ 					[cmdEncoder->_mtlRenderEncoder drawMeshThreadgroups: MTLSizeMake(threadCount, _instanceCount, 1)
+ 											threadsPerObjectThreadgroup: MTLSizeMake(1, 1, 1)
+ 											  threadsPerMeshThreadgroup: MTLSizeMake(1, 1, 1)];
+@@ -658,7 +659,6 @@
+ 					drawInfo.indexBuffer = ibb.mtlBuffer.gpuAddress + idxBuffOffset;
+ 
+ 					[cmdEncoder->_mtlRenderEncoder useResource: ibb.mtlBuffer usage: MTLResourceUsageRead stages: MTLRenderStageObject];
+-					[cmdEncoder->_mtlRenderEncoder setObjectBytes: &drawInfo length: sizeof(drawInfo) atIndex: pipeline->getDrawInfoBufferIndex()];
+ 
+ 					auto primitiveType = cmdEncoder->getMtlGraphics().getPrimitiveType();
+ 					int threadCount = 0;
+@@ -681,6 +681,9 @@
+ 					if (_vertexOffset) reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Vertex offset not supported yet.");
+ 					if (_firstInstance) reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "First instance not supported yet.");
+ 
++					// setObjectBytes copies the struct, so set it once all fields (topoStrip) are known.
++					[cmdEncoder->_mtlRenderEncoder setObjectBytes: &drawInfo length: sizeof(drawInfo) atIndex: pipeline->getDrawInfoBufferIndex()];
++
+ 					[cmdEncoder->_mtlRenderEncoder drawMeshThreadgroups:MTLSizeMake(threadCount, _instanceCount, 1)
+ 											threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1)
+ 											  threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
+-- 
+2.50.1 (Apple Git-155)
+

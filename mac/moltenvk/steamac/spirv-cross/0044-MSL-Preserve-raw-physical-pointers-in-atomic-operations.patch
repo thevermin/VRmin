@@ -1,0 +1,28 @@
+From 868b987ce3aaa578bb9070caff60e1b571f68b19 Mon Sep 17 00:00:00 2001
+From: georgii pl <gp@fx.gl>
+Date: Sun, 1 Nov 2026 11:12:49 +0300
+Subject: [PATCH] MSL: Preserve raw physical pointers in atomic operations
+
+STEAMAC-6D: an OpConvertUToPtr scalar pointer is not an lvalue. Use the existing pointer-expression conversion rather than unconditionally taking the address; access-chain lvalues still receive their address. Reconstructed atomic_fetch_add_explicit on reinterpret_cast<device uint*>(as_type<ulong>(address)) reports the same Metal rvalue-address diagnostic before this change.
+---
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index bb619d3..b8197c3 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -13467,8 +13467,12 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+ 		exp += type_to_glsl(remapped_type);
+ 		exp += "*)";
+ 
+-		exp += "&";
+-		exp += to_enclosed_expression(obj);
++		// Emulated image atomics are lvalues in an auxiliary device buffer, not
++		// logical pointer expressions. Raw physical pointers already hold an address.
++		if (ptr_type.storage == StorageClassImage)
++			exp += "&" + to_enclosed_expression(obj);
++		else
++			exp += to_enclosed_pointer_expression(obj);
+ 	}
+ 
+ 	if (is_atomic_compare_exchange_strong)
+-- 
+2.54.0

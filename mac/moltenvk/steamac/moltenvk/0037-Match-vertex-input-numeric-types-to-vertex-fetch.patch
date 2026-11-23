@@ -1,0 +1,69 @@
+From: steamac <steamac@localhost>
+Subject: [PATCH] Match vertex input numeric types to vertex fetch
+
+STEAMAC-3N: BLUE REFLECTION pipelines fail in Metal when BLENDINDICES1
+is int4 but the vertex format is Float3 or Float4; character bodies vanish.
+
+Enable SPIRV-Cross's vertex_attribute_type_compatibility for ordinary
+vertex pipelines: use format-compatible stage_in numeric types and
+reinterpret fetched bits as the shader's declared types. Include the
+option in serialized shader configurations and account for the existing
+padding byte it consumes in Options and its enclosing configurations.
+The format metadata already contains signed, unsigned and floating-point
+vertex fetch categories.
+
+---
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1765,6 +1765,7 @@
+ 	// ("Vertex attribute in_var_NORMAL(1) is missing from the vertex descriptor", SCS Truck Simulator, STEAMAC-2Y),
+ 	// while Vulkan only leaves the values read undefined: SPIRV-Cross makes inputs without an attribute read zeros.
+ 	shaderConfig.options.mslOptions.zero_missing_vertex_attributes = true;
++	shaderConfig.options.mslOptions.vertex_attribute_type_compatibility = true;
+ 
+ 	MVKMTLFunction func = getMTLFunction(shaderConfig, pVertexSS, pVertexFB, _vertexModule, "Vertex");
+ 	id<MTLFunction> mtlFunc = func.getMTLFunction();
+@@ -2897,11 +2898,8 @@
+ 
+         si.binding = pVKVA->binding;
+ 
+-        // Metal can't do signedness conversions on vertex buffers (rdar://45922847). If the shader
+-        // and the vertex attribute have mismatched signedness, we have to fix the shader
+-        // to match the vertex attribute. So tell SPIRV-Cross if we're expecting an unsigned format.
+-        // Only do this if the attribute could be reasonably expected to fit in the shader's
+-        // declared type. Programs that try to invoke undefined behavior are on their own.
++        // Describe the numeric type delivered by vertex fetch, including float formats. SPIRV-Cross
++        // matches Metal's stage_in type to it and reinterprets mismatched shader inputs on load.
+ 		auto mvkFormat = getPixelFormats()->getFormatType(pVKVA->format);
+         si.shaderVar.format = toMslShaderFormat(mvkFormat);
+ 
+@@ -3589,6 +3587,7 @@
+ 				opt.null_descriptor,
+ 				opt.for_mesh_pipeline,
+ 				opt.zero_missing_vertex_attributes,
++				opt.vertex_attribute_type_compatibility,
+ 				opt.input_primitive_type);
+ 	}
+ 
+@@ -3894,17 +3893,17 @@
+ 
+ void mvkValidateCeralArchiveDefinitions() {
+ 	[[maybe_unused]] size_t missingBytes = 0;
+-	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(9);
++	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(8);
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLShaderInterfaceVariable>(3);
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLResourceBinding>();
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLConstexprSampler>();
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVWorkgroupSizeDimension>(3);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVEntryPoint>(20);						// Contains string
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(31);			// Contains string
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(30);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLShaderInterfaceVariable>(6);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLResourceBinding>(2);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::DescriptorBinding>();
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(111);	// Contains collection
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(110);	// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(39);		// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLSpecializationMacroInfo>(22);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<MVKShaderModuleKey>();

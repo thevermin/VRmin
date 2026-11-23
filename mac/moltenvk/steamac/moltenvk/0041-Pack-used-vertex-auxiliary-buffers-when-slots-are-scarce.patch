@@ -1,0 +1,48 @@
+From: steamac <steamac@localhost>
+Subject: [PATCH] Pack used vertex auxiliary buffers when Metal slots are scarce
+
+STEAMAC-67 emitted spvBufferSizeConstants [[buffer(255)]]: the layout
+reserved slots for texture and dynamic offsets even when neither was used.
+For constrained vertex stages discover usage before compiling Metal and
+allocate only the auxiliary buffers actually required. Leave ordinary
+pipelines on the existing one-conversion path and reject true exhaustion.
+
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1802,6 +1802,36 @@
+ 	// while Vulkan only leaves the values read undefined: SPIRV-Cross makes inputs without an attribute read zeros.
+ 	shaderConfig.options.mslOptions.zero_missing_vertex_attributes = true;
+ 	shaderConfig.options.mslOptions.vertex_attribute_type_compatibility = true;
++
++	// Layouts with many discrete descriptors and vertex bindings may leave fewer than the
++	// three pessimistically reserved auxiliary slots. Discover which buffers this shader
++	// actually uses before compiling Metal, then pack only those buffers into the free slots.
++	if (!shouldFailOnPipelineCompileRequired() &&
++		(implicit[MVKImplicitBuffer::BufferSize] == kMVKUnassignedImplicitBufferIndex ||
++		 (shaderConfig.options.mslOptions.emulate_reversed_depth_viewport &&
++		  implicit[MVKImplicitBuffer::EmulatedReversedDepthViewport] == kMVKUnassignedImplicitBufferIndex) ||
++		 (shaderConfig.options.mslOptions.emulate_depth_clip_enable &&
++		  implicit[MVKImplicitBuffer::DepthClip] == kMVKUnassignedImplicitBufferIndex))) {
++		SPIRVToMSLConversionResult discovery;
++		if (!_vertexModule->convert(&shaderConfig, discovery)) { return false; }
++		const auto& needs = discovery.resultInfo;
++		auto& buffers = _stageResources[kMVKShaderStageVertex].implicitBuffers;
++		buffers.needed.set(MVKImplicitBuffer::TextureOffset, needs.needsTextureOffsetBuffer);
++		buffers.needed.set(MVKImplicitBuffer::DynamicOffset, needs.needsDynamicOffsetBuffer);
++		buffers.needed.set(MVKImplicitBuffer::BufferSize, needs.needsBufferSizeBuffer);
++		buffers.needed.set(MVKImplicitBuffer::ViewRange, needs.needsViewRangeBuffer);
++		buffers.needed.set(MVKImplicitBuffer::EmulatedReversedDepthViewport, shaderConfig.options.mslOptions.emulate_reversed_depth_viewport);
++		buffers.needed.set(MVKImplicitBuffer::DepthClip, shaderConfig.options.mslOptions.emulate_depth_clip_enable);
++		uint32_t offset = 0;
++		for (MVKImplicitBuffer buffer : buffers.needed.removingAll(MVKImplicitBuffer::PushConstant)) {
++			buffers.ids[buffer] = getImplicitBufferIndex(kMVKShaderStageVertex, offset++);
++		}
++		if (!verifyImplicitBuffers(kMVKShaderStageVertex)) { return false; }
++		addCommonImplicitBuffersToShaderConfig(shaderConfig, buffers.ids);
++		shaderConfig.options.mslOptions.view_mask_buffer_index = buffers.ids[MVKImplicitBuffer::ViewRange];
++		setEmulatedReversedDepthViewportConfig(shaderConfig, buffers.ids, shaderConfig.options.mslOptions.emulate_reversed_depth_viewport);
++		setDepthClipConfig(shaderConfig, buffers.ids, shaderConfig.options.mslOptions.emulate_depth_clip_enable);
++	}
+ 
+ 	MVKMTLFunction func = getMTLFunction(shaderConfig, pVertexSS, pVertexFB, _vertexModule, "Vertex");
+ 	id<MTLFunction> mtlFunc = func.getMTLFunction();

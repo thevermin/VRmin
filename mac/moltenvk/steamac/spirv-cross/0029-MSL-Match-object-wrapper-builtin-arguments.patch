@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000029 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Tue, 6 Oct 2026 18:01:00 +0300
+Subject: [PATCH 29/29] MSL: Match object wrapper builtin arguments to the vertex function
+
+STEAMAC-1E: Stellar Blade's emulated geometry pipeline fails to compile
+because the object wrapper passes five arguments to a four-argument vertex
+function (stage input, descriptor set, buffer sizes and push constants;
+no direct builtin inputs). The wrapper passed every builtin input declared
+in the module, even unused ones, whereas entry_point_args_builtin() only
+declares active direct builtin inputs of the selected entry point.
+
+Use the same active/interface/direct-input predicate as the mesh wrapper,
+and pass each builtin once, matching the deduplicated function declaration.
+Rename the shared predicate to cover both stages of mesh emulation.
+---
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -2490,11 +2490,16 @@
+ 			statement(need_comma ? ", " : "", mesh_wrapper_resource_arg(resource));
+ 			need_comma = true;
+ 		}
++		// Match entry_point_args_builtin(): only active direct inputs of this entry point, once per builtin.
++		Bitset passed_builtins;
+ 		ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var)
+ 		{
+-			if (var.storage == StorageClassInput && is_builtin_variable(var))
++			if (is_mesh_direct_input_builtin(var))
+ 			{
+ 				uint32_t builtin = get_decoration(var_id, DecorationBuiltIn);
++				if (passed_builtins.get(builtin))
++					return;
++				passed_builtins.set(builtin);
+ 
+ 				switch (builtin)
+ 				{
+@@ -2740,7 +2745,7 @@
+ 		// Builtin arguments, in the order entry_point_args_builtin() declares them (once per builtin).
+ 		Bitset passed_builtins;
+ 		ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
+-			if (!is_geometry_direct_input_builtin(var))
++			if (!is_mesh_direct_input_builtin(var))
+ 				return;
+ 			auto bi_type = BuiltIn(get_decoration(var.self, DecorationBuiltIn));
+ 			if (passed_builtins.get(bi_type))
+@@ -2788,9 +2793,9 @@
+ 	return resource.name;
+ }
+ 
+-// Returns whether the variable is a builtin input of the geometry stage that becomes a
+-// separate entry point argument (rather than a member of the per-vertex stage input).
+-bool CompilerMSL::is_geometry_direct_input_builtin(const SPIRVariable &var)
++// Returns whether the variable is an active direct builtin input passed separately to the wrapped stage
++// function of a mesh pipeline (rather than a member of its per-vertex stage input).
++bool CompilerMSL::is_mesh_direct_input_builtin(const SPIRVariable &var)
+ {
+ 	if (var.storage != StorageClassInput || !is_builtin_variable(var))
+ 		return false;
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -1177,7 +1177,7 @@
+ 	std::string ensure_valid_name(std::string name, std::string pfx);
+ 	std::string to_sampler_expression(uint32_t id);
+ 	std::string to_plane_expression(const std::string &img_expr, uint32_t plane);
+-	bool is_geometry_direct_input_builtin(const SPIRVariable &var);
++	bool is_mesh_direct_input_builtin(const SPIRVariable &var);
+ 	std::string mesh_wrapper_resource_arg(const Entry_Point_Resource &resource);
+ 	std::string to_swizzle_expression(uint32_t id);
+ 	std::string to_texture_offset_expression(uint32_t id);
+-- 
+2.50.1

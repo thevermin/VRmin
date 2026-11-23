@@ -1,0 +1,74 @@
+From f9d81f20c4b5fe61979126a69f0aececddfd3563 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 23:42:55 +0300
+Subject: [PATCH 15/22] Geometry shaders: vertex attribute memory format for
+ the object stage
+
+The geometry-shader (mesh) object stage fetches vertex attributes itself; tell SPIRV-Cross the
+component type of each attribute in memory (from the attribute's MTLVertexFormat) rather than
+the format type, which is float for SCALED and NORM formats.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 40 +++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 984b7251..5e0f1d90 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1722,6 +1722,40 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+ 	return verifyImplicitBuffers(kMVKShaderStageVertex);
+ }
+ 
++// The component type in memory of a vertex format, for the geometry-shader (mesh) object stage, which
++// fetches vertex attributes itself and converts them to the shader's type (SCALED formats are integers
++// converted to float, NORM formats are additionally normalized).
++static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlFormat) {
++	switch (mtlFormat) {
++		case MTLVertexFormatUChar: case MTLVertexFormatUChar2: case MTLVertexFormatUChar3: case MTLVertexFormatUChar4:
++		case MTLVertexFormatUCharNormalized: case MTLVertexFormatUChar2Normalized:
++		case MTLVertexFormatUChar3Normalized: case MTLVertexFormatUChar4Normalized:
++			return MSL_SHADER_VARIABLE_FORMAT_UINT8;
++		case MTLVertexFormatChar: case MTLVertexFormatChar2: case MTLVertexFormatChar3: case MTLVertexFormatChar4:
++		case MTLVertexFormatCharNormalized: case MTLVertexFormatChar2Normalized:
++		case MTLVertexFormatChar3Normalized: case MTLVertexFormatChar4Normalized:
++			return MSL_SHADER_VARIABLE_FORMAT_INT8;
++		case MTLVertexFormatUShort: case MTLVertexFormatUShort2: case MTLVertexFormatUShort3: case MTLVertexFormatUShort4:
++		case MTLVertexFormatUShortNormalized: case MTLVertexFormatUShort2Normalized:
++		case MTLVertexFormatUShort3Normalized: case MTLVertexFormatUShort4Normalized:
++			return MSL_SHADER_VARIABLE_FORMAT_UINT16;
++		case MTLVertexFormatShort: case MTLVertexFormatShort2: case MTLVertexFormatShort3: case MTLVertexFormatShort4:
++		case MTLVertexFormatShortNormalized: case MTLVertexFormatShort2Normalized:
++		case MTLVertexFormatShort3Normalized: case MTLVertexFormatShort4Normalized:
++			return MSL_SHADER_VARIABLE_FORMAT_INT16;
++		case MTLVertexFormatHalf: case MTLVertexFormatHalf2: case MTLVertexFormatHalf3: case MTLVertexFormatHalf4:
++			return MSL_SHADER_VARIABLE_FORMAT_HALF;
++		case MTLVertexFormatFloat: case MTLVertexFormatFloat2: case MTLVertexFormatFloat3: case MTLVertexFormatFloat4:
++			return MSL_SHADER_VARIABLE_FORMAT_FLOAT;
++		case MTLVertexFormatUInt: case MTLVertexFormatUInt2: case MTLVertexFormatUInt3: case MTLVertexFormatUInt4:
++			return MSL_SHADER_VARIABLE_FORMAT_UINT32;
++		case MTLVertexFormatInt: case MTLVertexFormatInt2: case MTLVertexFormatInt3: case MTLVertexFormatInt4:
++			return MSL_SHADER_VARIABLE_FORMAT_INT32;
++		default:
++			return MSL_SHADER_VARIABLE_FORMAT_OTHER;
++	}
++}
++
+ struct MSLVertexFormatInfo {
+ 	uint8_t num_elements : 7;
+ 	bool normalized : 1;
+@@ -2673,6 +2707,12 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+ 			}
+ 		}
+ 
++		// The mesh (geometry-shader) object stage reads the attribute's memory itself.
++		if (shaderConfig.options.mslOptions.for_mesh_pipeline) {
++			auto memFormat = mvkMSLMeshVertexMemoryFormat(getPixelFormats()->getMTLVertexFormat(pVKVA->format));
++			if (memFormat != MSL_SHADER_VARIABLE_FORMAT_OTHER) { si.shaderVar.format = memFormat; }
++		}
++
+         shaderConfig.shaderInputs.push_back(si);
+     }
+ }
+-- 
+2.50.1 (Apple Git-155)
+

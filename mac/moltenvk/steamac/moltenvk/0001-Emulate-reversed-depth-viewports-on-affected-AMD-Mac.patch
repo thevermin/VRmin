@@ -1,0 +1,314 @@
+From 4ca60f75ddc1cfeb22269de01bebeb4d87ab92a8 Mon Sep 17 00:00:00 2001
+From: Edward Li <vk.edward.li@gmail.com>
+Date: Sun, 21 Jun 2026 02:44:17 +0800
+Subject: [PATCH 01/22] Emulate reversed-depth viewports on affected AMD Mac
+ GPUs
+
+Avoid passing reversed depth ranges directly to Metal on AMD Mac2 GPUs that do not support Metal 3.
+For reversed Vulkan viewports, pass Metal a forward depth range by swapping min/max depth, and pass a hidden per-draw viewport mask to vertex/tessellation-evaluation shaders so SPIRV-Cross can emit dynamic clip-space Z inversion.
+
+Disable discarded fragment store checking on the affected path to avoid the helper-thread behavior that breaks OIT rendering.
+
+steamac: backport of KhronosGroup/MoltenVK 74850136 onto utmapp/MoltenVK
+geometry-shaders 05604465 (v1.4.1 base). Prerequisite of the
+VK_EXT_depth_clip_enable backport (same implicit-buffer/viewport code).
+Conflict resolution: keep the fork's SPIRV-Cross pin (the needed SPIRV-Cross
+change is carried as a steamac patch), keep the fork's TextureOffset/xfb
+implicit buffers and robustness2 options, drop the isNVIDIAGPU()/isIntelGPU()/
+isMacGPUFamily1() helpers and the unrelated Mac1 NVIDIA discard-check change
+(the fork has no supportsMac1 capability).
+---
+ .../Commands/MVKCommandEncoderState.h         |  3 ++
+ .../Commands/MVKCommandEncoderState.mm        | 38 ++++++++++++++++++-
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.h      |  5 +++
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm     |  7 ++++
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   | 28 ++++++++++++--
+ MoltenVK/MoltenVK/Utility/MVKStateTracking.h  |  2 +
+ 6 files changed, 78 insertions(+), 5 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.h b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.h
+index fccf5779..949e2cef 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.h
+@@ -160,6 +160,7 @@ struct MVKImplicitBufferData {
+ 	MVKSmallVector<uint32_t, 8> bufferSizes;
+ 	MVKSmallVector<uint32_t, 8> dynamicOffsets;
+ 	MVKSmallVector<uint32_t, 8> textureOffsets;
++	uint32_t emulatedReversedDepthViewportMask = 0;
+ };
+ 
+ enum class MVKResourceUsageStages : uint8_t {
+@@ -522,6 +523,8 @@ public:
+ 	}
+ 	/** Binds the given graphics pipeline to the Vulkan graphics state, invalidating any necessary resources. */
+ 	void bindGraphicsPipeline(MVKGraphicsPipeline* pipeline);
++	/** Updates the mask of viewports whose reversed-depth range should be emulated in graphics shaders. */
++	void setGraphicsEmulatedReversedDepthViewportMask(uint32_t mask);
+ 	/** Binds the given compute pipeline to the Vulkan graphics state, invalidating any necessary resources. */
+ 	void bindComputePipeline(MVKComputePipeline* pipeline);
+ 	/** Binds the given push constants to the Vulkan state, invalidating any necessary resources. */
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index 6e4535ba..6a3bc6a1 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -816,6 +816,14 @@ static void bindMetalResources(id<MTLCommandEncoder> encoder,
+ 				binder.setBytes(encoder, viewRange, sizeof(viewRange), idx);
+ 				break;
+ 			}
++			case MVKNonVolatileImplicitBuffer::EmulatedReversedDepthViewport:
++				bindImmediateData(encoder,
++				                  mvkEncoder,
++				                  reinterpret_cast<const uint8_t*>(&implicitBufferData.emulatedReversedDepthViewportMask),
++				                  sizeof(implicitBufferData.emulatedReversedDepthViewportMask),
++				                  idx,
++				                  binder);
++				break;
+ 			case MVKNonVolatileImplicitBuffer::Count:
+ 				assert(0);
+ 				break;
+@@ -1279,6 +1287,10 @@ static uint32_t getSampleCount(VkSampleCountFlags vk) {
+ 
+ static constexpr MVKRenderStateFlags FlagsHandledByBindStateData = FlagsViewportScissor | FlagsMetalState;
+ 
++static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physicalDevice) {
++	return physicalDevice->shouldEmulateReversedDepthViewport();
++}
++
+ void MVKMetalGraphicsCommandEncoderState::bindStateData(
+   id<MTLRenderCommandEncoder> encoder,
+   MVKCommandEncoder& mvkEncoder,
+@@ -1293,14 +1305,23 @@ static uint32_t getSampleCount(VkSampleCountFlags vk) {
+ 			mvkCopy(_viewports, viewports, data.numViewports);
+ 			MTLViewport mtlViewports[kMVKMaxViewportScissorCount];
+ 			uint32_t numViewports = data.numViewports;
++			uint32_t emulatedReversedDepthViewportMask = 0;
++			bool shouldEmulateReversedDepthViewports = shouldEmulateReversedDepthViewport(mvkEncoder.getDevice()->getPhysicalDevice());
+ 			for (uint32_t i = 0; i < numViewports; i++) {
+ 				mtlViewports[i].width = viewports[i].width;
+ 				mtlViewports[i].height = viewports[i].height;
+ 				mtlViewports[i].originX = viewports[i].x;
+ 				mtlViewports[i].originY = viewports[i].y;
+-				mtlViewports[i].znear = viewports[i].minDepth;
+-				mtlViewports[i].zfar = viewports[i].maxDepth;
++				bool isReversedDepthViewport = viewports[i].minDepth > viewports[i].maxDepth;
++				// Only reversed Vulkan depth ranges are emulated. Normal depth ranges are passed to Metal unchanged.
++				// The reversed range is swapped to preserve arbitrary Vulkan depth subranges after shader Z inversion.
++				if (shouldEmulateReversedDepthViewports && isReversedDepthViewport) {
++					emulatedReversedDepthViewportMask |= 1u << i;
++				}
++				mtlViewports[i].znear = shouldEmulateReversedDepthViewports && isReversedDepthViewport ? viewports[i].maxDepth : viewports[i].minDepth;
++				mtlViewports[i].zfar = shouldEmulateReversedDepthViewports && isReversedDepthViewport ? viewports[i].minDepth : viewports[i].maxDepth;
+ 			}
++			mvkEncoder.getState().setGraphicsEmulatedReversedDepthViewportMask(emulatedReversedDepthViewportMask);
+ 			if (numViewports == 1) {
+ 				[encoder setViewport:mtlViewports[0]];
+ 			} else {
+@@ -1862,6 +1883,19 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
+ 	state.applyToActiveMTLState(bindPoint, [buffer](auto& mtl){ invalidateImplicitBuffer(mtl, buffer); });
+ }
+ 
++void MVKCommandEncoderState::setGraphicsEmulatedReversedDepthViewportMask(uint32_t mask) {
++	bool changed = false;
++	for (auto& stageData : _vkGraphics._implicitBufferData) {
++		if (stageData.emulatedReversedDepthViewportMask != mask) {
++			stageData.emulatedReversedDepthViewportMask = mask;
++			changed = true;
++		}
++	}
++	if (changed) {
++		invalidateImplicitBuffer(*this, VK_PIPELINE_BIND_POINT_GRAPHICS, MVKNonVolatileImplicitBuffer::EmulatedReversedDepthViewport);
++	}
++}
++
+ void MVKCommandEncoderState::bindGraphicsPipeline(MVKGraphicsPipeline* pipeline) {
+ 	_mtlGraphics.changePipeline(_vkGraphics._pipeline, pipeline);
+ 	_vkGraphics._pipeline = pipeline;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index 6d960149..60153ee8 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -202,6 +202,11 @@ public:
+ 	/** Returns the name of this device. */
+ 	const char* getName() { return _properties.deviceName; }
+ 
++	/** Returns whether this GPU is in the affected AMD Mac family for the reversed-depth viewport workaround. */
++	bool needsAMDMac2ReversedDepthViewportWorkaround() const;
++
++	/** Returns whether reversed-depth viewports should be emulated instead of passed through to Metal. */
++	bool shouldEmulateReversedDepthViewport() const;
+ 	/** Populates the specified structure with the format properties of this device. */
+ 	void getFormatProperties(VkFormat format, VkFormatProperties* pFormatProperties);
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index e451619c..081ad380 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -3332,6 +3332,13 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 	_memoryProperties.memoryTypes[typeIndex].propertyFlags = propertyFlags;
+ }
+ 
++bool MVKPhysicalDevice::needsAMDMac2ReversedDepthViewportWorkaround() const {
++	return _properties.vendorID == kAMDVendorId && !_gpuCapabilities.isAppleGPU && _gpuCapabilities.supportsMac2 && !_gpuCapabilities.supportsMetal3;
++}
++
++bool MVKPhysicalDevice::shouldEmulateReversedDepthViewport() const {
++	return needsAMDMac2ReversedDepthViewportWorkaround();
++}
+ void MVKPhysicalDevice::initMemoryProperties() {
+ 
+ 	mvkClear(&_memoryProperties);	// Start with everything cleared
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index fbead640..1ecb45f7 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1584,6 +1584,7 @@ static MTLVertexFormat mvkAdjustFormatVectorToSize(MTLVertexFormat format, uint3
+ 		case MVKImplicitBuffer::DynamicOffset:  return "dynamic offset";
+ 		case MVKImplicitBuffer::TextureOffset:  return "texture offset";
+ 		case MVKImplicitBuffer::ViewRange:      return "view range";
++		case MVKImplicitBuffer::EmulatedReversedDepthViewport: return "emulated reversed-depth viewport";
+ 		case MVKImplicitBuffer::IndirectParams: return "indirect parameter";
+ 		case MVKImplicitBuffer::Output:         return "per-vertex output";
+ 		case MVKImplicitBuffer::PatchOutput:    return "per-patch output";
+@@ -1613,6 +1614,11 @@ static void addCommonImplicitBuffersToShaderConfig(SPIRVToMSLConversionConfigura
+ 	dst.options.mslOptions.texture_offset_buffer_index = src[MVKImplicitBuffer::TextureOffset];
+ }
+ 
++static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfiguration& shaderConfig, const MVKOnePerEnumEntry<uint8_t, MVKImplicitBuffer>& implicit, bool enable) {
++	shaderConfig.options.mslOptions.emulate_reversed_depth_viewport = enable;
++	shaderConfig.options.mslOptions.reversed_depth_viewport_buffer_index = enable ? implicit[MVKImplicitBuffer::EmulatedReversedDepthViewport] : 0;
++}
++
+ bool MVKGraphicsPipeline::verifyImplicitBuffers(MVKShaderStage stage) {
+ 	const char* stageNames[] = {
+ 		"Vertex",
+@@ -1642,6 +1648,7 @@ static void addCommonImplicitBuffersToShaderConfig(SPIRVToMSLConversionConfigura
+ 	shaderConfig.options.mslOptions.disable_rasterization = !_isRasterizing;
+ 	shaderConfig.options.mslOptions.robust_buffer_access2 = shouldEnableRobustBufferAccess2(this, pCreateInfo, pVertexSS);
+ 	shaderConfig.options.mslOptions.robust_image_access2 = shouldEnableRobustImageAccess2(this, pCreateInfo, pVertexSS);
++	setEmulatedReversedDepthViewportConfig(shaderConfig, implicit, getPhysicalDevice()->shouldEmulateReversedDepthViewport());
+     addVertexInputToShaderConversionConfig(shaderConfig, pCreateInfo);
+ 
+ 	MVKMTLFunction func = getMTLFunction(shaderConfig, pVertexSS, pVertexFB, _vertexModule, "Vertex");
+@@ -1652,6 +1659,7 @@ static void addCommonImplicitBuffersToShaderConfig(SPIRVToMSLConversionConfigura
+ 	auto& funcRslts = func.shaderConversionResults;
+ 	plDesc.rasterizationEnabled = !funcRslts.isRasterizationDisabled;
+ 	populateResourceUsage(_stageResources[kMVKShaderStageVertex], shaderConfig, funcRslts, spv::ExecutionModelVertex);
++	_stageResources[kMVKShaderStageVertex].implicitBuffers.needed.set(MVKImplicitBuffer::EmulatedReversedDepthViewport, shaderConfig.options.mslOptions.emulate_reversed_depth_viewport);
+ 	_layout->populateBindOperations(_stageResources[kMVKShaderStageVertex].bindScript, shaderConfig, spv::ExecutionModelVertex);
+ 
+ 	if (funcRslts.isRasterizationDisabled) {
+@@ -1851,6 +1859,7 @@ static void addCommonImplicitBuffersToShaderConfig(SPIRVToMSLConversionConfigura
+ 	shaderConfig.options.mslOptions.disable_rasterization = true;
+ 	shaderConfig.options.mslOptions.robust_buffer_access2 = shouldEnableRobustBufferAccess2(this, pCreateInfo, pVertexSS);
+ 	shaderConfig.options.mslOptions.robust_image_access2 = shouldEnableRobustImageAccess2(this, pCreateInfo, pVertexSS);
++	setEmulatedReversedDepthViewportConfig(shaderConfig, implicit, false);
+     addVertexInputToShaderConversionConfig(shaderConfig, pCreateInfo);
+ 	addNextStageInputToShaderConversionConfig(shaderConfig, tcInputs);
+ 
+@@ -1899,6 +1908,7 @@ static void addCommonImplicitBuffersToShaderConfig(SPIRVToMSLConversionConfigura
+ 	shaderConfig.options.mslOptions.fixed_subgroup_size = mvkIsAnyFlagEnabled(pTessCtlSS->flags, VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT) ? 0 : getMetalFeatures().maxSubgroupSize;
+ 	shaderConfig.options.mslOptions.robust_buffer_access2 = shouldEnableRobustBufferAccess2(this, pCreateInfo, pTessCtlSS);
+ 	shaderConfig.options.mslOptions.robust_image_access2 = shouldEnableRobustImageAccess2(this, pCreateInfo, pTessCtlSS);
++	setEmulatedReversedDepthViewportConfig(shaderConfig, implicit, false);
+ 	addPrevStageOutputToShaderConversionConfig(shaderConfig, vtxOutputs);
+ 	addNextStageInputToShaderConversionConfig(shaderConfig, teInputs);
+ 
+@@ -1937,6 +1947,7 @@ static void addCommonImplicitBuffersToShaderConfig(SPIRVToMSLConversionConfigura
+ 	shaderConfig.options.mslOptions.disable_rasterization = !_isRasterizing;
+ 	shaderConfig.options.mslOptions.robust_buffer_access2 = shouldEnableRobustBufferAccess2(this, pCreateInfo, pTessEvalSS);
+ 	shaderConfig.options.mslOptions.robust_image_access2 = shouldEnableRobustImageAccess2(this, pCreateInfo, pTessEvalSS);
++	setEmulatedReversedDepthViewportConfig(shaderConfig, implicit, getPhysicalDevice()->shouldEmulateReversedDepthViewport());
+ 	addPrevStageOutputToShaderConversionConfig(shaderConfig, tcOutputs);
+ 
+ 	MVKMTLFunction func = getMTLFunction(shaderConfig, pTessEvalSS, pTessEvalFB, _tessEvalModule, "Tessellation evaluation");
+@@ -1947,6 +1958,7 @@ static void addCommonImplicitBuffersToShaderConfig(SPIRVToMSLConversionConfigura
+ 	auto& funcRslts = func.shaderConversionResults;
+ 	plDesc.rasterizationEnabled = !funcRslts.isRasterizationDisabled;
+ 	populateResourceUsage(_stageResources[kMVKShaderStageTessEval], shaderConfig, funcRslts, spv::ExecutionModelTessellationEvaluation);
++	_stageResources[kMVKShaderStageTessEval].implicitBuffers.needed.set(MVKImplicitBuffer::EmulatedReversedDepthViewport, shaderConfig.options.mslOptions.emulate_reversed_depth_viewport);
+ 	_layout->populateBindOperations(_stageResources[kMVKShaderStageTessEval].bindScript, shaderConfig, spv::ExecutionModelTessellationEvaluation);
+ 
+ 	if (funcRslts.isRasterizationDisabled) {
+@@ -1972,7 +1984,14 @@ static void addCommonImplicitBuffersToShaderConfig(SPIRVToMSLConversionConfigura
+ 		shaderConfig.options.entryPointName = pFragmentSS->pName;
+ 		shaderConfig.options.mslOptions.capture_output_to_buffer = false;
+ 		shaderConfig.options.mslOptions.fixed_subgroup_size = mvkIsAnyFlagEnabled(pFragmentSS->flags, VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT) ? 0 : mtlFeats.maxSubgroupSize;
++		bool shouldEmulateReversedDepthViewports = getPhysicalDevice()->shouldEmulateReversedDepthViewport();
++		setEmulatedReversedDepthViewportConfig(shaderConfig, implicit, false);
+ 		shaderConfig.options.mslOptions.check_discarded_frag_stores = true;
++		if (shouldEmulateReversedDepthViewports) {
++			// The discard-store helper path uses simd_is_helper_thread(), which is unreliable on the
++			// same AMD Metal path that needs reversed-depth viewport emulation.
++			shaderConfig.options.mslOptions.check_discarded_frag_stores = false;
++		}
+ 		/* Enabling makes dEQP-VK.fragment_shader_interlock.basic.discard.image.pixel_ordered.1xaa.no_sample_shading.1024x1024 and similar tests fail. Requires investigation */
+ 		shaderConfig.options.mslOptions.force_fragment_with_side_effects_execution = false;
+ 		shaderConfig.options.mslOptions.input_attachment_is_ds_attachment = _inputAttachmentIsDSAttachment;
+@@ -2386,6 +2405,7 @@ static void addCommonImplicitBuffersToShaderConfig(SPIRVToMSLConversionConfigura
+ 		_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::DynamicOffset]  = getImplicitBufferIndex(stage, 1);
+ 		_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::BufferSize]     = getImplicitBufferIndex(stage, 2);
+ 		_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::Output]         = getImplicitBufferIndex(stage, 4);
++		_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::EmulatedReversedDepthViewport] = getImplicitBufferIndex(stage, 7);
+ 		uint32_t extra = getImplicitBufferIndex(stage, 3);
+ 		switch (stage) {
+ 			case kMVKShaderStageVertex:
+@@ -3157,6 +3177,7 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+ 				opt.draw_info_index,
+ 				opt.xfb_buffer_index,
+ 				opt.texture_offset_buffer_index,
++				opt.reversed_depth_viewport_buffer_index,
+ 				opt.shader_input_wg_index,
+ 				opt.device_index,
+ 				opt.enable_frag_output_mask,
+@@ -3175,6 +3196,7 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+ 				opt.view_index_from_device_index,
+ 				opt.dispatch_base,
+ 				opt.texture_1D_as_2D,
++				opt.emulate_reversed_depth_viewport,
+ 				opt.argument_buffers,
+ 				opt.argument_buffers_tier,
+ 				opt.runtime_array_rich_descriptor,
+@@ -3516,17 +3538,17 @@ static size_t mvkValidateCerealArchiveSize(size_t padByteCnt = 0) {
+ 
+ void mvkValidateCeralArchiveDefinitions() {
+ 	[[maybe_unused]] size_t missingBytes = 0;
+-	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(9);
++	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(8);
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLShaderInterfaceVariable>(3);
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLResourceBinding>();
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLConstexprSampler>();
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVWorkgroupSizeDimension>(3);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVEntryPoint>(20);						// Contains string
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(27);			// Contains string
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(30);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLShaderInterfaceVariable>(6);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLResourceBinding>(2);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::DescriptorBinding>();
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(107);	// Contains collection
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(110);	// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(40);		// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLSpecializationMacroInfo>(22);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<MVKShaderModuleKey>();
+diff --git a/MoltenVK/MoltenVK/Utility/MVKStateTracking.h b/MoltenVK/MoltenVK/Utility/MVKStateTracking.h
+index b704777b..1f0975d6 100644
+--- a/MoltenVK/MoltenVK/Utility/MVKStateTracking.h
++++ b/MoltenVK/MoltenVK/Utility/MVKStateTracking.h
+@@ -172,6 +172,7 @@ enum class MVKNonVolatileImplicitBuffer : uint32_t {
+ 	DynamicOffset,
+ 	TextureOffset,
+ 	ViewRange,
++	EmulatedReversedDepthViewport,
+ 	Count
+ };
+ 
+@@ -181,6 +182,7 @@ enum class MVKImplicitBuffer : uint32_t {
+ 	DynamicOffset = static_cast<uint32_t>(MVKNonVolatileImplicitBuffer::DynamicOffset),
+ 	TextureOffset = static_cast<uint32_t>(MVKNonVolatileImplicitBuffer::TextureOffset),
+ 	ViewRange     = static_cast<uint32_t>(MVKNonVolatileImplicitBuffer::ViewRange),
++	EmulatedReversedDepthViewport = static_cast<uint32_t>(MVKNonVolatileImplicitBuffer::EmulatedReversedDepthViewport),
+ 
+ 	// Volatile implicit buffers
+ 	// These buffers are updated per draw call, and are therefore always considered dirty
+-- 
+2.50.1 (Apple Git-155)
+

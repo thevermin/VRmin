@@ -1,0 +1,134 @@
+From 3b7281ef990fb3c56f8ab24d029a108e2b472a25 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sun, 4 Oct 2026 00:59:15 +0300
+Subject: [PATCH 17/22] Allocate implicit buffer indices around the vertex
+ buffers actually used
+
+Implicit buffers (buffer sizes, dynamic and texture offsets, view range, output buffers,
+emulation buffers, the geometry-shader DrawInfo) were placed at
+maxPerStageBufferCount - 1 - (highest vertex binding + 1 + offset). With high binding
+numbers (vertex binding 30 is valid) the index went negative and wrapped, and the indices left
+free by sparse bindings were never used.
+
+Take the free indices from the top down instead, skipping the indices of the declared vertex
+bindings (and their synthetic translation bindings) and of the reserved tessellation buffers,
+and staying above the descriptor buffers. When none is free the buffer gets
+kMVKUnassignedImplicitBufferIndex and the stage fails with a clear error if it needs it.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h  |  4 ++
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 48 ++++++++++++++++++---
+ 2 files changed, 46 insertions(+), 6 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index 846f2f62..48366721 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -38,6 +38,9 @@
+ class MVKCommandEncoder;
+ class MVKPipelineCache;
+ 
++/** Implicit buffer index of a stage that has no free Metal buffer index for it. */
++static constexpr uint32_t kMVKUnassignedImplicitBufferIndex = 0xFF;
++
+ struct MVKShaderImplicitRezBinding {
+ 	uint32_t stages[kMVKShaderStageCount];
+ };
+@@ -431,6 +434,7 @@ protected:
+ 	id<MTLRenderPipelineState> _mtlPipelineState = nil;
+ 
+ 	MVKShaderImplicitRezBinding _reservedVertexAttributeBufferCount;
++	uint32_t _occupiedVertexBufferIndices[kMVKShaderStageCount] = {};	// Metal buffer indices of vertex/reserved buffers, by stage
+ 	VkPrimitiveTopology _vkPrimitiveTopology;
+ 	uint32_t _outputControlPointCount;
+     uint32_t _meshDrawInfoBufferIndex = 0;		// Object stage of a geometry-shader pipeline, below the vertex stage's implicit buffers
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 3f1a28d5..7f7ab8c9 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1632,7 +1632,7 @@ static MTLVertexFormat mvkAdjustFormatVectorToSize(MTLVertexFormat format, uint3
+ static bool verifyImplicitBuffers(MVKImplicitBufferBindings& buffers, const char* stageName, uint32_t limit, MVKPipeline* pipeline) {
+ 	static constexpr MVKImplicitBufferList ignored = MVKImplicitBuffer::PushConstant; // Push constants are in the main buffer area
+ 	for (MVKImplicitBuffer needed : buffers.needed.removingAll(ignored)) {
+-		if (buffers.ids[needed] < limit) {
++		if (buffers.ids[needed] < limit || buffers.ids[needed] == kMVKUnassignedImplicitBufferIndex) {
+ 			pipeline->setConfigurationResult(pipeline->reportError(VK_ERROR_INITIALIZATION_FAILED, "%s shader requires %s buffer, but there is no free slot to pass it.", stageName, getImplicitBufferName(needed)));
+ 			return false;
+ 		}
+@@ -1882,7 +1882,8 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 
+ 	if ( !setGeometryInputPrimitiveType(shaderConfig) ) { return false; }
+ 
+-	if (_meshDrawInfoBufferIndex < _descriptorBufferCounts.stages[kMVKShaderStageVertex]) {
++	if (_meshDrawInfoBufferIndex < _descriptorBufferCounts.stages[kMVKShaderStageVertex] ||
++		_meshDrawInfoBufferIndex == kMVKUnassignedImplicitBufferIndex) {
+ 		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Vertex shader of a geometry pipeline requires a draw info buffer, but there is no free slot to pass it."));
+ 		return false;
+ 	}
+@@ -2541,9 +2542,18 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 				break;
+ 		}
+ 	}
+-	// The DrawInfo buffer of the geometry-shader object stage (the vertex shader) comes after the vertex
+-	// stage's implicit buffers, so that it cannot share an index with them or with vertex buffers.
+-	_meshDrawInfoBufferIndex = getImplicitBufferIndex(kMVKShaderStageVertex, 9);
++	// The vertex shader of a geometry-shader pipeline is the object stage of a mesh pipeline: it uses no
++	// output, view range, index, reversed-depth or depth-clip buffers, but the DrawInfo buffer.
++	// Keep the free indices for the buffers it can use.
++	if (isGeometryPipeline()) {
++		auto& vtxIds = _stageResources[kMVKShaderStageVertex].implicitBuffers.ids;
++		vtxIds[MVKImplicitBuffer::Output] = kMVKUnassignedImplicitBufferIndex;
++		vtxIds[MVKImplicitBuffer::ViewRange] = kMVKUnassignedImplicitBufferIndex;
++		vtxIds[MVKImplicitBuffer::Index] = kMVKUnassignedImplicitBufferIndex;
++		vtxIds[MVKImplicitBuffer::EmulatedReversedDepthViewport] = kMVKUnassignedImplicitBufferIndex;
++		vtxIds[MVKImplicitBuffer::DepthClip] = kMVKUnassignedImplicitBufferIndex;
++		_meshDrawInfoBufferIndex = getImplicitBufferIndex(kMVKShaderStageVertex, 3);
++	}
+ 
+ 	const VkPipelineRenderingCreateInfo* pRendInfo = getRenderingCreateInfo(pCreateInfo);
+ 	MVKPixelFormats* pixFmts = getPixelFormats();
+@@ -2589,8 +2599,20 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+     shaderConfig.options.numTessControlPoints = reflectData.numControlPoints;
+ }
+ 
++// Implicit buffers take the free Metal buffer indices from the top down, skipping the indices of the
++// vertex buffers (Vulkan binding b is at index maxPerStageBufferCount - 1 - b, so sparse or high binding
++// numbers leave free indices below them) and the reserved buffers of the stage, and staying above the
++// descriptor buffers. Returns kMVKUnassignedImplicitBufferIndex if there is no free index; the stage
++// then fails with a clear error if it needs that buffer (verifyImplicitBuffers()).
+ uint32_t MVKGraphicsPipeline::getImplicitBufferIndex(MVKShaderStage stage, uint32_t bufferIndexOffset) {
+-	return getMetalBufferIndexForVertexAttributeBinding(_reservedVertexAttributeBufferCount.stages[stage] + bufferIndexOffset);
++	int32_t maxIdx = (int32_t)getMetalFeatures().maxPerStageBufferCount - 1;
++	uint32_t remaining = bufferIndexOffset;
++	for (int32_t idx = maxIdx; idx >= (int32_t)_descriptorBufferCounts.stages[stage]; idx--) {
++		if (mvkIsAnyFlagEnabled(_occupiedVertexBufferIndices[stage], 1u << idx)) { continue; }
++		if (remaining == 0) { return (uint32_t)idx; }
++		remaining--;
++	}
++	return kMVKUnassignedImplicitBufferIndex;
+ }
+ 
+ // Set the number of vertex attribute buffers consumed by this pipeline at each stage.
+@@ -2632,6 +2654,20 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 	_reservedVertexAttributeBufferCount.stages[kMVKShaderStageVertex] = (maxBinding + 1) + xltdBuffCnt;
+ 	_reservedVertexAttributeBufferCount.stages[kMVKShaderStageTessCtl] = kMVKTessCtlNumReservedBuffers;
+ 	_reservedVertexAttributeBufferCount.stages[kMVKShaderStageTessEval] = kMVKTessEvalNumReservedBuffers;
++
++	// Metal buffer indices taken by vertex buffers (declared bindings, and the synthetic bindings
++	// after the highest one) and by the reserved buffers of the tessellation stages.
++	mvkClear<uint32_t>(_occupiedVertexBufferIndices, kMVKShaderStageCount);
++	auto occupy = [&](MVKShaderStage stage, uint32_t binding) {
++		uint32_t idx = getMetalBufferIndexForVertexAttributeBinding(binding);
++		if (idx < 32) { _occupiedVertexBufferIndices[stage] |= 1u << idx; }
++	};
++	for (uint32_t vbIdx = 0; vbIdx < vbCnt; vbIdx++) {
++		occupy(kMVKShaderStageVertex, pVI->pVertexBindingDescriptions[vbIdx].binding);
++	}
++	for (uint32_t i = 0; i < xltdBuffCnt; i++) { occupy(kMVKShaderStageVertex, maxBinding + 1 + i); }
++	for (uint32_t i = 0; i < kMVKTessCtlNumReservedBuffers; i++) { occupy(kMVKShaderStageTessCtl, i); }
++	for (uint32_t i = 0; i < kMVKTessEvalNumReservedBuffers; i++) { occupy(kMVKShaderStageTessEval, i); }
+ }
+ 
+ static MVK_spirv_cross::MSLShaderVariableFormat toMslShaderFormat(MVKFormatType type) {
+-- 
+2.50.1 (Apple Git-155)
+

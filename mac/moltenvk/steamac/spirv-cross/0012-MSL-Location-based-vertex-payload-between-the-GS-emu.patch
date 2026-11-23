@@ -1,0 +1,449 @@
+From 9db8bbfd2c8565ab96f542cfdd28637d3855d908 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 23:13:31 +0300
+Subject: [PATCH 12/17] MSL: Location-based vertex payload between the
+ GS-emulation stages
+
+The payload between the object stage (vertex shader) and the mesh stage (geometry shader)
+of an emulated geometry pipeline was the vertex shader's output struct on one side and a
+struct built from the geometry shader's inputs on the other, so the two only matched if the
+geometry shader read every vertex output, in order, with the same types. A geometry shader
+reading a subset of the outputs read a shifted layout, and gl_in[] blocks (glslang, DXVK) did
+not compile at all (undeclared gl_PerVertex, '.out.' member access, [[position]] on a
+struct).
+
+Use a layout independent of both shaders: per vertex, position, point size, clip and cull
+distances, and one uint4 per location holding the bits of each component. The object stage
+stores the vertex outputs by builtin / location / component; the mesh stage loads the
+geometry inputs the same way, including the members of user blocks and of gl_in[] blocks.
+Declare the gl_PerVertex struct of gl_in[] and access its members as plain struct members.
+---
+ spirv_msl.cpp | 336 ++++++++++++++++++++++++++++++++++++++++++--------
+ spirv_msl.hpp |   5 +
+ 2 files changed, 289 insertions(+), 52 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 8b8d0df8..27a825cc 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -1928,6 +1928,166 @@ int CompilerMSL::get_primitive_vertex_count()
+ 	return 1;
+ }
+ 
++// The vertex shader (object stage) and the geometry shader (mesh stage) of a geometry pipeline are
++// compiled separately, so the vertices they exchange through the payload use a layout that depends
++// on neither shader's interface: position, point size, clip/cull distances, and one uint4 per
++// location holding the bits of each component. Vertex outputs are stored by location and component,
++// geometry inputs are loaded by location and component, so a geometry shader may read any subset of
++// the vertex outputs, with any types, and gl_in[] blocks work.
++static const uint32_t kMeshPayloadLocations = 32;
++static const uint32_t kMeshPayloadClipCullDistances = 8;
++
++void CompilerMSL::emit_mesh_payload_vertex_struct()
++{
++	statement("struct spvGSVertex");
++	begin_scope();
++	statement("float4 position;");
++	statement("float pointSize;");
++	statement("float clipDistance[", kMeshPayloadClipCullDistances, "];");
++	statement("float cullDistance[", kMeshPayloadClipCullDistances, "];");
++	statement("uint4 locations[", kMeshPayloadLocations, "];");
++	end_scope_decl();
++	statement("");
++}
++
++uint32_t CompilerMSL::mesh_payload_location_slots(const SPIRType &type)
++{
++	if (!type.array.empty())
++		return to_array_size_literal(type) * mesh_payload_location_slots(get<SPIRType>(type.parent_type));
++	if (type.basetype == SPIRType::Struct)
++	{
++		uint32_t slots = 0;
++		for (auto &mbr : type.member_types)
++			slots += mesh_payload_location_slots(get<SPIRType>(mbr));
++		return slots;
++	}
++	return type.columns;
++}
++
++static const char *mesh_payload_to_bits(SPIRType::BaseType basetype, const std::string &v, std::string &out)
++{
++	switch (basetype)
++	{
++	case SPIRType::Float: out = "as_type<uint>(" + v + ")"; break;
++	case SPIRType::Half: out = "uint(as_type<ushort>(" + v + "))"; break;
++	case SPIRType::Int: out = "as_type<uint>(" + v + ")"; break;
++	case SPIRType::UInt: out = "uint(" + v + ")"; break;
++	case SPIRType::Short: out = "uint(as_type<ushort>(" + v + "))"; break;
++	case SPIRType::UShort: out = "uint(" + v + ")"; break;
++	case SPIRType::SByte: out = "uint(as_type<uchar>(" + v + "))"; break;
++	case SPIRType::UByte: out = "uint(" + v + ")"; break;
++	case SPIRType::Boolean: out = "uint(" + v + ")"; break;
++	default: return "Unsupported vertex output type in a geometry pipeline.";
++	}
++	return nullptr;
++}
++
++static const char *mesh_payload_from_bits(SPIRType::BaseType basetype, const std::string &u, std::string &out)
++{
++	switch (basetype)
++	{
++	case SPIRType::Float: out = "as_type<float>(" + u + ")"; break;
++	case SPIRType::Half: out = "as_type<half>(ushort(" + u + "))"; break;
++	case SPIRType::Int: out = "as_type<int>(" + u + ")"; break;
++	case SPIRType::UInt: out = u; break;
++	case SPIRType::Short: out = "as_type<short>(ushort(" + u + "))"; break;
++	case SPIRType::UShort: out = "ushort(" + u + ")"; break;
++	case SPIRType::SByte: out = "as_type<char>(uchar(" + u + "))"; break;
++	case SPIRType::UByte: out = "uchar(" + u + ")"; break;
++	case SPIRType::Boolean: out = "(" + u + " != 0u)"; break;
++	default: return "Unsupported geometry shader input type.";
++	}
++	return nullptr;
++}
++
++void CompilerMSL::emit_mesh_payload_store(const SPIRType &type, const std::string &expr, uint32_t location,
++                                          uint32_t component)
++{
++	if (!type.array.empty())
++	{
++		auto &elem_type = get<SPIRType>(type.parent_type);
++		uint32_t elem_slots = mesh_payload_location_slots(elem_type);
++		for (uint32_t i = 0; i < to_array_size_literal(type); i++)
++			emit_mesh_payload_store(elem_type, join(expr, "[", i, "]"), location + i * elem_slots, component);
++		return;
++	}
++	if (type.basetype == SPIRType::Struct)
++		SPIRV_CROSS_THROW("Struct vertex outputs are not supported in a geometry pipeline.");
++	if (type.columns > 1)
++	{
++		auto col_type = type;
++		col_type.columns = 1;
++		for (uint32_t c = 0; c < type.columns; c++)
++			emit_mesh_payload_store(col_type, join(expr, "[", c, "]"), location + c, component);
++		return;
++	}
++	if (location >= kMeshPayloadLocations || component + type.vecsize > 4)
++		SPIRV_CROSS_THROW("Vertex output location out of range in a geometry pipeline.");
++	for (uint32_t k = 0; k < type.vecsize; k++)
++	{
++		string bits;
++		string v = type.vecsize == 1 ? expr : join(expr, ".", "xyzw"[k]);
++		if (const char *err = mesh_payload_to_bits(type.basetype, v, bits))
++			SPIRV_CROSS_THROW(err);
++		statement("payload.vertices[i].locations[", location, "][", component + k, "] = ", bits, ";");
++	}
++}
++
++string CompilerMSL::mesh_payload_load(const SPIRType &type, uint32_t location, uint32_t component)
++{
++	if (location >= kMeshPayloadLocations || component + type.vecsize > 4)
++		SPIRV_CROSS_THROW("Geometry shader input location out of range.");
++	string comps;
++	for (uint32_t k = 0; k < type.vecsize; k++)
++	{
++		string v;
++		if (const char *err = mesh_payload_from_bits(type.basetype,
++		                                            join("vtx.locations[", location, "][", component + k, "]"), v))
++			SPIRV_CROSS_THROW(err);
++		comps += (k ? ", " : "") + v;
++	}
++	auto scalar_type = type;
++	scalar_type.vecsize = 1;
++	scalar_type.columns = 1;
++	return type.vecsize == 1 ? comps : join(type_to_glsl(type), "(", comps, ")");
++}
++
++void CompilerMSL::emit_mesh_payload_load(const SPIRType &type, const std::string &lhs, uint32_t location,
++                                         uint32_t component)
++{
++	if (!type.array.empty())
++	{
++		auto &elem_type = get<SPIRType>(type.parent_type);
++		uint32_t elem_slots = mesh_payload_location_slots(elem_type);
++		for (uint32_t i = 0; i < to_array_size_literal(type); i++)
++			emit_mesh_payload_load(elem_type, join(lhs, "[", i, "]"), location + i * elem_slots, component);
++		return;
++	}
++	if (type.basetype == SPIRType::Struct)
++	{
++		uint32_t loc = location;
++		for (uint32_t m = 0; m < uint32_t(type.member_types.size()); m++)
++		{
++			auto &mbr_type = get<SPIRType>(type.member_types[m]);
++			if (has_member_decoration(type.self, m, DecorationLocation))
++				loc = get_member_decoration(type.self, m, DecorationLocation);
++			uint32_t comp = get_member_decoration(type.self, m, DecorationComponent);
++			emit_mesh_payload_load(mbr_type, join(lhs, ".", to_member_name(type, m)), loc, comp);
++			loc += mesh_payload_location_slots(mbr_type);
++		}
++		return;
++	}
++	if (type.columns > 1)
++	{
++		auto col_type = type;
++		col_type.columns = 1;
++		for (uint32_t c = 0; c < type.columns; c++)
++			statement(lhs, "[", c, "] = ", mesh_payload_load(col_type, location + c, component), ";");
++		return;
++	}
++	statement(lhs, " = ", mesh_payload_load(type, location, component), ";");
++}
++
+ void CompilerMSL::emit_mesh_wrapper()
+ {
+ 	auto &execution = get_entry_point();
+@@ -1936,15 +2096,14 @@ void CompilerMSL::emit_mesh_wrapper()
+ 	{
+ 		auto out_var_type = get_variable_data_type(get<SPIRVariable>(stage_out_var_id));
+ 
+-		// Emit the payload struct
++		// Emit the payload struct. Must match the Payload declared for the geometry stage.
++		emit_mesh_payload_vertex_struct();
+ 		statement("struct Payload");
+ 		begin_scope();
+-		// Index of the input primitive, for gl_PrimitiveIDIn in the geometry (mesh) stage. It comes
+-		// first, padded to 16 bytes, so that its offset does not depend on the vertex layout.
+-		// Must match the Payload declared for the geometry stage.
++		// Index of the input primitive, for gl_PrimitiveIDIn in the geometry (mesh) stage.
+ 		statement("uint primitiveId;");
+ 		statement("uint spvPayloadPad[3];");
+-		statement(join(type_to_glsl(out_var_type), " vertices[", std::to_string(vertex_count_in_primitive(msl_options.input_primitive_type)), "];"));
++		statement(join("spvGSVertex vertices[", std::to_string(vertex_count_in_primitive(msl_options.input_primitive_type)), "];"));
+ 		end_scope(";");
+ 
+ 		// Emit struct with info about the draw call.
+@@ -2115,7 +2274,7 @@ void CompilerMSL::emit_mesh_wrapper()
+ 			statement(to_name(var.self), " = ", load_string, get_normalization_string(variable.format, variable.normalized), ";");
+ 		});
+ 
+-		statement("payload.vertices[i] = ", execution.name, "(");
++		statement("auto spvVSOut = ", execution.name, "(");
+ 		bool need_comma = false;
+ 		if (stage_in_var_id)
+ 		{
+@@ -2181,6 +2340,45 @@ void CompilerMSL::emit_mesh_wrapper()
+ 
+ 		statement(");");
+ 
++		// Store the vertex outputs into the payload by builtin / location.
++		for (uint32_t m = 0; m < uint32_t(out_var_type.member_types.size()); m++)
++		{
++			auto &mbr_type = get<SPIRType>(out_var_type.member_types[m]);
++			string mbr_expr = join("spvVSOut.", to_member_name(out_var_type, m));
++			BuiltIn bi = BuiltInMax;
++			if (is_member_builtin(out_var_type, m, &bi))
++			{
++				switch (bi)
++				{
++				case BuiltInPosition:
++					statement("payload.vertices[i].position = ", mbr_expr, ";");
++					break;
++				case BuiltInPointSize:
++					statement("payload.vertices[i].pointSize = ", mbr_expr, ";");
++					break;
++				case BuiltInClipDistance:
++				case BuiltInCullDistance:
++				{
++					const char *dst = bi == BuiltInClipDistance ? "clipDistance" : "cullDistance";
++					uint32_t n = mbr_type.array.empty() ? 1 : to_array_size_literal(mbr_type);
++					for (uint32_t k = 0; k < n && k < kMeshPayloadClipCullDistances; k++)
++						statement("payload.vertices[i].", dst, "[", k, "] = ", mbr_expr, mbr_type.array.empty() ? "" : join("[", k, "]"), ";");
++					break;
++				}
++				default:
++					break;
++				}
++				continue;
++			}
++			if (!has_member_decoration(out_var_type.self, m, DecorationLocation))
++				continue;
++			// Clip/cull distances are declared as user attributes in the output struct.
++			if (has_member_decoration(out_var_type.self, m, DecorationBuiltIn))
++				continue;
++			emit_mesh_payload_store(mbr_type, mbr_expr, get_member_decoration(out_var_type.self, m, DecorationLocation),
++			                        get_member_decoration(out_var_type.self, m, DecorationComponent));
++		}
++
+ 		end_scope();
+ 
+ 		statement("meshGridProperties.set_threadgroups_per_grid(uint3(1, 1, 1));");
+@@ -2191,35 +2389,14 @@ void CompilerMSL::emit_mesh_wrapper()
+ 	{
+ 		assert(execution.model == ExecutionModelGeometry);
+ 
+-		// Emit the payload struct
++		// Emit the payload struct. Must match the Payload declared for the vertex (object) stage.
++		int vertex_count = get_primitive_vertex_count();
++		emit_mesh_payload_vertex_struct();
+ 		statement("struct Payload");
+ 		begin_scope();
+ 		statement("uint primitiveId;");
+ 		statement("uint spvPayloadPad[3];");
+-		statement("struct");
+-		begin_scope();
+-
+-		statement("struct ");
+-		begin_scope();
+-
+-		auto &ib_var = get<SPIRVariable>(stage_in_var_id);
+-		auto &ib_type = get_variable_data_type(ib_var);
+-
+-		msl_options.for_mesh_pipeline = false;
+-		int i = 0;
+-		for (auto &member : ib_type.member_types)
+-		{
+-			auto type = get<SPIRType>(member);
+-			auto parent = get<SPIRType>(type.parent_type);
+-			emit_struct_member(ib_type, type.parent_type, i);
+-			i++;
+-		}
+-		msl_options.for_mesh_pipeline = true;
+-
+-		int vertex_count = get_primitive_vertex_count();
+-
+-		end_scope_decl("in");
+-		end_scope_decl(join("vertices[", std::to_string(vertex_count), "]"));
++		statement("spvGSVertex vertices[", vertex_count, "];");
+ 		end_scope(";");
+ 
+ 		// Mesh entry point.
+@@ -2251,29 +2428,70 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		statement("for (unsigned long i = 0; i < vertexCount; ++i)");
+ 		begin_scope();
+ 
+-		statement("auto out = payload.vertices[i];");
++		statement("const object_data spvGSVertex &vtx = payload.vertices[i];");
+ 
+-		ir.for_each_typed_id<SPIRVariable>([&](uint32_t id, SPIRVariable &var)
++		// Load the geometry inputs (members of the stage-in struct, arrays over the input vertices)
++		// from the payload by builtin / location. Per-primitive builtins (gl_PrimitiveIDIn,
++		// gl_InvocationID) are passed to the geometry entry point as arguments below.
+ 		{
+-			std::string name = to_name(id);
+-
+-			if (var.storage != StorageClassInput)
+-				return;
+-
+-			if (!interface_variable_exists_in_entry_point(var.self))
+-				return;
+-
+-			if (is_hidden_variable(var, true))
+-				return;
+-
+-			// Per-primitive builtins (gl_PrimitiveIDIn, gl_InvocationID) are not per-vertex payload
+-			// members; they are passed to the geometry entry point as arguments below.
+-			if (is_geometry_direct_input_builtin(var))
+-				return;
+-
+-			statement("if (i < sizeof(", name, ") / sizeof(", name, "[0]))");
+-			statement("\t", name, "[i] = out.", name, ";");
+-		});
++			auto &ib_type = get_variable_data_type(get<SPIRVariable>(stage_in_var_id));
++			string ib_name = to_name(stage_in_var_id);
++			auto load_builtin = [&](BuiltIn bi, const SPIRType &type, const string &lhs) {
++				switch (bi)
++				{
++				case BuiltInPosition:
++					statement(lhs, " = vtx.position;");
++					break;
++				case BuiltInPointSize:
++					statement(lhs, " = vtx.pointSize;");
++					break;
++				case BuiltInClipDistance:
++				case BuiltInCullDistance:
++				{
++					const char *src = bi == BuiltInClipDistance ? "clipDistance" : "cullDistance";
++					uint32_t n = type.array.empty() ? 1 : to_array_size_literal(type);
++					for (uint32_t k = 0; k < n && k < kMeshPayloadClipCullDistances; k++)
++						statement(lhs, type.array.empty() ? "" : join("[", k, "]"), " = vtx.", src, "[", k, "];");
++					break;
++				}
++				default:
++					break;
++				}
++			};
++			for (uint32_t m = 0; m < uint32_t(ib_type.member_types.size()); m++)
++			{
++				auto &mbr_type = get<SPIRType>(ib_type.member_types[m]);
++				if (mbr_type.array.empty())
++					continue; // Not per-vertex.
++				auto &elem_type = get<SPIRType>(mbr_type.parent_type);
++				string lhs = join(ib_name, ".", to_member_name(ib_type, m), "[i]");
++				BuiltIn bi = BuiltInMax;
++				if (elem_type.basetype == SPIRType::Struct && is_builtin_type(elem_type))
++				{
++					// gl_in[] block: load its builtin members.
++					for (uint32_t bm = 0; bm < uint32_t(elem_type.member_types.size()); bm++)
++					{
++						BuiltIn bbi = BuiltInMax;
++						if (is_member_builtin(elem_type, bm, &bbi))
++							load_builtin(bbi, get<SPIRType>(elem_type.member_types[bm]), join(lhs, ".", to_member_name(elem_type, bm)));
++					}
++				}
++				else if (is_member_builtin(ib_type, m, &bi) && bi != BuiltInClipDistance && bi != BuiltInCullDistance)
++				{
++					load_builtin(bi, elem_type, lhs);
++				}
++				else if (has_member_decoration(ib_type.self, m, DecorationBuiltIn))
++				{
++					bi = BuiltIn(get_member_decoration(ib_type.self, m, DecorationBuiltIn));
++					load_builtin(bi, elem_type, lhs);
++				}
++				else if (has_member_decoration(ib_type.self, m, DecorationLocation))
++				{
++					emit_mesh_payload_load(elem_type, lhs, get_member_decoration(ib_type.self, m, DecorationLocation),
++					                       get_member_decoration(ib_type.self, m, DecorationComponent));
++				}
++			}
++		}
+ 
+ 		end_scope();
+ 
+@@ -9320,6 +9538,16 @@ void CompilerMSL::emit_specialization_constants_and_structs()
+ 	});
+ 
+ 	bool builtin_block_type_is_required = is_mesh_shader();
++	// gl_in[] of an emulated geometry shader is an array of the gl_PerVertex struct in the stage-in struct.
++	if (get_execution_model() == ExecutionModelGeometry)
++	{
++		ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
++			auto &type = get_variable_data_type(var);
++			if (var.storage == StorageClassInput && is_array(type) && has_decoration(type.self, DecorationBlock) &&
++			    is_builtin_type(type))
++				builtin_block_type_is_required = true;
++		});
++	}
+ 	// Very special case. If gl_PerVertex is initialized as an array (tessellation)
+ 	// we have to potentially emit the gl_PerVertex struct type so that we can emit a constant LUT.
+ 	ir.for_each_typed_id<SPIRConstant>([&](uint32_t, SPIRConstant &c) {
+@@ -10244,6 +10472,10 @@ bool CompilerMSL::prepare_access_chain_for_scalar_access(std::string &expr, cons
+ bool CompilerMSL::access_chain_needs_stage_io_builtin_translation(uint32_t base)
+ {
+ 	auto *var = maybe_get_backing_variable(base);
++	// gl_in[] of an emulated geometry shader is an array of gl_PerVertex structs in the stage-in
++	// struct: its members are accessed as plain struct members.
++	if (var && get_execution_model() == ExecutionModelGeometry && var->storage == StorageClassInput)
++		return false;
+ 	if (!var || !is_tessellation_shader())
+ 		return true;
+ 
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 6e1ea33d..7f2524ef 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -1138,6 +1138,11 @@ protected:
+ 	void emit_interface_block(uint32_t ib_var_id);
+ 	bool maybe_emit_array_assignment(uint32_t id_lhs, uint32_t id_rhs);
+ 	void emit_mesh_wrapper();
++	void emit_mesh_payload_vertex_struct();
++	uint32_t mesh_payload_location_slots(const SPIRType &type);
++	void emit_mesh_payload_store(const SPIRType &type, const std::string &expr, uint32_t location, uint32_t component);
++	std::string mesh_payload_load(const SPIRType &type, uint32_t location, uint32_t component);
++	void emit_mesh_payload_load(const SPIRType &type, const std::string &lhs, uint32_t location, uint32_t component);
+ 	bool is_var_runtime_size_array(const SPIRVariable &var) const;
+ 	uint32_t get_resource_array_size(const SPIRType &type, uint32_t id) const;
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,139 @@
+From 715df38b62f0db520b7c96f9cec55eadb619920a Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Mon, 5 Oct 2026 11:09:15 +0300
+Subject: [PATCH 25/25] Log the MSL source of failed shader library compiles
+
+When Metal fails to compile the MSL of a shader, write it to stderr right after the error, every
+line prefixed with "[mvk-msl] ": the first 40 lines, a "... (N lines total)" line if there are more,
+and the 5 lines before and after each line the compiler error names ("program_source:LINE:", up to
+4 locations), prefixed with their line number. Lines are cut at 512 bytes. One write(), so the
+lines are not interleaved with other output. The launcher attaches these lines to its error
+reports, which only carried the compiler messages so far.
+---
+ .../MoltenVK/GPUObjects/MVKShaderModule.h     |  2 +
+ .../MoltenVK/GPUObjects/MVKShaderModule.mm    | 73 +++++++++++++++++++
+ 2 files changed, 75 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
+index c76c3d1..8f2d5d7 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
+@@ -320,8 +320,10 @@ protected:
+ 	bool compileComplete(id<MTLLibrary> mtlLibrary, NSError *error);
+ 	void handleError() override;
+ 	void logCompilation(MTLCompileOptions*);
++	void logMSLSource();
+ 
+ 	id<MTLLibrary> _mtlLibrary = nil;
++	NSString* _mslSourceCode = nil;		// Not retained, only valid during newMTLLibrary().
+ };
+ 
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index 7fd7f7d..1994b9d 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -20,6 +20,7 @@
+ #include "MVKPipeline.h"
+ #include "MVKFoundation.h"
+ #include <sys/stat.h>
++#include <unistd.h>
+ 
+ using namespace std;
+ using namespace mvk;
+@@ -563,6 +564,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 													   const SPIRVToMSLConversionResultInfo& shaderConversionResults,
+ 													   const vector<pair<MSLSpecializationMacroInfo, MVKShaderMacroValue>>& specializationMacroDef) {
+ 	unique_lock<mutex> lock(_completionLock);
++	_mslSourceCode = mslSourceCode;		// For logMSLSource(), from handleError() within compile().
+ 
+ 	compile(lock, ^{
+ 		auto mtlDev = getMTLDevice();
+@@ -593,6 +595,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 			}
+ 		}
+ 	});
++	_mslSourceCode = nil;
+ 
+ 	return [_mtlLibrary retain];
+ }
+@@ -656,6 +659,76 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 				   (long)_compileError.code, _compileError.localizedDescription.UTF8String);
+ 	} else {
+ 		MVKMetalCompiler::handleError();
++		logMSLSource();
++	}
++}
++
++// Writes the MSL of a failed compile to stderr, right after the error, every line prefixed with "[mvk-msl] "
++// (the launcher attaches these lines to its error report): the first lines, then the lines around each line
++// the compiler error names ("program_source:LINE:"), prefixed with their line number. One write(), so the
++// lines are not interleaved with other output.
++void MVKShaderLibraryCompiler::logMSLSource() {
++	static constexpr size_t kHeadLineCount = 40;
++	static constexpr size_t kContextLineCount = 5;
++	static constexpr size_t kMaxErrorLocations = 4;
++	static constexpr size_t kMaxLineLength = 512;
++
++	const char* src = _mslSourceCode.UTF8String;
++	if ( !src ) { return; }
++
++	vector<string_view> lines;
++	for (const char* p = src; *p; ) {
++		const char* eol = strchr(p, '\n');
++		size_t len = eol ? size_t(eol - p) : strlen(p);
++		lines.emplace_back(p, len);
++		p += len + (eol ? 1 : 0);
++	}
++
++	string out;
++	auto append = [&](size_t lineNum, string_view text) {
++		out += "[mvk-msl] ";
++		if (lineNum) {
++			out += to_string(lineNum);
++			out += ": ";
++		}
++		if (text.size() > kMaxLineLength) {
++			out.append(text.substr(0, kMaxLineLength));
++			out += " [...]";
++		} else {
++			out.append(text);
++		}
++		out += '\n';
++	};
++
++	for (size_t i = 0; i < min(kHeadLineCount, lines.size()); i++) {
++		append(0, lines[i]);
++	}
++	if (lines.size() > kHeadLineCount) {
++		out += "[mvk-msl] ... (" + to_string(lines.size()) + " lines total)\n";
++	}
++
++	static constexpr char kLocationPrefix[] = "program_source:";
++	vector<size_t> errorLines;
++	const char* errDesc = _compileError.localizedDescription.UTF8String;
++	for (const char* p = errDesc; p && (p = strstr(p, kLocationPrefix)) && errorLines.size() < kMaxErrorLocations; ) {
++		p += sizeof(kLocationPrefix) - 1;
++		size_t lineNum = strtoul(p, nullptr, 10);
++		if (lineNum && lineNum <= lines.size() && find(errorLines.begin(), errorLines.end(), lineNum) == errorLines.end()) {
++			errorLines.push_back(lineNum);
++		}
++	}
++	for (size_t lineNum : errorLines) {
++		size_t first = lineNum > kContextLineCount ? lineNum - kContextLineCount : 1;
++		size_t last = min(lineNum + kContextLineCount, lines.size());
++		for (size_t n = first; n <= last; n++) {
++			append(n, lines[n - 1]);
++		}
++	}
++
++	for (size_t done = 0; done < out.size(); ) {
++		ssize_t written = write(STDERR_FILENO, out.data() + done, out.size() - done);
++		if (written <= 0) { break; }
++		done += size_t(written);
+ 	}
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

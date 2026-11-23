@@ -1,0 +1,66 @@
+From 93761ea526c1d653e621b4f4df9f2c87e3f50832 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Tue, 6 Oct 2026 11:00:00 +0300
+Subject: [PATCH 23/23] MSL: No __restrict on buffers that share an argument
+ buffer binding
+
+Buffers declared more than once for one argument buffer binding (dxil-spirv declares vkd3d-proton's raw SSBO heap
+binding once per access type) are one member of the argument buffer plus reinterpret_casts of it for the other
+declarations. Each kept its own Restrict decoration: when the member was __restrict and an alias was not, the cast
+dropped the qualifier and Metal rejected the shader ("reinterpret_cast ... casts away qualifiers"; Stellar Blade's
+compute pipelines failed). Restrict is also wrong for pointers that alias each other, so none of the variables of an
+overlapping binding is __restrict.
+---
+ spirv_msl.cpp | 7 +++++++
+ spirv_msl.hpp | 3 +++
+ 2 files changed, 10 insertions(+)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index c07094a..45b039a 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -16794,6 +16794,10 @@ const char *CompilerMSL::to_restrict(uint32_t id, bool space)
+ 	Bitset flags;
+ 	if (ir.ids[id].get_type() == TypeVariable)
+ 	{
++		// Buffers sharing an argument buffer binding alias each other, and the aliases are casts of the declared
++		// member, which must not drop a qualifier.
++		if (argument_buffer_overlapping_vars.count(id))
++			return "";
+ 		uint32_t type_id = expression_type_id(id);
+ 		auto &type = expression_type(id);
+ 		if (type.basetype == SPIRType::Struct &&
+@@ -22329,6 +22333,7 @@ void CompilerMSL::analyze_argument_buffers()
+ 	// you will need to use the remapping from the API.
+ 	for (auto &id : argument_buffer_ids)
+ 		id = 0;
++	argument_buffer_overlapping_vars.clear();
+ 
+ 	// Output resources, sorted by resource index & type.
+ 	struct Resource
+@@ -22559,6 +22564,8 @@ void CompilerMSL::analyze_argument_buffers()
+ 					r2.overlapping_var_id = r1.var->self;
+ 
+ 				set_extended_decoration(r2.var->self, SPIRVCrossDecorationOverlappingBinding, r2.overlapping_var_id);
++				argument_buffer_overlapping_vars.insert(r2.overlapping_var_id);
++				argument_buffer_overlapping_vars.insert(r2.var->self);
+ 			}
+ 		}
+ 
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index edbbbb1..07f17cd 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -1481,6 +1481,9 @@ protected:
+ 	uint32_t pending_robust_buffer_atomic_result_id = 0;
+ 
+ 	SmallVector<uint32_t> buffer_aliases_discrete;
++	// Variables that share an argument buffer binding with another variable (the declared one and its aliases):
++	// none of them is __restrict, so the aliases' casts keep the qualifiers of the declared member.
++	std::unordered_set<uint32_t> argument_buffer_overlapping_vars;
+ 	std::unordered_set<uint32_t> atomic_image_vars_emulated; // Emulate texture2D atomic operations
+ 	// Pointer operands of atomics, and whether the access chain being emitted is one of them: atomics on
+ 	// vector components behind buffer device addresses need a scalar pointer (see
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,105 @@
+From ad2525121ac2bba46513d46c0de61dfbcec3fb47 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sun, 4 Oct 2026 01:30:20 +0300
+Subject: [PATCH 21/22] Geometry-shader pipelines without a fragment shader
+
+Metal asserts (aborting the process) when a mesh render pipeline that rasterizes has no fragment
+function: 'Mesh Render Pipeline Descriptor Validation: fragmentFunction must not be nil'. A
+geometry-shader pipeline without a Vulkan fragment shader and with dynamic rasterizer discard
+(DXVK stream output) reached that state.
+
+Disable rasterization of the mesh pipeline when rasterizer discard is static, otherwise give it
+an empty fragment function (depth-only passes, dynamic rasterizer discard). Do not read
+pMultisampleState when rasterization is disabled (it may be NULL).
+---
+ ...KCommandPipelineStateFactoryShaderSource.h |  3 +++
+ .../Commands/MVKCommandResourceFactory.h      |  3 +++
+ .../Commands/MVKCommandResourceFactory.mm     |  4 ++++
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   | 21 ++++++++++++++++++-
+ 4 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
+index f04d3627..6f0a535f 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
+@@ -307,6 +307,9 @@ typedef struct {
+ // Converts Vulkan indirect draws (VkDrawIndirectCommand or VkDrawIndexedIndirectCommand) for a
+ // geometry-shader (object + mesh) pipeline: mesh threadgroups = primitives x instances, and the
+ // DrawInfo the object stage reads (index buffer at firstIndex, base vertex, base instance).
++// Fragment function of geometry-shader (mesh) pipelines that rasterize without a Vulkan fragment shader.
++fragment void fragCmdMeshWithoutFragmentShader() {}
++
+ kernel void cmdCopyUint32(device uint* dst [[buffer(0)]],
+                           const device uint* src [[buffer(1)]]) {
+ 	dst[0] = src[0];
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h
+index 790d9816..d2b835a4 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h
+@@ -360,6 +360,9 @@ public:
+ 	id<MTLComputePipelineState> newCmdDrawIndirectTessConvertBuffersMTLComputePipelineState(bool indexed,
+ 																							MVKVulkanAPIDeviceObject* owner);
+ 
++	/** Returns a retained empty fragment function, for geometry-shader pipelines without a fragment shader. */
++	id<MTLFunction> newEmptyMeshFragmentFunction();
++
+ 	/** Returns a new MTLComputePipelineState for copying a 32-bit value between buffers. */
+ 	id<MTLComputePipelineState> newCmdCopyUint32MTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm
+index 91a9bea4..569569ab 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm
+@@ -563,6 +563,10 @@
+ 	return newMTLComputePipelineState("cmdDrawIndirectPopulateIndexes", owner);
+ }
+ 
++id<MTLFunction> MVKCommandResourceFactory::newEmptyMeshFragmentFunction() {
++	return newFunctionNamed("fragCmdMeshWithoutFragmentShader");
++}
++
+ id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdCopyUint32MTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
+ 	return newMTLComputePipelineState("cmdCopyUint32", owner);
+ }
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index f8b82407..e74b9adf 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1308,7 +1308,10 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 
+ 	MTLMeshRenderPipelineDescriptor* plDesc = [MTLMeshRenderPipelineDescriptor new];    // retained
+ 
+-    plDesc.rasterSampleCount = mvkSampleCountFromVkSampleCountFlagBits(pCreateInfo->pMultisampleState->rasterizationSamples);
++	// pMultisampleState may be NULL (and must be ignored) when rasterization is disabled.
++	if (_isRasterizing && pCreateInfo->pMultisampleState) {
++		plDesc.rasterSampleCount = mvkSampleCountFromVkSampleCountFlagBits(pCreateInfo->pMultisampleState->rasterizationSamples);
++	}
+ 
+     std::string geomErrorLog;
+     _geometryInputVertexCount = getGeometryShaderInputVertexCount(_geometryModule->getSPIRV(), pGeometrySS->pName, geomErrorLog);
+@@ -1370,6 +1373,22 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 
+ 	addFragmentOutputToPipeline(plDesc, pCreateInfo);
+ 
++	// Metal requires a fragment function in a mesh render pipeline that rasterizes (it asserts in
++	// newRenderPipelineStateWithMeshDescriptor: otherwise). Without a Vulkan fragment shader:
++	// rasterizer discard (static) disables rasterization; otherwise (depth-only passes, dynamic
++	// rasterizer discard) an empty fragment function rasterizes without writing color.
++	if ( !_isRasterizing ) {
++		plDesc.rasterizationEnabled = NO;
++	} else if ( !plDesc.fragmentFunction ) {
++		id<MTLFunction> mtlFunc = getDevice()->getCommandResourceFactory()->newEmptyMeshFragmentFunction();	// temp retained
++		plDesc.fragmentFunction = mtlFunc;
++		[mtlFunc release];
++		if ( !mtlFunc ) {
++			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Could not create the fragment function of a geometry-shader pipeline without a fragment shader."));
++			return nullptr;
++		}
++	}
++
+ 	// Metal does not allow the name of the pipeline to be changed after it has been created,
+ 	// and we need to create the Metal pipeline immediately to provide error feedback to app.
+ 	// The best we can do at this point is set the pipeline name from the layout.
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,34 @@
+From: steamac <steamac@localhost>
+Subject: [PATCH] MSL: Test a dynamic image sampler's primary plane for null
+
+STEAMAC-3W: release events fail Metal compilation at
+is_null_texture(layerSampler) and is_null_texture(tex), where the helper
+argument is spvDynamicImageSampler<float>, not a native Metal texture.
+A YCbCr immutable sampler passed to a sampler2D helper enables this wrapper;
+robustImageAccess2 then emits the invalid native null check.
+
+Provide a matching overload next to the wrapper. The primary plane defines
+whether the descriptor is null; absent extra planes are normal for one-
+and two-plane images. Keep the null result at four zeros, including alpha.
+
+The texture_helpers repro uses the same YCbCr/helper/robust-image path and
+fails with the report's exact compiler error before this change.
+---
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -9631,6 +9631,14 @@ void CompilerMSL::emit_custom_functions()
+ 			end_scope();
+ 			end_scope_decl();
+ 			statement("");
++			// Robust image access tests combined image-sampler arguments just like native textures.
++			// The conversion's extra planes may legitimately be null; plane0 determines descriptor validity.
++			statement("template<typename T>");
++			statement("inline bool is_null_texture(spvDynamicImageSampler<T> image)");
++			begin_scope();
++			statement("return metal::is_null_texture(image.plane0);");
++			end_scope();
++			statement("");
+ 			break;
+ 
+ 		case SPVFuncImplRayQueryIntersectionParams:

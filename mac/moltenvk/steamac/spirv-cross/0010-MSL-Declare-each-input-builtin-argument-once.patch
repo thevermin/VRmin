@@ -1,0 +1,63 @@
+From 0c705086918b4f6d0773847e159978628b87c651 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 22:24:03 +0300
+Subject: [PATCH 10/17] MSL: Declare each input builtin argument once
+
+A module can declare the same input builtin in more than one variable (zink
+declares gl_PrimitiveIDIn both as a shader input and as a system value). Every
+such variable gets the same MSL name, so entry_point_args_builtin() declared
+the argument twice: 'redefinition of parameter gl_PrimitiveIDIn'. Declare one
+argument per builtin, and pass one per builtin from the geometry-shader mesh
+wrapper.
+---
+ spirv_msl.cpp | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 1b916373..e074d3f2 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -2294,11 +2294,16 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		for (auto &resource : resources)
+ 			statement(", ", mesh_wrapper_resource_arg(resource));
+ 
+-		// Builtin arguments, in the order entry_point_args_builtin() declares them.
++		// Builtin arguments, in the order entry_point_args_builtin() declares them (once per builtin).
++		Bitset passed_builtins;
+ 		ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
+ 			if (!is_geometry_direct_input_builtin(var))
+ 				return;
+-			switch (BuiltIn(get_decoration(var.self, DecorationBuiltIn)))
++			auto bi_type = BuiltIn(get_decoration(var.self, DecorationBuiltIn));
++			if (passed_builtins.get(bi_type))
++				return;
++			passed_builtins.set(bi_type);
++			switch (bi_type)
+ 			{
+ 			case BuiltInPrimitiveId:
+ 				statement(", payload.primitiveId");
+@@ -16343,6 +16348,10 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+ 
+ 	// Builtin variables
+ 	SmallVector<pair<SPIRVariable *, BuiltIn>, 8> active_builtins;
++	// Builtins already declared as an argument. Modules may declare the same input builtin in more
++	// than one variable (zink: gl_PrimitiveIDIn as both a shader input and a system value); they all
++	// have the same MSL name, so only one argument is declared.
++	Bitset declared_direct_builtins;
+ 	ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var) {
+ 		if (var.storage != StorageClassInput)
+ 			return;
+@@ -16363,8 +16372,9 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+ 			// Remember this variable. We may need to correct its type.
+ 			active_builtins.push_back(make_pair(&var, bi_type));
+ 
+-			if (is_direct_input_builtin(bi_type))
++			if (is_direct_input_builtin(bi_type) && !declared_direct_builtins.get(bi_type))
+ 			{
++				declared_direct_builtins.set(bi_type);
+ 				if (bi_type == BuiltInViewportIndex)
+ 					depth_clip_viewport_idx_var_name = to_expression(var_id);
+ 
+-- 
+2.50.1 (Apple Git-155)
+

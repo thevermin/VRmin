@@ -1,0 +1,88 @@
+From b1dc323f9be66dfe794f1523894ff4582abd6fd0 Mon Sep 17 00:00:00 2001
+From: squidbus <175574877+squidbus@users.noreply.github.com>
+Date: Sat, 9 May 2026 17:14:07 -0700
+Subject: [PATCH 09/22] Prevent null dereference in MVKPixelFormats
+
+(cherry picked from commit 2da7c3cb62b30794d279a5c895bee17de0d98aab)
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.h        | 1 +
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm       | 7 +++++--
+ MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm | 4 ++--
+ 3 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index 81a875eb..529cbd61 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -121,6 +121,7 @@ typedef struct MVKMTLDeviceCapabilities {
+ 	bool supportsDepth24Stencil8;
+ 	bool supports32BitFloatFiltering;
+ 	bool supports32BitMSAA;
++	bool supportsRenderLinearTextures;
+ 
+ 	uint8_t getHighestAppleGPU() const;
+ 	uint8_t getHighestMacGPU() const;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 3a16464f..d5386762 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -126,6 +126,9 @@
+ #if MVK_MACOS
+ 	supportsDepth24Stencil8 = mtlDev.isDepth24Stencil8PixelFormatSupported;
+ #endif
++#if !MVK_OS_SIMULATOR
++	supportsRenderLinearTextures = supportsApple1;
++#endif
+ }
+ 
+ 
+@@ -2496,6 +2499,8 @@
+ 	_metalFeatures.dynamicVertexStride = mvkOSVersionIsAtLeast(14.0, 17.0, 1.0) && (supportsMTLGPUFamily(Apple4) || supportsMTLGPUFamily(Mac2));
+ 	_metalFeatures.nativeTextureAtomics = mvkOSVersionIsAtLeast(14.0, 17.0, 1.0) && (supportsMTLGPUFamily(Metal3) || supportsMTLGPUFamily(Apple6) || supportsMTLGPUFamily(Mac2));
+ 
++	_metalFeatures.renderLinearTextures = _gpuCapabilities.supportsRenderLinearTextures;
++
+ 	if (supportsMTLGPUFamily(Mac2)) {
+ 		_metalFeatures.mtlBufferAlignment = 256;
+ 		_metalFeatures.mtlCopyBufferAlignment = 4;
+@@ -2535,7 +2540,6 @@
+ 		_metalFeatures.maxQueryBufferSize = (64 * KIBI);
+ 
+ 		_metalFeatures.maxPerStageDynamicMTLBufferCount = _metalFeatures.maxPerStageBufferCount;
+-		_metalFeatures.renderLinearTextures = true;
+ 		_metalFeatures.tileBasedDeferredRendering = true;
+ 
+ 		// From testing, these guarantees are only true on Apple GPUs.
+@@ -2607,7 +2611,6 @@
+ // iOS, tvOS and visionOS adjustments necessary when running on the simulator.
+ #if MVK_OS_SIMULATOR
+ 	_metalFeatures.mtlBufferAlignment = 256;	// Even on Apple Silicon
+-	_metalFeatures.renderLinearTextures = false;
+ #endif
+ 
+ #define setMSLVersion(maj, min)	\
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
+index cdc72f31..b6d05e3d 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
+@@ -602,7 +602,7 @@
+ 	bool isStencilFmt = isStencilFormat(mtlFormat);
+ 	bool isCombinedDepthStencilFmt = isDepthFmt && isStencilFmt;
+ 	bool isColorFormat = !(isDepthFmt || isStencilFmt);
+-	bool linearRenderSupported = _physicalDevice->getMetalFeatures()->renderLinearTextures;
++	bool linearRenderSupported = _physicalDevice && _physicalDevice->getMetalFeatures()->renderLinearTextures;
+ 	MVKMTLFmtCaps mtlFmtCaps = getCapabilities(mtlFormat, isExtended);
+ 
+ 	MTLTextureUsage mtlUsage = MTLTextureUsageUnknown;
+@@ -1600,7 +1600,7 @@
+ 		// Start with optimal tiling features, and modify.
+ 		vkProps.linearTilingFeatures = vkProps.optimalTilingFeatures;
+ 
+-        if (!_physicalDevice->getMetalFeatures()->renderLinearTextures) {
++        if (!gpuCaps.supportsRenderLinearTextures) {
+             // On macOS IMR GPUs, linear textures cannot be used as attachments, so disable those features.
+             mvkDisableFlags(vkProps.linearTilingFeatures, (kMVKVkFormatFeatureFlagsTexColorAtt |
+                                                            kMVKVkFormatFeatureFlagsTexDSAtt |
+-- 
+2.50.1 (Apple Git-155)
+

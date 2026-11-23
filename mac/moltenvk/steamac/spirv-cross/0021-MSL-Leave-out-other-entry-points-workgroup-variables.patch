@@ -1,0 +1,106 @@
+From 8b909707d775d77c5d3f3a21e254bc74d7388bd5 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Mon, 5 Oct 2026 22:36:20 +0300
+Subject: [PATCH 21/21] MSL: Leave out other entry points' workgroup variables
+
+A SPIR-V module with several entry points (Slang, spirv-link, game engines) declares the workgroup
+variables of its compute entry points for all of them, and SPIRV-Cross moved every Workgroup variable
+of the module into the entry function: the vertex and fragment functions of such a module did not
+compile ("variables in the threadgroup address space cannot be declared in a vertex function"), and a
+zero-initialized workgroup variable also made them use the compute zero-initialization
+(gl_LocalInvocationIndex [[thread_index_in_threadgroup]], gl_WorkGroupSize).
+
+Only compute, mesh and task entry points can use workgroup memory. For other entry points, Workgroup
+variables that no instruction reachable from the entry point references are neither declared nor
+zero-initialized.
+---
+ spirv_msl.cpp | 44 +++++++++++++++++++++++++++++++++++++++++---
+ spirv_msl.hpp |  2 ++
+ 2 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index fe260da..f75cbad 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -3187,6 +3187,7 @@ void CompilerMSL::preprocess_op_codes()
+ 
+ // Move the Private and Workgroup global variables to the entry function.
+ // Non-constant variables cannot have global scope in Metal.
++// Workgroup variables of other entry points (see analyze_workgroup_variables()) are left out.
+ void CompilerMSL::localize_global_variables()
+ {
+ 	auto &entry_func = get<SPIRFunction>(ir.default_entry_point);
+@@ -3198,7 +3199,7 @@ void CompilerMSL::localize_global_variables()
+ 		if (var.storage == StorageClassPrivate || var.storage == StorageClassWorkgroup ||
+ 		    var.storage == StorageClassTaskPayloadWorkgroupEXT)
+ 		{
+-			if (!variable_is_lut(var))
++			if (!variable_is_lut(var) && !unreferenced_workgroup_variables.count(v_id))
+ 				entry_func.add_local_variable(v_id);
+ 			iter = global_variables.erase(iter);
+ 		}
+@@ -21186,9 +21187,46 @@ void CompilerMSL::analyze_sampled_image_usage()
+ 
+ void CompilerMSL::analyze_workgroup_variables()
+ {
+-	ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
++	// Only compute, mesh and task entry points may use workgroup memory, but a module with several entry points
++	// declares the workgroup variables of its compute entry points for all of them. Those cannot be declared in
++	// vertex or fragment functions ("variables in the threadgroup address space cannot be declared in a vertex
++	// function"), nor be zero-initialized there: leave out the ones this entry point does not reference.
++	unreferenced_workgroup_variables.clear();
++	switch (get_execution_model())
++	{
++	case ExecutionModelGLCompute:
++	case ExecutionModelKernel:
++	case ExecutionModelMeshEXT:
++	case ExecutionModelTaskEXT:
++	case ExecutionModelMeshNV:
++	case ExecutionModelTaskNV:
++		break;
++	default:
++	{
++		// Every ID an instruction reachable from the entry point uses (literals may add false positives, which
++		// only keep a variable).
++		struct IdUseHandler : OpcodeHandler
++		{
++			explicit IdUseHandler(Compiler &compiler_) : OpcodeHandler(compiler_) {}
++			bool handle(Op, const uint32_t *args, uint32_t length) override
++			{
++				ids.insert(args, args + length);
++				return true;
++			}
++			std::unordered_set<uint32_t> ids;
++		} handler(*this);
++		traverse_all_reachable_opcodes(get<SPIRFunction>(ir.default_entry_point), handler);
++		ir.for_each_typed_id<SPIRVariable>([&](uint32_t id, SPIRVariable &var) {
++			if (var.storage == StorageClassWorkgroup && !handler.ids.count(id))
++				unreferenced_workgroup_variables.insert(id);
++		});
++		break;
++	}
++	}
++
++	ir.for_each_typed_id<SPIRVariable>([&](uint32_t id, SPIRVariable &var) {
+ 		// If workgroup variables have initializer, it can only be ConstantNull (zero init)
+-		if (var.storage == StorageClassWorkgroup && var.initializer)
++		if (var.storage == StorageClassWorkgroup && var.initializer && !unreferenced_workgroup_variables.count(id))
+ 		{
+ 			needs_workgroup_zero_init = true;
+ 
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 3c4ee43..edbbbb1 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -1421,6 +1421,8 @@ protected:
+ 	bool needs_sample_id = false;
+ 	bool needs_helper_invocation = false;
+ 	bool needs_workgroup_zero_init = false;
++	// Workgroup variables of the module that this (non-compute) entry point does not reference.
++	std::unordered_set<uint32_t> unreferenced_workgroup_variables;
+ 	bool needs_point_size_output = false;
+ 	bool writes_to_depth = false;
+ 	bool writes_to_point_size = false;
+-- 
+2.50.1 (Apple Git-155)
+

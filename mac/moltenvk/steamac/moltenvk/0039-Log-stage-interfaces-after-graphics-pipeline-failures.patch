@@ -1,0 +1,60 @@
+From: steamac <steamac@localhost>
+Subject: [PATCH] Log shader interfaces after graphics pipeline compilation fails
+
+STEAMAC-2M contains only a Metal varying link error at locn3: the previous
+report cannot distinguish absent vertex outputs from incompatible types.
+STEAMAC-41 contains only a Metal internal compiler error. Neither includes
+shader source or interface details, so a shader fix cannot be inferred.
+
+On failures only, reflect each original stage and log entry point, shader
+hash, input/output locations, scalar category, width and usage. Use the MSL
+diagnostic stream so launcher's existing error-tail capture attaches these
+interfaces to the next report. Do not change shader behavior speculatively.
+No reflection or diagnostic allocation is added on successful pipelines.
+---
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1236,6 +1275,42 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 			_hasValidMTLPipelineStates = false;
+ 		}
+ 	}
++	// Link failures have no program_source line numbers. Preserve the stage interfaces in the
++	// same diagnostic stream as MSL errors, rather than guessing whether a varying is missing
++	// or has a different numeric type (STEAMAC-2M), or losing all context for a Metal ICE (41).
++	if (!_hasValidMTLPipelineStates && getConfigurationResult() != VK_PIPELINE_COMPILE_REQUIRED) {
++		std::ostringstream diagnostic;
++		diagnostic << "[mvk-msl] // Failed graphics pipeline stage interfaces (SPIR-V BaseType values)\n";
++		auto logStage = [&](const char* label, MVKShaderModule* module,
++							const VkPipelineShaderStageCreateInfo* stage, spv::ExecutionModel model) {
++			if (!module || !stage || module->getSPIRV().empty()) { return; }
++			diagnostic << "[mvk-msl] // " << label << " entry=" << stage->pName
++					   << " hash=" << std::hex << module->getKey().codeHash << std::dec << "\n";
++			for (bool input : {true, false}) {
++				SPIRVShaderOutputs variables;
++				std::string error;
++				bool ok = input ? getShaderInputs(module->getSPIRV(), model, stage->pName, variables, error)
++								: getShaderOutputs(module->getSPIRV(), model, stage->pName, variables, error);
++				if (!ok) {
++					diagnostic << "[mvk-msl] // reflection failed: " << error << "\n";
++					continue;
++				}
++				for (auto& var : variables) {
++					diagnostic << "[mvk-msl] // " << (input ? "in" : "out") << " location=" << var.location
++							   << " component=" << var.component << " type=" << unsigned(var.baseType)
++							   << " width=" << var.vecWidth << " builtin=" << unsigned(var.builtin)
++							   << " used=" << var.isUsed << " patch=" << var.perPatch << "\n";
++				}
++			}
++		};
++		logStage("vertex", _vertexModule, pVertexSS, spv::ExecutionModelVertex);
++		logStage("tess-control", _tessCtlModule, pTessCtlSS, spv::ExecutionModelTessellationControl);
++		logStage("tess-eval", _tessEvalModule, pTessEvalSS, spv::ExecutionModelTessellationEvaluation);
++		logStage("geometry", _geometryModule, pGeometrySS, spv::ExecutionModelGeometry);
++		logStage("fragment", _fragmentModule, pFragmentSS, spv::ExecutionModelFragment);
++		auto text = diagnostic.str();
++		write(STDERR_FILENO, text.data(), text.size());
++	}
+ 
+ 	if (pPipelineFB) {
+ 		if ( _hasValidMTLPipelineStates ) {

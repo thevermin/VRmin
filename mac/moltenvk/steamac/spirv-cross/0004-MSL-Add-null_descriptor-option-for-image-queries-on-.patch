@@ -1,0 +1,64 @@
+From 04faecac8bf3d729e13e215516a6283be86f47e7 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 21:20:57 +0300
+Subject: [PATCH 04/17] MSL: Add null_descriptor option for image queries on
+ null textures
+
+VK_EXT_robustness2 nullDescriptor requires image size/levels/samples queries on
+null descriptors to return zero. Metal does not guarantee that for nil textures
+(get_num_mip_levels() of a nil texture2d returned 1 on Apple M4 / macOS 15).
+SPIRV-Cross only zeroed these queries under robust_image_access2; add
+null_descriptor so that the API can request it with nullDescriptor alone.
+
+gamescope enables only nullDescriptor and detects a disabled shaper/3D LUT with
+textureQueryLevels(s_shaperLut[i]) == 0 on a null descriptor; without this the
+LUT path ran on nil textures and composited black.
+---
+ spirv_msl.cpp | 7 +++----
+ spirv_msl.hpp | 5 +++++
+ 2 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index b300ae34..bfee2a9b 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -11019,9 +11019,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 
+ 		expr += ")";
+ 
+-		// For robustImageAccess2 with nullDescriptor support,
+-		// image size queries on null images must return zero.
+-		if (msl_options.robust_image_access2)
++		// With nullDescriptor support, image size queries on null images must return zero.
++		if (msl_options.robust_image_access2 || msl_options.null_descriptor)
+ 		{
+ 			string zero_expr = type_to_glsl(rslt_type) + "(0)";
+ 			expr = join("(is_null_texture(", img_exp, ") ? ", zero_expr, " : ", expr, ")");
+@@ -11089,7 +11088,7 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 		uint32_t img_id = ops[2];                                                           \
+ 		string img_exp = to_expression(img_id);                                             \
+ 		string expr = type_to_glsl(rslt_type) + "(" + img_exp + ".get_num_" #qrytype "())"; \
+-		if (msl_options.robust_image_access2)                                               \
++		if (msl_options.robust_image_access2 || msl_options.null_descriptor)                \
+ 		{                                                                                   \
+ 			string zero_expr = type_to_glsl(rslt_type) + "(0)";                             \
+ 			expr = join("(is_null_texture(", img_exp, ") ? ", zero_expr, " : ", expr, ")"); \
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 9d2e50b6..f6b3142d 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -595,6 +595,11 @@ public:
+ 		// OOB image writes and atomics are discarded/return zero.
+ 		bool robust_image_access2 = false;
+ 
++		// VK_EXT_robustness2 nullDescriptor is enabled: image size/levels/samples queries on null
++		// (nil) textures must return zero. Metal does not guarantee that for nil textures.
++		// Implied by robust_image_access2.
++		bool null_descriptor = false;
++
+ 		bool is_ios() const
+ 		{
+ 			return platform == iOS;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,180 @@
+From c6aedec7df88154ae22fdb6ebbaa69b55bab3b71 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 21:53:56 +0300
+Subject: [PATCH 05/17] MSL: Support gl_PrimitiveIDIn / gl_PrimitiveID in
+ mesh-emulated geometry shaders
+
+The geometry-shader-as-mesh-shader emulation treated every input variable as a
+per-vertex payload member. A geometry shader reading gl_PrimitiveIDIn (zink
+emits one for gl_PrimitiveID passthrough; zink names it
+VARYING_SLOT_PRIMITIVE_ID) produced invalid MSL: the mesh wrapper copied
+'VARYING_SLOT_PRIMITIVE_ID[i] = out.VARYING_SLOT_PRIMITIVE_ID' from a payload
+member that does not exist and called the geometry function without its
+primitive ID argument. The output gl_PrimitiveID was dropped and named like the
+input.
+
+- The object (vertex) stage stores the input primitive index
+  (thread_position_in_grid.x) in a new leading Payload member primitiveId (padded to 16 bytes so that its
+  offset does not depend on the vertex layout);
+  the geometry (mesh) Payload declares the same member.
+- Direct-input builtins (gl_PrimitiveIDIn, gl_InvocationID) are not copied from
+  the per-vertex payload; the wrapper passes them as arguments in the order
+  entry_point_args_builtin() declares them (primitiveId, 0 for InvocationId).
+- The input is named gl_PrimitiveIDIn; the output gl_PrimitiveID is a uint
+  [[primitive_id]] member of the per-primitive mesh output, so the fragment
+  stage sees the value the geometry shader wrote.
+---
+ spirv_msl.cpp | 63 +++++++++++++++++++++++++++++++++++++++++++++++++--
+ spirv_msl.hpp |  1 +
+ 2 files changed, 62 insertions(+), 2 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index bfee2a9b..75d21ba0 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -1939,6 +1939,11 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		// Emit the payload struct
+ 		statement("struct Payload");
+ 		begin_scope();
++		// Index of the input primitive, for gl_PrimitiveIDIn in the geometry (mesh) stage. It comes
++		// first, padded to 16 bytes, so that its offset does not depend on the vertex layout.
++		// Must match the Payload declared for the geometry stage.
++		statement("uint primitiveId;");
++		statement("uint spvPayloadPad[3];");
+ 		statement(join(type_to_glsl(out_var_type), " vertices[", std::to_string(vertex_count_in_primitive(msl_options.input_primitive_type)), "];"));
+ 		end_scope(";");
+ 
+@@ -2020,6 +2025,7 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		}
+ 
+ 		statement("int instanceIndex = positionInGrid.y;");
++		statement("payload.primitiveId = positionInGrid.x;");
+ 
+ 		statement("for (int i = 0; i < vertexCount; ++i)");
+ 		begin_scope();
+@@ -2182,6 +2188,8 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		// Emit the payload struct
+ 		statement("struct Payload");
+ 		begin_scope();
++		statement("uint primitiveId;");
++		statement("uint spvPayloadPad[3];");
+ 		statement("struct");
+ 		begin_scope();
+ 
+@@ -2252,6 +2260,11 @@ void CompilerMSL::emit_mesh_wrapper()
+ 			if (is_hidden_variable(var, true))
+ 				return;
+ 
++			// Per-primitive builtins (gl_PrimitiveIDIn, gl_InvocationID) are not per-vertex payload
++			// members; they are passed to the geometry entry point as arguments below.
++			if (is_geometry_direct_input_builtin(var))
++				return;
++
+ 			statement("if (i < sizeof(", name, ") / sizeof(", name, "[0]))");
+ 			statement("\t", name, "[i] = out.", name, ";");
+ 		});
+@@ -2277,11 +2290,44 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		for (auto &resource : resources)
+ 			statement(", ", resource.name);
+ 
++		// Builtin arguments, in the order entry_point_args_builtin() declares them.
++		ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
++			if (!is_geometry_direct_input_builtin(var))
++				return;
++			switch (BuiltIn(get_decoration(var.self, DecorationBuiltIn)))
++			{
++			case BuiltInPrimitiveId:
++				statement(", payload.primitiveId");
++				break;
++			case BuiltInInvocationId:
++				// Geometry shader instancing is not supported by the mesh emulation: one invocation.
++				statement(", 0");
++				break;
++			default:
++				statement(", 0 /* Unhandled builtin ", get_decoration(var.self, DecorationBuiltIn), " */");
++				break;
++			}
++		});
++
+ 		statement(");");
+ 		end_scope();
+ 	}
+ }
+ 
++// Returns whether the variable is a builtin input of the geometry stage that becomes a
++// separate entry point argument (rather than a member of the per-vertex stage input).
++bool CompilerMSL::is_geometry_direct_input_builtin(const SPIRVariable &var)
++{
++	if (var.storage != StorageClassInput || !is_builtin_variable(var))
++		return false;
++	auto &type = get_variable_data_type(var);
++	if (type.basetype == SPIRType::Struct || type.basetype == SPIRType::ControlPointArray)
++		return false;
++	auto bi_type = BuiltIn(get_decoration(var.self, DecorationBuiltIn));
++	return active_input_builtins.get(bi_type) && interface_variable_exists_in_entry_point(var.self) &&
++	       is_direct_input_builtin(bi_type);
++}
++
+ 
+ string CompilerMSL::compile()
+ {
+@@ -4969,7 +5015,9 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch, bool
+ 		                               bi_type == BuiltInLayer || bi_type == BuiltInViewportIndex ||
+ 		                               bi_type == BuiltInBaryCoordKHR || bi_type == BuiltInBaryCoordNoPerspKHR ||
+ 		                               bi_type == BuiltInFragDepth ||
+-		                               bi_type == BuiltInFragStencilRefEXT || bi_type == BuiltInSampleMask;
++		                               bi_type == BuiltInFragStencilRefEXT || bi_type == BuiltInSampleMask ||
++		                               (get_execution_model() == ExecutionModelGeometry &&
++		                                storage == StorageClassOutput && bi_type == BuiltInPrimitiveId);
+ 
+ 		if (get_execution_model() == ExecutionModelGeometry)
+ 		{
+@@ -5625,7 +5673,8 @@ uint32_t CompilerMSL::ensure_correct_builtin_type(uint32_t type_id, BuiltIn buil
+ 	auto &pointee_type = get_pointee_type(type);
+ 
+ 	if ((builtin == BuiltInSampleMask && is_array(pointee_type)) ||
+-	    ((builtin == BuiltInLayer || builtin == BuiltInViewportIndex || builtin == BuiltInFragStencilRefEXT) &&
++	    ((builtin == BuiltInLayer || builtin == BuiltInViewportIndex || builtin == BuiltInFragStencilRefEXT ||
++	      (builtin == BuiltInPrimitiveId && get_execution_model() == ExecutionModelGeometry)) &&
+ 	     pointee_type.basetype != SPIRType::UInt))
+ 	{
+ 		uint32_t next_id = ir.increase_bound_by(is_pointer(type) ? 2 : 1);
+@@ -19815,6 +19864,15 @@ string CompilerMSL::builtin_to_glsl(BuiltIn builtin, StorageClass storage)
+ 		return "simd_is_helper_thread()";
+ 
+ 	case BuiltInPrimitiveId:
++		if (get_execution_model() == ExecutionModelGeometry)
++		{
++			// The geometry stage is emulated with a mesh shader. gl_PrimitiveIDIn is an entry point
++			// argument; gl_PrimitiveID is a per-primitive mesh output.
++			if (storage == StorageClassInput)
++				return "gl_PrimitiveIDIn";
++			if (current_function && current_function->self == ir.default_entry_point)
++				return stage_out_mesh_primitive_var_name + ".gl_PrimitiveID";
++		}
+ 		return "gl_PrimitiveID";
+ 
+ 	default:
+@@ -19900,6 +19958,7 @@ string CompilerMSL::builtin_qualifier(BuiltIn builtin)
+ 				SPIRV_CROSS_THROW("PrimitiveId on macOS requires MSL 2.2.");
+ 			return "primitive_id";
+ 		case ExecutionModelMeshEXT:
++		case ExecutionModelGeometry: // Emulated with a mesh shader: per-primitive output.
+ 			return "primitive_id";
+ 		default:
+ 			SPIRV_CROSS_THROW("PrimitiveId is not supported in this execution model.");
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index f6b3142d..ee821406 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -1169,6 +1169,7 @@ protected:
+ 	std::string ensure_valid_name(std::string name, std::string pfx);
+ 	std::string to_sampler_expression(uint32_t id);
+ 	std::string to_plane_expression(const std::string &img_expr, uint32_t plane);
++	bool is_geometry_direct_input_builtin(const SPIRVariable &var);
+ 	std::string to_swizzle_expression(uint32_t id);
+ 	std::string to_texture_offset_expression(uint32_t id);
+ 	std::string to_buffer_size_expression(uint32_t id);
+-- 
+2.50.1 (Apple Git-155)
+

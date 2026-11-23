@@ -1,0 +1,96 @@
+From 7e506fdd5b8a2e0208f954df796aeeb22ac1601f Mon Sep 17 00:00:00 2001
+From: georgii pl <gp@fx.gl>
+Date: Sun, 1 Nov 2026 11:15:40 +0300
+Subject: [PATCH] MSL: remap full-width Vulkan SpecIds to Metal indices
+ (STEAMAC-6A)
+
+Metal function_constant indices stop at 65535, but SpecId is a full uint32 value including UINT32_MAX. Reserve identity mappings for low IDs and allocate unused Metal indices for high IDs. Reflect the original-ID to Metal-index map for API consumers, retaining duplicate-ID defaults and existing scalar conversion handling. MoltenVK must consume this map rather than compare the Metal index with the Vulkan constantID directly.
+
+Original steamac change on top of 939b40b3 plus steamac 0001-0037; not an upstream cherry-pick. Reconstructed s1_useShadow diagnostic before; private SPIRV-Cross and Metal compilation regressions cover both boundaries and no-SpecId constants.
+---
+ spirv_msl.cpp | 29 ++++++++++++++++++++++++++++-
+ spirv_msl.hpp |  9 +++++++++
+ 2 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index bb619d3..31b8f32 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -10138,6 +10138,20 @@ void CompilerMSL::emit_specialization_constants_and_structs()
+ 	// that ID.
+ 	std::unordered_map<uint32_t, ConstantID> unique_func_constants;
+ 
++	// Reserve identity mappings before assigning compact indices to 32-bit SpecIds.
++	// API users must use this reflected map when specializing Metal functions.
++	msl_function_constant_ids.clear();
++	ir.for_each_typed_id<SPIRConstant>([&](uint32_t, const SPIRConstant &c) {
++		if (c.specialization && has_decoration(c.self, DecorationSpecId) && !c.is_used_as_array_length &&
++		    msl_options.supports_msl_version(1, 2))
++		{
++			uint32_t spec_id = get_decoration(c.self, DecorationSpecId);
++			if (spec_id <= 0xffffu)
++				msl_function_constant_ids.emplace(spec_id, spec_id);
++		}
++	});
++	uint32_t next_function_constant_index = 0;
++
+ 	for (auto &id_ : ir.ids_for_constant_undef_or_type)
+ 	{
+ 		auto &id = ir.ids[id_];
+@@ -10172,12 +10186,25 @@ void CompilerMSL::emit_specialization_constants_and_structs()
+ 				{
+ 					// Only scalar, non-composite values can be function constants.
+ 					uint32_t constant_id = get_decoration(c.self, DecorationSpecId);
++					auto mapped_id = msl_function_constant_ids.find(constant_id);
++					if (mapped_id == msl_function_constant_ids.end())
++					{
++						// Vulkan SpecIds span uint32_t, while Metal function constant indices are 16-bit.
++						// Keep all low IDs unchanged and never collide with the internal alignment override.
++						while (next_function_constant_index <= 0xffffu &&
++						       (msl_function_constant_ids.count(next_function_constant_index) ||
++						        next_function_constant_index == msl_options.r32ui_alignment_constant_id))
++							next_function_constant_index++;
++						if (next_function_constant_index > 0xffffu)
++							SPIRV_CROSS_THROW("Too many Metal function constants to remap Vulkan SpecIds.");
++						mapped_id = msl_function_constant_ids.emplace(constant_id, next_function_constant_index++).first;
++					}
+ 					if (!unique_func_constants.count(constant_id))
+ 						unique_func_constants.insert(make_pair(constant_id, c.self));
+ 					SPIRType::BaseType sc_tmp_type = expression_type(unique_func_constants[constant_id]).basetype;
+ 					string sc_tmp_name = to_name(unique_func_constants[constant_id]) + "_tmp";
+ 					if (unique_func_constants[constant_id] == c.self)
+-						statement("constant ", sc_type_name, " ", sc_tmp_name, " [[function_constant(", constant_id,
++						statement("constant ", sc_type_name, " ", sc_tmp_name, " [[function_constant(", mapped_id->second,
+ 						          ")]];");
+ 					// RenderDoc and other instrumentation may reuse the same SpecId with different base types.
+ 					// We deduplicate to one [[function_constant(id)]] temp and then initialize all variants from it.
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 02a094b..668e95a 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -881,6 +881,14 @@ public:
+ 	// These must only be called after a successful call to CompilerMSL::compile().
+ 	bool specialization_constant_is_macro(uint32_t constant_id) const;
+ 
++	// Maps Vulkan SpecIds to Metal function constant indices after compile().
++	// Indices in Metal are limited to 16 bits; larger SpecIds are compacted without changing
++	// the original SPIR-V decorations. Macro-specialized constants are not included.
++	const std::unordered_map<uint32_t, uint32_t> &get_msl_function_constant_ids() const
++	{
++		return msl_function_constant_ids;
++	}
++
+ 	// Returns a mask of SPIR-V FP Fast Math Mode flags, that represents the set of flags that can be applied
+ 	// across all floating-point types. Each FPFastMathDefault execution mode operation identifies the flags
+ 	// for one floating-point type, and the value returned here is a bitwise-AND combination across all types.
+@@ -1397,6 +1405,7 @@ protected:
+ 	std::vector<std::string> typedef_lines;
+ 	SmallVector<uint32_t> vars_needing_early_declaration;
+ 	std::unordered_set<uint32_t> constant_macro_ids;
++	std::unordered_map<uint32_t, uint32_t> msl_function_constant_ids;
+ 
+ 	std::unordered_map<StageSetBinding, std::pair<MSLResourceBinding, bool>, InternalHasher> resource_bindings;
+ 	std::unordered_map<StageSetBinding, uint32_t, InternalHasher> resource_arg_buff_idx_to_binding_number;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,89 @@
+From f200c2be521b62dc12ab363bea2bc37fef55cd90 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Wed, 7 Oct 2026 17:07:00 +0300
+Subject: [PATCH 35/35] Pass the color attachments' numeric types to SPIRV-Cross
+
+STEAMAC-2C: Metal fails a render pipeline whose fragment output has another
+numeric type than its color attachment ("output of type uint4 is not
+compatible with a MTLPixelFormatR32Sint color attachment", a Left 4 Dead 2
+pipeline through DXVK), while Vulkan only leaves the values written undefined.
+
+Set SPIRV-Cross' frag_output_float_mask, frag_output_sint_mask and
+frag_output_uint_mask by color attachment location (VkRenderingAttachment-
+LocationInfo applied) from the attachments' format types, so that it declares
+such outputs with the attachment's type and bit casts the values to it. The
+masks are part of the cached shader conversion options and their archive; the
+12 bytes they add to CompilerMSL::Options leave 4 bytes less padding in
+SPIRVToMSLConversionOptions and SPIRVToMSLConversionConfiguration.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 37 +++++++++++++++++++--
+ 1 file changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 58adde6..b21fa1e 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -2727,6 +2727,36 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 		}
+ 	}
+ 
++	// Metal fails a render pipeline whose fragment output has another numeric type than its color attachment
++	// ("output of type uint4 is not compatible with a MTLPixelFormatR32Sint color attachment", STEAMAC-2C), while
++	// Vulkan only leaves the values written undefined. Tell SPIRV-Cross the attachments' numeric types by location,
++	// so that it declares such outputs with the attachment's type and bit casts the values to it.
++	if (_isRasterizingColor) {
++		auto& mslOpts = shaderConfig.options.mslOptions;
++		for (uint32_t caIdx = 0; caIdx < pRendInfo->colorAttachmentCount; caIdx++) {
++			uint32_t caLoc = _colorAttachmentLocations[caIdx];
++			if (caLoc >= 32) { continue; }	// VK_ATTACHMENT_UNUSED
++			switch (pixFmts->getFormatType(pRendInfo->pColorAttachmentFormats[caIdx])) {
++				case kMVKFormatColorHalf:
++				case kMVKFormatColorFloat:
++					mvkEnableFlags(mslOpts.frag_output_float_mask, 1u << caLoc);
++					break;
++				case kMVKFormatColorInt8:
++				case kMVKFormatColorInt16:
++				case kMVKFormatColorInt32:
++					mvkEnableFlags(mslOpts.frag_output_sint_mask, 1u << caLoc);
++					break;
++				case kMVKFormatColorUInt8:
++				case kMVKFormatColorUInt16:
++				case kMVKFormatColorUInt32:
++					mvkEnableFlags(mslOpts.frag_output_uint_mask, 1u << caLoc);
++					break;
++				default:
++					break;
++			}
++		}
++	}
++
+ 	shaderConfig.options.mslOptions.ios_support_base_vertex_instance = mtlFeats.baseVertexInstanceDrawing;
+ 	shaderConfig.options.mslOptions.texture_1D_as_2D = mvkCfg.texture1DAs2D;
+ 	shaderConfig.options.mslOptions.null_descriptor = getEnabledRobustness2Features().nullDescriptor;
+@@ -3496,6 +3526,9 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+ 				opt.shader_input_wg_index,
+ 				opt.device_index,
+ 				opt.enable_frag_output_mask,
++				opt.frag_output_float_mask,
++				opt.frag_output_sint_mask,
++				opt.frag_output_uint_mask,
+ 				opt.additional_fixed_sample_mask,
+ 				opt.enable_point_size_builtin,
+ 				opt.enable_point_size_default,
+@@ -3862,11 +3895,11 @@ void mvkValidateCeralArchiveDefinitions() {
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLConstexprSampler>();
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVWorkgroupSizeDimension>(3);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVEntryPoint>(20);						// Contains string
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(28);			// Contains string
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(24);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLShaderInterfaceVariable>(6);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLResourceBinding>(2);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::DescriptorBinding>();
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(108);	// Contains collection
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(104);	// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(39);		// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLSpecializationMacroInfo>(22);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<MVKShaderModuleKey>();
+-- 
+2.54.0 (Apple Git-157)
+

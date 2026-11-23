@@ -1,0 +1,124 @@
+From d5d06efc80795fe5e0d127fad08433739abe8560 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Mon, 5 Oct 2026 11:09:15 +0300
+Subject: [PATCH 24/25] Use the largest supported sample count for unsupported
+ sample counts
+
+Apple GPUs support 1, 2 and 4 samples, and MoltenVK reports exactly these in the sample count
+limits and image format properties. Apps and guest drivers still request 8 (D3D games through
+DXVK and Venus), and Metal fails the render pipeline: "rasterSampleCount (8) is not supported by
+device", and the draws using it are skipped.
+
+Graphics pipelines use the largest supported count not greater than rasterizationSamples (with a
+warning), and so do the default sample count of render passes without attachments, the sample
+count of images (Metal cannot create such textures) and of render pass attachments, so they stay
+consistent with each other.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.h      |  7 +++++++
+ MoltenVK/MoltenVK/GPUObjects/MVKImage.mm      |  9 +++++++++
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   | 15 ++++++++++++---
+ MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm |  3 ++-
+ 4 files changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index 4473264..79f2786 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -424,6 +424,13 @@ public:
+ 	/** Returns whether Metal OpenGL mode is enabled and available. */
+ 	bool canUseMetalOpenGLMode() const;
+ 
++	/** Returns the largest sample count supported by the device that is not greater than the specified count. */
++	VkSampleCountFlagBits getSupportedSampleCount(VkSampleCountFlagBits sampleCount) const {
++		uint32_t count = sampleCount;
++		while (count > VK_SAMPLE_COUNT_1_BIT && !(_metalFeatures.supportedSampleCounts & count)) { count >>= 1; }
++		return count ? (VkSampleCountFlagBits)count : VK_SAMPLE_COUNT_1_BIT;
++	}
++
+ 	/** Returns the underlying Metal device. */
+ 	id<MTLDevice> getMTLDevice() const { return _mtlDevice; }
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index a1250dc..259e390 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -1343,6 +1343,15 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+ 		validSamples = VK_SAMPLE_COUNT_1_BIT;
+ 	}
+ 
++	// Metal cannot create textures with sample counts the device does not support (8 on Apple GPUs). Use the
++	// largest supported count, as graphics pipelines do with rasterizationSamples.
++	VkSampleCountFlagBits supportedSamples = getPhysicalDevice()->getSupportedSampleCount(validSamples);
++	if (supportedSamples != validSamples) {
++		reportWarning(VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateImage() : %u samples are not supported by this device, using %u.",
++					  (uint32_t)validSamples, (uint32_t)supportedSamples);
++		validSamples = supportedSamples;
++	}
++
+ 	return validSamples;
+ }
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index ece63d0..f7e5f45 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1325,7 +1325,7 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 
+ 	// pMultisampleState may be NULL (and must be ignored) when rasterization is disabled.
+ 	if (_isRasterizing && pCreateInfo->pMultisampleState) {
+-		plDesc.rasterSampleCount = mvkSampleCountFromVkSampleCountFlagBits(pCreateInfo->pMultisampleState->rasterizationSamples);
++		plDesc.rasterSampleCount = mvkSampleCountFromVkSampleCountFlagBits(getPhysicalDevice()->getSupportedSampleCount(pCreateInfo->pMultisampleState->rasterizationSamples));
+ 	}
+ 
+     std::string geomErrorLog;
+@@ -2509,7 +2509,16 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 
+     // Multisampling - must ignore allowed bad pMultisampleState pointer if rasterization disabled
+     if (_isRasterizing && pCreateInfo->pMultisampleState) {
+-        plDesc.rasterSampleCount = mvkSampleCountFromVkSampleCountFlagBits(pCreateInfo->pMultisampleState->rasterizationSamples);
++		// Metal fails the pipeline with an unsupported rasterSampleCount ("rasterSampleCount (8) is not supported
++		// by device" on Apple GPUs, which support 1, 2 and 4 samples), and apps and guest drivers request counts
++		// the device does not report: use the largest supported count instead.
++		VkSampleCountFlagBits sampleCount = pCreateInfo->pMultisampleState->rasterizationSamples;
++		VkSampleCountFlagBits supportedSampleCount = getPhysicalDevice()->getSupportedSampleCount(sampleCount);
++		if (supportedSampleCount != sampleCount) {
++			reportWarning(VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateGraphicsPipelines(): rasterizationSamples %u is not supported by this device, using %u.",
++						  (uint32_t)sampleCount, (uint32_t)supportedSampleCount);
++		}
++        plDesc.rasterSampleCount = mvkSampleCountFromVkSampleCountFlagBits(supportedSampleCount);
+ #if MVK_USE_METAL_PRIVATE_API
+         if (getMVKConfig().useMetalPrivateAPI && pCreateInfo->pMultisampleState->pSampleMask) {
+             plDesc.sampleMaskMVK = pCreateInfo->pMultisampleState->pSampleMask[0];
+@@ -2520,7 +2529,7 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 
+ 		// If the pipeline uses a specific render subpass, set its default sample count
+ 		if (pCreateInfo->renderPass) {
+-			((MVKRenderPass*)pCreateInfo->renderPass)->getSubpass(pCreateInfo->subpass)->setDefaultSampleCount(pCreateInfo->pMultisampleState->rasterizationSamples);
++			((MVKRenderPass*)pCreateInfo->renderPass)->getSubpass(pCreateInfo->subpass)->setDefaultSampleCount(supportedSampleCount);
+ 		}
+     }
+ }
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm b/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
+index 353ccbc..76ccc70 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
+@@ -980,7 +980,7 @@ static size_t getAttachmentCount(const MVKArrayRef<uint32_t> colorAttIdxs,
+ 												   const VkAttachmentDescription* pCreateInfo) {
+ 	_info.flags = pCreateInfo->flags;
+ 	_info.format = pCreateInfo->format;
+-	_info.samples = pCreateInfo->samples;
++	_info.samples = renderPass->getPhysicalDevice()->getSupportedSampleCount(pCreateInfo->samples);	// Images do the same.
+ 	_info.loadOp = pCreateInfo->loadOp;
+ 	_info.storeOp = pCreateInfo->storeOp;
+ 	_info.stencilLoadOp = pCreateInfo->stencilLoadOp;
+@@ -994,6 +994,7 @@ static size_t getAttachmentCount(const MVKArrayRef<uint32_t> colorAttIdxs,
+ MVKAttachmentDescription::MVKAttachmentDescription(MVKRenderPass* renderPass,
+ 												   const VkAttachmentDescription2* pCreateInfo) {
+ 	_info = *pCreateInfo;
++	_info.samples = renderPass->getPhysicalDevice()->getSupportedSampleCount(pCreateInfo->samples);	// Images do the same.
+ 	_renderPass = renderPass;
+ 	_attachmentIndex = uint32_t(_renderPass->_attachments.size());
+ }
+-- 
+2.50.1 (Apple Git-155)
+

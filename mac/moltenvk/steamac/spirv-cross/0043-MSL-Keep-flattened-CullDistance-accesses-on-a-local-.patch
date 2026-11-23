@@ -1,0 +1,160 @@
+From 45c4372e4e33a0520037d358794dad260fb4d7f1 Mon Sep 17 00:00:00 2001
+From: georgii pl <gp@fx.gl>
+Date: Sun, 1 Nov 2026 11:22:39 +0300
+Subject: [PATCH] MSL: Keep flattened CullDistance accesses on a local array
+
+CullDistance user(cullN) members are scalars, unlike the native ClipDistance array. Keep standalone and gl_PerVertex block accesses and helper arguments on an indexable local, then flatten at return or every geometry EmitVertex using meshStream.vertexData. Preserve arrays for object-stage payloads and captured/tessellation buffers. Preserve block initializers. Reproduces the exact STEAMAC-6E and STEAMAC-66 Metal diagnostics with two- and one-element standalone arrays. Metal 3.1 compilation passes for 24 vertex/capture/object/tessellation/geometry/fragment regression variants.
+---
+ spirv_msl.cpp | 74 ++++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 61 insertions(+), 13 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index cce6ad9..cb4c080 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -4670,19 +4670,20 @@ void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage
+ 
+ 			case StorageClassOutput:
+ 			{
++				string output_ref = get_execution_model() == ExecutionModelGeometry ? "meshStream.vertexData" : ib_var_ref;
+ 				auto hook = [=, &var]() {
+ 					auto value = to_fragment_output_value(*usable_type, out_basetype, join(to_name(var.self), "[", i, "]"));
+ 					if (padded_output)
+ 					{
+ 						auto &padded_type = this->get<SPIRType>(type_id);
+-						statement(ib_var_ref, ".", mbr_name, " = ", remap_swizzle(padded_type, usable_type->vecsize, value),
++						statement(output_ref, ".", mbr_name, " = ", remap_swizzle(padded_type, usable_type->vecsize, value),
+ 						          ";");
+ 					}
+ 					else if (flatten_from_ib_var)
+-						statement(ib_var_ref, ".", mbr_name, " = ", ib_var_ref, ".", flatten_from_ib_mbr_name, "[", i,
++						statement(output_ref, ".", mbr_name, " = ", output_ref, ".", flatten_from_ib_mbr_name, "[", i,
+ 						          "];");
+ 					else
+-						statement(ib_var_ref, ".", mbr_name, " = ", value, ";");
++						statement(output_ref, ".", mbr_name, " = ", value, ";");
+ 				};
+ 				// A geometry shader's outputs go out with each emitted vertex.
+ 				if (get_execution_model() == ExecutionModelGeometry)
+@@ -4783,6 +4784,27 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass
+ 		if (!msl_options.enable_clip_distance_user_varying)
+ 			return;
+ 	}
++	else if (storage == StorageClassOutput && is_builtin && builtin == BuiltInCullDistance &&
++	         !meta.strip_array && meta.allow_local_declaration)
++	{
++		// Unlike ClipDistance, CullDistance has no native Metal array attribute.
++		// Keep an indexable local array even when SPIR-V puts it in gl_PerVertex.
++		uint32_t ids = ir.increase_bound_by(2);
++		auto &ptr_type = set<SPIRType>(ids, mbr_type);
++		ptr_type.pointer = true;
++		ptr_type.pointer_depth++;
++		ptr_type.parent_type = mbr_type_id;
++		ptr_type.storage = StorageClassFunction;
++		uint32_t initializer = 0;
++		if (var.initializer)
++			if (auto *c = maybe_get<SPIRConstant>(var.initializer))
++				initializer = c->subconstants[mbr_idx];
++		set<SPIRVariable>(ids + 1, ids, StorageClassFunction, initializer);
++		set_decoration(ids + 1, DecorationBuiltIn, BuiltInCullDistance);
++		set_name(ids + 1, CompilerGLSL::builtin_to_glsl(BuiltInCullDistance, StorageClassFunction));
++		entry_func.add_local_variable(ids + 1);
++		vars_needing_early_declaration.push_back(ids + 1);
++	}
+ 
+ 	// Recursively handle nested structures.
+ 	if (mbr_type.basetype == SPIRType::Struct)
+@@ -4907,7 +4929,11 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass
+ 		// Unflatten or flatten from [[stage_in]] or [[stage_out]] as appropriate.
+ 		if (!meta.strip_array && meta.allow_local_declaration)
+ 		{
+-			string var_chain = join(var_chain_qual, ".", to_member_name(var_type, mbr_idx), (mbr_is_indexable ? join("[", i, "]") : ""));
++			string var_chain;
++			if (storage == StorageClassOutput && is_builtin && builtin == BuiltInCullDistance)
++				var_chain = join(CompilerGLSL::builtin_to_glsl(builtin, StorageClassFunction), "[", i, "]");
++			else
++				var_chain = join(var_chain_qual, ".", to_member_name(var_type, mbr_idx), (mbr_is_indexable ? join("[", i, "]") : ""));
+ 			switch (storage)
+ 			{
+ 			case StorageClassInput:
+@@ -4932,12 +4958,19 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass
+ 				break;
+ 
+ 			case StorageClassOutput:
+-				entry_func.fixup_hooks_out.push_back([=]() {
+-					if (flatten_from_ib_var)
+-						statement(ib_var_ref, ".", mbr_name, " = ", ib_var_ref, ".", flatten_from_ib_mbr_name, "[", i, "];");
++				{
++					string output_ref = get_execution_model() == ExecutionModelGeometry ? "meshStream.vertexData" : ib_var_ref;
++					auto hook = [=]() {
++						if (flatten_from_ib_var)
++							statement(output_ref, ".", mbr_name, " = ", output_ref, ".", flatten_from_ib_mbr_name, "[", i, "];");
++						else
++							statement(output_ref, ".", mbr_name, " = ", var_chain, ";");
++					};
++					if (get_execution_model() == ExecutionModelGeometry)
++						geometry_vertex_output_hooks.push_back(hook);
+ 					else
+-						statement(ib_var_ref, ".", mbr_name, " = ", var_chain, ";");
+-				});
++						entry_func.fixup_hooks_out.push_back(hook);
++				}
+ 				break;
+ 
+ 			default:
+@@ -5527,7 +5560,13 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
+ 							var_chain_qual += join("[", elem_idx, "]");
+ 						}
+ 
+-						if ((!is_builtin || attribute_load_store) && storage_is_stage_io && is_composite_type)
++						// The object-stage vertex function returns a payload, not Metal stage IO.
++						// Match standalone CullDistance outputs and keep its array intact there.
++						bool payload_cull_array = msl_options.for_mesh_pipeline &&
++						                          get_execution_model() == ExecutionModelVertex &&
++						                          storage == StorageClassOutput && builtin == BuiltInCullDistance;
++						if ((!is_builtin || attribute_load_store) && storage_is_stage_io && is_composite_type &&
++						    !payload_cull_array)
+ 						{
+ 							add_composite_member_variable_to_interface_block(storage, ib_var_ref, ib_type,
+ 							                                                 var, var_type, mbr_idx, meta,
+@@ -5591,7 +5630,8 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
+ 			// Mesh pipelines keep composites whole (stage I/O goes through buffers), except the user outputs of a
+ 			// geometry shader: they are mesh vertex members, which cannot be arrays or matrices either.
+ 			bool mesh_vertex_user_output = msl_options.for_mesh_pipeline && get_execution_model() == ExecutionModelGeometry &&
+-			                               storage == StorageClassOutput && !is_builtin_variable(var);
++			                               storage == StorageClassOutput &&
++			                               (!is_builtin_variable(var) || builtin == BuiltInCullDistance);
+ 			if ((!msl_options.for_mesh_pipeline || mesh_vertex_user_output) && (!is_builtin || attribute_load_store) &&
+ 			    storage_is_stage_io && is_composite_type)
+ 			{
+@@ -18770,8 +18810,10 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+ 			is_using_builtin_array = true;
+ 		}
+ 
++		bool flattened_cull_distance = builtin_type == BuiltInCullDistance &&
++		                               (!msl_options.for_mesh_pipeline || get_execution_model() == ExecutionModelGeometry);
+ 		if (storage == StorageClassOutput && variable_storage_requires_stage_io(storage) &&
+-		    !is_stage_output_builtin_masked(builtin_type))
++		    !is_stage_output_builtin_masked(builtin_type) && !flattened_cull_distance)
+ 			is_using_builtin_array = true;
+ 
+ 		if (is_using_builtin_array)
+@@ -20654,8 +20696,14 @@ string CompilerMSL::builtin_to_glsl(BuiltIn builtin, StorageClass storage)
+ 		/* fallthrough */
+ 	case BuiltInPosition:
+ 	case BuiltInPointSize:
+-	case BuiltInClipDistance:
+ 	case BuiltInCullDistance:
++		// Flattened CullDistance outputs are scalar user(cullN) members, not an
++		// array in the output struct. Access the local array until the output fixup.
++		if (builtin == BuiltInCullDistance && !capture_output_to_buffer &&
++		    (!msl_options.for_mesh_pipeline || get_execution_model() == ExecutionModelGeometry))
++			break;
++		/* fallthrough */
++	case BuiltInClipDistance:
+ 	case BuiltInLayer:
+ 		if (is_tesc_shader())
+ 			break;
+-- 
+2.54.0 (Apple Git-157)
+

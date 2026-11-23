@@ -1,0 +1,36 @@
+From 85ae8043291d8d42b49bdf66ce87eb62a9eb5174 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 23:33:32 +0300
+Subject: [PATCH 14/17] MSL: Triangle fans in the GS object stage
+
+DrawInfo::topoStrip is now 0 for lists, 1 for strips and 2 for triangle fans; primitive x
+of a fan is (0, x + 1, x + 2).
+---
+ spirv_msl.cpp | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 7c27fefd..58458a92 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -2191,12 +2191,15 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		statement("uint vertexIndex;");
+ 		// Odd triangles of a strip take their vertices in the order (n, n + 2, n + 1) to keep the
+ 		// winding (Vulkan spec, triangle strips).
+-		statement("int element = (drawInfo->topoStrip && vertexCount == 3 && (positionInGrid.x & 1) && i > 0) ? 3 - i : i;");
++		// drawInfo->topoStrip: 0 list, 1 strip, 2 triangle fan (primitive x is (0, x + 1, x + 2)).
++		statement("int element = (drawInfo->topoStrip == 1 && vertexCount == 3 && (positionInGrid.x & 1) && i > 0) ? 3 - i : i;");
++		if (vertices_per_primitive == 3)
++			statement("if (drawInfo->topoStrip == 2 && i == 0) element = -int(positionInGrid.x);");
+ 		if (vertices_per_primitive == 6)
+ 		{
+ 			// Triangle strips with adjacency (Vulkan spec, "Triangle Strips With Adjacency"): absolute
+ 			// vertex of each geometry shader input, depending on the primitive's position in the strip.
+-			statement("if (drawInfo->topoStrip)");
++			statement("if (drawInfo->topoStrip == 1)");
+ 			begin_scope();
+ 			statement("int p = int(positionInGrid.x), n = int(gridSize.x), b = 2 * p;");
+ 			statement("int v;");
+-- 
+2.50.1 (Apple Git-155)
+

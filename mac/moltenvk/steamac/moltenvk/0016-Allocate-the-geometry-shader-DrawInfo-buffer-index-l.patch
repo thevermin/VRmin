@@ -1,0 +1,62 @@
+From 76cdfe85f2c9f22188ed85da60e391e9d4eec02d Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sun, 4 Oct 2026 00:31:13 +0300
+Subject: [PATCH 16/22] Allocate the geometry-shader DrawInfo buffer index like
+ the implicit buffers
+
+The DrawInfo buffer of the geometry-shader object stage was fixed at Metal buffer index 20.
+The vertex stage's implicit buffers are allocated downwards below the vertex buffers, so with
+vertex bindings 0..7 (zink declares them) the buffer-size buffer of robust buffer access also
+got index 20: 'cannot reserve buffer resource location at index 20'. Vertex binding 10 would
+also have landed on 20.
+
+Allocate it after the vertex stage's implicit buffers, check it against the descriptor buffers
+like the other implicit buffers, and pass it to SPIRV-Cross (draw_info_index).
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h  | 2 +-
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 9 +++++++++
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index 35611ca4..846f2f62 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -433,7 +433,7 @@ protected:
+ 	MVKShaderImplicitRezBinding _reservedVertexAttributeBufferCount;
+ 	VkPrimitiveTopology _vkPrimitiveTopology;
+ 	uint32_t _outputControlPointCount;
+-    uint32_t _meshDrawInfoBufferIndex = 20;
++    uint32_t _meshDrawInfoBufferIndex = 0;		// Object stage of a geometry-shader pipeline, below the vertex stage's implicit buffers
+ 
+ 	MVKShaderModule* _vertexModule = nullptr;
+ 	MVKShaderModule* _tessCtlModule = nullptr;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 5e0f1d90..3f1a28d5 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1882,6 +1882,12 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 
+ 	if ( !setGeometryInputPrimitiveType(shaderConfig) ) { return false; }
+ 
++	if (_meshDrawInfoBufferIndex < _descriptorBufferCounts.stages[kMVKShaderStageVertex]) {
++		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Vertex shader of a geometry pipeline requires a draw info buffer, but there is no free slot to pass it."));
++		return false;
++	}
++	shaderConfig.options.mslOptions.draw_info_index = _meshDrawInfoBufferIndex;
++
+ 	addVertexInputToShaderConversionConfig(shaderConfig, pCreateInfo);
+ 
+ 	MVKMTLFunction func = getMTLFunction(shaderConfig, pVertexSS, pVertexFB, _vertexModule, "Vertex");
+@@ -2535,6 +2541,9 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 				break;
+ 		}
+ 	}
++	// The DrawInfo buffer of the geometry-shader object stage (the vertex shader) comes after the vertex
++	// stage's implicit buffers, so that it cannot share an index with them or with vertex buffers.
++	_meshDrawInfoBufferIndex = getImplicitBufferIndex(kMVKShaderStageVertex, 9);
+ 
+ 	const VkPipelineRenderingCreateInfo* pRendInfo = getRenderingCreateInfo(pCreateInfo);
+ 	MVKPixelFormats* pixFmts = getPixelFormats();
+-- 
+2.50.1 (Apple Git-155)
+

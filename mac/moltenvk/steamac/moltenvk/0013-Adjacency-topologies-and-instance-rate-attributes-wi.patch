@@ -1,0 +1,317 @@
+From 573264774899acc8806c4978e739917d7c08145b Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 23:20:56 +0300
+Subject: [PATCH 13/22] Adjacency topologies and instance-rate attributes with
+ geometry shaders
+
+- Pipelines with a geometry shader and a *_WITH_ADJACENCY topology set the matching input
+  primitive type (they were treated as the non-adjacency topology, so the geometry shader
+  read half of its input vertices), and draws count primitives with the geometry shader's
+  vertices per primitive (strips with adjacency: n - 3 lines, (n - 4) / 2 triangles), on
+  the CPU and in the indirect-draw conversion kernel.
+- DrawInfo gains vertexDivisors[] by Metal vertex buffer index (per-vertex or the instance
+  divisor of VK_VERTEX_INPUT_RATE_INSTANCE bindings, including
+  VkPipelineVertexInputDivisorStateCreateInfo), so the object stage fetches per-instance
+  attributes by instance.
+---
+ MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm      | 93 ++++++++-----------
+ ...KCommandPipelineStateFactoryShaderSource.h | 11 ++-
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h    |  9 ++
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   | 38 ++++++--
+ 4 files changed, 88 insertions(+), 63 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index 8c69894b..c430bc06 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -168,6 +168,7 @@
+ 	int32_t baseVertex;      // firstVertex (non-indexed) or vertexOffset (indexed)
+ 	uint32_t baseInstance;
+ 	uint32_t vertexStrides[kMVKMaxBufferCount];  // by Metal vertex buffer index
++	uint32_t vertexDivisors[kMVKMaxBufferCount]; // by Metal vertex buffer index: kMVKGeometryPerVertex or instance divisor
+ 	uint8_t topoStrip;
+ };
+ static_assert(kMVKMaxBufferCount == 31, "DrawInfo.vertexStrides must match the SPIRV-Cross object stage");
+@@ -183,9 +184,36 @@ static void setGeometryVertexStrides(DrawInfo& drawInfo, MVKCommandEncoder* cmdE
+ 		if (mtlIdx >= kMVKMaxBufferCount) { continue; }
+ 		drawInfo.vertexStrides[mtlIdx] = dynamicStride ? vkState._vertexBuffers[vkIdx].stride
+ 		                                               : pipeline->getVkVertexBindingStride((uint32_t)vkIdx);
++		drawInfo.vertexDivisors[mtlIdx] = pipeline->getVkVertexBindingDivisor((uint32_t)vkIdx);
+ 	}
+ }
+ 
++/* Returns the vertices per input primitive of the geometry shader and whether the bound topology is a
++ * strip, or false if the primitive type cannot be drawn with a geometry shader. */
++static bool getGeometryPrimitiveShape(MVKCommandEncoder* cmdEncoder, MVKGraphicsPipeline* pipeline,
++									  uint32_t& vertsPerPrim, bool& isStrip) {
++	auto primitiveType = cmdEncoder->getMtlGraphics().getPrimitiveType();
++	switch (primitiveType) {
++		case MTLPrimitiveTypePoint:
++		case MTLPrimitiveTypeLine:
++		case MTLPrimitiveTypeTriangle:      isStrip = false; break;
++		case MTLPrimitiveTypeLineStrip:
++		case MTLPrimitiveTypeTriangleStrip: isStrip = true; break;
++		default:
++			cmdEncoder->reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Unsupported primitive type %lu with a geometry shader.", (unsigned long)primitiveType);
++			return false;
++	}
++	vertsPerPrim = pipeline->getGeometryInputVertexCount();
++	return vertsPerPrim > 0;
++}
++
++/* Returns the number of geometry shader input primitives in a draw of the given number of vertices. */
++static uint32_t getGeometryPrimitiveCount(uint32_t vertexCount, uint32_t vertsPerPrim, bool isStrip) {
++	if ( !isStrip ) { return vertexCount / vertsPerPrim; }
++	if (vertsPerPrim == 6) { return vertexCount >= 6 ? (vertexCount - 4) / 2 : 0; }	// Triangle strip with adjacency
++	return vertexCount >= vertsPerPrim ? vertexCount - vertsPerPrim + 1 : 0;
++}
++
+ #if MVK_XCODE_14
+ /* Parameters of the compute pass that converts indirect draws for geometry-shader (mesh) pipelines.
+  * Must match MVKGeometryIndirectParams in the command shaders. */
+@@ -196,21 +224,9 @@ static void setGeometryVertexStrides(DrawInfo& drawInfo, MVKCommandEncoder* cmdE
+ 	uint32_t vertsPerPrim;
+ 	uint32_t isStrip;
+ 	uint32_t vertexStrides[kMVKMaxBufferCount];
++	uint32_t vertexDivisors[kMVKMaxBufferCount];
+ };
+ 
+-/* Returns the vertices per primitive and whether the topology is a strip, or false if the
+- * primitive type cannot be drawn with a geometry shader. */
+-static bool getGeometryPrimitiveShape(MTLPrimitiveType type, uint32_t& vertsPerPrim, bool& isStrip) {
+-	switch (type) {
+-		case MTLPrimitiveTypePoint:         vertsPerPrim = 1; isStrip = false; return true;
+-		case MTLPrimitiveTypeLine:          vertsPerPrim = 2; isStrip = false; return true;
+-		case MTLPrimitiveTypeLineStrip:     vertsPerPrim = 2; isStrip = true;  return true;
+-		case MTLPrimitiveTypeTriangle:      vertsPerPrim = 3; isStrip = false; return true;
+-		case MTLPrimitiveTypeTriangleStrip: vertsPerPrim = 3; isStrip = true;  return true;
+-		default: return false;
+-	}
+-}
+-
+ /* Encodes indirect draws with a geometry-shader (object + mesh) pipeline: a compute pass turns each
+  * Vulkan indirect draw into mesh threadgroup counts and the DrawInfo the object stage reads, then
+  * each draw is a drawMeshThreadgroupsWithIndirectBuffer. ibb is null for non-indexed draws. */
+@@ -222,11 +238,7 @@ static void encodeGeometryIndirectDraws(MVKCommandEncoder* cmdEncoder, MVKGraphi
+ 
+ 	uint32_t vertsPerPrim = 0;
+ 	bool isStrip = false;
+-	auto primitiveType = cmdEncoder->getMtlGraphics().getPrimitiveType();
+-	if ( !getGeometryPrimitiveShape(primitiveType, vertsPerPrim, isStrip) ) {
+-		cmdEncoder->reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Unsupported primitive type %lu with a geometry shader.", (unsigned long)primitiveType);
+-		return;
+-	}
++	if ( !getGeometryPrimitiveShape(cmdEncoder, pipeline, vertsPerPrim, isStrip) ) { return; }
+ 
+ 	GeometryIndirectParams params = {};
+ 	params.indexed = ibb != nullptr;
+@@ -239,6 +251,7 @@ static void encodeGeometryIndirectDraws(MVKCommandEncoder* cmdEncoder, MVKGraphi
+ 	DrawInfo strides = {};
+ 	setGeometryVertexStrides(strides, cmdEncoder, pipeline);
+ 	memcpy(params.vertexStrides, strides.vertexStrides, sizeof(params.vertexStrides));
++	memcpy(params.vertexDivisors, strides.vertexDivisors, sizeof(params.vertexDivisors));
+ 
+ 	// Per draw: MTLDispatchThreadgroupsIndirectArguments (mesh threadgroups) and DrawInfo.
+ 	const VkDeviceSize dispatchSize = sizeof(MTLDispatchThreadgroupsIndirectArguments) * drawCount;
+@@ -483,23 +496,11 @@ static void encodeGeometryIndirectDraws(MVKCommandEncoder* cmdEncoder, MVKGraphi
+                 } else if (pipeline->isGeometryPipeline()) {
+ 					DrawInfo drawInfo = {};
+ 
+-					auto primitiveType = cmdEncoder->getMtlGraphics().getPrimitiveType();
+-					int threadCount = 0;
+-					if (primitiveType == MTLPrimitiveTypePoint) {
+-						threadCount = _vertexCount;
+-					} else if (primitiveType == MTLPrimitiveTypeLine) {
+-						threadCount = _vertexCount / 2;
+-					} else if (primitiveType == MTLPrimitiveTypeLineStrip) {
+-						threadCount = _vertexCount - 1;
+-						drawInfo.topoStrip = true;
+-					} else if (primitiveType == MTLPrimitiveTypeTriangle) {
+-						threadCount = _vertexCount / 3;
+-					} else if (primitiveType == MTLPrimitiveTypeTriangleStrip) {
+-						threadCount = _vertexCount - 2;
+-						drawInfo.topoStrip = true;
+-					} else {
+-						reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Unsupported primitive type: %lu", primitiveType);
+-					}
++					uint32_t vertsPerPrim = 0;
++					bool isStrip = false;
++					if ( !getGeometryPrimitiveShape(cmdEncoder, pipeline, vertsPerPrim, isStrip) ) { return; }
++					uint32_t threadCount = getGeometryPrimitiveCount(_vertexCount, vertsPerPrim, isStrip);
++					drawInfo.topoStrip = isStrip;
+ 
+ 					drawInfo.baseVertex = (int32_t)_firstVertex;
+ 					drawInfo.baseInstance = _firstInstance;
+@@ -774,23 +775,11 @@ static void encodeGeometryIndirectDraws(MVKCommandEncoder* cmdEncoder, MVKGraphi
+ 
+ 					[cmdEncoder->_mtlRenderEncoder useResource: ibb.mtlBuffer usage: MTLResourceUsageRead stages: MTLRenderStageObject];
+ 
+-					auto primitiveType = cmdEncoder->getMtlGraphics().getPrimitiveType();
+-					int threadCount = 0;
+-					if (primitiveType == MTLPrimitiveTypePoint) {
+-						threadCount = _indexCount;
+-					} else if (primitiveType == MTLPrimitiveTypeLine) {
+-						threadCount = _indexCount / 2;
+-					} else if (primitiveType == MTLPrimitiveTypeLineStrip) {
+-						drawInfo.topoStrip = true;
+-						threadCount = _indexCount - 1;
+-					} else if (primitiveType == MTLPrimitiveTypeTriangle) {
+-						threadCount = _indexCount / 3;
+-					} else if (primitiveType == MTLPrimitiveTypeTriangleStrip) {
+-						drawInfo.topoStrip = true;
+-						threadCount = _indexCount - 2;
+-					} else {
+-						reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Unsupported primitive type %lu.", primitiveType);
+-					}
++					uint32_t vertsPerPrim = 0;
++					bool isStrip = false;
++					if ( !getGeometryPrimitiveShape(cmdEncoder, pipeline, vertsPerPrim, isStrip) ) { return; }
++					uint32_t threadCount = getGeometryPrimitiveCount(_indexCount, vertsPerPrim, isStrip);
++					drawInfo.topoStrip = isStrip;
+ 
+ 					drawInfo.baseVertex = _vertexOffset;
+ 					drawInfo.baseInstance = _firstInstance;
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
+index 19ff659c..59f3fa66 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
+@@ -290,6 +290,7 @@ typedef struct {
+ 	uint32_t vertsPerPrim;
+ 	uint32_t isStrip;
+ 	uint32_t vertexStrides[31];
++	uint32_t vertexDivisors[31];
+ } MVKGeometryIndirectParams;
+ 
+ typedef struct {
+@@ -299,6 +300,7 @@ typedef struct {
+ 	int32_t baseVertex;
+ 	uint32_t baseInstance;
+ 	uint32_t vertexStrides[31];
++	uint32_t vertexDivisors[31];
+ 	uint8_t topoStrip;
+ } MVKGeometryDrawInfo;
+ 
+@@ -329,7 +331,9 @@ kernel void cmdDrawIndirectGeometryConvertBuffers(const device char* srcBuff [[b
+ 		baseInstance = src[3];
+ 	}
+ 	uint32_t primCount;
+-	if (params.isStrip) {
++	if (params.isStrip && params.vertsPerPrim == 6) {
++		primCount = count >= 6 ? (count - 4) / 2 : 0;	// Triangle strip with adjacency
++	} else if (params.isStrip) {
+ 		primCount = count >= params.vertsPerPrim ? count - params.vertsPerPrim + 1 : 0;
+ 	} else {
+ 		primCount = count / params.vertsPerPrim;
+@@ -344,7 +348,10 @@ kernel void cmdDrawIndirectGeometryConvertBuffers(const device char* srcBuff [[b
+ 	drawInfo.indexBuffer = int64_t(params.indexBuffer + uint64_t(firstIndex) * params.indexSize);
+ 	drawInfo.baseVertex = baseVertex;
+ 	drawInfo.baseInstance = baseInstance;
+-	for (uint i = 0; i < 31; i++) { drawInfo.vertexStrides[i] = params.vertexStrides[i]; }
++	for (uint i = 0; i < 31; i++) {
++		drawInfo.vertexStrides[i] = params.vertexStrides[i];
++		drawInfo.vertexDivisors[i] = params.vertexDivisors[i];
++	}
+ 	drawInfo.topoStrip = uint8_t(params.isStrip);
+ }
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index 161caa66..35611ca4 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -213,6 +213,9 @@ protected:
+ 
+ 
+ #pragma mark -
++/** Divisor of a per-vertex binding in the geometry-shader (mesh) path. */
++static constexpr uint32_t kMVKGeometryPerVertex = 0xFFFFFFFF;
++
+ #pragma mark MVKGraphicsPipeline
+ 
+ /** Describes a buffer binding to accommodate vertex attributes with offsets greater than the stride. */
+@@ -325,6 +328,10 @@ public:
+ 	uint32_t getVertexStride(uint32_t binding) const { return _vertexStrides[binding]; }
+ 	/** Returns the binding stride of the given vertex buffer in a geometry-shader (mesh) pipeline (only valid for static strides). */
+ 	uint32_t getVkVertexBindingStride(uint32_t binding) const { return _vkVertexBindingStrides[binding]; }
++	/** Returns kMVKGeometryPerVertex for a per-vertex binding of a geometry-shader (mesh) pipeline, else its instance divisor. */
++	uint32_t getVkVertexBindingDivisor(uint32_t binding) const { return _vkVertexBindingDivisors[binding]; }
++	/** Returns the number of vertices of each geometry shader input primitive (1, 2, 3, 4 or 6). */
++	uint32_t getGeometryInputVertexCount() const { return _geometryInputVertexCount; }
+ 	const VkViewport* getViewports() const { return _viewports; }
+ 	const VkRect2D* getScissors() const { return _scissors; }
+ 	const MTLSamplePosition* getSampleLocations() const { return _sampleLocations; }
+@@ -413,6 +420,8 @@ protected:
+ 	MVKStaticBitSet<kMVKMaxBufferCount> _mtlVertexBuffers;
+ 	uint32_t _vertexStrides[kMVKMaxBufferCount] = {};
+ 	uint32_t _vkVertexBindingStrides[kMVKMaxBufferCount] = {};
++	uint32_t _vkVertexBindingDivisors[kMVKMaxBufferCount] = {};
++	uint32_t _geometryInputVertexCount = 0;
+ 	MVKPipelineStageResourceInfo _stageResources[kMVKShaderStageFragment + 1] = {};
+ 
+ 	id<MTLComputePipelineState> _mtlTessVertexStageState = nil;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 34548c6f..14c26667 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1315,6 +1315,12 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+     // For mesh pipelines, we need to track which vertex buffers are used
+     // so that bindVertexBuffers() can bind them to the object shader.
+     const VkPipelineVertexInputStateCreateInfo* pVI = pCreateInfo->pVertexInputState;
++    const VkPipelineVertexInputDivisorStateCreateInfo* pVIDivisors = nullptr;
++    for (const auto* next = (const VkBaseInStructure*)pVI->pNext; next; next = next->pNext) {
++        if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO) {
++            pVIDivisors = (const VkPipelineVertexInputDivisorStateCreateInfo*)next;
++        }
++    }
+     uint32_t vbCnt = pVI->vertexBindingDescriptionCount;
+     for (uint32_t i = 0; i < vbCnt; i++) {
+         const VkVertexInputBindingDescription* pVKVB = &pVI->pVertexBindingDescriptions[i];
+@@ -1322,7 +1328,18 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+             uint32_t vbIdx = getMetalBufferIndexForVertexAttributeBinding(pVKVB->binding);
+             _mtlVertexBuffers.set(vbIdx);
+             _vkVertexBuffers.set(pVKVB->binding);
+-            _vkVertexBindingStrides[pVKVB->binding] = pVKVB->stride;  // the object stage reads vertices with it
++            // The object stage fetches vertices with these.
++            _vkVertexBindingStrides[pVKVB->binding] = pVKVB->stride;
++            uint32_t divisor = kMVKGeometryPerVertex;
++            if (pVKVB->inputRate == VK_VERTEX_INPUT_RATE_INSTANCE) {
++                divisor = 1;
++                for (uint32_t d = 0; pVIDivisors && d < pVIDivisors->vertexBindingDivisorCount; d++) {
++                    if (pVIDivisors->pVertexBindingDivisors[d].binding == pVKVB->binding) {
++                        divisor = pVIDivisors->pVertexBindingDivisors[d].divisor;
++                    }
++                }
++            }
++            _vkVertexBindingDivisors[pVKVB->binding] = divisor;
+         }
+     }
+ 
+@@ -1782,15 +1799,18 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+ bool MVKGraphicsPipeline::setGeometryInputPrimitiveType(SPIRVToMSLConversionConfiguration& shaderConfig) {
+ 	using Topology = CompilerMSL::Options::PrimitiveTopology;
+ 	auto& inputType = shaderConfig.options.mslOptions.input_primitive_type;
+-	auto mtlPrimitiveType = mvkMTLPrimitiveTypeFromVkPrimitiveTopology(_vkPrimitiveTopology);
+-	switch (mtlPrimitiveType) {
+-		case MTLPrimitiveTypeTriangleStrip: inputType = Topology::TriangleStrip; return true;
+-		case MTLPrimitiveTypeTriangle:      inputType = Topology::Triangles;     return true;
+-		case MTLPrimitiveTypeLineStrip:     inputType = Topology::LineStrip;     return true;
+-		case MTLPrimitiveTypeLine:          inputType = Topology::Lines;         return true;
+-		case MTLPrimitiveTypePoint:         inputType = Topology::Points;        return true;
++	switch (_vkPrimitiveTopology) {
++		case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:                    inputType = Topology::Points;                 _geometryInputVertexCount = 1; return true;
++		case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:                     inputType = Topology::Lines;                  _geometryInputVertexCount = 2; return true;
++		case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:                    inputType = Topology::LineStrip;              _geometryInputVertexCount = 2; return true;
++		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:                 inputType = Topology::Triangles;              _geometryInputVertexCount = 3; return true;
++		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:                inputType = Topology::TriangleStrip;          _geometryInputVertexCount = 3; return true;
++		case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY:      inputType = Topology::LinesAdjacency;         _geometryInputVertexCount = 4; return true;
++		case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY:     inputType = Topology::LineStripAdjacency;     _geometryInputVertexCount = 4; return true;
++		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY:  inputType = Topology::TrianglesAdjacency;     _geometryInputVertexCount = 6; return true;
++		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY: inputType = Topology::TriangleStripAdjacency; _geometryInputVertexCount = 6; return true;
+ 		default:
+-			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Geometry shaders: unsupported topology %lu.", (unsigned long)mtlPrimitiveType));
++			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Geometry shaders: unsupported topology %d.", _vkPrimitiveTopology));
+ 			return false;
+ 	}
+ }
+-- 
+2.50.1 (Apple Git-155)
+

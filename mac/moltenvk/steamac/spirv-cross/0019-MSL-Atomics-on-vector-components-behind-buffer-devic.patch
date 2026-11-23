@@ -1,0 +1,113 @@
+From 0af640334a62a7fb22908c22bdc759980f7aaff9 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Mon, 5 Oct 2026 19:30:00 +0300
+Subject: [PATCH 19/19] MSL: Atomics on vector components behind buffer device
+ addresses
+
+Atomics on a vector component reached through a buffer device address did not compile:
+'atomic_fetch_add_explicit((device atomic_uint*)&region_buffer->region_count[0u], ...)' ("address of
+vector element requested"). vkd3d-proton creates such a pipeline (cs_emit_nv_memory_decompression_regions,
+'atomicAdd(region_buffer.region_count.x, 1)' on a scalar-layout uvec3) on every D3D12 device creation, so
+D3D12CreateDevice failed with E_FAIL.
+
+Vector components of SSBOs and workgroup memory are accessed through a scalar pointer
+('((device uint*)&v)[0u]'), which an atomic can take the address of. That cast is chosen by the effective
+storage class of the access chain base, and for a physical pointer this was the storage class of the
+variable the pointer value was loaded from (push constant, function variable). Report PhysicalStorageBuffer
+for physical pointers, and cast their vector components in the access chains that atomics use (collected by
+the preprocessor). Other component loads and stores behind buffer device addresses keep the vector form:
+with the cast, gathered component loads were 5% slower on an M4 Max (steamac host/moltenvk/bench).
+---
+ spirv_glsl.cpp |  7 +++++++
+ spirv_msl.cpp  | 11 ++++++++++-
+ spirv_msl.hpp  |  5 +++++
+ 3 files changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/spirv_glsl.cpp b/spirv_glsl.cpp
+index f9ce6cb..26721bc 100644
+--- a/spirv_glsl.cpp
++++ b/spirv_glsl.cpp
+@@ -20129,6 +20129,13 @@ uint32_t CompilerGLSL::get_accumulated_member_location(const SPIRVariable &var,
+ 
+ StorageClass CompilerGLSL::get_expression_effective_storage_class(uint32_t ptr)
+ {
++	// A physical pointer carries its storage class in its type. The variable it was loaded from
++	// (a push constant, a function variable holding the pointer value, ...) says nothing about the
++	// memory it points to.
++	auto &ptr_type = expression_type(ptr);
++	if (ptr_type.pointer && ptr_type.storage == StorageClassPhysicalStorageBuffer)
++		return StorageClassPhysicalStorageBuffer;
++
+ 	auto *var = maybe_get_backing_variable(ptr);
+ 
+ 	// If the expression has been lowered to a temporary, we need to use the Generic storage class.
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 3a1ba85..9fb6ac7 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -10710,7 +10710,9 @@ bool CompilerMSL::prepare_access_chain_for_scalar_access(std::string &expr, cons
+ 	// For packed types, we could technically omit this if we know the reference does not have to turn into a pointer
+ 	// of some kind, but that requires external analysis passes to figure out, and
+ 	// this case is likely rare enough that we don't need to bother.
+-	if (storage == StorageClassStorageBuffer || storage == StorageClassWorkgroup)
++	// Behind buffer device addresses, only atomics need it: the cast made component loads slower.
++	if (storage == StorageClassStorageBuffer || storage == StorageClassWorkgroup ||
++	    (storage == StorageClassPhysicalStorageBuffer && emitting_atomic_access_chain))
+ 	{
+ 		const char *addr_space = storage == StorageClassWorkgroup ? "threadgroup" : "device";
+ 		expr = join("((", addr_space, " ", type_to_glsl(type), "*)&", enclose_expression(expr), ")");
+@@ -11862,7 +11864,11 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 				CompilerGLSL::emit_instruction(instruction);
+ 		}
+ 		else
++		{
++			emitting_atomic_access_chain = atomic_pointer_ids.count(ops[1]) != 0;
+ 			CompilerGLSL::emit_instruction(instruction);
++			emitting_atomic_access_chain = false;
++		}
+ 		fix_up_interpolant_access_chain(ops, instruction.length);
+ 
+ 		// If we have pending robust access info, associate it with the result ID
+@@ -21315,6 +21321,7 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
+ 	case OpAtomicXor:
+ 	{
+ 		uses_atomics = true;
++		self.atomic_pointer_ids.insert(args[2]);
+ 		auto it = image_pointers_emulated.find(args[2]);
+ 		if (it != image_pointers_emulated.end())
+ 		{
+@@ -21329,6 +21336,7 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
+ 	case OpAtomicStore:
+ 	{
+ 		uses_atomics = true;
++		self.atomic_pointer_ids.insert(args[0]);
+ 		auto it = image_pointers_emulated.find(args[0]);
+ 		if (it != image_pointers_emulated.end())
+ 		{
+@@ -21343,6 +21351,7 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
+ 	case OpAtomicLoad:
+ 	{
+ 		uses_atomics = true;
++		self.atomic_pointer_ids.insert(args[2]);
+ 		auto it = image_pointers_emulated.find(args[2]);
+ 		if (it != image_pointers_emulated.end())
+ 		{
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 954aec4..17169e5 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -1484,6 +1484,11 @@ protected:
+ 
+ 	SmallVector<uint32_t> buffer_aliases_discrete;
+ 	std::unordered_set<uint32_t> atomic_image_vars_emulated; // Emulate texture2D atomic operations
++	// Pointer operands of atomics, and whether the access chain being emitted is one of them: atomics on
++	// vector components behind buffer device addresses need a scalar pointer (see
++	// prepare_access_chain_for_scalar_access()).
++	std::unordered_set<uint32_t> atomic_pointer_ids;
++	bool emitting_atomic_access_chain = false;
+ 	std::unordered_set<uint32_t> pull_model_inputs;
+ 	std::unordered_set<uint32_t> recursive_inputs;
+ 
+-- 
+2.50.1 (Apple Git-155)
+

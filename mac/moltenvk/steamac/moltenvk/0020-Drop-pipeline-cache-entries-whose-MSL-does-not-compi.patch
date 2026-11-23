@@ -1,0 +1,51 @@
+From b3b13ad28d698759733992050db998dac1aeb92e Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sun, 4 Oct 2026 01:03:34 +0300
+Subject: [PATCH 20/22] Drop pipeline cache entries whose MSL does not compile
+
+Pipeline cache initial data whose MSL did not compile (written by a build with other shader
+conversion) made vkCreatePipelineCache fail with VK_ERROR_INITIALIZATION_FAILED, which Venus
+cannot recover from. Drop such entries instead: the shaders are converted again when used.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm     | 8 +++++++-
+ MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm | 5 +++++
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 90c859f5..f8b82407 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -3286,7 +3286,13 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 					// Add the shader library to the staging cache.
+ 					MVKShaderLibraryCache* slCache = getShaderLibraryCache(smKey);
+ 					addPerformanceInterval(getPerformanceStats().pipelineCache.readPipelineCache, startTime);
+-					slCache->addShaderLibrary(&shaderConversionConfig, resultInfo, compressedMSL);
++					// Initial data must not make the pipeline cache fail: an entry whose MSL does not
++					// compile is dropped (addShaderLibrary()) and its compile error is not kept.
++					VkResult prevResult = getConfigurationResult();
++					if ( !slCache->addShaderLibrary(&shaderConversionConfig, resultInfo, compressedMSL) && prevResult == VK_SUCCESS ) {
++						clearConfigurationResult();
++						reportWarning(VK_SUCCESS, "Dropped a pipeline cache entry whose MSL does not compile.");
++					}
+ 
+ 					break;
+ 				}
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index a75dfb68..7fd7f7de 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -370,6 +370,11 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 														  const SPIRVToMSLConversionResultInfo& resultInfo,
+ 														  const MVKCompressor<std::string> compressedMSL) {
+ 	MVKShaderLibrary* shLib = new MVKShaderLibrary(_owner, resultInfo, compressedMSL);
++	// Cached MSL that no longer compiles is dropped: the shader is converted again when it is used.
++	if ( !shLib->_mtlLibrary ) {
++		shLib->destroy();
++		return nullptr;
++	}
+ 	_shaderLibraries.emplace_back(*pShaderConfig, shLib);
+ 	return shLib;
+ }
+-- 
+2.50.1 (Apple Git-155)
+

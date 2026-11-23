@@ -1,0 +1,39 @@
+From 3977ccfb3bb54e97b683a25701aabfa7628cc0ec Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Tue, 6 Oct 2026 10:30:00 +0300
+Subject: [PATCH 32/32] Size variable-count descriptor sets with buffer sizes
+ for one size slot per element
+
+A variable-count binding whose descriptors keep their sizes in the aux buffer (uniform/storage buffers; texel
+buffers with single texel alignment emulation) added the 4-byte size slot to the GPU size of each variable
+element, and the aux buffer was placed after those enlarged elements; sizeBufSize counts the variable elements'
+slots again in the aux buffer. Every such set took 4 bytes per element more than the pool reserves for it, so a
+pool sized exactly for its sets failed with VK_ERROR_OUT_OF_POOL_MEMORY: one variable-count UBO or SSBO set of 63
+descriptors, and vkd3d-proton's descriptor heaps (one variable-count set per descriptor type in a pool per heap)
+once texel buffer sets kept texel offsets there too (Stellar Blade's first heap; Venus then lost the set and
+stopped the game's command stream). The aux buffer now starts right after the variable elements.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
+index 93e7d46..64a363c 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
+@@ -726,11 +726,11 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
+ 		ret->_cpuVariableElementSize = descriptorCPUSize(variable.cpuLayout);
+ 		ret->_gpuAlignment = gpuAlign;
+ 		if (argBufMode != MVKArgumentBufferMode::ArgEncoder) {
++			// The variable elements' sizes are in the aux buffer after the descriptors (sizeBufSize counts them), so
++			// the aux buffer starts right after the last variable element.
+ 			ret->_gpuAuxBase = gpuOffset;
+ 			ret->_gpuSize = gpuOffset;
+ 			ret->_gpuVariableElementSize = descriptorGPUSizeMetal3(variable.gpuLayout);
+-			if (needsAuxBuf(variable))
+-				ret->_gpuVariableElementSize += sizeof(uint32_t);
+ 		}
+ 	} else {
+ 		if (argBufMode == MVKArgumentBufferMode::ArgEncoder) {
+-- 
+2.50.1 (Apple Git-155)
+

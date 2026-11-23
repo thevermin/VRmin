@@ -1,0 +1,69 @@
+From 73710605f11e51814675e3faae3a719f70ec30a9 Mon Sep 17 00:00:00 2001
+From: georgii pl <gp@fx.gl>
+Date: Sun, 1 Nov 2026 11:14:57 +0300
+Subject: [PATCH] MSL: Keep flattened stage IO in the thread address space
+
+Component-packed outputs use local vectors before their final copy into a captured output buffer. Do not classify those locals, or their extracted helper aliases, as device memory. Use the same classification for helper reference parameters. Reproduces STEAMAC-33 float2/float3 component pointer casts.
+---
+ spirv_msl.cpp | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index bb619d3..cce6ad9 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -16896,6 +16896,11 @@ string CompilerMSL::get_type_address_space(const SPIRType &type, uint32_t id, bo
+ 		break;
+ 
+ 	case StorageClassInput:
++		if (var && variable_decl_is_remapped_storage(*var, StorageClassFunction))
++		{
++			addr_space = "thread";
++			break;
++		}
+ 		if (is_tesc_shader() && var && var->basevariable == stage_in_ptr_var_id)
+ 			addr_space = msl_options.multi_patch_workgroup ? "const device" : "threadgroup";
+ 		// Don't pass tessellation levels in the device AS; we load and convert them
+@@ -16915,6 +16920,11 @@ string CompilerMSL::get_type_address_space(const SPIRType &type, uint32_t id, bo
+ 		break;
+ 
+ 	case StorageClassOutput:
++		if (var && variable_decl_is_remapped_storage(*var, StorageClassFunction))
++		{
++			addr_space = "thread";
++			break;
++		}
+ 		if (capture_output_to_buffer)
+ 		{
+ 			if (var && type.storage == StorageClassOutput)
+@@ -19711,6 +19721,17 @@ string CompilerMSL::constant_op_expression(const SPIRConstantOp &cop)
+ 
+ bool CompilerMSL::variable_decl_is_remapped_storage(const SPIRVariable &variable, StorageClass storage) const
+ {
++	// Flattened/component-packed stage IO is evaluated in a function-local variable,
++	// then copied to or from the interface. Capturing the interface to a device buffer
++	// does not change the address space of that local (or an extracted helper's alias).
++	uint32_t backing_id = variable.basevariable ? uint32_t(variable.basevariable) : uint32_t(variable.self);
++	StorageClass declared_storage = get<SPIRType>(variable.basetype).storage;
++	bool local_stage_io = (declared_storage == StorageClassInput || declared_storage == StorageClassOutput) &&
++	                      find(begin(vars_needing_early_declaration), end(vars_needing_early_declaration), backing_id) !=
++	                          end(vars_needing_early_declaration);
++	if (storage == StorageClassFunction)
++		return local_stage_io;
++
+ 	if (variable.storage == storage)
+ 		return true;
+ 
+@@ -19732,6 +19753,9 @@ bool CompilerMSL::variable_decl_is_remapped_storage(const SPIRVariable &variable
+ 	}
+ 	else if (storage == StorageClassStorageBuffer)
+ 	{
++		if (local_stage_io)
++			return false;
++
+ 		// These builtins are passed directly; we don't want to use remapping
+ 		// for them.
+ 		auto builtin = (BuiltIn)get_decoration(variable.self, DecorationBuiltIn);
+-- 
+2.54.0 (Apple Git-157)
+

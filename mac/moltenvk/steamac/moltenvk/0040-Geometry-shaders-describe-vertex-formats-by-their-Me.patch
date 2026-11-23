@@ -1,0 +1,163 @@
+From: steamac
+Subject: [PATCH] Geometry shaders: describe vertex formats by their Metal vertex format
+
+The object stage took component counts from a VkFormat-indexed table covering only plain
+8/16/32-bit formats: packed and A8B8G8R8/sRGB formats had 0 components, B10G11R11,
+E5B9G9R9 and A8_UNORM indexed past its end, and B8G8R8A8 was read as float4. Derive count,
+normalization and memory layout from the MTLVertexFormat MoltenVK selects (packed layouts
+are unpacked by SPIRV-Cross).
+---
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index b0daded..cc298a2 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1855,88 +1855,63 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 			return MSL_SHADER_VARIABLE_FORMAT_UINT32;
+ 		case MTLVertexFormatInt: case MTLVertexFormatInt2: case MTLVertexFormatInt3: case MTLVertexFormatInt4:
+ 			return MSL_SHADER_VARIABLE_FORMAT_INT32;
++		// Formats whose components are not separate memory elements: the object stage unpacks them.
++		case MTLVertexFormatUChar4Normalized_BGRA:
++			return MSL_SHADER_VARIABLE_FORMAT_UINT8_BGRA;
++		case MTLVertexFormatUInt1010102Normalized:
++			return MSL_SHADER_VARIABLE_FORMAT_UNORM1010102;
++		case MTLVertexFormatInt1010102Normalized:
++			return MSL_SHADER_VARIABLE_FORMAT_SNORM1010102;
++		case MTLVertexFormatFloatRG11B10:
++			return MSL_SHADER_VARIABLE_FORMAT_FLOAT_RG11B10;
++		case MTLVertexFormatFloatRGB9E5:
++			return MSL_SHADER_VARIABLE_FORMAT_FLOAT_RGB9E5;
+ 		default:
+ 			return MSL_SHADER_VARIABLE_FORMAT_OTHER;
+ 	}
+ }
+ 
+ struct MSLVertexFormatInfo {
+-	uint8_t num_elements : 7;
+-	bool normalized : 1;
++	uint32_t num_elements;
++	bool normalized;
+ };
+ 
+-static constexpr MSLVertexFormatInfo vertexFormatInfo[] = {
+-	[VK_FORMAT_R8_UNORM]             = {1, true},
+-	[VK_FORMAT_R8_SNORM]             = {1, true},
+-	[VK_FORMAT_R8_USCALED]           = {1, false},
+-	[VK_FORMAT_R8_SSCALED]           = {1, false},
+-	[VK_FORMAT_R8_UINT]              = {1, false},
+-	[VK_FORMAT_R8_SINT]              = {1, false},
+-	[VK_FORMAT_R8G8_UNORM]           = {2, true},
+-	[VK_FORMAT_R8G8_SNORM]           = {2, true},
+-	[VK_FORMAT_R8G8_USCALED]         = {2, false},
+-	[VK_FORMAT_R8G8_SSCALED]         = {2, false},
+-	[VK_FORMAT_R8G8_UINT]            = {2, false},
+-	[VK_FORMAT_R8G8_SINT]            = {2, false},
+-	[VK_FORMAT_R8G8B8_UNORM]         = {3, true},
+-	[VK_FORMAT_R8G8B8_SNORM]         = {3, true},
+-	[VK_FORMAT_R8G8B8_USCALED]       = {3, false},
+-	[VK_FORMAT_R8G8B8_SSCALED]       = {3, false},
+-	[VK_FORMAT_R8G8B8_UINT]          = {3, false},
+-	[VK_FORMAT_R8G8B8_SINT]          = {3, false},
+-	[VK_FORMAT_R8G8B8A8_UNORM]       = {4, true},
+-	[VK_FORMAT_R8G8B8A8_SNORM]       = {4, true},
+-	[VK_FORMAT_R8G8B8A8_USCALED]     = {4, false},
+-	[VK_FORMAT_R8G8B8A8_SSCALED]     = {4, false},
+-	[VK_FORMAT_R8G8B8A8_UINT]        = {4, false},
+-	[VK_FORMAT_R8G8B8A8_SINT]        = {4, false},
+-    [VK_FORMAT_B8G8R8A8_UNORM]       = {4, true},
+-    [VK_FORMAT_B8G8R8A8_SNORM]       = {4, true},
+-    [VK_FORMAT_B8G8R8A8_USCALED]     = {4, false},
+-    [VK_FORMAT_B8G8R8A8_SSCALED]     = {4, false},
+-    [VK_FORMAT_B8G8R8A8_UINT]        = {4, false},
+-    [VK_FORMAT_B8G8R8A8_SINT]        = {4, false},
+-    [VK_FORMAT_R16_UNORM]            = {1, true},
+-	[VK_FORMAT_R16_SNORM]            = {1, true},
+-	[VK_FORMAT_R16_USCALED]          = {1, false},
+-	[VK_FORMAT_R16_SSCALED]          = {1, false},
+-	[VK_FORMAT_R16_UINT]             = {1, false},
+-	[VK_FORMAT_R16_SINT]             = {1, false},
+-	[VK_FORMAT_R16_SFLOAT]           = {1, false},
+-	[VK_FORMAT_R16G16_UNORM]         = {2, true},
+-	[VK_FORMAT_R16G16_SNORM]         = {2, true},
+-	[VK_FORMAT_R16G16_USCALED]       = {2, false},
+-	[VK_FORMAT_R16G16_SSCALED]       = {2, false},
+-	[VK_FORMAT_R16G16_UINT]          = {2, false},
+-	[VK_FORMAT_R16G16_SINT]          = {2, false},
+-	[VK_FORMAT_R16G16_SFLOAT]        = {2, false},
+-	[VK_FORMAT_R16G16B16_UNORM]      = {3, true},
+-	[VK_FORMAT_R16G16B16_SNORM]      = {3, true},
+-	[VK_FORMAT_R16G16B16_USCALED]    = {3, false},
+-	[VK_FORMAT_R16G16B16_SSCALED]    = {3, false},
+-	[VK_FORMAT_R16G16B16_UINT]       = {3, false},
+-	[VK_FORMAT_R16G16B16_SINT]       = {3, false},
+-	[VK_FORMAT_R16G16B16_SFLOAT]     = {3, false},
+-	[VK_FORMAT_R16G16B16A16_UNORM]   = {4, true},
+-	[VK_FORMAT_R16G16B16A16_SNORM]   = {4, true},
+-	[VK_FORMAT_R16G16B16A16_USCALED] = {4, false},
+-	[VK_FORMAT_R16G16B16A16_SSCALED] = {4, false},
+-	[VK_FORMAT_R16G16B16A16_UINT]    = {4, false},
+-	[VK_FORMAT_R16G16B16A16_SINT]    = {4, false},
+-	[VK_FORMAT_R16G16B16A16_SFLOAT]  = {4, false},
+-	[VK_FORMAT_R32_UINT]             = {1, false},
+-	[VK_FORMAT_R32_SINT]             = {1, false},
+-	[VK_FORMAT_R32_SFLOAT]           = {1, false},
+-	[VK_FORMAT_R32G32_UINT]          = {2, false},
+-	[VK_FORMAT_R32G32_SINT]          = {2, false},
+-	[VK_FORMAT_R32G32_SFLOAT]        = {2, false},
+-	[VK_FORMAT_R32G32B32_UINT]       = {3, false},
+-	[VK_FORMAT_R32G32B32_SINT]       = {3, false},
+-	[VK_FORMAT_R32G32B32_SFLOAT]     = {3, false},
+-	[VK_FORMAT_R32G32B32A32_UINT]    = {4, false},
+-	[VK_FORMAT_R32G32B32A32_SINT]    = {4, false},
+-	[VK_FORMAT_R32G32B32A32_SFLOAT]  = {4, false},
+-};
++// Component count and normalization of a vertex format, for the geometry-shader (mesh) object stage.
++// Derived from the Metal vertex format MoltenVK selects for the Vulkan one, so every vertex format
++// the device accepts is described, and unsupported ones (MTLVertexFormatInvalid) have no components.
++static MSLVertexFormatInfo mvkMSLMeshVertexFormatInfo(MTLVertexFormat mtlFormat) {
++	switch (mtlFormat) {
++		case MTLVertexFormatUChar: case MTLVertexFormatChar: case MTLVertexFormatUShort: case MTLVertexFormatShort:
++		case MTLVertexFormatHalf: case MTLVertexFormatFloat: case MTLVertexFormatUInt: case MTLVertexFormatInt:
++			return {1, false};
++		case MTLVertexFormatUCharNormalized: case MTLVertexFormatCharNormalized:
++		case MTLVertexFormatUShortNormalized: case MTLVertexFormatShortNormalized:
++			return {1, true};
++		case MTLVertexFormatUChar2: case MTLVertexFormatChar2: case MTLVertexFormatUShort2: case MTLVertexFormatShort2:
++		case MTLVertexFormatHalf2: case MTLVertexFormatFloat2: case MTLVertexFormatUInt2: case MTLVertexFormatInt2:
++			return {2, false};
++		case MTLVertexFormatUChar2Normalized: case MTLVertexFormatChar2Normalized:
++		case MTLVertexFormatUShort2Normalized: case MTLVertexFormatShort2Normalized:
++			return {2, true};
++		case MTLVertexFormatUChar3: case MTLVertexFormatChar3: case MTLVertexFormatUShort3: case MTLVertexFormatShort3:
++		case MTLVertexFormatHalf3: case MTLVertexFormatFloat3: case MTLVertexFormatUInt3: case MTLVertexFormatInt3:
++		case MTLVertexFormatFloatRG11B10: case MTLVertexFormatFloatRGB9E5:
++			return {3, false};
++		case MTLVertexFormatUChar3Normalized: case MTLVertexFormatChar3Normalized:
++		case MTLVertexFormatUShort3Normalized: case MTLVertexFormatShort3Normalized:
++			return {3, true};
++		case MTLVertexFormatUChar4: case MTLVertexFormatChar4: case MTLVertexFormatUShort4: case MTLVertexFormatShort4:
++		case MTLVertexFormatHalf4: case MTLVertexFormatFloat4: case MTLVertexFormatUInt4: case MTLVertexFormatInt4:
++			return {4, false};
++		case MTLVertexFormatUChar4Normalized: case MTLVertexFormatChar4Normalized:
++		case MTLVertexFormatUShort4Normalized: case MTLVertexFormatShort4Normalized:
++		case MTLVertexFormatUChar4Normalized_BGRA:
++		case MTLVertexFormatUInt1010102Normalized: case MTLVertexFormatInt1010102Normalized:
++			return {4, true};
++		default:
++			return {0, false};
++	}
++}
+ 
+ #if MVK_XCODE_14
+ 
+@@ -2927,8 +2902,9 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+         si.shaderVar.stride = pVKVB ? pVKVB->stride : 0;
+ 
+         if (shaderConfig.options.mslOptions.for_mesh_pipeline) {
+-            si.shaderVar.vecsize = vertexFormatInfo[pVKVA->format].num_elements;
+-            si.shaderVar.normalized = vertexFormatInfo[pVKVA->format].normalized;
++            auto info = mvkMSLMeshVertexFormatInfo(getPixelFormats()->getMTLVertexFormat(pVKVA->format));
++            si.shaderVar.vecsize = info.num_elements;
++            si.shaderVar.normalized = info.normalized;
+             si.shaderVar.binding = getDevice()->getMetalBufferIndexForVertexAttributeBinding(pVKVA->binding);
+         }
+ 

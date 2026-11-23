@@ -1,0 +1,163 @@
+From: steamac <steamac@localhost>
+Subject: [PATCH] Log shader source and compute memory context after pipeline failures
+
+STEAMAC-57 has no shader or workgroup context; STEAMAC-41 and R retain
+only stage interfaces after a Metal ICE or compiler-service interruption.
+Borrow already-cached compressed libraries during pipeline construction
+and decompress only on failure. Log bounded numbered source (without
+helper templates), source size, and threadgroup declarations, plus compute
+entry/hash/workgroup and the actual Metal shared-memory limit.
+
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -173,6 +173,9 @@
+ 	/** Returns the pipeline layout used by this pipeline. */
+ 	MVKPipelineLayout* getLayout() const { return _layout; }
+ 
++	/** Shader libraries borrowed only while constructing the pipeline, for failure diagnostics. */
++	void recordShaderLibrary(spv::ExecutionModel stage, MVKShaderLibrary* library);
++
+ 	/** Returns whether the pipeline creation fail if a pipeline compile is required. */
+ 	bool shouldFailOnPipelineCompileRequired() {
+ 		return (getEnabledPipelineCreationCacheControlFeatures().pipelineCreationCacheControl &&
+@@ -203,6 +206,7 @@
+ 
+ protected:
+ 	void propagateDebugName() override {}
++	void logFailedPipelineShaders();
+ 
+ 	MVKPipelineLayout* _layout;
+ 	MVKPipelineCache* _pipelineCache;
+@@ -211,6 +215,7 @@
+ 	uint32_t _descriptorSetCount;
+ 	bool _stageUsesPushConstants[kMVKShaderStageCount];
+ 	bool _hasValidMTLPipelineStates = true;
++	MVKShaderLibrary* _diagnosticShaderLibraries[kMVKShaderStageCount] = {};
+ 
+ };
+ 
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -77,6 +77,21 @@
+ 	}
+ 	assert(!"Invalid stage");
+ 	return spv::ExecutionModelMax;
++}
++
++void MVKPipeline::recordShaderLibrary(spv::ExecutionModel stage, MVKShaderLibrary* library) {
++	for (uint32_t i = 0; i < kMVKShaderStageCount; i++) {
++		if (spvExecModelForStage(static_cast<MVKShaderStage>(i)) == stage) {
++			_diagnosticShaderLibraries[i] = library;
++			break;
++		}
++	}
++}
++
++void MVKPipeline::logFailedPipelineShaders() {
++	for (uint32_t i = 0; i < kMVKShaderStageCount; i++) {
++		if (_diagnosticShaderLibraries[i]) { _diagnosticShaderLibraries[i]->logPipelineFailureSource(i); }
++	}
+ }
+ 
+ static mvk::MSLResourceBinding makeResourceBinding(const MVKShaderStageResourceBinding& binding,
+@@ -1097,7 +1112,7 @@
+ 		MVKRenderPipelineCompiler* plc = new MVKRenderPipelineCompiler(this);
+ 		plState = plc->newMTLRenderPipelineState(plDesc);	// retained
+ 		plc->destroy();
+-		if ( !plState ) { _hasValidMTLPipelineStates = false; }
++		if ( !plState ) { _hasValidMTLPipelineStates = false; logFailedPipelineShaders(); }
+ 	}
+ 	return plState;
+ }
+@@ -1111,7 +1126,7 @@
+ 		MVKRenderPipelineCompiler* plc = new MVKRenderPipelineCompiler(this);
+ 		plState = plc->newMTLRenderPipelineState(plDesc);    // retained
+ 		plc->destroy();
+-		if ( !plState ) { _hasValidMTLPipelineStates = false; }
++		if ( !plState ) { _hasValidMTLPipelineStates = false; logFailedPipelineShaders(); }
+ 	}
+ 	return plState;
+ }
+@@ -3170,7 +3185,14 @@
+ 		plc->destroy();
+ 		[plDesc release];															// temp release
+ 
+-		if ( !_mtlPipelineState ) { _hasValidMTLPipelineStates = false; }
++		if ( !_mtlPipelineState ) {
++			_hasValidMTLPipelineStates = false;
++			MVKLogError("Compute pipeline diagnostics: entry=%s hash=%016zx workgroup=%zux%zux%zu shared-memory-limit=%lu.",
++				pCreateInfo->stage.pName, _module->getKey().codeHash,
++				_mtlThreadgroupSize.width, _mtlThreadgroupSize.height, _mtlThreadgroupSize.depth,
++				(unsigned long)getMTLDevice().maxThreadgroupMemoryLength);
++			logFailedPipelineShaders();
++		}
+ 	} else {
+ 		_hasValidMTLPipelineStates = false;
+ 	}
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
+@@ -111,6 +111,9 @@
+ 	 * set the workgroup size..
+ 	 */
+     void setWorkgroupSize(uint32_t x, uint32_t y, uint32_t z);
++
++	/** Logs bounded source and every threadgroup declaration after a Metal pipeline compile fails. */
++	void logPipelineFailureSource(uint32_t stage);
+     
+ 	MVKShaderLibrary(MVKVulkanAPIDeviceObject* owner,
+ 					 const mvk::SPIRVToMSLConversionResult& conversionResult);
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -205,6 +205,44 @@
+ 	addPerformanceInterval(getPerformanceStats().shaderCompilation.mslDecompress, startTime);
+ }
+ 
++void MVKShaderLibrary::logPipelineFailureSource(uint32_t stage) {
++	string msl;
++	decompressMSL(msl);
++	if (msl.empty()) { return; }
++	vector<string_view> lines;
++	for (size_t offset = 0; offset < msl.size();) {
++		size_t end = msl.find('\n', offset);
++		if (end == string::npos) { end = msl.size(); }
++		lines.emplace_back(msl.data() + offset, end - offset);
++		offset = end + 1;
++	}
++	string out = "[mvk-msl] // Pipeline failure MSL stage=" + to_string(stage) +
++		" entry=" + _shaderConversionResultInfo.entryPoint.mtlFunctionName +
++		" bytes=" + to_string(msl.size()) + " lines=" + to_string(lines.size()) + "\n";
++	size_t head = 0, shared = 0;
++	for (size_t i = 0; i < lines.size(); i++) {
++		// Keep shader structs and entry points, not generated helper templates.
++		if (head < 80 && lines[i].substr(0, 9) == "template<") {
++			while (i + 1 < lines.size() && lines[i] != "}" && lines[i] != "};" &&
++				   !(lines[i].size() && lines[i].back() == '}')) { i++; }
++			continue;
++		}
++		bool threadgroup = lines[i].find("threadgroup ") != string_view::npos;
++		if (head < 80 || i + 40 >= lines.size() || (threadgroup && shared < 16)) {
++			out += "[mvk-msl] " + to_string(i + 1) + ": ";
++			out.append(lines[i].substr(0, 512));
++			out += '\n';
++			if (head < 80) { head++; }
++			if (threadgroup) { shared++; }
++		}
++	}
++	for (size_t done = 0; done < out.size();) {
++		ssize_t written = write(STDERR_FILENO, out.data() + done, out.size() - done);
++		if (written <= 0) { break; }
++		done += size_t(written);
++	}
++}
++
+ MVKShaderLibrary::MVKShaderLibrary(MVKVulkanAPIDeviceObject* owner,
+ 								   const SPIRVToMSLConversionResult& conversionResult) :
+ 	MVKBaseDeviceObject(owner->getDevice()),
+@@ -423,6 +461,7 @@
+ 		pShaderConfig->markAllInterfaceVarsAndResourcesUsed();
+ 	}
+ 
++	if (mvkLib) { pipeline->recordShaderLibrary(pShaderConfig->options.entryPointStage, mvkLib); }
+ 	return mvkLib ? mvkLib->getMTLFunction(pSpecializationInfo, pShaderFeedback, this) : MVKMTLFunctionNull;
+ }
+ 

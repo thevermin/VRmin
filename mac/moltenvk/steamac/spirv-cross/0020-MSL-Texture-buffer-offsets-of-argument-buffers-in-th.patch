@@ -1,0 +1,120 @@
+From 392b71aae8368de73479663be0eeea2a1e203b87 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Mon, 5 Oct 2026 23:00:00 +0300
+Subject: [PATCH 20/20] MSL: Texture buffer offsets of argument buffers in the
+ buffer size array
+
+With add_texture_buffer_offsets, an argument buffer read the offsets of its texture buffers from a separate
+spvTextureOffsetConstants member (binding kTextureOffsetBufferBinding), a second array the API had to provide
+next to the buffer sizes. Read them from spvBufferSizeConstants, at the index of the texture: a texture and a
+buffer never share an argument buffer index, so one array holds both (MoltenVK's aux buffer of the descriptor
+set). A set with texture buffers therefore needs the buffer size member. Texture buffers also did not get it
+when the set needed a swizzle buffer for them (else-if). kTextureOffsetBufferBinding is no longer used.
+
+robustImageAccess2 bounds of a texture buffer with an offset compared the coordinate with the width of the
+Metal texture, which starts offset texels before the view: coordinates up to offset texels past the end of
+the view passed and read past the texture ((0, 0, 0, 0) instead of (0, 0, 0, 1), writes past the view). Compare
+with the width minus the offset, like the size query.
+---
+ spirv_msl.cpp | 30 ++++++++++++------------------
+ spirv_msl.hpp |  4 ----
+ 2 files changed, 12 insertions(+), 22 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 9fb6ac7..fe260da 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -15394,9 +15394,12 @@ string CompilerMSL::get_robust_image_bounds_check(uint32_t img_id, const string
+ 	// For 1D non-arrayed images and buffer images, coordinate is scalar; otherwise it's a vector
+ 	bool coord_is_scalar = ((imgtype.dim == Dim1D || imgtype.dim == DimBuffer) && !imgtype.arrayed);
+ 
+-	// Check x coordinate (always present)
++	// Check x coordinate (always present). A texture buffer with an offset starts that many texels before the view.
+ 	string x_coord = coord_is_scalar ? coord_expr : (coord_expr + ".x");
+-	checks.push_back(join("(uint(", x_coord, ") < ", img_expr, ".get_width(", lod_param, "))"));
++	if (msl_options.add_texture_buffer_offsets && imgtype.dim == DimBuffer)
++		checks.push_back(join("(uint(", x_coord, ") < ", img_expr, ".get_width() - ", to_texture_offset_expression(img_id), ")"));
++	else
++		checks.push_back(join("(uint(", x_coord, ") < ", img_expr, ".get_width(", lod_param, "))"));
+ 
+ 	// Check y coordinate for 2D, Cube, 3D
+ 	if (imgtype.dim == Dim2D || imgtype.dim == DimCube || imgtype.dim == Dim3D)
+@@ -17714,9 +17717,11 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 					uint32_t desc_set = get_decoration(var_id, DecorationDescriptorSet);
+ 					if (descriptor_set_is_argument_buffer(desc_set))
+ 					{
++						// Argument buffers keep texture buffer offsets in the array of buffer sizes, at the index of the
++						// texture (a texture and a buffer never share an index).
+ 						statement("constant uint", is_array_type ? "* " : "& ", to_texture_offset_expression(var_id),
+ 						          is_array_type ? " = &" : " = ", to_name(argument_buffer_ids[desc_set]),
+-						          ".spvTextureOffsetConstants", "[",
++						          ".spvBufferSizeConstants", "[",
+ 						          convert_to_string(get_metal_resource_index(var, SPIRType::Image)), "];");
+ 					}
+ 					else
+@@ -22297,7 +22302,6 @@ void CompilerMSL::analyze_argument_buffers()
+ 
+ 	bool set_needs_swizzle_buffer[kMaxArgumentBuffers] = {};
+ 	bool set_needs_buffer_sizes[kMaxArgumentBuffers] = {};
+-	bool set_needs_texture_offsets[kMaxArgumentBuffers] = {};
+ 	bool needs_additional_constants = needs_swizzle_buffer_def;
+ 
+ 	ir.for_each_typed_id<SPIRVariable>([&](uint32_t self, SPIRVariable &var) {
+@@ -22382,9 +22386,10 @@ void CompilerMSL::analyze_argument_buffers()
+ 				set_needs_buffer_sizes[desc_set] = true;
+ 				needs_additional_constants = true;
+ 			}
+-			else if (msl_options.add_texture_buffer_offsets && IsTextureBuffer(type))
++			// Texture buffer offsets share the array of buffer sizes.
++			if (msl_options.add_texture_buffer_offsets && IsTextureBuffer(type))
+ 			{
+-				set_needs_texture_offsets[desc_set] = true;
++				set_needs_buffer_sizes[desc_set] = true;
+ 				needs_additional_constants = true;
+ 			}
+ 		}
+@@ -22397,7 +22402,7 @@ void CompilerMSL::analyze_argument_buffers()
+ 		// We might have to add a swizzle buffer resource to the set.
+ 		for (uint32_t desc_set = 0; desc_set < kMaxArgumentBuffers; desc_set++)
+ 		{
+-			if (!set_needs_swizzle_buffer[desc_set] && !set_needs_buffer_sizes[desc_set] && !set_needs_texture_offsets[desc_set])
++			if (!set_needs_swizzle_buffer[desc_set] && !set_needs_buffer_sizes[desc_set])
+ 				continue;
+ 
+ 			if (uint_ptr_type_id == 0)
+@@ -22436,17 +22441,6 @@ void CompilerMSL::analyze_argument_buffers()
+ 				resources_in_set[desc_set].push_back(
+ 				    { &var, to_name(var_id), SPIRType::UInt, get_metal_resource_index(var, SPIRType::UInt), 1, 0, 0 });
+ 			}
+-
+-			if (set_needs_texture_offsets[desc_set])
+-			{
+-				uint32_t var_id = ir.increase_bound_by(1);
+-				auto &var = set<SPIRVariable>(var_id, uint_ptr_type_id, StorageClassUniformConstant);
+-				set_name(var_id, "spvTextureOffsetConstants");
+-				set_decoration(var_id, DecorationDescriptorSet, desc_set);
+-				set_decoration(var_id, DecorationBinding, kTextureOffsetBufferBinding);
+-				resources_in_set[desc_set].push_back(
+-				    { &var, to_name(var_id), SPIRType::UInt, get_metal_resource_index(var, SPIRType::UInt), 1, 0, 0 });
+-			}
+ 		}
+ 	}
+ 
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 17169e5..3c4ee43 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -295,10 +295,6 @@ static const uint32_t kSwizzleBufferBinding = ~(1u);
+ // element to indicate the buffer binding for buffer size buffers to support OpArrayLength.
+ static const uint32_t kBufferSizeBufferBinding = ~(2u);
+ 
+-// Special constant used in a MSLResourceBinding binding
+-// element to indicate the buffer binding used for the argument buffer itself.
+-static const uint32_t kTextureOffsetBufferBinding = ~(3u);
+-
+ // Special constant used in a MSLResourceBinding binding
+ // element to indicate the buffer binding used for the argument buffer itself.
+ // This buffer binding should be kept as small as possible as all automatic bindings for buffers
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,377 @@
+From 1c9b959128f19dedf5505fd9576c3a087a8670c7 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 23:33:33 +0300
+Subject: [PATCH 14/22] Geometry shaders: input primitive from the shader,
+ triangle fans
+
+Geometry-shader pipelines took the input primitive from the pipeline's topology, which with
+VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY only fixes the topology class: zink's pipelines with a
+TRIANGLE_FAN static topology failed with 'Geometry shaders: unsupported topology 5', and
+Xwayland lost its device.
+
+- The input primitive comes from the geometry shader's execution mode (InputPoints ...
+  InputTrianglesAdjacency).
+- Triangle fans (static or dynamic topology) are assembled by the object stage instead of
+  being converted to indexed triangles: the render state records whether the topology is a
+  fan, and DrawInfo::topoStrip / the indirect conversion use list, strip or fan.
+- Vertex and geometry outputs are reflected from the pipeline's shader modules (the stage's
+  module may be VK_NULL_HANDLE with an inline VkShaderModuleCreateInfo).
+---
+ MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm      | 66 ++++++++++++-------
+ MoltenVK/MoltenVK/Commands/MVKCmdRendering.mm |  4 +-
+ .../Commands/MVKCommandEncoderState.h         |  3 +
+ .../Commands/MVKCommandEncoderState.mm        |  1 +
+ ...KCommandPipelineStateFactoryShaderSource.h | 10 +--
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   | 33 ++++++----
+ MoltenVK/MoltenVK/Utility/MVKStateTracking.h  |  1 +
+ .../MoltenVKShaderConverter/SPIRVReflection.h | 29 ++++++++
+ 8 files changed, 104 insertions(+), 43 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index c430bc06..1215fbf1 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -188,17 +188,26 @@ static void setGeometryVertexStrides(DrawInfo& drawInfo, MVKCommandEncoder* cmdE
+ 	}
+ }
+ 
+-/* Returns the vertices per input primitive of the geometry shader and whether the bound topology is a
+- * strip, or false if the primitive type cannot be drawn with a geometry shader. */
++/* How the bound topology assembles the geometry shader's input primitives. Must match the values of
++ * DrawInfo::topoStrip the SPIRV-Cross object stage tests, and MVKGeometryIndirectParams::topology. */
++enum MVKGeometryTopology : uint32_t {
++	kMVKGeometryTopologyList = 0,
++	kMVKGeometryTopologyStrip = 1,
++	kMVKGeometryTopologyFan = 2,
++};
++
++/* Returns the vertices per input primitive of the geometry shader and how the bound topology assembles
++ * them, or false if the primitive type cannot be drawn with a geometry shader. */
+ static bool getGeometryPrimitiveShape(MVKCommandEncoder* cmdEncoder, MVKGraphicsPipeline* pipeline,
+-									  uint32_t& vertsPerPrim, bool& isStrip) {
+-	auto primitiveType = cmdEncoder->getMtlGraphics().getPrimitiveType();
++									  uint32_t& vertsPerPrim, MVKGeometryTopology& topology) {
++	auto& mtlGraphics = cmdEncoder->getMtlGraphics();
++	auto primitiveType = mtlGraphics.getPrimitiveType();
+ 	switch (primitiveType) {
+ 		case MTLPrimitiveTypePoint:
+-		case MTLPrimitiveTypeLine:
+-		case MTLPrimitiveTypeTriangle:      isStrip = false; break;
++		case MTLPrimitiveTypeLine:          topology = kMVKGeometryTopologyList; break;
++		case MTLPrimitiveTypeTriangle:      topology = mtlGraphics.isTriangleFan() ? kMVKGeometryTopologyFan : kMVKGeometryTopologyList; break;
+ 		case MTLPrimitiveTypeLineStrip:
+-		case MTLPrimitiveTypeTriangleStrip: isStrip = true; break;
++		case MTLPrimitiveTypeTriangleStrip: topology = kMVKGeometryTopologyStrip; break;
+ 		default:
+ 			cmdEncoder->reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Unsupported primitive type %lu with a geometry shader.", (unsigned long)primitiveType);
+ 			return false;
+@@ -208,10 +217,15 @@ static bool getGeometryPrimitiveShape(MVKCommandEncoder* cmdEncoder, MVKGraphics
+ }
+ 
+ /* Returns the number of geometry shader input primitives in a draw of the given number of vertices. */
+-static uint32_t getGeometryPrimitiveCount(uint32_t vertexCount, uint32_t vertsPerPrim, bool isStrip) {
+-	if ( !isStrip ) { return vertexCount / vertsPerPrim; }
+-	if (vertsPerPrim == 6) { return vertexCount >= 6 ? (vertexCount - 4) / 2 : 0; }	// Triangle strip with adjacency
+-	return vertexCount >= vertsPerPrim ? vertexCount - vertsPerPrim + 1 : 0;
++static uint32_t getGeometryPrimitiveCount(uint32_t vertexCount, uint32_t vertsPerPrim, MVKGeometryTopology topology) {
++	switch (topology) {
++		case kMVKGeometryTopologyList:  return vertexCount / vertsPerPrim;
++		case kMVKGeometryTopologyFan:   return vertexCount >= 3 ? vertexCount - 2 : 0;
++		case kMVKGeometryTopologyStrip:
++			if (vertsPerPrim == 6) { return vertexCount >= 6 ? (vertexCount - 4) / 2 : 0; }	// Triangle strip with adjacency
++			return vertexCount >= vertsPerPrim ? vertexCount - vertsPerPrim + 1 : 0;
++	}
++	return 0;
+ }
+ 
+ #if MVK_XCODE_14
+@@ -222,7 +236,7 @@ static uint32_t getGeometryPrimitiveCount(uint32_t vertexCount, uint32_t vertsPe
+ 	uint32_t indexed;
+ 	uint32_t indexSize;
+ 	uint32_t vertsPerPrim;
+-	uint32_t isStrip;
++	uint32_t topology;       // MVKGeometryTopology
+ 	uint32_t vertexStrides[kMVKMaxBufferCount];
+ 	uint32_t vertexDivisors[kMVKMaxBufferCount];
+ };
+@@ -237,13 +251,13 @@ static void encodeGeometryIndirectDraws(MVKCommandEncoder* cmdEncoder, MVKGraphi
+ 	if (drawCount == 0) { return; }
+ 
+ 	uint32_t vertsPerPrim = 0;
+-	bool isStrip = false;
+-	if ( !getGeometryPrimitiveShape(cmdEncoder, pipeline, vertsPerPrim, isStrip) ) { return; }
++	MVKGeometryTopology topology = kMVKGeometryTopologyList;
++	if ( !getGeometryPrimitiveShape(cmdEncoder, pipeline, vertsPerPrim, topology) ) { return; }
+ 
+ 	GeometryIndirectParams params = {};
+ 	params.indexed = ibb != nullptr;
+ 	params.vertsPerPrim = vertsPerPrim;
+-	params.isStrip = isStrip;
++	params.topology = topology;
+ 	if (ibb) {
+ 		params.indexSize = (uint32_t)mvkMTLIndexTypeSizeInBytes((MTLIndexType)ibb->mtlIndexType);
+ 		params.indexBuffer = ibb->mtlBuffer.gpuAddress + ibb->offset;
+@@ -366,7 +380,8 @@ static void encodeGeometryIndirectDraws(MVKCommandEncoder* cmdEncoder, MVKGraphi
+ 	auto& dvcLimits = cmdEncoder->getDeviceProperties().limits;
+ 
+ 	// Metal doesn't support triangle fans, so encode it as triangles via an indexed indirect triangles command instead.
+-	if (pipeline->getVkPrimitiveTopology() == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
++	// The object stage of a geometry-shader pipeline assembles fans itself.
++	if (pipeline->getVkPrimitiveTopology() == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && !pipeline->isGeometryPipeline()) {
+ 		encodeIndexedIndirect(cmdEncoder);
+ 		return;
+ 	}
+@@ -497,10 +512,10 @@ static void encodeGeometryIndirectDraws(MVKCommandEncoder* cmdEncoder, MVKGraphi
+ 					DrawInfo drawInfo = {};
+ 
+ 					uint32_t vertsPerPrim = 0;
+-					bool isStrip = false;
+-					if ( !getGeometryPrimitiveShape(cmdEncoder, pipeline, vertsPerPrim, isStrip) ) { return; }
+-					uint32_t threadCount = getGeometryPrimitiveCount(_vertexCount, vertsPerPrim, isStrip);
+-					drawInfo.topoStrip = isStrip;
++					MVKGeometryTopology topology = kMVKGeometryTopologyList;
++					if ( !getGeometryPrimitiveShape(cmdEncoder, pipeline, vertsPerPrim, topology) ) { return; }
++					uint32_t threadCount = getGeometryPrimitiveCount(_vertexCount, vertsPerPrim, topology);
++					drawInfo.topoStrip = topology;
+ 
+ 					drawInfo.baseVertex = (int32_t)_firstVertex;
+ 					drawInfo.baseInstance = _firstInstance;
+@@ -599,7 +614,8 @@ static void encodeGeometryIndirectDraws(MVKCommandEncoder* cmdEncoder, MVKGraphi
+ 	auto& dvcLimits = cmdEncoder->getDeviceProperties().limits;
+ 
+ 	// Metal doesn't support triangle fans, so encode it as triangles via an indexed indirect triangles command instead.
+-	if (pipeline->getVkPrimitiveTopology() == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
++	// The object stage of a geometry-shader pipeline assembles fans itself.
++	if (pipeline->getVkPrimitiveTopology() == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && !pipeline->isGeometryPipeline()) {
+ 		encodeIndexedIndirect(cmdEncoder);
+ 		return;
+ 	}
+@@ -776,10 +792,10 @@ static void encodeGeometryIndirectDraws(MVKCommandEncoder* cmdEncoder, MVKGraphi
+ 					[cmdEncoder->_mtlRenderEncoder useResource: ibb.mtlBuffer usage: MTLResourceUsageRead stages: MTLRenderStageObject];
+ 
+ 					uint32_t vertsPerPrim = 0;
+-					bool isStrip = false;
+-					if ( !getGeometryPrimitiveShape(cmdEncoder, pipeline, vertsPerPrim, isStrip) ) { return; }
+-					uint32_t threadCount = getGeometryPrimitiveCount(_indexCount, vertsPerPrim, isStrip);
+-					drawInfo.topoStrip = isStrip;
++					MVKGeometryTopology topology = kMVKGeometryTopologyList;
++					if ( !getGeometryPrimitiveShape(cmdEncoder, pipeline, vertsPerPrim, topology) ) { return; }
++					uint32_t threadCount = getGeometryPrimitiveCount(_indexCount, vertsPerPrim, topology);
++					drawInfo.topoStrip = topology;
+ 
+ 					drawInfo.baseVertex = _vertexOffset;
+ 					drawInfo.baseInstance = _firstInstance;
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdRendering.mm b/MoltenVK/MoltenVK/Commands/MVKCmdRendering.mm
+index 7cb22d62..947888a9 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdRendering.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdRendering.mm
+@@ -558,7 +558,9 @@ void mvkPopulateFromOrFillAscending(Vec& dst, const uint32_t* pSrc, size_t count
+ #pragma mark MVKCmdSetPrimitiveTopology
+ 
+ void MVKCmdSetPrimitiveTopology::encode(MVKCommandEncoder* cmdEncoder) {
+-	cmdEncoder->getState().updateDynamicState(MVKRenderStateFlag::PrimitiveTopology)._renderState.primitiveType = mvkMTLPrimitiveTypeFromVkPrimitiveTopology(_value);
++	auto& renderState = cmdEncoder->getState().updateDynamicState(MVKRenderStateFlag::PrimitiveTopology)._renderState;
++	renderState.primitiveType = mvkMTLPrimitiveTypeFromVkPrimitiveTopology(_value);
++	renderState.isTriangleFan = _value == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+ }
+ 
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.h b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.h
+index 3758ca3c..f10fd642 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.h
+@@ -388,6 +388,7 @@ struct MVKMetalGraphicsCommandEncoderStateQuickReset {
+ /** Tracks the state of a Metal render encoder. */
+ struct MVKMetalGraphicsCommandEncoderState : public MVKMetalGraphicsCommandEncoderStateQuickReset {
+ 	uint8_t _primitiveType;
++	bool _isTriangleFan = false;
+ 	uint8_t _numSamplePositions = 0;
+ 	MVKDepthBias _depthBias;
+ 	MVKDepthBounds _depthBounds;
+@@ -403,6 +404,8 @@ struct MVKMetalGraphicsCommandEncoderState : public MVKMetalGraphicsCommandEncod
+ 	MTLSamplePosition _samplePositions[kMVKMaxSampleCount];
+ 
+ 	MTLPrimitiveType getPrimitiveType() const { return static_cast<MTLPrimitiveType>(_primitiveType); }
++	/** Whether the bound topology is VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN (getPrimitiveType() is then MTLPrimitiveTypeTriangle). */
++	bool isTriangleFan() const { return _isTriangleFan; }
+ 
+ 	/** For API compatibility with MVKMetalComputeCommandEncoderState. */
+ 	MVKArrayRef<MVKStageResourceBits> exists() { return _exists.elements; }
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index 98f6db60..1e3278ca 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -1463,6 +1463,7 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+ 			}
+ 		}
+ 		_primitiveType = prim;
++		_isTriangleFan = prim == MTLPrimitiveTypeTriangle && PICK_STATE(PrimitiveTopology)->isTriangleFan;
+ 		bool isTriangle = prim == MTLPrimitiveTypeTriangle || prim == MTLPrimitiveTypeTriangleStrip;
+ 		// Fill mode only affects triangles in Metal, might as well save a few API calls
+ 		if (isTriangle && fill != _polygonMode) {
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
+index 59f3fa66..59beff64 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
+@@ -288,7 +288,7 @@ typedef struct {
+ 	uint32_t indexed;
+ 	uint32_t indexSize;
+ 	uint32_t vertsPerPrim;
+-	uint32_t isStrip;
++	uint32_t topology;          // 0 list, 1 strip, 2 fan
+ 	uint32_t vertexStrides[31];
+ 	uint32_t vertexDivisors[31];
+ } MVKGeometryIndirectParams;
+@@ -331,9 +331,11 @@ kernel void cmdDrawIndirectGeometryConvertBuffers(const device char* srcBuff [[b
+ 		baseInstance = src[3];
+ 	}
+ 	uint32_t primCount;
+-	if (params.isStrip && params.vertsPerPrim == 6) {
++	if (params.topology == 2) {
++		primCount = count >= 3 ? count - 2 : 0;			// Triangle fan
++	} else if (params.topology == 1 && params.vertsPerPrim == 6) {
+ 		primCount = count >= 6 ? (count - 4) / 2 : 0;	// Triangle strip with adjacency
+-	} else if (params.isStrip) {
++	} else if (params.topology == 1) {
+ 		primCount = count >= params.vertsPerPrim ? count - params.vertsPerPrim + 1 : 0;
+ 	} else {
+ 		primCount = count / params.vertsPerPrim;
+@@ -352,7 +354,7 @@ kernel void cmdDrawIndirectGeometryConvertBuffers(const device char* srcBuff [[b
+ 		drawInfo.vertexStrides[i] = params.vertexStrides[i];
+ 		drawInfo.vertexDivisors[i] = params.vertexDivisors[i];
+ 	}
+-	drawInfo.topoStrip = uint8_t(params.isStrip);
++	drawInfo.topoStrip = uint8_t(params.topology);
+ }
+ 
+ kernel void cmdDrawIndirectConvertBuffers(const device char* srcBuff [[buffer(0)]],
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 14c26667..984b7251 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -936,6 +936,7 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 	}
+ 
+ 	_staticStateData.primitiveType = mvkMTLPrimitiveTypeFromVkPrimitiveTopology(_vkPrimitiveTopology);
++	_staticStateData.isTriangleFan = _vkPrimitiveTopology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+ 	_staticStateData.enable.set(MVKRenderStateEnableFlag::PrimitiveRestart, primitiveRestart);
+ 
+ #if MVK_USE_METAL_PRIVATE_API
+@@ -1309,6 +1310,13 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 
+     plDesc.rasterSampleCount = mvkSampleCountFromVkSampleCountFlagBits(pCreateInfo->pMultisampleState->rasterizationSamples);
+ 
++    std::string geomErrorLog;
++    _geometryInputVertexCount = getGeometryShaderInputVertexCount(_geometryModule->getSPIRV(), pGeometrySS->pName, geomErrorLog);
++    if ( !_geometryInputVertexCount ) {
++        setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Geometry shader: %s", geomErrorLog.c_str()));
++        return nullptr;
++    }
++
+     if (!addVertexShaderToPipeline(plDesc, pCreateInfo, shaderConfig, pVertexSS, pVertexFB))
+         return nullptr;
+ 
+@@ -1345,7 +1353,7 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 
+     std::string errorLog;
+     SPIRVShaderOutputs vertexOutputs, geometryOutputs;
+-    if (!getShaderOutputs(((MVKShaderModule*)pVertexSS->module)->getSPIRV(), spv::ExecutionModelVertex, pVertexSS->pName, vertexOutputs, errorLog)) {
++    if (!getShaderOutputs(_vertexModule->getSPIRV(), spv::ExecutionModelVertex, pVertexSS->pName, vertexOutputs, errorLog)) {
+         reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get vertex outputs: %s", errorLog.c_str());
+         return nullptr;
+     }
+@@ -1353,7 +1361,7 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+     if (!addGeometryShaderToPipeline(plDesc, pCreateInfo, shaderConfig, pGeometrySS, pGeometryFB, vertexOutputs))
+         return nullptr;
+ 
+-	if (!getShaderOutputs(((MVKShaderModule*)pGeometrySS->module)->getSPIRV(), spv::ExecutionModelGeometry, pGeometrySS->pName, geometryOutputs, errorLog)) {
++	if (!getShaderOutputs(_geometryModule->getSPIRV(), spv::ExecutionModelGeometry, pGeometrySS->pName, geometryOutputs, errorLog)) {
+ 		reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get vertex outputs: %s", errorLog.c_str());
+ 		return nullptr;
+ 	}
+@@ -1797,20 +1805,19 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+ // Sets the input primitive type of the geometry-shader emulation (object + mesh stages)
+ // from the pipeline topology. Returns false (pipeline creation fails) if it is not supported.
+ bool MVKGraphicsPipeline::setGeometryInputPrimitiveType(SPIRVToMSLConversionConfiguration& shaderConfig) {
++	// The input primitive is the geometry shader's (InputPoints, InputLines, ...). The pipeline topology
++	// may be dynamic state, and then only its class is known here; whether the draw's topology is a list,
++	// strip or fan is passed to the object stage at draw time (DrawInfo::topoStrip).
+ 	using Topology = CompilerMSL::Options::PrimitiveTopology;
+ 	auto& inputType = shaderConfig.options.mslOptions.input_primitive_type;
+-	switch (_vkPrimitiveTopology) {
+-		case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:                    inputType = Topology::Points;                 _geometryInputVertexCount = 1; return true;
+-		case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:                     inputType = Topology::Lines;                  _geometryInputVertexCount = 2; return true;
+-		case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:                    inputType = Topology::LineStrip;              _geometryInputVertexCount = 2; return true;
+-		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:                 inputType = Topology::Triangles;              _geometryInputVertexCount = 3; return true;
+-		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:                inputType = Topology::TriangleStrip;          _geometryInputVertexCount = 3; return true;
+-		case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY:      inputType = Topology::LinesAdjacency;         _geometryInputVertexCount = 4; return true;
+-		case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY:     inputType = Topology::LineStripAdjacency;     _geometryInputVertexCount = 4; return true;
+-		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY:  inputType = Topology::TrianglesAdjacency;     _geometryInputVertexCount = 6; return true;
+-		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY: inputType = Topology::TriangleStripAdjacency; _geometryInputVertexCount = 6; return true;
++	switch (_geometryInputVertexCount) {
++		case 1: inputType = Topology::Points;             return true;
++		case 2: inputType = Topology::Lines;              return true;
++		case 3: inputType = Topology::Triangles;          return true;
++		case 4: inputType = Topology::LinesAdjacency;     return true;
++		case 6: inputType = Topology::TrianglesAdjacency; return true;
+ 		default:
+-			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Geometry shaders: unsupported topology %d.", _vkPrimitiveTopology));
++			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Geometry shaders: unsupported input primitive (%u vertices).", _geometryInputVertexCount));
+ 			return false;
+ 	}
+ }
+diff --git a/MoltenVK/MoltenVK/Utility/MVKStateTracking.h b/MoltenVK/MoltenVK/Utility/MVKStateTracking.h
+index 7bbcfa9b..c67d42a5 100644
+--- a/MoltenVK/MoltenVK/Utility/MVKStateTracking.h
++++ b/MoltenVK/MoltenVK/Utility/MVKStateTracking.h
+@@ -340,6 +340,7 @@ struct MVKRenderStateData {
+ 	uint8_t cullMode = MTLCullModeNone;
+ 	uint8_t frontFace = MTLWindingClockwise;
+ 	uint8_t primitiveType = MTLPrimitiveTypePoint;
++	bool isTriangleFan = false;		// primitiveType is MTLPrimitiveTypeTriangle; fans are converted (or assembled by a geometry shader)
+ 	MVKPolygonMode polygonMode = MVKPolygonMode::Fill;
+ 	MVKLineRasterizationMode lineRasterizationMode = MVKLineRasterizationMode::Default;
+ 	MVKRenderStateEnableFlags enable;
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h
+index b955e4bd..41d9d7c9 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h
+@@ -95,6 +95,35 @@ namespace mvk {
+ #pragma mark -
+ #pragma mark Functions
+ 
++	/**
++	 * Given a geometry shader in SPIR-V format, returns the number of vertices of its input primitive
++	 * (1, 2, 4 for lines with adjacency, 3, or 6 for triangles with adjacency), or 0 on error.
++	 */
++	template<typename Vs>
++	static inline uint32_t getGeometryShaderInputVertexCount(const Vs& geom, const std::string& entryName, std::string& errorLog) {
++#ifndef SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS
++		try {
++#endif
++			SPIRV_CROSS_NAMESPACE::CompilerReflection reflect(geom);
++			if (!entryName.empty()) {
++				reflect.set_entry_point(entryName, spv::ExecutionModelGeometry);
++			}
++			const SPIRV_CROSS_NAMESPACE::Bitset& modes = reflect.get_execution_mode_bitset();
++			if (modes.get(spv::ExecutionModeInputPoints)) { return 1; }
++			if (modes.get(spv::ExecutionModeInputLines)) { return 2; }
++			if (modes.get(spv::ExecutionModeInputLinesAdjacency)) { return 4; }
++			if (modes.get(spv::ExecutionModeTriangles)) { return 3; }
++			if (modes.get(spv::ExecutionModeInputTrianglesAdjacency)) { return 6; }
++			errorLog = "The geometry shader does not specify an input primitive.";
++			return 0;
++#ifndef SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS
++		} catch (SPIRV_CROSS_NAMESPACE::CompilerError& ex) {
++			errorLog = ex.what();
++			return 0;
++		}
++#endif
++	}
++
+ 	/**
+ 	 * Given a tessellation control shader and a tessellation evaluation shader,
+ 	 * both in SPIR-V format, returns tessellation reflection data.
+-- 
+2.50.1 (Apple Git-155)
+

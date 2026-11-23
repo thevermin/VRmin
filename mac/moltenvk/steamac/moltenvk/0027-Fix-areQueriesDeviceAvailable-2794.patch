@@ -1,0 +1,54 @@
+From 0c88fd523b3ab95f03650fc9f495f4867f018e01 Mon Sep 17 00:00:00 2001
+From: David Grinberg <green.grinya@gmail.com>
+Date: Sat, 8 Aug 2026 12:35:05 +0700
+Subject: [PATCH 27/28] Fix areQueriesDeviceAvailable (#2794)
+
+* fix areQueriesDeviceAvailable
+
+* fix availability buffer offset
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h  | 4 ++--
+ MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm | 5 +++--
+ 2 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h
+index 8089347..b724cbb 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h
+@@ -92,8 +92,8 @@ public:
+     /** Called from the MVKCmdBeginQuery command when it is added to the command buffer */
+     virtual void beginQueryAddedTo(uint32_t query, MVKCommandBuffer* cmdBuffer) {};
+ 
+-    /** Returns whether all the queries in [firstQuery, endQuery) are available on the device. */
+-    bool areQueriesDeviceAvailable(uint32_t firstQuery, uint32_t endQuery);
++    /** Returns whether queryCount queries starting at firstQuery are available on the device. */
++    bool areQueriesDeviceAvailable(uint32_t firstQuery, uint32_t queryCount);
+ 
+ #pragma mark Construction
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
+index 5231d79..428a51f 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
+@@ -100,7 +100,8 @@
+ 	return rqstRslt;
+ }
+ 
+-bool MVKQueryPool::areQueriesDeviceAvailable(uint32_t firstQuery, uint32_t endQuery) {
++bool MVKQueryPool::areQueriesDeviceAvailable(uint32_t firstQuery, uint32_t queryCount) {
++	uint32_t endQuery = firstQuery + queryCount;
+     for (uint32_t query = firstQuery; query < endQuery; query++) {
+         if ( _availability[query] < DeviceAvailable ) { return false; }
+     }
+@@ -182,7 +183,7 @@
+ 		state.bindStructBytes(mtlComputeCmdEnc, &queryCount, 3);
+ 		state.bindStructBytes(mtlComputeCmdEnc, &flags,      4);
+ 		_availabilityLock.lock();
+-		cmdEncoder->setComputeBytes(mtlComputeCmdEnc, _availability.data(), _availability.size() * sizeof(Status), 5);
++		cmdEncoder->setComputeBytes(mtlComputeCmdEnc, _availability.data() + firstQuery, queryCount * sizeof(Status), 5);
+ 		_availabilityLock.unlock();
+ 
+ 		// Run one thread per query. Try to fill up a subgroup.
+-- 
+2.50.1 (Apple Git-155)
+

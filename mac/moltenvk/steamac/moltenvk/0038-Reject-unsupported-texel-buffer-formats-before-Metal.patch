@@ -1,0 +1,74 @@
+From: steamac <steamac@localhost>
+Subject: [PATCH 0038] STEAMAC-3Q Reject unsupported texel buffer formats before Metal
+
+STEAMAC-3Q and development reports STEAMAC-46/47 abort in
+MVKDevice::getVkFormatTexelBufferAlignment from vkCreateBufferView. STEAMAC-46
+records Metal's always-on assertion: MTLPixelFormatInvalid is not supported
+on this device. Vulkan applications can pass RGB formats that have no Metal
+pixel representation (and advertise no texel-buffer format features).
+
+Reject unsupported buffer-view formats with VK_ERROR_FORMAT_NOT_SUPPORTED
+before alignment queries or texel arithmetic. The existing Vulkan entry point
+clears the returned handle and destroys the failed view.
+Check advertised texel-buffer capabilities before converting the format: the
+conversion error path appends a format name, which is null for unknown enums.
+Report rejected formats numerically so unknown values also fail cleanly.
+
+The alignment helper also serves image construction. Return the existing
+fallback alignment without querying Metal for unsupported or non-linear
+formats, checking the selected Metal plane to retain multi-planar alignment.
+Supported linear formats still obtain their device-specific alignment.
+
+Regression coverage: host/moltenvk/repro/texel_buffer.c --format <case>, with
+Metal API validation enabled. RGB32, RGB16, undefined/unknown, depth,
+compressed and YCbCr formats must fail cleanly; R32/R8/RGBA8 controls succeed.
+The ordinary texel-buffer repro also runs all format-creation cases.
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
+@@ -304,11 +304,24 @@
+ 	MVKPixelFormats* pixFmts = getPixelFormats();
+     _buffer = (MVKBuffer*)pCreateInfo->buffer;
+     _offset = pCreateInfo->offset;
+-    _mtlPixelFormat = pixFmts->getMTLPixelFormat(pCreateInfo->format);
++	// Check capabilities before format conversion: unknown VkFormats have no diagnostic name.
++	VkFormatFeatureFlags2 formatFeatures = pixFmts->getVkFormatProperties3(pCreateInfo->format).bufferFeatures;
++	_mtlPixelFormat = mvkIsAnyFlagEnabled(formatFeatures,
++										VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT | VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT)
++						? pixFmts->getMTLPixelFormat(pCreateInfo->format) : MTLPixelFormatInvalid;
+     VkExtent2D fmtBlockSize = pixFmts->getBlockTexelSize(pCreateInfo->format);  // Pixel size of format
+     size_t bytesPerBlock = pixFmts->getBytesPerBlock(pCreateInfo->format);
+ 	_bytesPerPixel = static_cast<uint32_t>(bytesPerBlock);
+ 	_mtlTexture = nil;
++
++	// Games can request formats with no Metal texel-buffer representation (e.g. RGB32).
++	// Reject them before offset/size arithmetic or Metal's always-on alignment validation.
++	if (!_mtlPixelFormat || !bytesPerBlock) {
++		setConfigurationResult(reportError(VK_ERROR_FORMAT_NOT_SUPPORTED,
++										   "vkCreateBufferView(): Format %d does not support texel buffers on this device.",
++										   pCreateInfo->format));
++		return;
++	}
+ 	auto& mtlFeats = getMetalFeatures();
+ 
+ 	if (mtlFeats.emulatedTexelBufferAlignment) {
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -4968,6 +4968,15 @@
+ 		// typically have stricter alignment requirements due to it being a 2-component format.
+ 		mtlPixFmt = mvkPixFmts->getChromaSubsamplingPlaneMTLPixelFormat(format, 1);
+ 	}
++	// Metal asserts for invalid/unsupported formats, rather than returning zero.
++	// This helper is also used while configuring images, including rejected linear images.
++	// Check the selected plane's Metal format so valid multi-planar images retain their alignment.
++	VkExtent2D blockSize = mvkPixFmts->getBlockTexelSize(mtlPixFmt);
++	if (!mvkPixFmts->isSupported(mtlPixFmt) ||
++		mvkPixFmts->isDepthFormat(mtlPixFmt) || mvkPixFmts->isStencilFormat(mtlPixFmt) ||
++		blockSize.width != 1 || blockSize.height != 1) {
++		return _physicalDevice->_properties.limits.minTexelBufferOffsetAlignment;
++	}
+ 	deviceAlignment = [mtlDev minimumLinearTextureAlignmentForPixelFormat: mtlPixFmt];
+ 
+ 	return deviceAlignment ? deviceAlignment : _physicalDevice->_properties.limits.minTexelBufferOffsetAlignment;

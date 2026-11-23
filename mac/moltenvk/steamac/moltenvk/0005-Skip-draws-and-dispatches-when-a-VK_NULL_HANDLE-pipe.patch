@@ -1,0 +1,151 @@
+From 5e8831c6d8a3c479fa9f80d61727744ddceeb365 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 21:54:05 +0300
+Subject: [PATCH 05/22] Skip draws and dispatches when a VK_NULL_HANDLE
+ pipeline is bound
+
+vkCreate*Pipelines returns VK_NULL_HANDLE for pipelines that fail to compile.
+Binding VK_NULL_HANDLE is invalid usage, but it happens in practice: Venus
+(virglrenderer) creates pipelines on the host asynchronously for a guest that
+already got a handle, so when host-side compilation fails the guest's bind is
+replayed as vkCmdBindPipeline(VK_NULL_HANDLE). MoltenVK then crashed the whole
+host process (SIGSEGV in MVKCmdBindGraphicsPipeline::isTessellationPipeline()
+at record time, and null dereferences in bindPipeline/draw encoding).
+
+Record the null bind (with a warning), clear the bound pipeline in the encoder
+state without touching the layout, and skip every draw and dispatch while no
+valid pipeline is bound, so that the failure costs missing rendering instead of
+a crash.
+---
+ MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm         | 2 ++
+ MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm             | 5 +++++
+ MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm         | 9 ++++++++-
+ MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm       | 2 +-
+ MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm | 2 ++
+ 5 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm
+index c4f0aa90..78952bcd 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm
+@@ -43,6 +43,7 @@
+ }
+ 
+ void MVKCmdDispatch::encode(MVKCommandEncoder* cmdEncoder) {
++	if ( !cmdEncoder->getComputePipeline() ) { return; }	// No valid pipeline bound (see MVKCmdBindPipeline).
+ 	MTLRegion mtlThreadgroupCount = MTLRegionMake3D(_baseGroupX, _baseGroupY, _baseGroupZ, _groupCountX, _groupCountY, _groupCountZ);
+ 	cmdEncoder->finalizeDispatchState();	// Ensure all updated state has been submitted to Metal
+ 	id<MTLComputeCommandEncoder> mtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDispatch);
+@@ -69,6 +70,7 @@
+ }
+ 
+ void MVKCmdDispatchIndirect::encode(MVKCommandEncoder* cmdEncoder) {
++	if ( !cmdEncoder->getComputePipeline() ) { return; }	// No valid pipeline bound (see MVKCmdBindPipeline).
+     cmdEncoder->finalizeDispatchState();	// Ensure all updated state has been submitted to Metal
+     [cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDispatch) dispatchThreadgroupsWithIndirectBuffer: _mtlIndirectBuffer
+ 																				indirectBufferOffset: _mtlIndirectBufferOffset
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index ea656405..3ec3e425 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -231,6 +231,7 @@
+ void MVKCmdDraw::encode(MVKCommandEncoder* cmdEncoder) {
+ 
+ 	if (_vertexCount == 0 || _instanceCount == 0) { return; }	// Nothing to do.
++	if ( !cmdEncoder->getGraphicsPipeline() ) { return; }	// No valid pipeline bound (see MVKCmdBindPipeline).
+ 
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 
+@@ -473,6 +474,7 @@
+ void MVKCmdDrawIndexed::encode(MVKCommandEncoder* cmdEncoder) {
+ 
+ 	if (_indexCount == 0 || _instanceCount == 0) { return; }	// Nothing to do.
++	if ( !cmdEncoder->getGraphicsPipeline() ) { return; }	// No valid pipeline bound (see MVKCmdBindPipeline).
+ 
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 
+@@ -792,6 +794,7 @@
+ }
+ 
+ void MVKCmdDrawIndirect::encode(MVKCommandEncoder* cmdEncoder) {
++	if ( !cmdEncoder->getGraphicsPipeline() ) { return; }	// No valid pipeline bound (see MVKCmdBindPipeline).
+ 
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 
+@@ -1085,11 +1088,13 @@
+ }
+ 
+ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder) {
++	if ( !cmdEncoder->getGraphicsPipeline() ) { return; }	// No valid pipeline bound (see MVKCmdBindPipeline).
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 	encode(cmdEncoder, cmdEncoder->getVkGraphics()._indexBuffer);
+ }
+ 
+ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder, const MVKIndexMTLBufferBinding& ibbOrig) {
++	if ( !cmdEncoder->getGraphicsPipeline() ) { return; }	// No valid pipeline bound (see MVKCmdBindPipeline).
+ 
+     cmdEncoder->_isIndexedDraw = true;
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
+index 34e12474..4856f97d 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
+@@ -269,6 +269,13 @@ static uint64_t mvkPipelineStageFlagsToBarrierStages(VkPipelineStageFlags2 flags
+ VkResult MVKCmdBindPipeline::setContent(MVKCommandBuffer* cmdBuff, VkPipeline pipeline) {
+ 	_pipeline = (MVKPipeline*)pipeline;
+ 
++	// Binding VK_NULL_HANDLE is invalid usage, but it happens when a pipeline failed to compile and the
++	// app does not check (e.g. Venus creates pipelines asynchronously on behalf of a guest). Record the
++	// bind anyway so that later draws and dispatches are skipped instead of using a stale pipeline.
++	if ( !_pipeline ) {
++		cmdBuff->reportMessage(MVK_CONFIG_LOG_LEVEL_WARNING, "vkCmdBindPipeline(): pipeline is VK_NULL_HANDLE (it probably failed to compile). Draws and dispatches will be skipped until a valid pipeline is bound.");
++	}
++
+ 	cmdBuff->recordBindPipeline(this);
+ 
+ 	return VK_SUCCESS;
+@@ -283,7 +290,7 @@ static uint64_t mvkPipelineStageFlagsToBarrierStages(VkPipelineStageFlags2 flags
+ }
+ 
+ bool MVKCmdBindGraphicsPipeline::isTessellationPipeline() {
+-	return ((MVKGraphicsPipeline*)_pipeline)->isTessellationPipeline();
++	return _pipeline && ((MVKGraphicsPipeline*)_pipeline)->isTessellationPipeline();
+ }
+ 
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+index 79155649..ddd911c8 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -902,7 +902,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+     switch (pipelineBindPoint) {
+         case VK_PIPELINE_BIND_POINT_GRAPHICS:
+             _state.bindGraphicsPipeline(static_cast<MVKGraphicsPipeline*>(pipeline));
+-            static_cast<MVKGraphicsPipeline*>(pipeline)->wasBound(this);
++            if (pipeline) { static_cast<MVKGraphicsPipeline*>(pipeline)->wasBound(this); }
+             break;
+ 
+         case VK_PIPELINE_BIND_POINT_COMPUTE:
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index e4075302..98f6db60 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -1954,6 +1954,7 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
+ void MVKCommandEncoderState::bindGraphicsPipeline(MVKGraphicsPipeline* pipeline) {
+ 	_mtlGraphics.changePipeline(_vkGraphics._pipeline, pipeline);
+ 	_vkGraphics._pipeline = pipeline;
++	if ( !pipeline ) { return; }	// Null pipeline: draws are skipped until a valid one is bound.
+ 	MVKPipelineLayout* layout = pipeline->getLayout();
+ 	if (_vkGraphics._layout != layout) {
+ 		if (!_vkGraphics._layout || _vkGraphics._layout->getPushConstantsLength() < layout->getPushConstantsLength()) {
+@@ -1966,6 +1967,7 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
+ 
+ void MVKCommandEncoderState::bindComputePipeline(MVKComputePipeline* pipeline) {
+ 	_vkCompute._pipeline = pipeline;
++	if ( !pipeline ) { return; }	// Null pipeline: dispatches are skipped until a valid one is bound.
+ 	MVKPipelineLayout* layout = pipeline->getLayout();
+ 	if (_vkCompute._layout != layout) {
+ 		if (!_vkCompute._layout || _vkCompute._layout->getPushConstantsLength() < layout->getPushConstantsLength()) {
+-- 
+2.50.1 (Apple Git-155)
+

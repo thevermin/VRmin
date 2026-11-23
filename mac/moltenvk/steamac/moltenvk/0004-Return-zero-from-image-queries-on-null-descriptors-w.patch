@@ -1,0 +1,70 @@
+From 9f345fa779a3fd8f4e72b30dfe667453ffa4573e Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 21:21:40 +0300
+Subject: [PATCH 04/22] Return zero from image queries on null descriptors when
+ nullDescriptor is enabled
+
+Pass VK_EXT_robustness2 nullDescriptor to SPIRV-Cross (new MSL option
+null_descriptor, steamac SPIRV-Cross patch) so that textureSize /
+textureQueryLevels / textureSamples on a null descriptor return zero, as the
+extension requires. Previously this only happened with robustImageAccess2;
+Metal returns non-zero mip levels for a nil texture.
+
+gamescope enables only nullDescriptor and uses textureQueryLevels() == 0 on its
+null shaper-LUT descriptors to skip the LUT path; it composited black.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index e6c51620..8115779c 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -2492,6 +2492,7 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+ 
+ 	shaderConfig.options.mslOptions.ios_support_base_vertex_instance = mtlFeats.baseVertexInstanceDrawing;
+ 	shaderConfig.options.mslOptions.texture_1D_as_2D = mvkCfg.texture1DAs2D;
++	shaderConfig.options.mslOptions.null_descriptor = getEnabledRobustness2Features().nullDescriptor;
+ 	shaderConfig.options.mslOptions.enable_point_size_builtin = isRenderingPoints() || reflectData.pointMode;
+ 	shaderConfig.options.mslOptions.enable_point_size_default = shaderConfig.options.mslOptions.enable_point_size_builtin;
+ 	shaderConfig.options.mslOptions.default_point_size = 1.0f; // See VK_KHR_maintenance5
+@@ -2866,6 +2867,7 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+ 	shaderConfig.options.mslOptions.argument_buffers_tier = (SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::ArgumentBuffersTier)getMetalFeatures().argumentBuffersTier;
+ 	shaderConfig.options.mslOptions.robust_buffer_access2 = shouldEnableRobustBufferAccess2(this, pCreateInfo);
+ 	shaderConfig.options.mslOptions.robust_image_access2 = shouldEnableRobustImageAccess2(this, pCreateInfo);
++	shaderConfig.options.mslOptions.null_descriptor = getEnabledRobustness2Features().nullDescriptor;
+ 
+ #if MVK_MACOS
+     shaderConfig.options.mslOptions.emulate_subgroups = !mtlFeats.simdPermute;
+@@ -3273,6 +3275,7 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+ 				opt.use_fast_math_pragmas,
+ 				opt.robust_buffer_access2,
+ 				opt.robust_image_access2,
++				opt.null_descriptor,
+ 				opt.for_mesh_pipeline,
+ 				opt.input_primitive_type);
+ 	}
+@@ -3579,17 +3582,17 @@ static size_t mvkValidateCerealArchiveSize(size_t padByteCnt = 0) {
+ 
+ void mvkValidateCeralArchiveDefinitions() {
+ 	[[maybe_unused]] size_t missingBytes = 0;
+-	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(7);
++	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(6);
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLShaderInterfaceVariable>(3);
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLResourceBinding>();
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLConstexprSampler>();
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVWorkgroupSizeDimension>(3);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVEntryPoint>(20);						// Contains string
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(25);			// Contains string
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(24);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLShaderInterfaceVariable>(6);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLResourceBinding>(2);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::DescriptorBinding>();
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(105);	// Contains collection
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(104);	// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(39);		// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLSpecializationMacroInfo>(22);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<MVKShaderModuleKey>();
+-- 
+2.50.1 (Apple Git-155)
+

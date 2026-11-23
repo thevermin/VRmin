@@ -1,0 +1,113 @@
+From 8e4db6fea3e3bd8023df15cdd67ecce1db411f68 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Mon, 12 Oct 2026 22:11:23 +0300
+Subject: [PATCH 34/34] MSL: Vertex inputs without a vertex attribute read zeros
+
+STEAMAC-2Y: an SCS Truck Simulator vertex shader reads in_var_NORMAL at
+location 1 while its pipeline describes no vertex attribute 1. Vulkan only
+leaves the values read undefined (drivers read zeros or stale data), but
+Metal fails the render pipeline: "Vertex attribute in_var_NORMAL(1) is
+missing from the vertex descriptor", and every draw with it was dropped.
+
+Add Options::zero_missing_vertex_attributes. For vertex shaders of plain
+vertex pipelines (neither vertex_for_tessellation nor for_mesh_pipeline),
+location inputs none of whose locations has an msl_shader_input become
+Private variables with a null constant initializer before the interface
+blocks are built: they are left out of stage_in and declared as
+zero-initialized locals of the entry point. Inputs of several locations with
+an attribute at any of them are kept.
+---
+ spirv_msl.cpp | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ spirv_msl.hpp |  7 +++++++
+ 2 files changed, 51 insertions(+)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 64d46a6..66096d2 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -2935,6 +2935,8 @@ string CompilerMSL::compile()
+ 	}
+ 	sync_entry_point_aliases_and_names();
+ 
++	zero_missing_vertex_attributes();
++
+ 	build_function_control_flow_graphs_and_analyze();
+ 	update_active_builtins();
+ 	analyze_image_and_sampler_usage();
+@@ -3201,6 +3203,48 @@ void CompilerMSL::preprocess_op_codes()
+ 	}
+ }
+ 
++// Vertex inputs at locations without an msl_shader_input (no vertex attribute, see
++// Options::zero_missing_vertex_attributes) become zero-initialized Private variables: add_interface_block()
++// leaves them out of stage_in and localize_global_variables() declares them in the entry point.
++void CompilerMSL::zero_missing_vertex_attributes()
++{
++	if (!msl_options.zero_missing_vertex_attributes || get_execution_model() != ExecutionModelVertex ||
++	    msl_options.vertex_for_tessellation || msl_options.for_mesh_pipeline)
++		return;
++
++	SmallVector<uint32_t> missing;
++	ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var) {
++		if (var.storage != StorageClassInput || has_decoration(var_id, DecorationBuiltIn) ||
++		    !has_decoration(var_id, DecorationLocation))
++			return;
++		// Inputs that take several locations (matrices, arrays) are kept when any of them has an attribute.
++		uint32_t location = get_decoration(var_id, DecorationLocation);
++		uint32_t count = type_to_location_count(get_variable_data_type(var));
++		for (auto &input : inputs_by_location)
++			if (input.first.location >= location && input.first.location < location + count)
++				return;
++		missing.push_back(var_id);
++	});
++
++	for (uint32_t var_id : missing)
++	{
++		// New ids (also those of a null array's or struct's elements) may reallocate the id table: the variable is
++		// looked up after allocating them.
++		uint32_t ptr_type_id = ir.increase_bound_by(2);
++		uint32_t null_id = ptr_type_id + 1;
++		SPIRType ptr_type = get<SPIRType>(get<SPIRVariable>(var_id).basetype);
++		ptr_type.storage = StorageClassPrivate;
++		set<SPIRType>(ptr_type_id, ptr_type);
++		ir.make_constant_null(null_id, ptr_type.parent_type, false);
++		auto &var = get<SPIRVariable>(var_id);
++		var.basetype = ptr_type_id;
++		var.storage = StorageClassPrivate;
++		var.initializer = null_id;
++		// Only Private, Workgroup and Output variables were collected as global variables when parsing.
++		global_variables.push_back(var_id);
++	}
++}
++
+ // Move the Private and Workgroup global variables to the entry function.
+ // Non-constant variables cannot have global scope in Metal.
+ // Workgroup variables of other entry points (see analyze_workgroup_variables()) are left out.
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 6f71ff4..ac9796d 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -557,6 +557,12 @@ public:
+ 		// functions, and geometry shaders as [[mesh]].
+ 		bool for_mesh_pipeline = false;
+ 
++		// Vertex shaders of plain vertex pipelines (neither vertex_for_tessellation nor for_mesh_pipeline): inputs at
++		// locations without an msl_shader_input (no vertex attribute) read zeros. Metal fails a render pipeline whose
++		// vertex function reads an attribute missing from the vertex descriptor, while Vulkan only leaves the values
++		// read undefined; such inputs become zero-initialized local variables instead of stage_in members.
++		bool zero_missing_vertex_attributes = false;
++
+ 		enum class PrimitiveTopology
+ 		{
+ 			Triangles, TriangleStrip, Lines, LineStrip, Points,
+@@ -1075,6 +1081,7 @@ protected:
+ 	bool is_mesh_shader() const;
+ 
+ 	void preprocess_op_codes();
++	void zero_missing_vertex_attributes();
+ 	void localize_global_variables();
+ 	void extract_global_variables_from_functions();
+ 	void mark_packable_structs();
+-- 
+2.54.0 (Apple Git-157)
+

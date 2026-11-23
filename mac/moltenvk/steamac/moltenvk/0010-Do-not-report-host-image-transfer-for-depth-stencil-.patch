@@ -1,0 +1,41 @@
+From 26e6d94275554e31b00e0e1dbb0f5f3b99c207a6 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 22:55:54 +0300
+Subject: [PATCH 10/22] Do not report host image transfer for depth/stencil
+ formats
+
+Images of depth/stencil-capable formats always need private memory
+(MVKImage::getMemoryRequirements()), and VK_IMAGE_USAGE_HOST_TRANSFER_BIT removes the
+private memory types, so an image with both had memoryTypeBits = 0. The formats still
+reported VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT and vkGetPhysicalDeviceImageFormatProperties2
+accepted the usage. zink adds HOST_TRANSFER to every renderbuffer whose format reports it, so it
+could not allocate any depth or stencil renderbuffer: every GL framebuffer with a depth or
+stencil attachment was incomplete (GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT).
+
+Clear HOST_IMAGE_TRANSFER from formats with DEPTH_STENCIL_ATTACHMENT, so the HOST_TRANSFER usage
+is rejected for them.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
+index b6d05e3d..159aafd5 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
+@@ -1579,6 +1579,13 @@
+ 		vkProps.optimalTilingFeatures |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
+ 	}
+ 
++	// Images of depth/stencil-capable formats are always allocated in private memory (see
++	// MVKImage::getMemoryRequirements()), which host image copies cannot access: an image of
++	// such a format with VK_IMAGE_USAGE_HOST_TRANSFER_BIT would have no valid memory type.
++	if (mvkIsAnyFlagEnabled(vkProps.optimalTilingFeatures, VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT)) {
++		mvkDisableFlags(vkProps.optimalTilingFeatures, VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT);
++	}
++
+ 	// Vulkan forbids blits between chroma-subsampled formats.
+ 	// If we can't write the stencil reference from the shader, we can't blit stencil.
+ 	bool supportsStencilFeedback = gpuCaps.supportsApple5 || gpuCaps.supportsMac2;
+-- 
+2.50.1 (Apple Git-155)
+

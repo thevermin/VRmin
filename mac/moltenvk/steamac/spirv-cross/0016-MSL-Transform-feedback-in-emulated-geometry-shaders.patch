@@ -1,0 +1,484 @@
+From 5f65c8b3c86a7ecf1f99deca7a67259f79489f8e Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sun, 4 Oct 2026 01:03:01 +0300
+Subject: [PATCH 16/17] MSL: Transform feedback in emulated geometry shaders
+
+Transform feedback of a geometry shader (zink with a geometry shader on every draw, DXVK's
+stream-output geometry shaders) did not compile: one 'int gl_VertexIndex = 0' per captured
+output, the buffer declared const, and every vertex written at index 0 regardless of the
+output topology. Stream-output-only geometry shaders without a position also did not compile
+('missing mesh output declaration with attribute position').
+
+- Geometry shaders without a position output get an implicit one: the vertices of a Metal
+  mesh need it.
+- Captured outputs are written by the mesh stream when an output primitive is complete,
+  decomposed into points, lines or triangles in the order of the output topology (odd strip
+  triangles as (t, t + 2, t + 1)), to up to 4 buffers at Offset within XfbStride, skipping
+  buffers that are not bound.
+- The vertices of a draw must be written in primitive order, but each input primitive emits a
+  varying number of vertices. The mesh entry point therefore runs in two modes: 1 counts the
+  captured vertices of each input primitive (and outputs no primitives), 2 writes them at the
+  first vertex slot of the primitive computed by the API from the counts. Options
+  xfb_buffer_index (buffer b at xfb_buffer_index - b), xfb_session_index (sizes, offsets,
+  strides, used buffers), xfb_prims_index (per-primitive counts/slots), xfb_mode_index.
+- The object stage passes the input primitive index over all instances in the payload.
+- OpEmitStreamVertex / OpEndStreamPrimitive of stream 0 emit; other streams are ignored.
+- Rasterized strip triangles also use the (t, t + 2, t + 1) order for odd triangles (front
+  faces of odd strip triangles were reversed).
+- Remove a debug printf of the transform feedback buffer id.
+---
+ spirv_msl.cpp | 249 +++++++++++++++++++++++++++++++++++++++++++++++---
+ spirv_msl.hpp |  16 +++-
+ 2 files changed, 250 insertions(+), 15 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 92d227c5..3589a393 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -327,7 +327,18 @@ bool CompilerMSL::builtin_translates_to_nonarray(BuiltIn builtin) const
+ 
+ void CompilerMSL::build_implicit_builtins()
+ {
+-	bool need_xfb = get_execution_mode_bitset().get(ExecutionModeXfb);
++	// Transform feedback is captured by emulated geometry shaders through the mesh stream
++	// (collect_mesh_xfb_buffers()). The vertex shader of an emulated geometry pipeline captures nothing.
++	// Capture from other stages is not emitted; needs_xfb_buffer() reports it so the API can refuse it.
++	bool need_xfb = false;
++	if (get_execution_mode_bitset().get(ExecutionModeXfb))
++	{
++		if (get_execution_model() == ExecutionModelGeometry)
++			collect_mesh_xfb_buffers();
++		else if (!msl_options.for_mesh_pipeline && !msl_options.vertex_for_tessellation &&
++		         !is_tesc_shader())
++			stage_xfb_unsupported = true;
++	}
+ 	bool need_sample_pos = active_input_builtins.get(BuiltInSamplePosition);
+ 	bool need_vertex_params = (need_xfb || capture_output_to_buffer) && get_execution_model() == ExecutionModelVertex &&
+ 	                          !msl_options.vertex_for_tessellation;
+@@ -1184,6 +1195,31 @@ void CompilerMSL::build_implicit_builtins()
+ 	                     !capture_output_to_buffer && !get_is_rasterization_disabled() &&
+ 	                     !msl_options.auto_disable_rasterization &&
+ 	                     !active_output_builtins.get(BuiltInPosition) && !msl_options.for_mesh_pipeline;
++	// The vertices of the Metal mesh emulating a geometry shader need a position even if the geometry
++	// shader writes none (stream-output-only shaders such as DXVK's).
++	bool need_mesh_position = get_execution_model() == ExecutionModelGeometry && msl_options.for_mesh_pipeline &&
++	                          !active_output_builtins.get(BuiltInPosition);
++	if (need_mesh_position)
++	{
++		ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
++			if (var.storage == StorageClassOutput && interface_variable_exists_in_entry_point(var.self) &&
++			    has_decoration(var.self, DecorationBuiltIn) &&
++			    get_decoration(var.self, DecorationBuiltIn) == BuiltInPosition)
++				active_output_builtins.set(BuiltInPosition);
++			auto &var_type = get_variable_element_type(var);
++			if (var.storage == StorageClassOutput && interface_variable_exists_in_entry_point(var.self) &&
++			    var_type.basetype == SPIRType::Struct)
++			{
++				for (uint32_t m = 0; m < uint32_t(var_type.member_types.size()); m++)
++				{
++					auto builtin = BuiltInMax;
++					if (is_member_builtin(var_type, m, &builtin) && builtin == BuiltInPosition)
++						active_output_builtins.set(BuiltInPosition);
++				}
++			}
++		});
++		need_mesh_position = !active_output_builtins.get(BuiltInPosition);
++	}
+ 
+ 	if (need_position)
+ 	{
+@@ -1224,7 +1260,7 @@ void CompilerMSL::build_implicit_builtins()
+ 		is_rasterization_disabled = true;
+ 	}
+ 
+-	if (need_position)
++	if (need_position || need_mesh_position)
+ 	{
+ 		uint32_t offset = ir.increase_bound_by(3);
+ 		uint32_t type_id = offset;
+@@ -1329,7 +1365,6 @@ void CompilerMSL::build_implicit_builtins()
+ 		set_extended_decoration(var_id, SPIRVCrossDecorationResourceIndexPrimary,
+ 		                       msl_options.xfb_buffer_index);
+ 		xfb_buffer_id = var_id;
+-		printf("xfb_buffer_id = %u\n", var_id);
+ 	}
+ 
+ 	if (needs_msl_subgroup_size)
+@@ -2094,6 +2129,106 @@ void CompilerMSL::emit_mesh_payload_load(const SPIRType &type, const std::string
+ 	statement(lhs, " = ", mesh_payload_load(type, location, component), ";");
+ }
+ 
++// Transform feedback of an emulated geometry shader: the transform feedback buffers the geometry shader
++// writes, and their strides.
++void CompilerMSL::collect_mesh_xfb_buffers()
++{
++	mesh_xfb_used_mask = 0;
++	ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
++		if (var.storage != StorageClassOutput || !interface_variable_exists_in_entry_point(var.self))
++			return;
++		if (!has_decoration(var.self, DecorationXfbBuffer))
++			return;
++		uint32_t buffer = get_decoration(var.self, DecorationXfbBuffer);
++		if (buffer >= 4)
++			SPIRV_CROSS_THROW("Transform feedback buffer index out of range.");
++		auto &type = get_variable_data_type(var);
++		bool captured = has_decoration(var.self, DecorationOffset);
++		if (type.basetype == SPIRType::Struct)
++			for (uint32_t m = 0; m < uint32_t(type.member_types.size()); m++)
++				captured = captured || has_member_decoration(type.self, m, DecorationOffset);
++		if (!captured)
++			return;
++		mesh_xfb_used_mask |= 1u << buffer;
++		mesh_xfb_strides[buffer] = get_decoration(var.self, DecorationXfbStride);
++	});
++}
++
++// Stores one captured output of the vertex v into the transform feedback buffer at the vertex slot s.
++void CompilerMSL::emit_mesh_xfb_store(const SPIRType &type, const std::string &expr, uint32_t buffer, uint32_t offset)
++{
++	if (!type.array.empty())
++	{
++		auto &elem_type = get<SPIRType>(type.parent_type);
++		uint32_t elem_size = elem_type.vecsize * elem_type.columns * 4;
++		for (uint32_t i = 0; i < to_array_size_literal(type); i++)
++			emit_mesh_xfb_store(elem_type, join(expr, "[", i, "]"), buffer, offset + i * elem_size);
++		return;
++	}
++	if (type.columns > 1)
++	{
++		auto col_type = type;
++		col_type.columns = 1;
++		for (uint32_t c = 0; c < type.columns; c++)
++			emit_mesh_xfb_store(col_type, join(expr, "[", c, "]"), buffer, offset + c * type.vecsize * 4);
++		return;
++	}
++	if (type.width != 32 || (type.basetype != SPIRType::Float && type.basetype != SPIRType::Int &&
++	                         type.basetype != SPIRType::UInt))
++		SPIRV_CROSS_THROW("Transform feedback of this output type is not supported.");
++	string t = type_to_glsl(type);
++	if (type.vecsize > 1)
++		t = "packed_" + t;
++	// Outputs to a transform feedback buffer that is not bound are ignored.
++	statement("if (xfb.buffers[", buffer, "]) *(device ", t, " *)(xfb.buffers[", buffer, "] + s * ", mesh_xfb_strides[buffer],
++	          " + ", offset, ") = ", t, "(", expr, ");");
++}
++
++// The capture function of the mesh stream: stores the captured outputs of a vertex at its slot.
++void CompilerMSL::emit_mesh_xfb_capture_function(const std::string &vertex_type)
++{
++	auto &out_type = get_variable_data_type(get<SPIRVariable>(stage_out_var_id));
++	statement("static inline void spvXfbCapture(thread spvXfbContext &xfb, thread const ", vertex_type, " &v)");
++	begin_scope();
++	statement("if (xfb.mode == 2 && xfb.slot != 0xffffffffu)");
++	begin_scope();
++	statement("uint s = xfb.slot + xfb.count;");
++	for (uint32_t m = 0; m < uint32_t(out_type.member_types.size()); m++)
++	{
++		if (!has_extended_member_decoration(out_type.self, m, SPIRVCrossDecorationInterfaceOrigID))
++			continue;
++		uint32_t var_id = get_extended_member_decoration(out_type.self, m, SPIRVCrossDecorationInterfaceOrigID);
++		auto *var = maybe_get<SPIRVariable>(var_id);
++		if (!var || !has_decoration(var_id, DecorationXfbBuffer))
++			continue;
++		uint32_t buffer = get_decoration(var_id, DecorationXfbBuffer);
++		auto &var_type = get_variable_data_type(*var);
++		bool has_offset = false;
++		uint32_t offset = 0;
++		if (var_type.basetype == SPIRType::Struct)
++		{
++			uint32_t var_mbr = get_extended_member_decoration(out_type.self, m, SPIRVCrossDecorationInterfaceMemberIndex);
++			if (has_member_decoration(var_type.self, var_mbr, DecorationOffset))
++			{
++				has_offset = true;
++				offset = get_member_decoration(var_type.self, var_mbr, DecorationOffset);
++			}
++		}
++		else if (has_decoration(var_id, DecorationOffset))
++		{
++			has_offset = true;
++			offset = get_decoration(var_id, DecorationOffset);
++		}
++		if (!has_offset)
++			continue;
++		emit_mesh_xfb_store(get<SPIRType>(out_type.member_types[m]), join("v.", to_member_name(out_type, m)), buffer, offset);
++	}
++	end_scope();
++	statement("xfb.count++;");
++	end_scope();
++	statement("");
++}
++
+ void CompilerMSL::emit_mesh_wrapper()
+ {
+ 	auto &execution = get_entry_point();
+@@ -2185,6 +2320,8 @@ void CompilerMSL::emit_mesh_wrapper()
+ 
+ 		statement("int instanceIndex = int(positionInGrid.y + drawInfo->baseInstance);");
+ 		statement("payload.primitiveId = positionInGrid.x;");
++		// Input primitive of the draw over all instances, for the transform feedback of the geometry stage.
++		statement("payload.spvPayloadPad[0] = positionInGrid.y * gridSize.x + positionInGrid.x;");
+ 
+ 		statement("for (int i = 0; i < vertexCount; ++i)");
+ 		begin_scope();
+@@ -2455,10 +2592,45 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		statement(mesh_arguments);
+ 		msl_options.for_mesh_pipeline = true;
+ 
++		// Transform feedback (see emit_mesh_xfb_capture_function()). Session state, in uints: bound size in
++		// bytes of each buffer (0 = not bound) at 0, current byte offset of each buffer at 4, stride of each
++		// buffer at 8, mask of the buffers written at 12, byte offset of each buffer at the start of the
++		// current draw at 16. Per input primitive: its captured vertex count (mode 1), then its first
++		// vertex slot in the draw or 0xffffffff if it does not fit (mode 2).
++		if (mesh_xfb_used_mask)
++		{
++			for (uint32_t b = 0; b < 4; b++)
++				if (mesh_xfb_used_mask & (1u << b))
++					statement("device uchar *spvXfbBuffer", b, " [[buffer(", msl_options.xfb_buffer_index - b, ")]],");
++			statement("device uint *spvXfbSession [[buffer(", msl_options.xfb_session_index, ")]],");
++			statement("device uint *spvXfbPrims [[buffer(", msl_options.xfb_prims_index, ")]],");
++			statement("constant uint &spvXfbMode [[buffer(", msl_options.xfb_mode_index, ")]],");
++		}
++
+ 		statement("uint lid [[thread_index_in_threadgroup]], uint tid [[threadgroup_position_in_grid]])");
+ 
+ 		begin_scope();
+ 
++		if (mesh_xfb_used_mask)
++		{
++			statement("spvXfbContext spvXfb = {};");
++			statement("spvXfb.mode = spvXfbMode;");
++			statement("uint spvXfbPrim = payload.spvPayloadPad[0];");
++			statement("if (spvXfb.mode == 1 && spvXfbPrim == 0)");
++			begin_scope();
++			for (uint32_t b = 0; b < 4; b++)
++				statement("spvXfbSession[", 8 + b, "] = ", mesh_xfb_strides[b], ";");
++			statement("spvXfbSession[12] = ", mesh_xfb_used_mask, ";");
++			end_scope();
++			statement("if (spvXfb.mode == 2)");
++			begin_scope();
++			statement("spvXfb.slot = spvXfbPrims[spvXfbPrim];");
++			for (uint32_t b = 0; b < 4; b++)
++				if (mesh_xfb_used_mask & (1u << b))
++					statement("spvXfb.buffers[", b, "] = spvXfbSession[", b, "] ? spvXfbBuffer", b, " + spvXfbSession[", 16 + b, "] : nullptr;");
++			end_scope();
++		}
++
+ 		auto in_var_type = get_variable_data_type(get<SPIRVariable>(stage_in_var_id));
+ 		statement(type_to_glsl(in_var_type), " ", to_name(stage_in_var_id), ";");
+ 
+@@ -2533,7 +2705,7 @@ void CompilerMSL::emit_mesh_wrapper()
+ 
+ 		end_scope();
+ 
+-		statement(join(execution.name, "(outputMesh, ", to_name(stage_in_var_id)));
++		statement(join(execution.name, "(outputMesh, ", mesh_xfb_used_mask ? "spvXfb, " : "", to_name(stage_in_var_id)));
+ 
+ 		if (msl_options.argument_buffers)
+ 		{
+@@ -2577,6 +2749,8 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		});
+ 
+ 		statement(");");
++		if (mesh_xfb_used_mask)
++			statement("if (spvXfb.mode == 1) spvXfbPrims[spvXfbPrim] = spvXfb.count;");
+ 		end_scope();
+ 	}
+ }
+@@ -2631,7 +2805,8 @@ string CompilerMSL::compile()
+ 				auto &block = get<SPIRBlock>(block_id);
+ 				for (auto &inst : block.ops)
+ 				{
+-					if (inst.op == OpEmitVertex || inst.op == OpEndPrimitive)
++					if (inst.op == OpEmitVertex || inst.op == OpEndPrimitive || inst.op == OpEmitStreamVertex ||
++					    inst.op == OpEndStreamPrimitive)
+ 					{
+ 						functions_needing_mesh_stream.insert(func_id);
+ 						break;
+@@ -2849,7 +3024,8 @@ string CompilerMSL::compile()
+ 
+ 		entry_func.fixup_hooks_in.push_back([=]()
+ 		{
+-			statement("mesh_stream_t meshStream(spvMeshOut, ", to_name(stage_out_var_id),", ", to_name(stage_out_mesh_primitive_var_id) ,");");
++			statement("mesh_stream_t meshStream(spvMeshOut, ", to_name(stage_out_var_id),", ", to_name(stage_out_mesh_primitive_var_id),
++			          mesh_xfb_used_mask ? ", &spvXfb" : "", ");");
+ 		});
+ 	}
+ 
+@@ -2914,6 +3090,8 @@ string CompilerMSL::compile()
+ 
+ 			statement("enum { VERTEX_COUNT = ", std::to_string(output_vertices), ", PRIMITIVE_COUNT = ", std::to_string(output_primitives), " };");
+ 			statement("using mesh_stream_t = spvMeshStream<", vertex_type, ", ", prim_type, ", VERTEX_COUNT, PRIMITIVE_COUNT, metal::topology::", output_topology, ">;");
++			if (mesh_xfb_used_mask)
++				emit_mesh_xfb_capture_function(vertex_type);
+ 		}
+ 
+ 		emit_function(get<SPIRFunction>(ir.default_entry_point), Bitset());
+@@ -7154,6 +7332,22 @@ void CompilerMSL::emit_custom_templates()
+ 			break;
+ 
+ 		case SPVFuncImplEmitVertex:
++			// Transform feedback of an emulated geometry shader (see emit_mesh_wrapper()). mode 1 counts the
++			// captured vertices of each input primitive (and outputs no primitives), mode 2 writes them at the
++			// slot computed from the counts.
++			statement("struct spvXfbContext");
++			begin_scope();
++			statement("device uchar *buffers[4];");
++			statement("uint mode;");
++			statement("uint slot;");
++			statement("uint count;");
++			end_scope_decl();
++			statement("");
++			statement("template<typename V>");
++			statement("static inline void spvXfbCapture(thread spvXfbContext &, thread const V &)");
++			begin_scope();
++			end_scope();
++			statement("");
+ 			statement("template<typename V, typename P, int MaxV, int MaxP, metal::topology T>");
+ 			statement("struct spvMeshStream");
+ 			begin_scope();
+@@ -7167,14 +7361,16 @@ void CompilerMSL::emit_custom_templates()
+ 			statement("int currentPrimitive = 0;");
+ 			statement("thread P &primitiveData;");
+ 			statement("thread V &vertexData;");
++			statement("thread spvXfbContext *xfb;");
++			statement("V xfbPrev[2];");
+ 
+-			statement("spvMeshStream(thread mesh_t &_meshOut, thread V &_v, thread P &_p) : meshOut(_meshOut), primitiveData(_p), vertexData(_v)");
++			statement("spvMeshStream(thread mesh_t &_meshOut, thread V &_v, thread P &_p, thread spvXfbContext *_xfb = nullptr) : meshOut(_meshOut), primitiveData(_p), vertexData(_v), xfb(_xfb)");
+ 			begin_scope();
+ 			end_scope();
+ 
+ 			statement("~spvMeshStream()");
+ 			begin_scope();
+-			statement("meshOut.set_primitive_count(currentPrimitive);");
++			statement("meshOut.set_primitive_count(xfb && xfb->mode == 1 ? 0 : currentPrimitive);");
+ 			end_scope();
+ 
+ 			statement("int VperP()");
+@@ -7204,11 +7400,23 @@ void CompilerMSL::emit_custom_templates()
+ 			statement("currentVertexInPrimitive++;");
+ 			statement("if (currentVertexInPrimitive >= VperP())");
+ 			begin_scope();
++			// Triangle t of a strip is (t, t + 1, t + 2) for even t and (t, t + 2, t + 1) for odd t.
++			statement("bool odd = T == metal::topology::triangle && ((currentVertexInPrimitive - 3) & 1);");
+ 			statement("if (T == metal::topology::triangle) meshOut.set_index(currentIndex++, currentVertex-3);");
+-			statement("if (T == metal::topology::triangle || T == metal::topology::line) meshOut.set_index(currentIndex++, currentVertex-2);");
+-			statement("meshOut.set_index(currentIndex++, currentVertex-1);");
++			statement("if (T == metal::topology::triangle) meshOut.set_index(currentIndex++, odd ? currentVertex-1 : currentVertex-2);");
++			statement("if (T == metal::topology::triangle) meshOut.set_index(currentIndex++, odd ? currentVertex-2 : currentVertex-1);");
++			statement("if (T == metal::topology::line) meshOut.set_index(currentIndex++, currentVertex-2);");
++			statement("if (T != metal::topology::triangle) meshOut.set_index(currentIndex++, currentVertex-1);");
+ 			statement("meshOut.set_primitive(currentPrimitive++, primitiveData);");
++			statement("if (xfb)");
++			begin_scope();
++			statement("if (T == metal::topology::point) spvXfbCapture(*xfb, vertexData);");
++			statement("else if (T == metal::topology::line) { spvXfbCapture(*xfb, xfbPrev[1]); spvXfbCapture(*xfb, vertexData); }");
++			statement("else if (!odd) { spvXfbCapture(*xfb, xfbPrev[0]); spvXfbCapture(*xfb, xfbPrev[1]); spvXfbCapture(*xfb, vertexData); }");
++			statement("else { spvXfbCapture(*xfb, xfbPrev[0]); spvXfbCapture(*xfb, vertexData); spvXfbCapture(*xfb, xfbPrev[1]); }");
++			end_scope();
+ 			end_scope();
++			statement("if (xfb && T != metal::topology::point) { xfbPrev[0] = xfbPrev[1]; xfbPrev[1] = vertexData; }");
+ 			end_scope();
+ 			end_scope(";");
+ 
+@@ -12130,6 +12338,19 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 		break;
+ 	}
+ 
++	// Only vertex stream 0 is emulated (maxTransformFeedbackStreams = 1): it is rasterized and captured.
++	case OpEmitStreamVertex:
++	case OpEndStreamPrimitive:
++	{
++		add_spv_func_and_recompile(SPVFuncImplEmitVertex);
++		auto *stream = maybe_get<SPIRConstant>(ops[0]);
++		if (!stream)
++			SPIRV_CROSS_THROW("Geometry shader vertex stream must be a constant.");
++		if (stream->scalar() == 0)
++			statement(opcode == OpEmitStreamVertex ? "meshStream.EmitVertex();" : "meshStream.EndPrimitive();");
++		break;
++	}
++
+ 	case OpSDot:
+ 	case OpUDot:
+ 	case OpSUDot:
+@@ -13706,6 +13927,8 @@ void CompilerMSL::emit_function_prototype(SPIRFunction &func, const Bitset &)
+ 			auto output_primitives = execution.output_primitives;
+ 			if (!output_primitives) output_primitives = execution.output_vertices - 2;
+ 			decl += "mesh_stream_t::mesh_t spvMeshOut, ";
++			if (mesh_xfb_used_mask)
++				decl += "thread spvXfbContext &spvXfb, ";
+ 		}
+ 
+ 		if (msl_options.argument_buffers)
+@@ -18011,7 +18234,7 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 				break;
+ 			}
+ 		}
+-		else if (var.storage == StorageClassOutput && has_decoration(var_id, DecorationXfbBuffer))
++		else if (var.storage == StorageClassOutput && has_decoration(var_id, DecorationXfbBuffer) && xfb_buffer_id)
+ 		{
+ 			entry_func.fixup_hooks_out.push_back([=]() {
+ 				SPIRType type = get<SPIRType>(var.basetype);
+@@ -18020,8 +18243,6 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 				if (type.basetype != SPIRType::Boolean && (is_vector(type) || is_matrix(type))) {
+ 					cast = "(packed_" + type_to_glsl(type, 0) + ")";
+ 				}
+-				if (get_execution_model() == ExecutionModelGeometry)
+-					statement("int gl_VertexIndex = 0; // HACK: not implemented for geometry shaders!");
+ 				statement("spvWriteTranformFeedback<metal::primitive_type::triangle>(" + to_name(xfb_buffer_id) + ", gl_VertexIndex, ", cast, to_expression(var_id), ", ",
+ 				std::to_string(get_decoration(var_id, DecorationOffset)),
+ 					", ", std::to_string(get_decoration(var_id, DecorationXfbStride)), ");");
+@@ -19436,7 +19657,7 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool memb
+ 				if (!msl_options.supports_msl_version(2, 1))
+ 					SPIRV_CROSS_THROW("Native texture_buffer type is only supported in MSL 2.1.");
+ 				img_type_name = "texture_buffer";
+-				do_the_hack = needs_xfb_buffer();
++				do_the_hack = xfb_buffer_id != 0;
+ 			}
+ 			else
+ 				img_type_name += "texture2d";
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index b7d782ab..b9e4dc87 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -337,7 +337,13 @@ public:
+ 		uint32_t shader_index_buffer_index = 21;
+ 		uint32_t shader_patch_input_buffer_index = 20;
+ 		uint32_t draw_info_index = 20;
++		// Transform feedback. Vertex shaders: buffer of the captured outputs. Emulated geometry shaders:
++		// transform feedback buffer b is at xfb_buffer_index - b, plus the session state, per-primitive
++		// slots and mode buffers (see emit_mesh_wrapper()).
+ 		uint32_t xfb_buffer_index = 19;
++		uint32_t xfb_session_index = 0;
++		uint32_t xfb_prims_index = 0;
++		uint32_t xfb_mode_index = 0;
+ 		uint32_t texture_offset_buffer_index = 18;
+ 		uint32_t reversed_depth_viewport_buffer_index = 17;
+ 		uint32_t depth_clip_state_buffer_index = 16;
+@@ -689,7 +695,7 @@ public:
+ 
+ 	bool needs_xfb_buffer() const
+ 	{
+-		return xfb_buffer_id != 0;
++		return xfb_buffer_id != 0 || mesh_xfb_used_mask != 0 || stage_xfb_unsupported;
+ 	}
+ 
+ 
+@@ -1300,6 +1306,14 @@ protected:
+ 	uint32_t view_mask_buffer_id = 0;
+ 	uint32_t dynamic_offsets_buffer_id = 0;
+ 	uint32_t xfb_buffer_id = 0;
++	// Transform feedback buffers written by an emulated geometry shader, and their strides.
++	uint32_t mesh_xfb_used_mask = 0;
++	// Transform feedback from a vertex or tessellation evaluation shader: not emitted (the API reports it).
++	bool stage_xfb_unsupported = false;
++	uint32_t mesh_xfb_strides[4] = {};
++	void collect_mesh_xfb_buffers();
++	void emit_mesh_xfb_capture_function(const std::string &vertex_type);
++	void emit_mesh_xfb_store(const SPIRType &type, const std::string &expr, uint32_t buffer, uint32_t offset);
+ 	uint32_t uint_type_id = 0;
+ 	uint32_t shared_uint_type_id = 0;
+ 	uint32_t meshlet_type_id = 0;
+-- 
+2.50.1 (Apple Git-155)
+

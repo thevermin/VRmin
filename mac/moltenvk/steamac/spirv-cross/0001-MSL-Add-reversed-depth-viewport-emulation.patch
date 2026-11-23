@@ -1,0 +1,110 @@
+From 9235d76a6953150d7f8d226a5f9181870a8b9e6e Mon Sep 17 00:00:00 2001
+From: Edward Li <vk.edward.li@gmail.com>
+Date: Sat, 3 Oct 2026 20:32:22 +0300
+Subject: [PATCH 01/17] MSL: Add reversed depth viewport emulation
+
+Backport of KhronosGroup/SPIRV-Cross 35f52882 + da223760 (C API dropped)
+onto utmapp/SPIRV-Cross 939b40b3 for steamac. Default buffer index 17
+(18 is taken by the fork's texture_offset_buffer_index).
+---
+ spirv_msl.cpp | 27 +++++++++++++++++++++++++++
+ spirv_msl.hpp |  3 +++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index d4252fcf..e1bbc93a 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -2464,6 +2464,7 @@ string CompilerMSL::compile()
+ 	// Create structs to hold input, output and uniform variables.
+ 	// Do output first to ensure out. is declared at top of entry function.
+ 	qual_pos_var_name = "";
++	qual_viewport_idx_var_name = "";
+ 	if (is_mesh_shader())
+ 	{
+ 		fixup_implicit_builtin_block_names(get_execution_model());
+@@ -3708,6 +3709,8 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
+ 		set_member_decoration(ib_type.self, ib_mbr_idx, DecorationBuiltIn, builtin);
+ 		if (builtin == BuiltInPosition && storage == StorageClassOutput)
+ 			qual_pos_var_name = qual_var_name;
++		if (builtin == BuiltInViewportIndex && storage == StorageClassOutput)
++			qual_viewport_idx_var_name = qual_var_name;
+ 	}
+ 
+ 	// Copy interpolation decorations if needed
+@@ -4336,6 +4339,8 @@ void CompilerMSL::add_plain_member_variable_to_interface_block(StorageClass stor
+ 		set_member_decoration(ib_type.self, ib_mbr_idx, DecorationBuiltIn, builtin);
+ 		if (builtin == BuiltInPosition && storage == StorageClassOutput)
+ 			qual_pos_var_name = qual_var_name;
++		if (builtin == BuiltInViewportIndex && storage == StorageClassOutput)
++			qual_viewport_idx_var_name = qual_var_name;
+ 	}
+ 
+ 	const SPIRConstant *c = nullptr;
+@@ -14924,6 +14929,19 @@ void CompilerMSL::emit_fixup()
+ 
+ 		if (is_vertex_like_shader() && !qual_pos_var_name.empty())
+ 		{
++			if (msl_options.emulate_reversed_depth_viewport)
++			{
++				if (qual_viewport_idx_var_name.empty())
++					statement("if ((spvEmulatedReversedDepthViewportMask & 1u) != 0u)");
++				else
++					statement("if (((spvEmulatedReversedDepthViewportMask >> uint(", qual_viewport_idx_var_name,
++					          ")) & 1u) != 0u)");
++				begin_scope();
++				statement(qual_pos_var_name, ".z = ", qual_pos_var_name, ".w - ", qual_pos_var_name,
++				          ".z;    // Emulate reversed-depth viewport");
++				end_scope();
++			}
++
+ 			if (options.vertex.fixup_clipspace)
+ 				statement(qual_pos_var_name, ".z = (", qual_pos_var_name, ".z + ", qual_pos_var_name,
+ 						  ".w) * 0.5;       // Adjust clip-space for Metal");
+@@ -16222,6 +16240,15 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+ 	if (needs_base_instance_arg == TriState::Yes)
+ 		ep_args += built_in_func_arg(BuiltInBaseInstance, !ep_args.empty());
+ 
++	if (msl_options.emulate_reversed_depth_viewport && stage_out_var_id && !capture_output_to_buffer &&
++	    is_vertex_like_shader() && !qual_pos_var_name.empty())
++	{
++		if (!ep_args.empty())
++			ep_args += ", ";
++		ep_args += join("constant uint& spvEmulatedReversedDepthViewportMask [[buffer(",
++		                msl_options.reversed_depth_viewport_buffer_index, ")]]");
++	}
++
+ 	if (capture_output_to_buffer)
+ 	{
+ 		// Add parameters to hold the indirect draw parameters and the shader output. This has to be handled
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 94a23dea..1f6e63be 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -339,6 +339,7 @@ public:
+ 		uint32_t draw_info_index = 20;
+ 		uint32_t xfb_buffer_index = 19;
+ 		uint32_t texture_offset_buffer_index = 18;
++		uint32_t reversed_depth_viewport_buffer_index = 17;
+ 		uint32_t shader_input_wg_index = 0;
+ 		uint32_t device_index = 0;
+ 		uint32_t enable_frag_output_mask = 0xffffffff;
+@@ -361,6 +362,7 @@ public:
+ 		bool view_index_from_device_index = false;
+ 		bool dispatch_base = false;
+ 		bool texture_1D_as_2D = false;
++		bool emulate_reversed_depth_viewport = false;
+ 
+ 		// Enable use of Metal argument buffers.
+ 		// MSL 2.0 must also be enabled.
+@@ -1384,6 +1386,7 @@ protected:
+ 	bool writes_to_depth = false;
+ 	bool writes_to_point_size = false;
+ 	std::string qual_pos_var_name;
++	std::string qual_viewport_idx_var_name;
+ 	std::string stage_in_var_name = "in";
+ 	std::string stage_out_var_name = "out";
+ 	std::string stage_out_mesh_primitive_var_name = "out_1";
+-- 
+2.50.1 (Apple Git-155)
+

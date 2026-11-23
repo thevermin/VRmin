@@ -1,0 +1,171 @@
+From 81367e522982ce0ab008819eac6b8d2057973859 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 23:20:56 +0300
+Subject: [PATCH 13/17] MSL: Adjacency topologies and instance-rate attributes
+ in the GS object stage
+
+- Geometry shaders with lines/triangles adjacency input read 2/3 vertices per primitive
+  instead of 4/6 (zink draws GL_QUADS as LINE_LIST_WITH_ADJACENCY with a geometry shader
+  emitting two triangles: the second came from garbage vertices). Add the adjacency input
+  topologies; the object stage reads 4/6 vertices per primitive, in the order of the
+  Vulkan spec for triangle strips with adjacency.
+- The object stage fetched every vertex attribute with the vertex index. Attributes of
+  VK_VERTEX_INPUT_RATE_INSTANCE bindings (glamor's instanced rectangles) use the instance
+  (with its divisor) from DrawInfo::vertexDivisors.
+- gl_in[] used in a function other than the entry point is passed as the whole array of
+  gl_PerVertex structs (the per-member builtin path for output blocks crashed on it).
+---
+ spirv_msl.cpp | 63 ++++++++++++++++++++++++++++++++++-----------------
+ spirv_msl.hpp |  3 ++-
+ 2 files changed, 44 insertions(+), 22 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 27a825cc..7c27fefd 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -1859,6 +1859,12 @@ static int vertex_count_in_primitive(CompilerMSL::Options::PrimitiveTopology top
+ 		return 2;
+ 	else if (top == CompilerMSL::Options::PrimitiveTopology::Points)
+ 		return 1;
++	else if (top == CompilerMSL::Options::PrimitiveTopology::LinesAdjacency ||
++	         top == CompilerMSL::Options::PrimitiveTopology::LineStripAdjacency)
++		return 4;
++	else if (top == CompilerMSL::Options::PrimitiveTopology::TrianglesAdjacency ||
++	         top == CompilerMSL::Options::PrimitiveTopology::TriangleStripAdjacency)
++		return 6;
+ 
+ 	return 0;
+ }
+@@ -1919,11 +1925,11 @@ int CompilerMSL::get_primitive_vertex_count()
+ 	if (execution.flags.get(ExecutionModeInputLines))
+ 		return 2;
+ 	if (execution.flags.get(ExecutionModeInputLinesAdjacency))
+-		return 2;
++		return 4;
+ 	if (execution.flags.get(ExecutionModeTriangles))
+ 		return 3;
+ 	if (execution.flags.get(ExecutionModeInputTrianglesAdjacency))
+-		return 3;
++		return 6;
+ 
+ 	return 1;
+ }
+@@ -2117,9 +2123,21 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		statement("uint32_t baseInstance;");
+ 		// Vertex buffer strides by Metal buffer index (dynamic strides are only known at draw time).
+ 		statement("uint32_t vertexStrides[31];");
++		// Per Metal buffer index: 0xffffffff for per-vertex data, else the instance divisor.
++		statement("uint32_t vertexDivisors[31];");
+ 		statement("uint8_t topoStrip;");
+ 
+ 		end_scope(";");
++		statement("");
++
++		// Element of a vertex buffer: the vertex index for per-vertex data, else the instance
++		// (VK_VERTEX_INPUT_RATE_INSTANCE, with the binding's divisor).
++		statement("static inline uint spvFetchIndex(constant DrawInfo *drawInfo, int b, uint vertexIndex, uint instance)");
++		begin_scope();
++		statement("uint d = drawInfo->vertexDivisors[b];");
++		statement("return d == 0xffffffffu ? vertexIndex : drawInfo->baseInstance + (d ? instance / d : 0u);");
++		end_scope();
++		statement("");
+ 
+ 		// Object entry point.
+ 		statement("[[object]]  void ", execution.name, "(object_data Payload &payload [[payload]], mesh_grid_properties meshGridProperties, constant DrawInfo *drawInfo [[buffer(", std::to_string(get_msl_options().draw_info_index),")]],");
+@@ -2151,27 +2169,13 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		msl_options.for_mesh_pipeline = true;
+ 
+ 
+-		statement("uint3 positionInGrid [[thread_position_in_grid]])");
++		statement("uint3 positionInGrid [[thread_position_in_grid]], uint3 gridSize [[threadgroups_per_grid]])");
+ 
+ 		begin_scope();
+ 
+-		int vertices_per_primitive = 0;
+-		switch (msl_options.input_primitive_type)
+-		{
+-		case Options::PrimitiveTopology::Triangles:
+-		case Options::PrimitiveTopology::TriangleStrip:
+-			vertices_per_primitive = 3;
+-			break;
+-		case Options::PrimitiveTopology::Lines:
+-		case Options::PrimitiveTopology::LineStrip:
+-			vertices_per_primitive = 2;
+-			break;
+-		case Options::PrimitiveTopology::Points:
+-			vertices_per_primitive = 1;
+-			break;
+-		default:
++		int vertices_per_primitive = vertex_count_in_primitive(msl_options.input_primitive_type);
++		if (!vertices_per_primitive)
+ 			SPIRV_CROSS_THROW("Input primitive type not supported");
+-		}
+ 
+ 		// One object threadgroup per input primitive. The topology (list or strip) is a draw-time
+ 		// property (it can be dynamic state), so it comes from drawInfo->topoStrip, not from the
+@@ -2188,6 +2192,21 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		// Odd triangles of a strip take their vertices in the order (n, n + 2, n + 1) to keep the
+ 		// winding (Vulkan spec, triangle strips).
+ 		statement("int element = (drawInfo->topoStrip && vertexCount == 3 && (positionInGrid.x & 1) && i > 0) ? 3 - i : i;");
++		if (vertices_per_primitive == 6)
++		{
++			// Triangle strips with adjacency (Vulkan spec, "Triangle Strips With Adjacency"): absolute
++			// vertex of each geometry shader input, depending on the primitive's position in the strip.
++			statement("if (drawInfo->topoStrip)");
++			begin_scope();
++			statement("int p = int(positionInGrid.x), n = int(gridSize.x), b = 2 * p;");
++			statement("int v;");
++			statement("if (n == 1) { const int o[6] = { 0, 1, 2, 5, 4, 3 }; v = o[i]; }");
++			statement("else if (p == 0) { const int o[6] = { 0, 1, 2, 6, 4, 3 }; v = o[i]; }");
++			statement("else if (p & 1) { const int o[6] = { 2, -2, 0, 3, 4, 6 }; v = b + o[i]; if (p == n - 1 && i == 5) v = b + 5; }");
++			statement("else { const int o[6] = { 0, -2, 2, 6, 4, 3 }; v = b + o[i]; if (p == n - 1 && i == 3) v = b + 5; }");
++			statement("element = v - startingIndex;");
++			end_scope();
++		}
+ 
+ 		statement("if (drawInfo->indexed)");
+ 		begin_scope();
+@@ -2221,6 +2240,7 @@ void CompilerMSL::emit_mesh_wrapper()
+ 			statement(type_to_glsl(in_var_type), " ", to_name(stage_in_var_id), ";");
+ 		}
+ 
++
+ 		ir.for_each_typed_id<SPIRVariable>([&](uint32_t id, SPIRVariable &var)
+ 		{
+ 			if (var.storage != StorageClassInput)
+@@ -2259,7 +2279,7 @@ void CompilerMSL::emit_mesh_wrapper()
+ 			std::string type_name = get_variable_format_string(variable.format);
+ 			std::string component = type_name + get_vertex_loader_component_suffix(load_elements);
+ 			std::string packed = variable.vecsize > 1 ? "packed_" : "";
+-			std::string load_string = "*(device " + packed + component + " *)(vb" + std::to_string(variable.binding) + " + " + std::to_string(variable.offset) + " + vertexIndex * drawInfo->vertexStrides[" + std::to_string(variable.binding) + "])";
++			std::string load_string = "*(device " + packed + component + " *)(vb" + std::to_string(variable.binding) + " + " + std::to_string(variable.offset) + " + spvFetchIndex(drawInfo, " + std::to_string(variable.binding) + ", vertexIndex, positionInGrid.y) * drawInfo->vertexStrides[" + std::to_string(variable.binding) + "])";
+ 			if (load_elements != parent_type.vecsize)
+ 			{
+ 				component = type_name + get_vertex_loader_component_suffix(parent_type.vecsize);
+@@ -3492,7 +3512,8 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
+ 				}
+ 				ir.meta[next_id] = ir.meta[arg_id];
+ 			}
+-			else if (is_builtin && has_decoration(p_type->self, DecorationBlock))
++			else if (is_builtin && has_decoration(p_type->self, DecorationBlock) &&
++			         !(get_execution_model() == ExecutionModelGeometry && var.storage == StorageClassInput))
+ 			{
+ 				// Get the pointee type
+ 				type_id = get_pointee_type_id(type_id);
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 7f2524ef..b7d782ab 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -548,7 +548,8 @@ public:
+ 
+ 		enum class PrimitiveTopology
+ 		{
+-			Triangles, TriangleStrip, Lines, LineStrip, Points
++			Triangles, TriangleStrip, Lines, LineStrip, Points,
++			LinesAdjacency, LineStripAdjacency, TrianglesAdjacency, TriangleStripAdjacency
+ 		} input_primitive_type;
+ 
+ 		// If set, manual fixups of gradient vectors for cube texture lookups will be performed.
+-- 
+2.50.1 (Apple Git-155)
+

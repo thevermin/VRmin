@@ -1,0 +1,665 @@
+From 011555816cabebad3b21b6d43d81c26a4781f4b0 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sun, 4 Oct 2026 01:03:34 +0300
+Subject: [PATCH 19/22] Transform feedback captured by geometry shaders
+
+Transform feedback was a stub: the bound buffer was recorded but never bound to any shader
+stage, Begin/End only toggled a flag, counter buffers were ignored, and geometry shaders with
+transform feedback did not compile (DXVK stream output, zink with its geometry shader on every
+draw).
+
+- Geometry shaders (mesh emulation) capture transform feedback through SPIRV-Cross's mesh
+  stream, to up to 4 buffers. MoltenVK allocates the buffers, session state, per-primitive
+  slots and mode as implicit buffers of the geometry stage.
+- vkCmdBindTransformFeedbackBuffersEXT records the buffers per binding (offsets and sizes).
+- vkCmdBeginTransformFeedbackEXT creates the session state: bound sizes, and byte offsets
+  starting at 0 or, with counter buffers, at the counter values (copied on the GPU).
+  vkCmdEndTransformFeedbackEXT writes the byte offsets reached to the counter buffers.
+- A direct draw with transform feedback active and a capturing geometry shader runs a pass
+  counting the captured vertices of each input primitive, a compute pass turning the counts into
+  vertex slots in primitive order (primitives that do not fit in a buffer are not written, the
+  offsets advance by the vertices written), and the drawing pass writing the vertices at their
+  slots. Indirect draws do not capture (logged).
+- Vertex and tessellation evaluation shaders with transform feedback (no geometry shader) fail
+  pipeline creation with VK_ERROR_FEATURE_NOT_PRESENT instead of writing to an unbound buffer.
+- Transform feedback properties: 1 stream, 4 buffers, no queries, no vkCmdDrawIndirectByteCountEXT.
+---
+ MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm      | 95 ++++++++++++++++---
+ MoltenVK/MoltenVK/Commands/MVKCmdRendering.mm | 52 ++++++----
+ MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h | 21 +++-
+ .../MoltenVK/Commands/MVKCommandBuffer.mm     | 14 +++
+ .../Commands/MVKCommandEncodingPool.h         |  8 ++
+ .../Commands/MVKCommandEncodingPool.mm        | 14 +++
+ ...KCommandPipelineStateFactoryShaderSource.h | 60 ++++++++++++
+ .../Commands/MVKCommandResourceFactory.h      |  6 ++
+ .../Commands/MVKCommandResourceFactory.mm     |  8 ++
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.h      |  1 +
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm     | 12 ++-
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h    |  9 +-
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   | 35 ++++++-
+ MoltenVK/MoltenVK/Utility/MVKFoundation.h     |  1 +
+ 14 files changed, 298 insertions(+), 38 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index 1215fbf1..acaa9134 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -241,6 +241,82 @@ static uint32_t getGeometryPrimitiveCount(uint32_t vertexCount, uint32_t vertsPe
+ 	uint32_t vertexDivisors[kMVKMaxBufferCount];
+ };
+ 
++/* Binds the transform feedback state of the geometry stage for a draw: mode 0 (off), 1 (count the
++ * captured vertices of each input primitive) or 2 (write them at the slots computed from the counts).
++ * See SPIRV-Cross emit_mesh_wrapper(). */
++static void bindGeometryXfb(MVKCommandEncoder* cmdEncoder, MVKGraphicsPipeline* pipeline, uint32_t mode,
++							const MVKMTLBufferAllocation* prims) {
++	if ( !pipeline->usesGeometryXfb() ) { return; }
++	id<MTLRenderCommandEncoder> mtlRendEnc = cmdEncoder->_mtlRenderEncoder;
++	const auto& idx = pipeline->getGeometryXfbIndices();
++	// Placeholder bindings below are bound at every index of the 4 buffers; the shader declares only
++	// the buffers it writes, so binding the others is harmless.
++	[mtlRendEnc setMeshBytes: &mode length: sizeof(mode) atIndex: idx.mode];
++	// The shader only touches the buffers in modes 1 and 2 and the bound transform feedback buffers,
++	// but every buffer argument must be bound (Metal API validation).
++	const MVKMTLBufferAllocation* placeholder = nullptr;
++	auto bindOrPlaceholder = [&](id<MTLBuffer> mtlBuff, NSUInteger offset, NSUInteger index) {
++		if ( !mtlBuff ) {
++			if ( !placeholder ) { placeholder = cmdEncoder->getTempMTLBuffer(16, true); }
++			mtlBuff = placeholder->_mtlBuffer;
++			offset = placeholder->_offset;
++		}
++		[mtlRendEnc setMeshBuffer: mtlBuff offset: offset atIndex: index];
++	};
++	const MVKMTLBufferAllocation* session = mode ? cmdEncoder->_xfbSession : nullptr;
++	bindOrPlaceholder(session ? session->_mtlBuffer : nil, session ? session->_offset : 0, idx.session);
++	bindOrPlaceholder(mode ? prims->_mtlBuffer : nil, mode ? prims->_offset : 0, idx.prims);
++	for (uint32_t b = 0; b < kMVKMaxTransformFeedbackBuffers && b <= idx.buffer0; b++) {
++		const auto& binding = cmdEncoder->_xfbBindings[b];
++		bindOrPlaceholder(mode ? binding.mtlBuffer : nil, binding.offset, idx.buffer0 - b);
++	}
++}
++
++/* Draws primCount x instanceCount input primitives with a geometry-shader (mesh) pipeline. When the
++ * geometry shader captures transform feedback and transform feedback is active, the vertices must be
++ * written in primitive order although each input primitive emits a varying number of them: a first
++ * pass counts the captured vertices of each primitive (and draws nothing), a compute pass turns the
++ * counts into vertex slots (and advances the transform feedback offsets), and a second pass draws and
++ * writes the vertices at their slots. indexBuffer is used by the object stage of indexed draws. */
++static void encodeGeometryMeshDraw(MVKCommandEncoder* cmdEncoder, MVKGraphicsPipeline* pipeline, const DrawInfo& drawInfo,
++								   uint32_t primCount, uint32_t instanceCount, id<MTLBuffer> indexBuffer) {
++	auto draw = [&](uint32_t xfbMode, const MVKMTLBufferAllocation* prims) {
++		id<MTLRenderCommandEncoder> mtlRendEnc = cmdEncoder->_mtlRenderEncoder;
++		if (indexBuffer) { [mtlRendEnc useResource: indexBuffer usage: MTLResourceUsageRead stages: MTLRenderStageObject]; }
++		[mtlRendEnc setObjectBytes: &drawInfo length: sizeof(drawInfo) atIndex: pipeline->getDrawInfoBufferIndex()];
++		bindGeometryXfb(cmdEncoder, pipeline, xfbMode, prims);
++		[mtlRendEnc drawMeshThreadgroups: MTLSizeMake(primCount, instanceCount, 1)
++			 threadsPerObjectThreadgroup: MTLSizeMake(1, 1, 1)
++			   threadsPerMeshThreadgroup: MTLSizeMake(1, 1, 1)];
++	};
++
++	uint32_t inputPrimCount = primCount * instanceCount;
++	if ( !pipeline->usesGeometryXfb() || !cmdEncoder->_xfbSession || !inputPrimCount ) {
++		if (inputPrimCount) { draw(0, nullptr); }
++		return;
++	}
++
++	const MVKMTLBufferAllocation* prims = cmdEncoder->getTempMTLBuffer(inputPrimCount * sizeof(uint32_t), true);
++	draw(1, prims);
++
++	cmdEncoder->encodeStoreActions(true);
++	MVKMetalComputeCommandEncoderState& state = cmdEncoder->getMtlCompute();
++	id<MTLComputeCommandEncoder> mtlScanEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTransformFeedback);
++	id<MTLComputePipelineState> mtlScanState = cmdEncoder->getCommandEncodingPool()->getCmdXfbScanPrimitivesMTLComputePipelineState();
++	const MVKMTLBufferAllocation* session = cmdEncoder->_xfbSession;
++	state.bindPipeline(mtlScanEncoder, mtlScanState);
++	state.bindBuffer(mtlScanEncoder, prims->_mtlBuffer, prims->_offset, 0);
++	state.bindBuffer(mtlScanEncoder, session->_mtlBuffer, session->_offset, 1);
++	state.bindStructBytes(mtlScanEncoder, &inputPrimCount, 2);
++	NSUInteger tgSize = std::min<NSUInteger>(1024, mtlScanState.maxTotalThreadsPerThreadgroup);
++	[mtlScanEncoder dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(tgSize, 1, 1)];
++	cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
++
++	cmdEncoder->finalizeDrawState(kMVKGraphicsStageRasterization);	// Ensure all updated state has been submitted to Metal
++	if ( !pipeline->hasValidMTLPipelineStates() ) { return; }
++	draw(2, prims);
++}
++
+ /* Encodes indirect draws with a geometry-shader (object + mesh) pipeline: a compute pass turns each
+  * Vulkan indirect draw into mesh threadgroup counts and the DrawInfo the object stage reads, then
+  * each draw is a drawMeshThreadgroupsWithIndirectBuffer. ibb is null for non-indexed draws. */
+@@ -295,6 +371,10 @@ static void encodeGeometryIndirectDraws(MVKCommandEncoder* cmdEncoder, MVKGraphi
+ 
+ 	id<MTLRenderCommandEncoder> mtlRendEnc = cmdEncoder->_mtlRenderEncoder;
+ 	if (ibb) { [mtlRendEnc useResource: ibb->mtlBuffer usage: MTLResourceUsageRead stages: MTLRenderStageObject]; }
++	if (pipeline->usesGeometryXfb() && cmdEncoder->_xfbSession) {
++		cmdEncoder->reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Transform feedback is not captured by indirect draws with a geometry shader.");
++	}
++	bindGeometryXfb(cmdEncoder, pipeline, 0, nullptr);
+ 	for (uint32_t drawIdx = 0; drawIdx < drawCount; drawIdx++) {
+ 		[mtlRendEnc setObjectBuffer: tempBuff->_mtlBuffer
+ 							 offset: tempBuff->_offset + drawInfoOffset + drawInfoStride * drawIdx
+@@ -521,12 +601,7 @@ static void encodeGeometryIndirectDraws(MVKCommandEncoder* cmdEncoder, MVKGraphi
+ 					drawInfo.baseInstance = _firstInstance;
+ 					setGeometryVertexStrides(drawInfo, cmdEncoder, pipeline);
+ 
+-					// setObjectBytes copies the struct, so set it once all fields (topoStrip) are known.
+-					[cmdEncoder->_mtlRenderEncoder setObjectBytes: &drawInfo length: sizeof(drawInfo) atIndex: pipeline->getDrawInfoBufferIndex()];
+-
+-					[cmdEncoder->_mtlRenderEncoder drawMeshThreadgroups: MTLSizeMake(threadCount, _instanceCount, 1)
+-											threadsPerObjectThreadgroup: MTLSizeMake(1, 1, 1)
+-											  threadsPerMeshThreadgroup: MTLSizeMake(1, 1, 1)];
++					encodeGeometryMeshDraw(cmdEncoder, pipeline, drawInfo, threadCount, _instanceCount, nil);
+ #endif
+                 } else {
+                     MVKRenderSubpass* subpass = cmdEncoder->getSubpass();
+@@ -789,7 +864,6 @@ static void encodeGeometryIndirectDraws(MVKCommandEncoder* cmdEncoder, MVKGraphi
+ 					drawInfo.indexSize = (int)idxSize;
+ 					drawInfo.indexBuffer = ibb.mtlBuffer.gpuAddress + idxBuffOffset;
+ 
+-					[cmdEncoder->_mtlRenderEncoder useResource: ibb.mtlBuffer usage: MTLResourceUsageRead stages: MTLRenderStageObject];
+ 
+ 					uint32_t vertsPerPrim = 0;
+ 					MVKGeometryTopology topology = kMVKGeometryTopologyList;
+@@ -801,12 +875,7 @@ static void encodeGeometryIndirectDraws(MVKCommandEncoder* cmdEncoder, MVKGraphi
+ 					drawInfo.baseInstance = _firstInstance;
+ 					setGeometryVertexStrides(drawInfo, cmdEncoder, pipeline);
+ 
+-					// setObjectBytes copies the struct, so set it once all fields (topoStrip) are known.
+-					[cmdEncoder->_mtlRenderEncoder setObjectBytes: &drawInfo length: sizeof(drawInfo) atIndex: pipeline->getDrawInfoBufferIndex()];
+-
+-					[cmdEncoder->_mtlRenderEncoder drawMeshThreadgroups:MTLSizeMake(threadCount, _instanceCount, 1)
+-											threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1)
+-											  threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
++					encodeGeometryMeshDraw(cmdEncoder, pipeline, drawInfo, threadCount, _instanceCount, ibb.mtlBuffer);
+ #endif
+                 } else {
+                     MVKRenderSubpass* subpass = cmdEncoder->getSubpass();
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdRendering.mm b/MoltenVK/MoltenVK/Commands/MVKCmdRendering.mm
+index 947888a9..2e0f705b 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdRendering.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdRendering.mm
+@@ -610,7 +610,21 @@ void mvkPopulateFromOrFillAscending(Vec& dst, const uint32_t* pSrc, size_t count
+ }
+ 
+ void MVKCmdBeginTransformFeedback::encode(MVKCommandEncoder* cmdEncoder) {
+-	cmdEncoder->_transformFeedbackEnabled = true;
++	// Session state (see MVKCommandEncoder::_xfbSession): bound sizes, start offsets 0 or from the counters.
++	const MVKMTLBufferAllocation* session = cmdEncoder->getTempMTLBuffer(20 * sizeof(uint32_t), false);
++	uint32_t* state = (uint32_t*)session->getContents();
++	memset(state, 0, 20 * sizeof(uint32_t));
++	for (uint32_t b = 0; b < kMVKMaxTransformFeedbackBuffers; b++) {
++		const auto& binding = cmdEncoder->_xfbBindings[b];
++		state[b] = binding.mtlBuffer ? (uint32_t)std::min<VkDeviceSize>(binding.size, UINT32_MAX) : 0;
++	}
++	cmdEncoder->_xfbSession = session;
++	for (uint32_t i = 0; i < _counterBuffers.size(); i++) {
++		uint32_t b = _firstCounterBuffer + i;
++		if ( !_counterBuffers[i] || b >= kMVKMaxTransformFeedbackBuffers ) { continue; }
++		cmdEncoder->encodeCopyUint32(session->_mtlBuffer, session->_offset + (4 + b) * sizeof(uint32_t),
++									 _counterBuffers[i]->getMTLBuffer(), _counterBuffers[i]->getMTLBufferOffset() + _counterBufferOffsets[i]);
++	}
+ }
+ 
+ 
+@@ -634,7 +648,16 @@ void mvkPopulateFromOrFillAscending(Vec& dst, const uint32_t* pSrc, size_t count
+ }
+ 
+ void MVKCmdEndTransformFeedback::encode(MVKCommandEncoder* cmdEncoder) {
+-	cmdEncoder->_transformFeedbackEnabled = false;
++	const MVKMTLBufferAllocation* session = cmdEncoder->_xfbSession;
++	if ( !session ) { return; }
++	// The counter value is the byte offset in the bound range at which transform feedback would resume.
++	for (uint32_t i = 0; i < _counterBuffers.size(); i++) {
++		uint32_t b = _firstCounterBuffer + i;
++		if ( !_counterBuffers[i] || b >= kMVKMaxTransformFeedbackBuffers ) { continue; }
++		cmdEncoder->encodeCopyUint32(_counterBuffers[i]->getMTLBuffer(), _counterBuffers[i]->getMTLBufferOffset() + _counterBufferOffsets[i],
++									 session->_mtlBuffer, session->_offset + (4 + b) * sizeof(uint32_t));
++	}
++	cmdEncoder->_xfbSession = nullptr;
+ }
+ 
+ 
+@@ -653,6 +676,7 @@ void mvkPopulateFromOrFillAscending(Vec& dst, const uint32_t* pSrc, size_t count
+ 	_offsets.resize(bindingCount);
+ 	memcpy(_offsets.data(), pOffsets, bindingCount * sizeof(VkDeviceSize));
+ 
++	_sizes.clear();	// Commands are reused from a pool
+ 	if (pSizes) {
+ 		_sizes.resize(bindingCount);
+ 		memcpy(_sizes.data(), pSizes, bindingCount * sizeof(VkDeviceSize));
+@@ -664,19 +688,15 @@ void mvkPopulateFromOrFillAscending(Vec& dst, const uint32_t* pSrc, size_t count
+ }
+ 
+ void MVKCmdBindTransformFeedbackBuffers::encode(MVKCommandEncoder* cmdEncoder) {
+-	if (_buffers.size()) {
+-		MVKMTLBufferBinding binding;
+-		binding.mtlBuffer = _buffers[0]->getMTLBuffer();
+-		binding.offset = _buffers[0]->getMTLBufferOffset() + _offsets[0];
+-
+-		if (_sizes.size()) {
+-			VkDeviceSize size = _sizes[0];
+-			if (size == VK_WHOLE_SIZE)
+-				size = _buffers[0]->getByteCount();
+-			binding.size = (uint32_t)size;
+-		}
+-
+-		cmdEncoder->_transformFeedbackBinding.index = cmdEncoder->_transformFeedbackBufferIndex;
+-		cmdEncoder->_transformFeedbackBinding.update(binding);
++	for (uint32_t i = 0; i < _buffers.size(); i++) {
++		uint32_t b = _firstBinding + i;
++		if (b >= kMVKMaxTransformFeedbackBuffers) { break; }
++		auto& binding = cmdEncoder->_xfbBindings[b];
++		MVKBuffer* buffer = _buffers[i];
++		if ( !buffer ) { binding = {}; continue; }
++		binding.mtlBuffer = buffer->getMTLBuffer();
++		binding.offset = buffer->getMTLBufferOffset() + _offsets[i];
++		VkDeviceSize size = (_sizes.size() && _sizes[i] != VK_WHOLE_SIZE) ? _sizes[i] : buffer->getByteCount() - _offsets[i];
++		binding.size = size;
+ 	}
+ }
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+index 4226a574..2201d8ff 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+@@ -508,9 +508,24 @@ public:
+ 	/** Indicates whether the current draw is an indexed draw. */
+ 	bool _isIndexedDraw;
+ 
+-	bool _transformFeedbackEnabled = false;
+-	uint32_t _transformFeedbackBufferIndex = 19;
+-	MVKMTLBufferBinding _transformFeedbackBinding;
++	/** Transform feedback buffers bound with vkCmdBindTransformFeedbackBuffersEXT (captured by geometry shaders). */
++	struct MVKXfbBufferBinding {
++		id<MTLBuffer> mtlBuffer = nil;
++		VkDeviceSize offset = 0;
++		VkDeviceSize size = 0;
++	};
++	MVKXfbBufferBinding _xfbBindings[kMVKMaxTransformFeedbackBuffers];
++
++	/**
++	 * Transform feedback session state while transform feedback is active (null otherwise), in uints:
++	 * bound size of each buffer at 0, current byte offset of each buffer at 4, stride of each buffer
++	 * at 8, mask of the buffers the geometry shader writes at 12, byte offset of each buffer at the
++	 * start of the current draw at 16 (see SPIRV-Cross emit_mesh_wrapper()).
++	 */
++	const MVKMTLBufferAllocation* _xfbSession = nullptr;
++
++	/** Copies a 32-bit value between buffers on the GPU (transform feedback counters). Ends the Metal render pass. */
++	void encodeCopyUint32(id<MTLBuffer> dst, VkDeviceSize dstOffset, id<MTLBuffer> src, VkDeviceSize srcOffset);
+ 
+ #pragma mark Construction
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+index ddd911c8..aee92eca 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -634,6 +634,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+ 	case kMVKCommandUseDispatch:                     return kMVKBarrierStageCompute; /**< vkCmdDispatch. */
+ 	case kMVKCommandUseTessellationVertexTessCtl:    return kMVKBarrierStageVertex; /**< vkCmdDraw* - vertex and tessellation control stages. */
+ 	case kMVKCommandUseDrawIndirectConvertBuffers:   return kMVKBarrierStageVertex; /**< vkCmdDrawIndirect* convert indirect buffers. */
++	case kMVKCommandUseTransformFeedback:            return kMVKBarrierStageVertex; /**< Transform feedback counters and slots. */
+ 	case kMVKCommandUseCopyQueryPoolResults:         return kMVKBarrierStageCopy; /**< vkCmdCopyQueryPoolResults. */
+ 	case kMVKCommandUseAccumOcclusionQuery:          return kMVKBarrierStageNone; /**< Any command terminating a Metal render pass with active visibility buffer. */
+ 	case kMVKCommandConvertUint8Indices:             return kMVKBarrierStageCopy; /**< Converting a Uint8 index buffer to Uint16. */
+@@ -863,6 +864,18 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+ 	}
+ }
+ 
++void MVKCommandEncoder::encodeCopyUint32(id<MTLBuffer> dst, VkDeviceSize dstOffset, id<MTLBuffer> src, VkDeviceSize srcOffset) {
++	bool inRenderPass = _mtlRenderEncoder != nil;
++	if (inRenderPass) { encodeStoreActions(true); }
++	MVKMetalComputeCommandEncoderState& state = getMtlCompute();
++	id<MTLComputeCommandEncoder> mtlEnc = getMTLComputeEncoder(kMVKCommandUseTransformFeedback);
++	state.bindPipeline(mtlEnc, getCommandEncodingPool()->getCmdCopyUint32MTLComputePipelineState());
++	state.bindBuffer(mtlEnc, dst, dstOffset, 0);
++	state.bindBuffer(mtlEnc, src, srcOffset, 1);
++	[mtlEnc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
++	if (inRenderPass) { beginMetalRenderPass(kMVKCommandUseRestartSubpass); }
++}
++
+ void MVKCommandEncoder::encodeStoreActions(bool storeOverride) {
+ 	getSubpass()->encodeStoreActions(this,
+ 									 _isRenderingEntireAttachment,
+@@ -1419,6 +1432,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+ 		case kMVKCommandUseResolveImage:                    return @"Resolve Subpass Attachment ComputeEncoder";
+         case kMVKCommandUseTessellationVertexTessCtl:       return @"vkCmdDraw (vertex and tess control stages) ComputeEncoder";
+         case kMVKCommandUseDrawIndirectConvertBuffers:      return @"vkCmdDraw (convert indirect buffers) ComputeEncoder";
++        case kMVKCommandUseTransformFeedback:               return @"Transform feedback ComputeEncoder";
+         case kMVKCommandUseCopyQueryPoolResults:            return @"vkCmdCopyQueryPoolResults ComputeEncoder";
+         case kMVKCommandUseAccumOcclusionQuery:             return @"Post-render-pass occlusion query accumulation ComputeEncoder";
+         case kMVKCommandConvertUint8Indices:                return @"Convert Uint8 indices to Uint16 ComputeEncoder";
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.h b/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.h
+index 1bf9dc5f..c60c469a 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.h
+@@ -127,6 +127,12 @@ public:
+ 	/** Returns a MTLComputePipelineState for converting an indirect buffer for a geometry-shader (mesh) draw. */
+ 	id<MTLComputePipelineState> getCmdDrawIndirectGeometryConvertBuffersMTLComputePipelineState();
+ 
++	/** Returns a MTLComputePipelineState for copying a 32-bit value between buffers. */
++	id<MTLComputePipelineState> getCmdCopyUint32MTLComputePipelineState();
++
++	/** Returns a MTLComputePipelineState for the transform feedback slots of a geometry-shader draw. */
++	id<MTLComputePipelineState> getCmdXfbScanPrimitivesMTLComputePipelineState();
++
+ 	/** Returns a MTLComputePipelineState for copying an index buffer for use in an indirect tessellated draw. */
+ 	id<MTLComputePipelineState> getCmdDrawIndexedCopyIndexBufferMTLComputePipelineState(MTLIndexType type);
+ 
+@@ -176,6 +182,8 @@ protected:
+ 	id<MTLComputePipelineState> _mtlDrawIndirectConvertBuffersComputePipelineState[2] = {nil, nil};
+ 	id<MTLComputePipelineState> _mtlDrawIndirectTessConvertBuffersComputePipelineState[2] = {nil, nil};
+ 	id<MTLComputePipelineState> _mtlDrawIndirectGeometryConvertBuffersComputePipelineState = nil;
++	id<MTLComputePipelineState> _mtlCopyUint32ComputePipelineState = nil;
++	id<MTLComputePipelineState> _mtlXfbScanPrimitivesComputePipelineState = nil;
+ 	id<MTLComputePipelineState> _mtlDrawIndexedCopyIndexBufferComputePipelineState[2] = {nil, nil};
+ 	id<MTLComputePipelineState> _mtlCopyQueryPoolResultsComputePipelineState = nil;
+ 	id<MTLComputePipelineState> _mtlAccumOcclusionQueryResultsComputePipelineState = nil;
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.mm
+index 3ab084ef..ad4da505 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.mm
+@@ -145,6 +145,14 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
+ 	MVK_ENC_REZ_ACCESS(_mtlDrawIndirectConvertBuffersComputePipelineState[indexed ? 1 : 0], newCmdDrawIndirectConvertBuffersMTLComputePipelineState(indexed, _commandPool));
+ }
+ 
++id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdCopyUint32MTLComputePipelineState() {
++	MVK_ENC_REZ_ACCESS(_mtlCopyUint32ComputePipelineState, newCmdCopyUint32MTLComputePipelineState(_commandPool));
++}
++
++id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdXfbScanPrimitivesMTLComputePipelineState() {
++	MVK_ENC_REZ_ACCESS(_mtlXfbScanPrimitivesComputePipelineState, newCmdXfbScanPrimitivesMTLComputePipelineState(_commandPool));
++}
++
+ id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdDrawIndirectGeometryConvertBuffersMTLComputePipelineState() {
+ 	MVK_ENC_REZ_ACCESS(_mtlDrawIndirectGeometryConvertBuffersComputePipelineState, newCmdDrawIndirectGeometryConvertBuffersMTLComputePipelineState(_commandPool));
+ }
+@@ -251,6 +259,12 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
+     [_mtlDrawIndirectGeometryConvertBuffersComputePipelineState release];
+     _mtlDrawIndirectGeometryConvertBuffersComputePipelineState = nil;
+ 
++    [_mtlCopyUint32ComputePipelineState release];
++    _mtlCopyUint32ComputePipelineState = nil;
++
++    [_mtlXfbScanPrimitivesComputePipelineState release];
++    _mtlXfbScanPrimitivesComputePipelineState = nil;
++
+     [_mtlDrawIndexedCopyIndexBufferComputePipelineState[0] release];
+     [_mtlDrawIndexedCopyIndexBufferComputePipelineState[1] release];
+     _mtlDrawIndexedCopyIndexBufferComputePipelineState[0] = nil;
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
+index 59beff64..f04d3627 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
+@@ -307,6 +307,66 @@ typedef struct {
+ // Converts Vulkan indirect draws (VkDrawIndirectCommand or VkDrawIndexedIndirectCommand) for a
+ // geometry-shader (object + mesh) pipeline: mesh threadgroups = primitives x instances, and the
+ // DrawInfo the object stage reads (index buffer at firstIndex, base vertex, base instance).
++kernel void cmdCopyUint32(device uint* dst [[buffer(0)]],
++                          const device uint* src [[buffer(1)]]) {
++	dst[0] = src[0];
++}
++
++// Transform feedback of a geometry-shader (mesh) draw: turns the number of vertices each input primitive
++// captured (counting pass) into the vertex slot of its first vertex, or 0xffffffff if the primitive does
++// not fit in every bound transform feedback buffer, and advances the byte offsets of the buffers by the
++// vertices written. Session state as in MVKCommandEncoder::_xfbSession. One threadgroup.
++kernel void cmdXfbScanPrimitives(device uint* prims [[buffer(0)]],
++                                 device uint* session [[buffer(1)]],
++                                 constant uint& count [[buffer(2)]],
++                                 uint lid [[thread_index_in_threadgroup]],
++                                 uint tgSize [[threads_per_threadgroup]]) {
++	threadgroup uint sums[1024];
++	threadgroup uint carry;
++	threadgroup atomic_uint written;
++	uint used = session[12];
++	uint capacity = 0xFFFFFFFFu;
++	for (uint b = 0; b < 4; b++) {
++		uint size = session[b], start = session[4 + b], stride = session[8 + b];
++		if ((used & (1u << b)) && size && stride) {
++			capacity = min(capacity, size > start ? (size - start) / stride : 0u);
++		}
++	}
++	if (lid == 0) {
++		carry = 0;
++		atomic_store_explicit(&written, 0u, memory_order_relaxed);
++	}
++	threadgroup_barrier(mem_flags::mem_threadgroup);
++	for (uint base = 0; base < count; base += tgSize) {
++		uint i = base + lid;
++		uint c = i < count ? prims[i] : 0u;
++		sums[lid] = c;
++		threadgroup_barrier(mem_flags::mem_threadgroup);
++		for (uint off = 1; off < tgSize; off <<= 1) {
++			uint v = lid >= off ? sums[lid - off] : 0u;
++			threadgroup_barrier(mem_flags::mem_threadgroup);
++			sums[lid] += v;
++			threadgroup_barrier(mem_flags::mem_threadgroup);
++		}
++		uint first = carry + sums[lid] - c;
++		bool fits = ulong(first) + c <= capacity;
++		if (i < count) {
++			prims[i] = fits ? first : 0xFFFFFFFFu;
++			if (fits && c) { atomic_fetch_max_explicit(&written, first + c, memory_order_relaxed); }
++		}
++		threadgroup_barrier(mem_flags::mem_threadgroup);
++		if (lid == tgSize - 1) { carry += sums[lid]; }
++		threadgroup_barrier(mem_flags::mem_threadgroup);
++	}
++	if (lid == 0) {
++		uint w = atomic_load_explicit(&written, memory_order_relaxed);
++		for (uint b = 0; b < 4; b++) {
++			session[16 + b] = session[4 + b];	// Where this draw writes
++			if (used & (1u << b)) { session[4 + b] += w * session[8 + b]; }
++		}
++	}
++}
++
+ kernel void cmdDrawIndirectGeometryConvertBuffers(const device char* srcBuff [[buffer(0)]],
+                                                   device MTLDispatchThreadgroupsIndirectArguments* destDispatch [[buffer(1)]],
+                                                   device char* destDrawInfo [[buffer(2)]],
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h
+index 40749eed..790d9816 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h
+@@ -360,6 +360,12 @@ public:
+ 	id<MTLComputePipelineState> newCmdDrawIndirectTessConvertBuffersMTLComputePipelineState(bool indexed,
+ 																							MVKVulkanAPIDeviceObject* owner);
+ 
++	/** Returns a new MTLComputePipelineState for copying a 32-bit value between buffers. */
++	id<MTLComputePipelineState> newCmdCopyUint32MTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
++
++	/** Returns a new MTLComputePipelineState for the transform feedback slots of a geometry-shader draw. */
++	id<MTLComputePipelineState> newCmdXfbScanPrimitivesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
++
+ 	/** Returns a new MTLComputePipelineState for converting an indirect buffer for a geometry-shader (mesh) draw. */
+ 	id<MTLComputePipelineState> newCmdDrawIndirectGeometryConvertBuffersMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm
+index dceb9e0f..91a9bea4 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm
+@@ -563,6 +563,14 @@
+ 	return newMTLComputePipelineState("cmdDrawIndirectPopulateIndexes", owner);
+ }
+ 
++id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdCopyUint32MTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
++	return newMTLComputePipelineState("cmdCopyUint32", owner);
++}
++
++id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdXfbScanPrimitivesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
++	return newMTLComputePipelineState("cmdXfbScanPrimitives", owner);
++}
++
+ id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdDrawIndirectGeometryConvertBuffersMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
+ 	return newMTLComputePipelineState("cmdDrawIndirectGeometryConvertBuffers", owner);
+ }
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index 529cbd61..4c4cb7ab 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -88,6 +88,7 @@ static constexpr uint32_t   kMVKMaxViewportScissorCount = 16;
+ static constexpr uint32_t   kMVKMaxDescriptorSetCount = SPIRV_CROSS_NAMESPACE::kMaxArgumentBuffers;
+ static constexpr uint32_t   kMVKMaxTextureCount = 128; // Maximum value across all GPUs in Metal feature set tables
+ static constexpr uint32_t   kMVKMaxBufferCount = 31;
++static constexpr uint32_t   kMVKMaxTransformFeedbackBuffers = 4;
+ static constexpr uint32_t   kMVKMaxSamplerCount = 16;
+ static constexpr uint32_t   kMVKMaxSampleCount = 8;
+ static constexpr uint32_t   kMVKSampleLocationCoordinateGridSize = 16;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 3fabf18c..bb8e099f 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -1323,10 +1323,18 @@
+ 				break;
+ 			}
+ 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT: {
+-				// Incomplete!
++				// Transform feedback is captured by geometry shaders (mesh emulation), vertex stream 0 only.
+ 				auto* xfbProps = (VkPhysicalDeviceTransformFeedbackPropertiesEXT*)next;
+-				xfbProps->maxTransformFeedbackBuffers = 1;
+ 				xfbProps->maxTransformFeedbackStreams = 1;
++				xfbProps->maxTransformFeedbackBuffers = kMVKMaxTransformFeedbackBuffers;
++				xfbProps->maxTransformFeedbackBufferSize = UINT32_MAX;
++				xfbProps->maxTransformFeedbackStreamDataSize = 512;
++				xfbProps->maxTransformFeedbackBufferDataSize = 512;
++				xfbProps->maxTransformFeedbackBufferDataStride = 2048;
++				xfbProps->transformFeedbackQueries = false;
++				xfbProps->transformFeedbackStreamsLinesTriangles = false;
++				xfbProps->transformFeedbackRasterizationStreamSelect = false;
++				xfbProps->transformFeedbackDraw = false;
+ 				break;
+ 			}
+ 			default:
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index 48366721..ccefc9aa 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -295,6 +295,11 @@ public:
+ 
+     /** Returns the current draw info buffer binding for the mesh shader. */
+     uint32_t getDrawInfoBufferIndex() { return _meshDrawInfoBufferIndex; }
++	/** Whether the geometry shader of this (mesh) pipeline captures transform feedback. */
++	bool usesGeometryXfb() const { return _usesGeometryXfb; }
++	/** Metal buffer indices of the geometry-shader transform feedback buffers (buffer b at buffer0 - b). */
++	struct GeometryXfbIndices { uint32_t buffer0, session, prims, mode; };
++	const GeometryXfbIndices& getGeometryXfbIndices() const { return _geometryXfbIndices; }
+ 
+ 	/** Returns the Vulkan primitive topology. */
+ 	VkPrimitiveTopology getVkPrimitiveTopology() { return _vkPrimitiveTopology; }
+@@ -437,7 +442,9 @@ protected:
+ 	uint32_t _occupiedVertexBufferIndices[kMVKShaderStageCount] = {};	// Metal buffer indices of vertex/reserved buffers, by stage
+ 	VkPrimitiveTopology _vkPrimitiveTopology;
+ 	uint32_t _outputControlPointCount;
+-    uint32_t _meshDrawInfoBufferIndex = 0;		// Object stage of a geometry-shader pipeline, below the vertex stage's implicit buffers
++    uint32_t _meshDrawInfoBufferIndex = 0;
++	GeometryXfbIndices _geometryXfbIndices = {};
++	bool _usesGeometryXfb = false;		// Object stage of a geometry-shader pipeline, below the vertex stage's implicit buffers
+ 
+ 	MVKShaderModule* _vertexModule = nullptr;
+ 	MVKShaderModule* _tessCtlModule = nullptr;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 7f7ab8c9..90c859f5 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1710,6 +1710,11 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+ 	if ( !mtlFunc ) { return false; }
+ 
+ 	auto& funcRslts = func.shaderConversionResults;
++	// Transform feedback is only captured by geometry shaders (emulated with mesh shaders).
++	if (funcRslts.needsXfbBuffer) {
++		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Transform feedback from a vertex shader without a geometry shader is not supported."));
++		return false;
++	}
+ 	plDesc.rasterizationEnabled = !funcRslts.isRasterizationDisabled;
+ 	populateResourceUsage(_stageResources[kMVKShaderStageVertex], shaderConfig, funcRslts, spv::ExecutionModelVertex);
+ 	_stageResources[kMVKShaderStageVertex].implicitBuffers.needed.set(MVKImplicitBuffer::EmulatedReversedDepthViewport, shaderConfig.options.mslOptions.emulate_reversed_depth_viewport);
+@@ -1868,7 +1873,8 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 	shaderConfig.options.mslOptions.shader_output_buffer_index = implicit[MVKImplicitBuffer::Output];
+ 	shaderConfig.options.mslOptions.view_mask_buffer_index = implicit[MVKImplicitBuffer::ViewRange];
+ 	shaderConfig.options.mslOptions.capture_output_to_buffer = false;
+-	shaderConfig.options.mslOptions.disable_rasterization = !_isRasterizing;
++	// The vertex shader feeds the geometry shader (object stage), never the rasterizer.
++	shaderConfig.options.mslOptions.disable_rasterization = false;
+ 	shaderConfig.options.mslOptions.for_mesh_pipeline = true;
+ 	shaderConfig.options.mslOptions.msl_version = getPhysicalDevice()->getMetalFeatures()->mslVersion;
+ 	shaderConfig.options.shouldFlipVertexY = false;
+@@ -1928,6 +1934,16 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 
+ 	if ( !setGeometryInputPrimitiveType(shaderConfig) ) { return false; }
+ 
++	// Transform feedback buffers 0..3, session state, per-primitive slots, mode (see SPIRV-Cross emit_mesh_wrapper()).
++	_geometryXfbIndices.buffer0 = getImplicitBufferIndex(kMVKShaderStageGeometry, 9);
++	_geometryXfbIndices.session = getImplicitBufferIndex(kMVKShaderStageGeometry, 13);
++	_geometryXfbIndices.prims   = getImplicitBufferIndex(kMVKShaderStageGeometry, 14);
++	_geometryXfbIndices.mode    = getImplicitBufferIndex(kMVKShaderStageGeometry, 15);
++	shaderConfig.options.mslOptions.xfb_buffer_index  = _geometryXfbIndices.buffer0;
++	shaderConfig.options.mslOptions.xfb_session_index = _geometryXfbIndices.session;
++	shaderConfig.options.mslOptions.xfb_prims_index   = _geometryXfbIndices.prims;
++	shaderConfig.options.mslOptions.xfb_mode_index    = _geometryXfbIndices.mode;
++
+ 	addPrevStageOutputToShaderConversionConfig(shaderConfig, vertexOutputs);
+ 
+ 	MVKMTLFunction func = getMTLFunction(shaderConfig, pGeometrySS, pGeometryFB, _geometryModule, "Geometry");
+@@ -1935,6 +1951,12 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 	if ( !mtlFunc ) { return false; }
+ 
+ 	auto& funcRslts = func.shaderConversionResults;
++	_usesGeometryXfb = funcRslts.needsXfbBuffer;
++	if (_usesGeometryXfb && (_geometryXfbIndices.mode == kMVKUnassignedImplicitBufferIndex ||
++							 _geometryXfbIndices.mode < _descriptorBufferCounts.stages[kMVKShaderStageGeometry])) {
++		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Geometry shader requires transform feedback buffers, but there is no free slot to pass them."));
++		return false;
++	}
+ 	populateResourceUsage(_stageResources[kMVKShaderStageGeometry], shaderConfig, funcRslts, spv::ExecutionModelGeometry);
+ 	_layout->populateBindOperations(_stageResources[kMVKShaderStageGeometry].bindScript, shaderConfig, spv::ExecutionModelGeometry);
+ 
+@@ -2063,6 +2085,10 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 	if ( !mtlFunc ) { return false; }
+ 
+ 	auto& funcRslts = func.shaderConversionResults;
++	if (funcRslts.needsXfbBuffer) {
++		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Transform feedback from a tessellation evaluation shader is not supported."));
++		return false;
++	}
+ 	plDesc.rasterizationEnabled = !funcRslts.isRasterizationDisabled;
+ 	populateResourceUsage(_stageResources[kMVKShaderStageTessEval], shaderConfig, funcRslts, spv::ExecutionModelTessellationEvaluation);
+ 	_stageResources[kMVKShaderStageTessEval].implicitBuffers.needed.set(MVKImplicitBuffer::EmulatedReversedDepthViewport, shaderConfig.options.mslOptions.emulate_reversed_depth_viewport);
+@@ -3331,6 +3357,9 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+ 				opt.shader_patch_input_buffer_index,
+ 				opt.draw_info_index,
+ 				opt.xfb_buffer_index,
++				opt.xfb_session_index,
++				opt.xfb_prims_index,
++				opt.xfb_mode_index,
+ 				opt.texture_offset_buffer_index,
+ 				opt.reversed_depth_viewport_buffer_index,
+ 				opt.depth_clip_state_buffer_index,
+@@ -3703,11 +3732,11 @@ void mvkValidateCeralArchiveDefinitions() {
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLConstexprSampler>();
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVWorkgroupSizeDimension>(3);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVEntryPoint>(20);						// Contains string
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(24);			// Contains string
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(28);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLShaderInterfaceVariable>(6);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLResourceBinding>(2);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::DescriptorBinding>();
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(104);	// Contains collection
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(108);	// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(39);		// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLSpecializationMacroInfo>(22);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<MVKShaderModuleKey>();
+diff --git a/MoltenVK/MoltenVK/Utility/MVKFoundation.h b/MoltenVK/MoltenVK/Utility/MVKFoundation.h
+index f05df58e..b0718223 100644
+--- a/MoltenVK/MoltenVK/Utility/MVKFoundation.h
++++ b/MoltenVK/MoltenVK/Utility/MVKFoundation.h
+@@ -102,6 +102,7 @@ typedef enum : uint8_t {
+     kMVKCommandUseDispatch,                     /**< vkCmdDispatch. */
+     kMVKCommandUseTessellationVertexTessCtl,    /**< vkCmdDraw* - vertex and tessellation control stages. */
+ 	kMVKCommandUseDrawIndirectConvertBuffers,   /**< vkCmdDrawIndirect* convert indirect buffers. */
++	kMVKCommandUseTransformFeedback,            /**< Transform feedback counters and primitive slots. */
+ 	kMVKCommandUseCopyQueryPoolResults,         /**< vkCmdCopyQueryPoolResults. */
+ 	kMVKCommandUseAccumOcclusionQuery,          /**< Any command terminating a Metal render pass with active visibility buffer. */
+ 	kMVKCommandConvertUint8Indices,             /**< Converting a Uint8 index buffer to Uint16. */
+-- 
+2.50.1 (Apple Git-155)
+

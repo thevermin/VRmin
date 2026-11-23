@@ -1,0 +1,279 @@
+From 9d90fa134679bbf122ee582aba5f7573d33addb7 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Wed, 7 Oct 2026 17:05:00 +0300
+Subject: [PATCH 33/33] MSL: Fragment outputs take their color attachment's numeric
+ type
+
+STEAMAC-2C: a Left 4 Dead 2 pipeline (DXVK) writes an unsigned integer
+output to an R32_SINT color attachment. Vulkan only leaves the values written
+undefined when the output's numeric type differs from the attachment's
+(KosmicKrisp writes the output's bits), but Metal fails the render pipeline:
+"output of type uint4 is not compatible with a MTLPixelFormatR32Sint color
+attachment", and Venus skipped every draw with that pipeline.
+
+Add Options::frag_output_float_mask, frag_output_sint_mask and
+frag_output_uint_mask: bit N marks the color attachment at location N as
+floating-point/normalized, signed or unsigned integer. A fragment output of
+another numeric type is declared in the output struct with the attachment's
+(same width; 8-bit integers to a float attachment become half), the shader
+writes a local of its own type, and the local is bit cast to the member on
+return (converted where the widths differ), with padding as before. This
+covers plain outputs, output arrays (per element location) and outputs packed
+into the components of one location. Locations in none of the masks keep
+their type.
+---
+ spirv_msl.cpp | 124 +++++++++++++++++++++++++++++++++++++++++++++-----
+ spirv_msl.hpp |  12 +++++
+ 2 files changed, 125 insertions(+), 11 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index cc91acc..64d46a6 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -3968,6 +3968,81 @@ uint32_t CompilerMSL::build_extended_vector_type(uint32_t type_id, uint32_t comp
+ 	return new_type_id;
+ }
+ 
++// The base type a fragment output needs at location for the numeric type of its color attachment (see
++// Options::frag_output_float_mask): the type's own, unless the attachment's numeric type is known and differs.
++// The width stays, except that 8-bit integers become half.
++SPIRType::BaseType CompilerMSL::get_fragment_output_base_type(StorageClass storage, uint32_t location,
++                                                              const SPIRType &type) const
++{
++	if (storage != StorageClassOutput || get_execution_model() != ExecutionModelFragment || location >= 32)
++		return type.basetype;
++
++	uint32_t bit = 1u << location;
++	bool is_float = type.basetype == SPIRType::Half || type.basetype == SPIRType::Float;
++	bool is_sint = type.basetype == SPIRType::SByte || type.basetype == SPIRType::Short || type.basetype == SPIRType::Int;
++	bool is_uint = type.basetype == SPIRType::UByte || type.basetype == SPIRType::UShort || type.basetype == SPIRType::UInt;
++	if (!is_float && !is_sint && !is_uint)
++		return type.basetype;
++
++	if ((msl_options.frag_output_float_mask & bit) && !is_float)
++		return type.width == 32 ? SPIRType::Float : SPIRType::Half;
++	if ((msl_options.frag_output_sint_mask & bit) && !is_sint)
++		return type.width == 8 ? SPIRType::SByte : type.width == 16 ? SPIRType::Short : SPIRType::Int;
++	if ((msl_options.frag_output_uint_mask & bit) && !is_uint)
++		return type.width == 8 ? SPIRType::UByte : type.width == 16 ? SPIRType::UShort : SPIRType::UInt;
++	return type.basetype;
++}
++
++static uint32_t base_type_width(SPIRType::BaseType basetype)
++{
++	switch (basetype)
++	{
++	case SPIRType::SByte:
++	case SPIRType::UByte:
++		return 8;
++	case SPIRType::Short:
++	case SPIRType::UShort:
++	case SPIRType::Half:
++		return 16;
++	default:
++		return 32;
++	}
++}
++
++// A scalar or vector type of components components and base type basetype, for a fragment output member.
++uint32_t CompilerMSL::build_fragment_output_type(uint32_t type_id, uint32_t components, SPIRType::BaseType basetype)
++{
++	assert(is_scalar(get<SPIRType>(type_id)) || is_vector(get<SPIRType>(type_id)));
++	uint32_t new_type_id;
++	if (components > 1)
++		new_type_id = build_extended_vector_type(type_id, components, basetype);
++	else
++	{
++		new_type_id = ir.increase_bound_by(1);
++		auto &type = set<SPIRType>(new_type_id, get<SPIRType>(type_id));
++		type.basetype = basetype;
++		type.self = new_type_id;
++	}
++	get<SPIRType>(new_type_id).width = base_type_width(basetype);
++	return new_type_id;
++}
++
++// expr, a value of the scalar or vector type type, converted to basetype: bit cast where the widths match.
++std::string CompilerMSL::to_fragment_output_value(const SPIRType &type, SPIRType::BaseType basetype,
++                                                  const std::string &expr)
++{
++	if (type.basetype == basetype)
++		return expr;
++	SPIRType out_type = type;
++	out_type.basetype = basetype;
++	out_type.width = base_type_width(basetype);
++	out_type.array.clear();
++	out_type.array_size_literal.clear();
++	if (out_type.width == type.width)
++		return bitcast_expression(out_type, type.basetype, expr);
++	return join(type_to_glsl(out_type), "(", expr, ")");
++}
++
+ uint32_t CompilerMSL::build_msl_interpolant_type(uint32_t type_id, bool is_noperspective)
+ {
+ 	uint32_t new_type_id = ir.increase_bound_by(1);
+@@ -4043,21 +4118,26 @@ bool CompilerMSL::add_component_variable_to_interface_block(StorageClass storage
+ 		}
+ 		else
+ 		{
++			// The m_location_N members have their color attachment's numeric type (see add_interface_block()).
+ 			entry_func.fixup_hooks_out.push_back([=, &type, &var]() {
+ 				if (!type.array.empty())
+ 				{
+ 					uint32_t array_size = to_array_size_literal(type);
+ 					for (uint32_t loc_off = 0; loc_off < array_size; loc_off++)
+ 					{
++						auto basetype = get_fragment_output_base_type(storage, location + loc_off, type);
+ 						statement(ib_var_ref, ".m_location_", location + loc_off,
+ 						          vector_swizzle(type_components, start_component), " = ",
+-						          to_name(var.self), "[", loc_off, "];");
++						          to_fragment_output_value(type, basetype, join(to_name(var.self), "[", loc_off, "]")),
++						          ";");
+ 					}
+ 				}
+ 				else
+ 				{
++					auto basetype = get_fragment_output_base_type(storage, location, type);
+ 					statement(ib_var_ref, ".m_location_", location,
+-					          vector_swizzle(type_components, start_component), " = ", to_name(var.self), ";");
++					          vector_swizzle(type_components, start_component), " = ",
++					          to_fragment_output_value(type, basetype, to_name(var.self)), ";");
+ 				}
+ 			});
+ 		}
+@@ -4086,6 +4166,7 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
+ 	if (meta.strip_array && is_array(get<SPIRType>(type_id)))
+ 		type_id = get<SPIRType>(type_id).parent_type;
+ 	auto &type = get<SPIRType>(type_id);
++	uint32_t value_type_id = type_id;
+ 	uint32_t target_components = 0;
+ 	uint32_t type_components = type.vecsize;
+ 
+@@ -4114,6 +4195,14 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
+ 		}
+ 	}
+ 
++	// The color attachment may need another numeric type: the member gets it, the shader writes a local.
++	SPIRType::BaseType out_basetype = SPIRType::Unknown;
++	if (has_decoration(var.self, DecorationLocation) && !meta.strip_array)
++		out_basetype = get_fragment_output_base_type(storage, get_decoration(var.self, DecorationLocation), type);
++	bool converted_output = out_basetype != SPIRType::Unknown && out_basetype != type.basetype;
++	if (converted_output)
++		type_id = build_fragment_output_type(type_id, get<SPIRType>(type_id).vecsize, out_basetype);
++
+ 	if (storage == StorageClassInput && pull_model_inputs.count(var.self))
+ 		ib_type.member_types.push_back(build_msl_interpolant_type(type_id, is_noperspective));
+ 	else
+@@ -4136,15 +4225,16 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
+ 			qual_var_name += ".interpolate_at_center()";
+ 	}
+ 
+-	if (padded_output || padded_input)
++	if (padded_output || padded_input || converted_output)
+ 	{
+ 		entry_func.add_local_variable(var.self);
+ 		vars_needing_early_declaration.push_back(var.self);
+ 
+-		if (padded_output)
++		if (padded_output || converted_output)
+ 		{
+ 			entry_func.fixup_hooks_out.push_back([=, &var]() {
+-				statement(qual_var_name, vector_swizzle(type_components, start_component), " = ", to_name(var.self),
++				statement(qual_var_name, vector_swizzle(type_components, start_component), " = ",
++				          to_fragment_output_value(this->get<SPIRType>(value_type_id), out_basetype, to_name(var.self)),
+ 				          ";");
+ 			});
+ 		}
+@@ -4161,7 +4251,7 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
+ 
+ 	if (var.storage == StorageClassOutput && var.initializer != ID(0))
+ 	{
+-		if (padded_output || padded_input)
++		if (padded_output || padded_input || converted_output)
+ 		{
+ 			entry_func.fixup_hooks_in.push_back(
+ 			    [=, &var]() { statement(to_name(var.self), " = ", to_expression(var.initializer), ";"); });
+@@ -4358,6 +4448,14 @@ void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage
+ 			}
+ 		}
+ 
++		// The color attachment may need another numeric type (see add_plain_variable_to_interface_block()).
++		SPIRType::BaseType out_basetype = usable_type->basetype;
++		if (get_decoration_bitset(var.self).get(DecorationLocation) && !meta.strip_array)
++			out_basetype = get_fragment_output_base_type(storage, get_decoration(var.self, DecorationLocation) + i,
++			                                             *usable_type);
++		if (out_basetype != usable_type->basetype)
++			type_id = build_fragment_output_type(type_id, get<SPIRType>(type_id).vecsize, out_basetype);
++
+ 		if (storage == StorageClassInput && pull_model_inputs.count(var.self))
+ 			ib_type.member_types.push_back(build_msl_interpolant_type(get_pointee_type_id(type_id), is_noperspective));
+ 		else
+@@ -4454,19 +4552,18 @@ void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage
+ 			case StorageClassOutput:
+ 			{
+ 				auto hook = [=, &var]() {
++					auto value = to_fragment_output_value(*usable_type, out_basetype, join(to_name(var.self), "[", i, "]"));
+ 					if (padded_output)
+ 					{
+ 						auto &padded_type = this->get<SPIRType>(type_id);
+-						statement(
+-						    ib_var_ref, ".", mbr_name, " = ",
+-						    remap_swizzle(padded_type, usable_type->vecsize, join(to_name(var.self), "[", i, "]")),
+-						    ";");
++						statement(ib_var_ref, ".", mbr_name, " = ", remap_swizzle(padded_type, usable_type->vecsize, value),
++						          ";");
+ 					}
+ 					else if (flatten_from_ib_var)
+ 						statement(ib_var_ref, ".", mbr_name, " = ", ib_var_ref, ".", flatten_from_ib_mbr_name, "[", i,
+ 						          "];");
+ 					else
+-						statement(ib_var_ref, ".", mbr_name, " = ", to_name(var.self), "[", i, "];");
++						statement(ib_var_ref, ".", mbr_name, " = ", value, ";");
+ 				};
+ 				// A geometry shader's outputs go out with each emitted vertex.
+ 				if (get_execution_model() == ExecutionModelGeometry)
+@@ -6018,6 +6115,11 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch, bool
+ 
+ 		uint32_t ib_mbr_idx = uint32_t(ib_type.member_types.size());
+ 		uint32_t type_id = build_extended_vector_type(location_meta.base_type_id, location_meta.num_components);
++		// A fragment output's color attachment may need another numeric type.
++		auto &base_type = get<SPIRType>(location_meta.base_type_id);
++		auto basetype = get_fragment_output_base_type(storage, location, base_type);
++		if (basetype != base_type.basetype)
++			type_id = build_fragment_output_type(type_id, location_meta.num_components, basetype);
+ 		ib_type.member_types.push_back(type_id);
+ 
+ 		set_member_name(ib_type.self, ib_mbr_idx, join("m_location_", location));
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index f15bbf4..6f71ff4 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -346,6 +346,15 @@ public:
+ 		uint32_t shader_input_wg_index = 0;
+ 		uint32_t device_index = 0;
+ 		uint32_t enable_frag_output_mask = 0xffffffff;
++		// Numeric types of the color attachments, by fragment output location: bit N of frag_output_float_mask,
++		// frag_output_sint_mask or frag_output_uint_mask marks location N as a floating-point or normalized, a
++		// signed integer or an unsigned integer attachment. Metal fails render pipelines whose fragment output
++		// has another numeric type than its color attachment (Vulkan only leaves the values written undefined),
++		// so such outputs are declared with the attachment's numeric type and converted to it, bit cast where
++		// the widths match. Outputs at locations in none of the masks keep their type.
++		uint32_t frag_output_float_mask = 0;
++		uint32_t frag_output_sint_mask = 0;
++		uint32_t frag_output_uint_mask = 0;
+ 		// Metal doesn't allow setting a fixed sample mask directly in the pipeline.
+ 		// We can evade this restriction by ANDing the internal sample_mask output
+ 		// of the shader with the additional fixed sample mask.
+@@ -1531,6 +1540,9 @@ protected:
+ 	uint32_t get_target_components_for_fragment_location(uint32_t location) const;
+ 	uint32_t build_extended_vector_type(uint32_t type_id, uint32_t components,
+ 	                                    SPIRType::BaseType basetype = SPIRType::Unknown);
++	SPIRType::BaseType get_fragment_output_base_type(StorageClass storage, uint32_t location, const SPIRType &type) const;
++	uint32_t build_fragment_output_type(uint32_t type_id, uint32_t components, SPIRType::BaseType basetype);
++	std::string to_fragment_output_value(const SPIRType &type, SPIRType::BaseType basetype, const std::string &expr);
+ 	uint32_t build_msl_interpolant_type(uint32_t type_id, bool is_noperspective);
+ 
+ 	bool suppress_missing_prototypes = false;
+-- 
+2.54.0 (Apple Git-157)
+

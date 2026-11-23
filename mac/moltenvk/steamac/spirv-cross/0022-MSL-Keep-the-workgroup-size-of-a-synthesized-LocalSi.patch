@@ -1,0 +1,41 @@
+From 250c13d390ff01c5214154151255ad1684804930 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Mon, 5 Oct 2026 23:53:20 +0300
+Subject: [PATCH 22/22] MSL: Keep the workgroup size of a synthesized LocalSizeId
+ WorkgroupSize constant
+
+When the MSL backend needs gl_WorkGroupSize and the shader declares none (zero-initialized workgroup
+memory since patch "Declare gl_WorkGroupSize for the zero initialization of workgroup memory", emulated
+NumSubgroups), it synthesizes a WorkgroupSize constant and sets SPIREntryPoint::workgroup_size.constant.
+For LocalSizeId, workgroup_size.x/y/z stayed 0, while the parser fills them with the constant's values
+for a WorkgroupSize builtin in the SPIR-V, and API users read them when the constant is set: MoltenVK
+dispatched 1x1x1 threadgroups. Every DXVK compute shader with groupshared memory (its new compiler emits
+LocalSizeId and OpConstantNull initializers) ran one invocation per workgroup (Rogue Trader's tiled
+lighting, 16x16 tiles lit by their first pixel).
+
+Set workgroup_size.x/y/z from the LocalSizeId constants (default values for specialization constants,
+which are still reported by get_work_group_size_specialization_constants()).
+---
+ spirv_msl.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index f75cbad..c07094a 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -1045,6 +1045,12 @@ void CompilerMSL::build_implicit_builtins()
+ 					bool specialized = init[0]->specialization || init[1]->specialization || init[2]->specialization;
+ 					set<SPIRConstant>(var_id, type_id, init, 3, specialized);
+ 					execution.workgroup_size.constant = var_id;
++					// With a WorkgroupSize constant, workgroup_size.x/y/z hold its (default) values, as the parser sets
++					// them for a WorkgroupSize builtin in the SPIR-V: the API reads them from there (MoltenVK sizes the
++					// threadgroups with them), and they are 0 for LocalSizeId.
++					execution.workgroup_size.x = init[0]->scalar();
++					execution.workgroup_size.y = init[1]->scalar();
++					execution.workgroup_size.z = init[2]->scalar();
+ 				}
+ 				else if (execution.flags.get(ExecutionModeLocalSize))
+ 				{
+-- 
+2.50.1 (Apple Git-155)
+

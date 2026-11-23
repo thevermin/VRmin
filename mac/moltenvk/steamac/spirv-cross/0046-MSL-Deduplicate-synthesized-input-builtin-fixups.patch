@@ -1,0 +1,40 @@
+From 596b5f61a63b8cdd8bc32fdeedc81ee223380919 Mon Sep 17 00:00:00 2001
+From: georgii pl <gp@fx.gl>
+Date: Sun, 1 Nov 2026 11:12:48 +0300
+Subject: [PATCH] MSL: Deduplicate synthesized input builtin fixups
+
+STEAMAC-5M: input aliases share one Metal builtin name. Patch 0010 deduplicated direct parameters but not multi-patch tessellation prologue hooks, yielding two identical gl_PrimitiveID definitions. Track processed input builtins for prologue fixups too; output handling is unchanged. Locally authored on pinned 939b40b3 plus steamac 0001-0037, not an upstream cherry-pick.
+---
+ spirv_msl.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index bb619d3..8c8e631 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -17974,7 +17974,10 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 	});
+ 
+ 	// Builtin variables
+-	ir.for_each_typed_id<SPIRVariable>([this, &entry_func](uint32_t, SPIRVariable &var) {
++	// All variables for an input builtin use the same MSL name. Just as with direct
++	// entry-point arguments, synthesized declarations and fixups must be emitted once.
++	Bitset fixed_input_builtins;
++	ir.for_each_typed_id<SPIRVariable>([this, &entry_func, &fixed_input_builtins](uint32_t, SPIRVariable &var) {
+ 		uint32_t var_id = var.self;
+ 		BuiltIn bi_type = ir.meta[var_id].decoration.builtin_type;
+ 
+@@ -17985,6 +17988,10 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 
+ 		if (var.storage == StorageClassInput && is_builtin_variable(var) && active_input_builtins.get(bi_type))
+ 		{
++			if (fixed_input_builtins.get(bi_type))
++				return;
++			fixed_input_builtins.set(bi_type);
++
+ 			switch (bi_type)
+ 			{
+ 			case BuiltInSamplePosition:
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,90 @@
+From 0cf1d2d0ddc7cefa25f517c8d627751a4b4423ba Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Mon, 5 Oct 2026 22:40:48 +0300
+Subject: [PATCH 31/31] Leave helper templates out of the logged MSL and log context
+ lines once
+
+The head of the MSL logged after a failed compile (patch "Log the MSL source of failed shader library
+compiles") was often only SPIRV-Cross' helper templates (spvUnsafeArray and friends, 30+ lines), so the
+launcher's report carried no shader code in it. Top-level template definitions are left out of the head
+("[mvk-msl] ... (N lines of templates left out)"), which shows the next 40 lines instead.
+
+The lines around neighboring compiler errors (one error per variable of a declaration list, for
+example) were logged once per error, repeating the same lines in the size-capped report. Log the context
+lines once, in source order.
+---
+ .../MoltenVK/GPUObjects/MVKShaderModule.mm    | 37 ++++++++++++++++---
+ 1 file changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index 1994b9d..978f32a 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -664,9 +664,10 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ }
+ 
+ // Writes the MSL of a failed compile to stderr, right after the error, every line prefixed with "[mvk-msl] "
+-// (the launcher attaches these lines to its error report): the first lines, then the lines around each line
+-// the compiler error names ("program_source:LINE:"), prefixed with their line number. One write(), so the
+-// lines are not interleaved with other output.
++// (the launcher attaches these lines to its error report): the first lines (without the helper templates
++// SPIRV-Cross puts first, such as spvUnsafeArray, which filled the head of many reports), then the lines
++// around each line the compiler error names ("program_source:LINE:"), prefixed with their line number.
++// One write(), so the lines are not interleaved with other output.
+ void MVKShaderLibraryCompiler::logMSLSource() {
+ 	static constexpr size_t kHeadLineCount = 40;
+ 	static constexpr size_t kContextLineCount = 5;
+@@ -700,10 +701,29 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 		out += '\n';
+ 	};
+ 
+-	for (size_t i = 0; i < min(kHeadLineCount, lines.size()); i++) {
++	size_t headLines = 0, templateLines = 0;
++	for (size_t i = 0; i < lines.size() && headLines < kHeadLineCount; i++) {
++		// A top-level template definition is one line ending with "}" or "};", or runs to the next line that is
++		// "}" or "};" (the end of a multi-line definition).
++		if (lines[i].substr(0, 9) == "template<") {
++			auto endsBlock = [](string_view s) {
++				return (s.size() >= 1 && s.substr(s.size() - 1) == "}") || (s.size() >= 2 && s.substr(s.size() - 2) == "};");
++			};
++			size_t end = i;
++			if ( !endsBlock(lines[i]) ) {
++				while (end + 1 < lines.size() && lines[end] != "}" && lines[end] != "};") { end++; }
++			}
++			templateLines += end - i + 1;
++			i = end;
++			continue;
++		}
+ 		append(0, lines[i]);
++		headLines++;
++	}
++	if (templateLines) {
++		out += "[mvk-msl] ... (" + to_string(templateLines) + " lines of templates left out)\n";
+ 	}
+-	if (lines.size() > kHeadLineCount) {
++	if (lines.size() > headLines + templateLines) {
+ 		out += "[mvk-msl] ... (" + to_string(lines.size()) + " lines total)\n";
+ 	}
+ 
+@@ -717,12 +737,17 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 			errorLines.push_back(lineNum);
+ 		}
+ 	}
++	// Neighboring errors (one per variable of a declaration list, for example) share their context lines: each
++	// line is logged once, in source order.
++	sort(errorLines.begin(), errorLines.end());
++	size_t lastLogged = 0;
+ 	for (size_t lineNum : errorLines) {
+-		size_t first = lineNum > kContextLineCount ? lineNum - kContextLineCount : 1;
++		size_t first = max(lineNum > kContextLineCount ? lineNum - kContextLineCount : 1, lastLogged + 1);
+ 		size_t last = min(lineNum + kContextLineCount, lines.size());
+ 		for (size_t n = first; n <= last; n++) {
+ 			append(n, lines[n - 1]);
+ 		}
++		lastLogged = max(lastLogged, last);
+ 	}
+ 
+ 	for (size_t done = 0; done < out.size(); ) {
+-- 
+2.50.1 (Apple Git-155)
+

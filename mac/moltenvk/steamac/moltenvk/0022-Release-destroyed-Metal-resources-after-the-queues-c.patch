@@ -1,0 +1,267 @@
+From 8aea411655a04a5906e40417410204f00da786a2 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sun, 4 Oct 2026 02:31:23 +0300
+Subject: [PATCH 22/22] Release destroyed Metal resources after the queues'
+ command buffers complete
+
+Queue submissions use MTLCommandBuffers that do not retain their resources (with a residency
+set), and timeline/binary semaphores signal from the GPU (MTLSharedEvent) before the command
+buffer that signals them completes. An app that waits on the semaphore and then frees memory or
+destroys a buffer/image (DXVK frees its memory chunks this way) released the Metal object while the
+command buffer still referenced it: kIOGPUCommandBufferCallbackErrorInvalidResource, device lost
+(Heroes Olden Era), and Metal API validation reports the object as destroyed while required to be
+alive by the command buffer.
+
+Release the MTLBuffers, MTLTextures and MTLHeaps of destroyed device memory, buffers, buffer views,
+images (and their views and texel buffers) and image views, and remove them from the residency set,
+only once every MTLCommandBuffer committed before them on the device's queues has completed. Destroyed
+objects are collected for 2 ms, then one empty marker command buffer per queue is committed for the
+whole batch (command buffers of a queue complete in commit order); its completion releases the batch.
+The device waits for pending batches before it is destroyed.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm     |  6 +-
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.h      | 24 ++++++
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm     | 81 +++++++++++++++++++
+ .../MoltenVK/GPUObjects/MVKDeviceMemory.mm    |  8 +-
+ MoltenVK/MoltenVK/GPUObjects/MVKImage.mm      | 11 ++-
+ 5 files changed, 116 insertions(+), 14 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
+index 61be7d89..f2276fc3 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
+@@ -240,9 +240,8 @@
+ 	MVKLiveResourceSet& live = _device->getLiveResources();
+ 	if (id<MTLBuffer> buf = _mtlBuffer) {
+ 		_mtlBuffer = nil;
+-		_device->removeResidency(buf);
+ 		live.remove(buf);
+-		[buf release];
++		_device->releaseMTLResourceAfterQueues(buf, true);	// May still be used by command buffers
+ 	}
+ }
+ 
+@@ -364,8 +363,7 @@ static VkDeviceSize getTextureBufferOffsetMask(const VkPhysicalDeviceTexelBuffer
+ void MVKBufferView::detachMemory() {
+ 	if (id<MTLTexture> tex = _mtlTexture) {
+ 		_device->getLiveResources().remove(tex);
+-		_device->removeResidency(tex);
+-		[tex release];
++		_device->releaseMTLResourceAfterQueues(tex, true);	// May still be used by command buffers
+ 		_mtlTexture = nil;
+ 	}
+ }
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index 4c4cb7ab..44732648 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -685,6 +685,30 @@ public:
+ 
+ 	/** Block the current thread until all queues in this device are idle. */
+ 	VkResult waitIdle();
++
++	/**
++	 * Releases the Metal resource (MTLBuffer, MTLTexture or MTLHeap; the caller's reference) once every
++	 * MTLCommandBuffer committed so far on the queues of this device has completed, removing it from the
++	 * residency set at that time if removeResidency is true. Queue submissions use command buffers that
++	 * do not retain their resources, and semaphores signal from the GPU before their command buffer
++	 * completes, so an app may destroy a resource (after waiting on the semaphore) while the command
++	 * buffer that used it is still alive: releasing it then makes the command buffer fail with
++	 * kIOGPUCommandBufferCallbackErrorInvalidResource (device lost).
++	 */
++	void releaseMTLResourceAfterQueues(id mtlResource, bool removeResidency);
++
++protected:
++	void flushMTLResourceReleases();
++
++	// Resources waiting for releaseMTLResourceAfterQueues(): collected for a short time, then released
++	// together once one marker command buffer per queue completes.
++	struct MVKPendingMTLRelease { id mtlResource; bool removeResidency; };
++	std::mutex _mtlReleaseLock;
++	std::vector<MVKPendingMTLRelease> _mtlReleases;
++	bool _mtlReleaseFlushScheduled = false;
++	std::atomic<uint32_t> _mtlReleaseBatchesInFlight = 0;	// Scheduled flushes and batches whose markers have not completed
++
++public:
+ 	
+ 	/** Mark this device (and optionally the physical device) as lost. Releases all waits for this device. */
+ 	VkResult markLost(bool alsoMarkPhysicalDevice = false);
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index bb8e099f..17a2a044 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -43,6 +43,8 @@
+ #import "CAMetalLayer+MoltenVK.h"
+ 
+ #include <sys/stat.h>
++#include <unistd.h>
++#include <atomic>
+ #include <cmath>
+ 
+ using namespace std;
+@@ -3870,6 +3872,82 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 	return _queuesByQueueFamilyIndex[queueInfo->queueFamilyIndex][queueInfo->queueIndex];
+ }
+ 
++// Delay before the marker command buffers of a batch of releases are committed: destroying many
++// objects at once (level loads, view churn) costs one marker per queue per batch.
++static constexpr int64_t kMVKMTLReleaseBatchDelayNanos = 2 * NSEC_PER_MSEC;
++
++void MVKDevice::releaseMTLResourceAfterQueues(id mtlResource, bool removeResidency) {
++	if ( !mtlResource ) { return; }
++	std::lock_guard<std::mutex> lock(_mtlReleaseLock);
++	_mtlReleases.push_back({ mtlResource, removeResidency });
++	if (_mtlReleaseFlushScheduled) { return; }
++	_mtlReleaseFlushScheduled = true;
++	_mtlReleaseBatchesInFlight++;
++	MVKDevice* dev = this;
++	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kMVKMTLReleaseBatchDelayNanos),
++				   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
++		dev->flushMTLResourceReleases();
++		dev->_mtlReleaseBatchesInFlight--;
++	});
++}
++
++// Commits one marker command buffer per queue. Command buffers of a queue complete in commit order,
++// so when the markers complete, every command buffer committed before them has completed, and the
++// collected resources are released (and removed from the residency set).
++void MVKDevice::flushMTLResourceReleases() {
++	std::vector<MVKPendingMTLRelease> batch;
++	{
++		std::lock_guard<std::mutex> lock(_mtlReleaseLock);
++		batch.swap(_mtlReleases);
++		_mtlReleaseFlushScheduled = false;
++	}
++	if (batch.empty()) { return; }
++
++	MVKDevice* dev = this;
++	auto* pBatch = new std::vector<MVKPendingMTLRelease>(std::move(batch));
++	auto release = [dev, pBatch]() {
++#if MVK_XCODE_16
++		if (dev->hasResidencySet()) {
++			@synchronized(dev->_residencySet) {
++				for (auto& r : *pBatch) {
++					if (r.removeResidency) { [dev->_residencySet removeAllocation: r.mtlResource]; }
++				}
++				[dev->_residencySet commit];
++			}
++		}
++#endif
++		for (auto& r : *pBatch) { [r.mtlResource release]; }
++		delete pBatch;
++	};
++
++	MVKSmallVector<id<MTLCommandQueue>, 8> mtlQueues;
++	for (auto& queues : _queuesByQueueFamilyIndex) {
++		for (MVKQueue* q : queues) {
++			if (q && q->getMTLCommandQueue()) { mtlQueues.push_back(q->getMTLCommandQueue()); }
++		}
++	}
++	if (mtlQueues.empty()) {
++		release();
++		return;
++	}
++
++	auto* pending = new std::atomic<uint32_t>((uint32_t)mtlQueues.size());
++	_mtlReleaseBatchesInFlight++;
++	@autoreleasepool {
++		for (id<MTLCommandQueue> mtlQueue : mtlQueues) {
++			id<MTLCommandBuffer> mtlCmdBuff = [mtlQueue commandBufferWithUnretainedReferences];
++			[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer>) {
++				if (pending->fetch_sub(1) == 1) {
++					release();
++					delete pending;
++					dev->_mtlReleaseBatchesInFlight--;
++				}
++			}];
++			[mtlCmdBuff commit];
++		}
++	}
++}
++
+ MVKQueue* MVKDevice::getAnyQueue() {
+ 	for (auto& queues : _queuesByQueueFamilyIndex) {
+ 		for (MVKQueue* q : queues) {
+@@ -5561,6 +5639,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 		}
+ 	}
+ 
++	// Deferred releases of Metal resources (releaseMTLResourceAfterQueues()) use this device.
++	while (_mtlReleaseBatchesInFlight.load()) { usleep(100); }
++
+ 	for (auto& queues : _queuesByQueueFamilyIndex) {
+ 		mvkDestroyContainerContents(queues);
+ 	}
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
+index b14a5a2a..473662be 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
+@@ -513,17 +513,17 @@
+ 	for (auto& img : _imageMemoryBindings) { img->_deviceMemory = nullptr; }
+ 	os_unfair_lock_unlock(&s_device_memory_destruction_lock);
+ 
++	// The Metal objects may still be used by command buffers that have not completed.
+ 	if (_externalMemoryHandleType & VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) {
+-		[_mtlTexture release];
++		_device->releaseMTLResourceAfterQueues(_mtlTexture, false);
+ 		_mtlTexture = nil;
+ 	} else if (id<MTLBuffer> buf = _mtlBuffer) {
+ 		_mtlBuffer = nil;
+-		_device->removeResidency(buf);
+ 		_device->getLiveResources().remove(buf);
+-		[buf release];
++		_device->releaseMTLResourceAfterQueues(buf, true);
+ 	}
+ 
+-	[_mtlHeap release];
++	_device->releaseMTLResourceAfterQueues(_mtlHeap, false);
+ 	_mtlHeap = nil;
+ 
+ 	freeHostMemory();
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index a5a07eb4..a1250dce 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -123,16 +123,16 @@
+ void MVKImagePlane::releaseMTLTexture() {
+     MVKDevice* dev = _image->_device;
+     MVKLiveResourceSet& live = dev->getLiveResources();
++    // The Metal objects may still be used by command buffers that have not completed.
+     if (id<MTLTexture> tex = _mtlTexture) {
+-        dev->removeResidency(tex);
+         live.remove(tex);
+-        [tex release];
++        dev->releaseMTLResourceAfterQueues(tex, true);
+         _mtlTexture = nil;
+     }
+ 
+     for (auto& elem : _mtlTextureViews) {
+         live.remove(elem.second);
+-        [elem.second release];
++        dev->releaseMTLResourceAfterQueues(elem.second, false);
+     }
+     _mtlTextureViews.clear();
+ }
+@@ -602,9 +602,8 @@
+ MVKImageMemoryBinding::~MVKImageMemoryBinding() {
+ 	if (_deviceMemory) { MVKDeviceMemory::removeImageMemoryBinding(&_deviceMemory, this); }
+ 	if (_ownsTexelBuffer) {
+-		_device->removeResidency(_mtlTexelBuffer);
+ 		_device->getLiveResources().remove(_mtlTexelBuffer);
+-		[_mtlTexelBuffer release];
++		_device->releaseMTLResourceAfterQueues(_mtlTexelBuffer, true);
+ 	}
+ }
+ 
+@@ -2140,7 +2139,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ MVKImageViewPlane::~MVKImageViewPlane() {
+ 	if (id<MTLTexture> tex = _mtlTexture) {
+ 		getDevice()->getLiveResources().remove(tex);
+-		[tex release];
++		getDevice()->releaseMTLResourceAfterQueues(tex, false);	// May still be used by command buffers
+ 	}
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

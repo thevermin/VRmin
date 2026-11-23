@@ -1,0 +1,68 @@
+From 10a839bd9ffe02ee5b58c90c46e2c20252e46e0c Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Mon, 12 Oct 2026 22:11:30 +0300
+Subject: [PATCH 36/36] Zero vertex shader inputs that have no vertex attribute
+
+STEAMAC-2Y: Metal fails a render pipeline whose vertex function reads an
+attribute missing from the vertex descriptor ("Vertex attribute
+in_var_NORMAL(1) is missing from the vertex descriptor", an SCS Truck
+Simulator pipeline that describes no attribute 1), while Vulkan only leaves
+the values read undefined, and Venus dropped every draw with the pipeline.
+
+Set SPIRV-Cross' zero_missing_vertex_attributes for vertex shaders of plain
+vertex pipelines, so that inputs without a vertex attribute are zero-
+initialized locals instead of stage_in members. The option is part of the
+cached shader conversion options and their archive; CompilerMSL::Options
+grows by 4 bytes (3 more bytes of padding in it, 7 more in
+SPIRVToMSLConversionOptions and SPIRVToMSLConversionConfiguration).
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index b21fa1e..e512459 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1761,6 +1761,10 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+ 	setEmulatedReversedDepthViewportConfig(shaderConfig, implicit, getPhysicalDevice()->shouldEmulateReversedDepthViewport());
+ 	setDepthClipConfig(shaderConfig, implicit, _isRasterizing && canDepthClipAndClampBothBe(_dynamicStateFlags, _staticStateData, false));
+     addVertexInputToShaderConversionConfig(shaderConfig, pCreateInfo);
++	// Metal fails a render pipeline whose vertex function reads an attribute missing from the vertex descriptor
++	// ("Vertex attribute in_var_NORMAL(1) is missing from the vertex descriptor", SCS Truck Simulator, STEAMAC-2Y),
++	// while Vulkan only leaves the values read undefined: SPIRV-Cross makes inputs without an attribute read zeros.
++	shaderConfig.options.mslOptions.zero_missing_vertex_attributes = true;
+ 
+ 	MVKMTLFunction func = getMTLFunction(shaderConfig, pVertexSS, pVertexFB, _vertexModule, "Vertex");
+ 	id<MTLFunction> mtlFunc = func.getMTLFunction();
+@@ -3584,6 +3588,7 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+ 				opt.robust_image_access2,
+ 				opt.null_descriptor,
+ 				opt.for_mesh_pipeline,
++				opt.zero_missing_vertex_attributes,
+ 				opt.input_primitive_type);
+ 	}
+ 
+@@ -3889,17 +3894,17 @@ static size_t mvkValidateCerealArchiveSize(size_t padByteCnt = 0) {
+ 
+ void mvkValidateCeralArchiveDefinitions() {
+ 	[[maybe_unused]] size_t missingBytes = 0;
+-	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(6);
++	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(9);
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLShaderInterfaceVariable>(3);
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLResourceBinding>();
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLConstexprSampler>();
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVWorkgroupSizeDimension>(3);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVEntryPoint>(20);						// Contains string
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(24);			// Contains string
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(31);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLShaderInterfaceVariable>(6);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLResourceBinding>(2);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::DescriptorBinding>();
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(104);	// Contains collection
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(111);	// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(39);		// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLSpecializationMacroInfo>(22);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<MVKShaderModuleKey>();
+-- 
+2.54.0 (Apple Git-157)
+

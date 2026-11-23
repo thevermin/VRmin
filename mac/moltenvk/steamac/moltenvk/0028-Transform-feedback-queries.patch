@@ -1,0 +1,474 @@
+From d618f69f0c5a6b6beac5a7917a6cfd0216f82e97 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Mon, 5 Oct 2026 20:50:00 +0300
+Subject: [PATCH 28/28] Transform feedback queries
+
+VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT was not supported (vkCreateQueryPool failed, Begin/EndQueryIndexedEXT
+were no-ops) and transformFeedbackQueries was false: vkd3d-proton refuses to create a D3D12 device without it,
+DXVK's D3D11 stream-output statistics queries failed.
+
+- MVKTransformFeedbackQueryPool: 2 uint64 results per query (primitives written, primitives needed) in a shared
+  MTLBuffer, reset on the GPU (vkCmdResetQueryPool) or the host (vkResetQueryPool).
+- The query active for vertex stream 0 is tracked by the encoder. The compute pass that turns a capturing
+  geometry-shader draw's per-primitive vertex counts into vertex slots adds the vertices written and the vertices
+  counted, divided by the vertices of the geometry shader's output primitive (points 1, line strips 2, triangle
+  strips 3), to the query's results. Draws without transform feedback active, without a capturing geometry
+  shader, or indirect (not captured) count nothing.
+- vkCmdBeginQueryIndexedEXT / vkCmdEndQueryIndexedEXT record Begin/EndQuery. Only stream 0 exists
+  (maxTransformFeedbackStreams 1); queries of other streams (vkd3d-proton and DXVK use the D3D stream index)
+  are not begun and end with their reset value 0.
+- vkGetQueryPoolResults and the vkCmdCopyQueryPoolResults kernel write every result of a query (was only the
+  first), followed by the availability value.
+- transformFeedbackQueries = true.
+---
+ MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm      | 12 +++
+ MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h | 11 +++
+ .../MoltenVK/Commands/MVKCommandBuffer.mm     | 16 ++++
+ ...KCommandPipelineStateFactoryShaderSource.h | 31 ++++++--
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm     |  4 +-
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h    |  3 +
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   |  5 ++
+ MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h   | 38 ++++++++++
+ MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm  | 74 +++++++++++++++++--
+ MoltenVK/MoltenVK/Vulkan/vulkan.mm            |  6 +-
+ .../MoltenVKShaderConverter/SPIRVReflection.h | 27 +++++++
+ 11 files changed, 212 insertions(+), 15 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index acaa913..20cb2b5 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -21,6 +21,7 @@
+ #include "MVKCommandPool.h"
+ #include "MVKBuffer.h"
+ #include "MVKPipeline.h"
++#include "MVKQueryPool.h"
+ #include "MVKFoundation.h"
+ #include "mvk_datatypes.hpp"
+ 
+@@ -308,6 +309,17 @@ static void encodeGeometryMeshDraw(MVKCommandEncoder* cmdEncoder, MVKGraphicsPip
+ 	state.bindBuffer(mtlScanEncoder, prims->_mtlBuffer, prims->_offset, 0);
+ 	state.bindBuffer(mtlScanEncoder, session->_mtlBuffer, session->_offset, 1);
+ 	state.bindStructBytes(mtlScanEncoder, &inputPrimCount, 2);
++	// Active transform feedback query (stream 0): the scan adds the primitives written and needed to it.
++	uint32_t vertsPerPrim = 0;
++	if (cmdEncoder->_xfbQueryPool) {
++		vertsPerPrim = pipeline->getGeometryOutputVertexCount();
++		state.bindBuffer(mtlScanEncoder, cmdEncoder->_xfbQueryPool->getResultsMTLBuffer(),
++						 MVKTransformFeedbackQueryPool::getResultOffset(cmdEncoder->_xfbQuery), 3);
++	} else {
++		// Not accessed with vertsPerPrim 0, but every buffer argument must be bound.
++		state.bindBuffer(mtlScanEncoder, session->_mtlBuffer, session->_offset, 3);
++	}
++	state.bindStructBytes(mtlScanEncoder, &vertsPerPrim, 4);
+ 	NSUInteger tgSize = std::min<NSUInteger>(1024, mtlScanState.maxTotalThreadsPerThreadgroup);
+ 	[mtlScanEncoder dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(tgSize, 1, 1)];
+ 	cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+index 2201d8f..9b0c25b 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+@@ -36,6 +36,7 @@ class MVKRenderPass;
+ class MVKFramebuffer;
+ class MVKRenderSubpass;
+ class MVKQueryPool;
++class MVKTransformFeedbackQueryPool;
+ class MVKPipeline;
+ class MVKGraphicsPipeline;
+ class MVKComputePipeline;
+@@ -476,6 +477,12 @@ public:
+     /** Marks a timestamp for the specified query. */
+     void markTimestamp(MVKTimestampQueryPool* pQueryPool, uint32_t query);
+ 
++	/** Begins a transform feedback query: capturing draws add their primitive counts to it. */
++	void beginTransformFeedbackQuery(MVKTransformFeedbackQueryPool* pQueryPool, uint32_t query);
++
++	/** Ends the current transform feedback query. */
++	void endTransformFeedbackQuery(MVKTransformFeedbackQueryPool* pQueryPool, uint32_t query);
++
+     /** Reset a range of queries. */
+     void resetQueries(MVKQueryPool* pQueryPool, uint32_t firstQuery, uint32_t queryCount);
+ 
+@@ -524,6 +531,10 @@ public:
+ 	 */
+ 	const MVKMTLBufferAllocation* _xfbSession = nullptr;
+ 
++	/** The active transform feedback query (vertex stream 0), or null. */
++	MVKTransformFeedbackQueryPool* _xfbQueryPool = nullptr;
++	uint32_t _xfbQuery = 0;
++
+ 	/** Copies a 32-bit value between buffers on the GPU (transform feedback counters). Ends the Metal render pass. */
+ 	void encodeCopyUint32(id<MTLBuffer> dst, VkDeviceSize dstOffset, id<MTLBuffer> src, VkDeviceSize srcOffset);
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+index aee92ec..e84c044 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -1275,6 +1275,22 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+ 	}
+ }
+ 
++void MVKCommandEncoder::beginTransformFeedbackQuery(MVKTransformFeedbackQueryPool* pQueryPool, uint32_t query) {
++	_xfbQueryPool = pQueryPool;
++	_xfbQuery = query;
++}
++
++// The query becomes available when the command buffer completes. In a multiview render pass, it uses
++// one query per view of the Metal pass; the counts are in the first one, the others stay 0.
++void MVKCommandEncoder::endTransformFeedbackQuery(MVKTransformFeedbackQueryPool* pQueryPool, uint32_t query) {
++	if (_xfbQueryPool == pQueryPool && _xfbQuery == query) { _xfbQueryPool = nullptr; }
++	uint32_t queryCount = 1;
++	if (isInRenderPass() && getSubpass()->isMultiview()) {
++		queryCount = getSubpass()->getViewCountInMetalPass(_multiviewPassIndex);
++	}
++	addActivatedQueries(pQueryPool, query, queryCount);
++}
++
+ // Metal stage GPU counters need to be configured in a Metal render, compute, or BLIT encoder, meaning that the
+ // Metal encoder needs to know about any Vulkan timestamp commands that will be executed during the execution
+ // of a renderpass, or set of Vulkan dispatch or BLIT commands. In addition, there are a very small number of
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
+index 6f0a535..a71119b 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
+@@ -319,9 +319,13 @@ kernel void cmdCopyUint32(device uint* dst [[buffer(0)]],
+ // captured (counting pass) into the vertex slot of its first vertex, or 0xffffffff if the primitive does
+ // not fit in every bound transform feedback buffer, and advances the byte offsets of the buffers by the
+ // vertices written. Session state as in MVKCommandEncoder::_xfbSession. One threadgroup.
++// With an active transform feedback query (vertsPerPrim = vertices of each output primitive, 0 without
++// a query), adds the primitives written and the primitives needed to its two 64-bit results.
+ kernel void cmdXfbScanPrimitives(device uint* prims [[buffer(0)]],
+                                  device uint* session [[buffer(1)]],
+                                  constant uint& count [[buffer(2)]],
++                                 device ulong* query [[buffer(3)]],
++                                 constant uint& vertsPerPrim [[buffer(4)]],
+                                  uint lid [[thread_index_in_threadgroup]],
+                                  uint tgSize [[threads_per_threadgroup]]) {
+ 	threadgroup uint sums[1024];
+@@ -367,6 +371,10 @@ kernel void cmdXfbScanPrimitives(device uint* prims [[buffer(0)]],
+ 			session[16 + b] = session[4 + b];	// Where this draw writes
+ 			if (used & (1u << b)) { session[4 + b] += w * session[8 + b]; }
+ 		}
++		if (vertsPerPrim) {
++			query[0] += w / vertsPerPrim;		// Primitives written
++			query[1] += carry / vertsPerPrim;	// Primitives needed: every captured vertex was counted
++		}
+ 	}
+ }
+ 
+@@ -588,25 +596,36 @@ typedef enum {
+ 	VK_QUERY_RESULT_PARTIAL_BIT           = 0x00000008,
+ } VkQueryResultFlagBits;
+ 
++// Each query has elementCount 64-bit results (2 for transform feedback queries), followed by the
++// availability value when requested.
+ kernel void cmdCopyQueryPoolResultsToBuffer(const device VisibilityBuffer* src [[buffer(0)]],
+                                             device uint8_t* dest [[buffer(1)]],
+                                             constant uint& stride [[buffer(2)]],
+                                             constant uint& numQueries [[buffer(3)]],
+                                             constant uint& flags [[buffer(4)]],
+                                             constant QueryStatus* availability [[buffer(5)]],
++                                            constant uint& elementCount [[buffer(6)]],
+                                             uint query [[thread_position_in_grid]]) {
+ 	if (query >= numQueries) { return; }
+ 	device uint32_t* destCount = (device uint32_t*)(dest + stride * query);
++	bool is64Bit = flags & VK_QUERY_RESULT_64_BIT;
+ 	if (availability[query] != Initial || flags & VK_QUERY_RESULT_PARTIAL_BIT) {
+-		destCount[0] = src[query].count;
+-		if (flags & VK_QUERY_RESULT_64_BIT) { destCount[1] = src[query].countHigh; }
++		for (uint e = 0; e < elementCount; e++) {
++			VisibilityBuffer value = src[query * elementCount + e];
++			if (is64Bit) {
++				destCount[2 * e] = value.count;
++				destCount[2 * e + 1] = value.countHigh;
++			} else {
++				destCount[e] = value.count;
++			}
++		}
+ 	}
+ 	if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) {
+-		if (flags & VK_QUERY_RESULT_64_BIT) {
+-			destCount[2] = availability[query] != Initial ? 1 : 0;
+-			destCount[3] = 0;
++		if (is64Bit) {
++			destCount[2 * elementCount] = availability[query] != Initial ? 1 : 0;
++			destCount[2 * elementCount + 1] = 0;
+ 		} else {
+-			destCount[1] = availability[query] != Initial ? 1 : 0;
++			destCount[elementCount] = availability[query] != Initial ? 1 : 0;
+ 		}
+ 	}
+ }
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 17a2a04..12f4978 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -1333,7 +1333,7 @@
+ 				xfbProps->maxTransformFeedbackStreamDataSize = 512;
+ 				xfbProps->maxTransformFeedbackBufferDataSize = 512;
+ 				xfbProps->maxTransformFeedbackBufferDataStride = 2048;
+-				xfbProps->transformFeedbackQueries = false;
++				xfbProps->transformFeedbackQueries = true;	// Counted by the capture passes (MVKTransformFeedbackQueryPool)
+ 				xfbProps->transformFeedbackStreamsLinesTriangles = false;
+ 				xfbProps->transformFeedbackRasterizationStreamSelect = false;
+ 				xfbProps->transformFeedbackDraw = false;
+@@ -4408,6 +4408,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 				return new MVKTimestampQueryPool(this, pCreateInfo);
+ 			case VK_QUERY_TYPE_PIPELINE_STATISTICS:
+ 				return new MVKPipelineStatisticsQueryPool(this, pCreateInfo);
++			case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
++				return new MVKTransformFeedbackQueryPool(this, pCreateInfo);
+ 			default:
+ 				return new MVKUnsupportedQueryPool(this, pCreateInfo);
+ 		}
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index 12c32e8..dfada03 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -340,6 +340,8 @@ public:
+ 	uint32_t getVkVertexBindingDivisor(uint32_t binding) const { return _vkVertexBindingDivisors[binding]; }
+ 	/** Returns the number of vertices of each geometry shader input primitive (1, 2, 3, 4 or 6). */
+ 	uint32_t getGeometryInputVertexCount() const { return _geometryInputVertexCount; }
++	/** Returns the number of vertices of each geometry shader output primitive (1, 2 or 3). */
++	uint32_t getGeometryOutputVertexCount() const { return _geometryOutputVertexCount; }
+ 	const VkViewport* getViewports() const { return _viewports; }
+ 	const VkRect2D* getScissors() const { return _scissors; }
+ 	const MTLSamplePosition* getSampleLocations() const { return _sampleLocations; }
+@@ -433,6 +435,7 @@ protected:
+ 	uint32_t _vkVertexBindingStrides[kMVKMaxBufferCount] = {};
+ 	uint32_t _vkVertexBindingDivisors[kMVKMaxBufferCount] = {};
+ 	uint32_t _geometryInputVertexCount = 0;
++	uint32_t _geometryOutputVertexCount = 0;
+ 	MVKPipelineStageResourceInfo _stageResources[kMVKShaderStageFragment + 1] = {};
+ 
+ 	id<MTLComputePipelineState> _mtlTessVertexStageState = nil;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 5af60d8..b11c5bb 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1342,6 +1342,11 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+         setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Geometry shader: %s", geomErrorLog.c_str()));
+         return nullptr;
+     }
++    _geometryOutputVertexCount = getGeometryShaderOutputVertexCount(_geometryModule->getSPIRV(), pGeometrySS->pName, geomErrorLog);
++    if ( !_geometryOutputVertexCount ) {
++        setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Geometry shader: %s", geomErrorLog.c_str()));
++        return nullptr;
++    }
+ 
+     if (!addVertexShaderToPipeline(plDesc, pCreateInfo, shaderConfig, pVertexSS, pVertexFB))
+         return nullptr;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h
+index b724cbb..59ab3c3 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h
+@@ -173,6 +173,44 @@ protected:
+ };
+ 
+ 
++#pragma mark -
++#pragma mark MVKTransformFeedbackQueryPool
++
++/**
++ * A Vulkan query pool for transform feedback stream queries: per query, the primitives written
++ * to the transform feedback buffers and the primitives needed (output by the vertex stream). Draws
++ * capturing transform feedback add their counts on the GPU (geometry-shader capture, stream 0).
++ */
++class MVKTransformFeedbackQueryPool : public MVKQueryPool {
++
++public:
++
++	/** Returns the MTLBuffer holding the results, 2 uint64_t values per query. */
++	id<MTLBuffer> getResultsMTLBuffer() const { return _resultsMTLBuffer; }
++
++	/** Returns the offset of the specified query in the results MTLBuffer. */
++	static NSUInteger getResultOffset(uint32_t query) { return query * 2 * sizeof(uint64_t); }
++
++	void beginQuery(uint32_t query, VkQueryControlFlags flags, MVKCommandEncoder* cmdEncoder) override;
++	void endQuery(uint32_t query, MVKCommandEncoder* cmdEncoder) override;
++	void resetResults(uint32_t firstQuery, uint32_t queryCount, MVKCommandEncoder* cmdEncoder) override;
++
++#pragma mark Construction
++
++	MVKTransformFeedbackQueryPool(MVKDevice* device, const VkQueryPoolCreateInfo* pCreateInfo);
++
++	~MVKTransformFeedbackQueryPool() override;
++
++protected:
++	void propagateDebugName() override;
++	NSData* getQuerySourceData(uint32_t firstQuery, uint32_t queryCount) override;
++	id<MTLBuffer> getResultBuffer(MVKCommandEncoder* cmdEncoder, uint32_t firstQuery, uint32_t queryCount, NSUInteger& offset) override;
++	id<MTLComputeCommandEncoder> encodeComputeCopyResults(MVKCommandEncoder* cmdEncoder, uint32_t firstQuery, uint32_t queryCount, uint32_t index) override;
++
++	id<MTLBuffer> _resultsMTLBuffer;
++};
++
++
+ #pragma mark -
+ #pragma mark MVKGPUCounterQueryPool
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
+index 428a51f..aaea2a9 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
+@@ -130,13 +130,15 @@
+ 	bool shouldOutput = (isAvailable || mvkAreAllFlagsEnabled(flags, VK_QUERY_RESULT_PARTIAL_BIT));
+ 	bool shouldOutput64Bit = mvkAreAllFlagsEnabled(flags, VK_QUERY_RESULT_64_BIT);
+ 
+-	// Output the results of this query
++	// Output the results of this query (_queryElementCount values)
+ 	if (shouldOutput) {
+-		uint64_t rsltVal = ((uint64_t*)srcData.bytes)[query - srcDataQueryOffset];
+-		if (shouldOutput64Bit) {
+-			*(uint64_t*)pDstData = rsltVal;
+-		} else {
+-			*(uint32_t*)pDstData = (uint32_t)rsltVal;
++		const uint64_t* pRslts = (const uint64_t*)srcData.bytes + (query - srcDataQueryOffset) * _queryElementCount;
++		for (uint32_t elem = 0; elem < _queryElementCount; elem++) {
++			if (shouldOutput64Bit) {
++				((uint64_t*)pDstData)[elem] = pRslts[elem];
++			} else {
++				((uint32_t*)pDstData)[elem] = (uint32_t)pRslts[elem];
++			}
+ 		}
+ 	}
+ 
+@@ -182,6 +184,7 @@
+ 		state.bindStructBytes(mtlComputeCmdEnc, &stride,     2);
+ 		state.bindStructBytes(mtlComputeCmdEnc, &queryCount, 3);
+ 		state.bindStructBytes(mtlComputeCmdEnc, &flags,      4);
++		state.bindStructBytes(mtlComputeCmdEnc, &_queryElementCount, 6);
+ 		_availabilityLock.lock();
+ 		cmdEncoder->setComputeBytes(mtlComputeCmdEnc, _availability.data() + firstQuery, queryCount * sizeof(Status), 5);
+ 		_availabilityLock.unlock();
+@@ -301,6 +304,65 @@
+ };
+ 
+ 
++#pragma mark -
++#pragma mark MVKTransformFeedbackQueryPool
++
++void MVKTransformFeedbackQueryPool::propagateDebugName() { setMetalObjectLabel(_resultsMTLBuffer, _debugName); }
++
++// Only vertex stream 0 is captured (maxTransformFeedbackStreams is 1); queries of other streams are
++// not begun (see vkCmdBeginQueryIndexedEXT) and keep their reset values of 0.
++void MVKTransformFeedbackQueryPool::beginQuery(uint32_t query, VkQueryControlFlags flags, MVKCommandEncoder* cmdEncoder) {
++	cmdEncoder->beginTransformFeedbackQuery(this, query);
++}
++
++void MVKTransformFeedbackQueryPool::endQuery(uint32_t query, MVKCommandEncoder* cmdEncoder) {
++	cmdEncoder->endTransformFeedbackQuery(this, query);
++	MVKQueryPool::endQuery(query, cmdEncoder);
++}
++
++void MVKTransformFeedbackQueryPool::resetResults(uint32_t firstQuery, uint32_t queryCount, MVKCommandEncoder* cmdEncoder) {
++	MVKQueryPool::resetResults(firstQuery, queryCount, cmdEncoder);
++
++	NSUInteger firstOffset = getResultOffset(firstQuery);
++	NSUInteger lastOffset = getResultOffset(firstQuery + queryCount);
++	if (cmdEncoder) {
++		id<MTLBlitCommandEncoder> blitEncoder = cmdEncoder->getMTLBlitEncoder(kMVKCommandUseResetQueryPool);
++		[blitEncoder fillBuffer: _resultsMTLBuffer range: NSMakeRange(firstOffset, lastOffset - firstOffset) value: 0];
++	} else {  // Host-side reset
++		mvkClear((char*)_resultsMTLBuffer.contents + firstOffset, std::min(lastOffset, _resultsMTLBuffer.length) - firstOffset);
++	}
++}
++
++NSData* MVKTransformFeedbackQueryPool::getQuerySourceData(uint32_t firstQuery, uint32_t queryCount) {
++	return [NSData dataWithBytesNoCopy: (void*)((uintptr_t)_resultsMTLBuffer.contents + getResultOffset(firstQuery))
++								length: getResultOffset(queryCount)
++						  freeWhenDone: false];
++}
++
++id<MTLBuffer> MVKTransformFeedbackQueryPool::getResultBuffer(MVKCommandEncoder*, uint32_t firstQuery, uint32_t, NSUInteger& offset) {
++	offset = getResultOffset(firstQuery);
++	return _resultsMTLBuffer;
++}
++
++id<MTLComputeCommandEncoder> MVKTransformFeedbackQueryPool::encodeComputeCopyResults(MVKCommandEncoder* cmdEncoder, uint32_t firstQuery, uint32_t, uint32_t index) {
++	id<MTLComputeCommandEncoder> mtlCmdEnc = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseCopyQueryPoolResults);
++	cmdEncoder->getMtlCompute().bindBuffer(mtlCmdEnc, _resultsMTLBuffer, getResultOffset(firstQuery), index);
++	return mtlCmdEnc;
++}
++
++MVKTransformFeedbackQueryPool::MVKTransformFeedbackQueryPool(MVKDevice* device, const VkQueryPoolCreateInfo* pCreateInfo)
++	: MVKQueryPool(device, pCreateInfo, 2) {
++	_resultsMTLBuffer = [getMTLDevice() newBufferWithLength: std::max<NSUInteger>(getResultOffset(pCreateInfo->queryCount), 16)
++													options: MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache];	// retained
++	[_resultsMTLBuffer setLabel: @"Transform Feedback Query Result Buffer"];
++	mvkClear((char*)_resultsMTLBuffer.contents, _resultsMTLBuffer.length);
++}
++
++MVKTransformFeedbackQueryPool::~MVKTransformFeedbackQueryPool() {
++	[_resultsMTLBuffer release];
++}
++
++
+ #pragma mark -
+ #pragma mark MVKGPUCounterQueryPool
+ 
+diff --git a/MoltenVK/MoltenVK/Vulkan/vulkan.mm b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
+index 5aa3965..760f1a6 100644
+--- a/MoltenVK/MoltenVK/Vulkan/vulkan.mm
++++ b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
+@@ -4406,7 +4406,9 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBeginQueryIndexedEXT(
+ 	uint32_t                                    index) {
+ 
+ 	MVKTraceVulkanCallStart();
+-	// MVKAddCmd(BeginQueryIndexed, commandBuffer, queryPool, query, flags, index);
++	// Only vertex stream 0 is captured (maxTransformFeedbackStreams is 1). Transform feedback queries of other
++	// streams (vkd3d-proton and DXVK use the D3D stream index) are not begun: they end with their reset value 0.
++	if (index == 0) { MVKAddCmd(BeginQuery, commandBuffer, queryPool, query, flags); }
+ 	MVKTraceVulkanCallEnd();
+ }
+ 
+@@ -4456,7 +4458,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdEndQueryIndexedEXT(
+ 	uint32_t                                    index) {
+ 
+ 	MVKTraceVulkanCallStart();
+-	// MVKAddCmd(EndQueryIndexed, commandBuffer, queryPool, query, index);
++	MVKAddCmd(EndQuery, commandBuffer, queryPool, query);
+ 	MVKTraceVulkanCallEnd();
+ }
+ 
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h
+index 41d9d7c..52542ab 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h
+@@ -124,6 +124,33 @@ namespace mvk {
+ #endif
+ 	}
+ 
++	/**
++	 * Given a geometry shader in SPIR-V format, returns the number of vertices of each primitive it
++	 * outputs (1 for points, 2 for line strips, 3 for triangle strips), or 0 on error.
++	 */
++	template<typename Vs>
++	static inline uint32_t getGeometryShaderOutputVertexCount(const Vs& geom, const std::string& entryName, std::string& errorLog) {
++#ifndef SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS
++		try {
++#endif
++			SPIRV_CROSS_NAMESPACE::CompilerReflection reflect(geom);
++			if (!entryName.empty()) {
++				reflect.set_entry_point(entryName, spv::ExecutionModelGeometry);
++			}
++			const SPIRV_CROSS_NAMESPACE::Bitset& modes = reflect.get_execution_mode_bitset();
++			if (modes.get(spv::ExecutionModeOutputPoints)) { return 1; }
++			if (modes.get(spv::ExecutionModeOutputLineStrip)) { return 2; }
++			if (modes.get(spv::ExecutionModeOutputTriangleStrip)) { return 3; }
++			errorLog = "The geometry shader does not specify an output primitive.";
++			return 0;
++#ifndef SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS
++		} catch (SPIRV_CROSS_NAMESPACE::CompilerError& ex) {
++			errorLog = ex.what();
++			return 0;
++		}
++#endif
++	}
++
+ 	/**
+ 	 * Given a tessellation control shader and a tessellation evaluation shader,
+ 	 * both in SPIR-V format, returns tessellation reflection data.
+-- 
+2.50.1 (Apple Git-155)
+

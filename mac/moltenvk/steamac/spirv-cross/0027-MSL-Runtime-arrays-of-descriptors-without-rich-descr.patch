@@ -1,0 +1,78 @@
+From f5abceb73cb205ad545e643cfa50499954172bf0 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Tue, 6 Oct 2026 14:00:00 +0300
+Subject: [PATCH 27/27] MSL: Runtime arrays of descriptors without rich
+ descriptors in argument buffers
+
+A runtime-sized array of descriptors (binding count 0) is declared as a one-element member that is indexed past
+its end. Metal parses the members of an argument buffer for every program: an array declared with the full count
+of a variable-count binding (1000000 descriptors for vkd3d-proton's heaps) costs a 32 MB table per program, ~100 MB
+per vkd3d-proton pipeline, hundreds of GB for a game. Runtime arrays now work with MoltenVK's descriptor layout:
+- a set with a runtime array is a device argument buffer (instead of failing compilation);
+- without rich descriptors, buffer lengths (OpArrayLength, robustBufferAccess2 bounds) come from the size buffer,
+  per element, like those of sized arrays (instead of failing: "OpArrayLength requires rich descriptor format").
+- a runtime-sized binding declared as a sized array in the shader (glslang sizes unsized arrays that only
+  constant indices access) uses the shader's size.
+---
+ spirv_msl.cpp | 23 +++++++++++++++++------
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 71aa06b..75c8fc1 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -292,7 +292,12 @@ uint32_t CompilerMSL::get_resource_array_size(const SPIRType &type, uint32_t id)
+ 	StageSetBinding tuple = { get_entry_point().model, desc_set,
+ 		                      get_decoration(id, DecorationBinding) };
+ 	auto itr = resource_bindings.find(tuple);
+-	return itr != end(resource_bindings) ? itr->second.first.count : array_size;
++	if (itr == end(resource_bindings))
++		return array_size;
++	// A runtime-sized binding (count 0) declared as a sized array in the shader (glslang sizes unsized arrays that
++	// only constant indices access): the shader uses the first array_size elements.
++	uint32_t count = itr->second.first.count;
++	return count == 0 ? array_size : count;
+ }
+ 
+ uint32_t CompilerMSL::get_automatic_msl_resource_binding(uint32_t id) const
+@@ -15378,11 +15383,9 @@ string CompilerMSL::to_buffer_size_expression(uint32_t id)
+ 	{
+ 		if (auto var = maybe_get_backing_variable(id))
+ 		{
+-			if (is_var_runtime_size_array(*var))
++			// Without rich descriptors, the sizes are in the size buffer like those of sized arrays.
++			if (is_var_runtime_size_array(*var) && msl_options.runtime_array_rich_descriptor)
+ 			{
+-				if (!msl_options.runtime_array_rich_descriptor)
+-					SPIRV_CROSS_THROW("OpArrayLength requires rich descriptor format");
+-
+ 				auto last_pos = array_expr.find_last_of(']');
+ 				if (last_pos != std::string::npos)
+ 					return buffer_expr + ".length(" + array_expr.substr(1, last_pos - 1) + ")";
+@@ -17773,7 +17776,10 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 				entry_func.fixup_hooks_in.push_back(
+ 				    [this, &type, &var, var_id]()
+ 				    {
+-					    bool is_array_type = !type.array.empty() && !is_var_runtime_size_array(var);
++					    // Runtime arrays of rich descriptors keep their lengths in the descriptors; otherwise the sizes of
++				    // all elements are in the size buffer.
++				    bool is_array_type = !type.array.empty() &&
++				                         (!is_var_runtime_size_array(var) || !msl_options.runtime_array_rich_descriptor);
+ 
+ 					    uint32_t desc_set = get_decoration(var_id, DecorationDescriptorSet);
+ 					    if (var.storage != StorageClassPushConstant && descriptor_set_is_argument_buffer(desc_set))
+@@ -22382,6 +22388,11 @@ void CompilerMSL::analyze_argument_buffers()
+ 			if (!descriptor_set_is_argument_buffer(desc_set))
+ 				return;
+ 
++			// A runtime-sized array of descriptors (binding count 0) is declared as a one-element array that is
++			// indexed past its end, which needs the set in device storage.
++			if (is_var_runtime_size_array(var) && desc_set < kMaxArgumentBuffers)
++				argument_buffer_device_storage_mask |= 1u << desc_set;
++
+ 			uint32_t var_id = var.self;
+ 			auto &type = get_variable_data_type(var);
+ 
+-- 
+2.50.1 (Apple Git-155)
+

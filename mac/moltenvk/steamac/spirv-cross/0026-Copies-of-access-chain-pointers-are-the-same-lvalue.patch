@@ -1,0 +1,51 @@
+From c353f087e225866aca483ecc69ebc7c58df3c766 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Tue, 6 Oct 2026 13:00:00 +0300
+Subject: [PATCH 26/26] Copies of access chain pointers are the same lvalue
+
+dxil-spirv stores to function-local arrays through an OpCopyObject of the element's access chain. The copy was a
+forwarded expression without the access chain flag, so MSL dereferenced it like a pointer ("*_117[_192] = ...",
+'indirection requires pointer operand': Stellar Blade's compute pipelines did not compile), and the scope analysis
+did not see the store as a write of the array: a constant-initialized array written only through the copy became
+a constant lookup table. The copy keeps the access chain flag, and the analysis gives it the source's backing
+variable, so stores through it write that variable.
+---
+ spirv_cross.cpp | 6 ++++++
+ spirv_glsl.cpp  | 3 +++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/spirv_cross.cpp b/spirv_cross.cpp
+index 7c0d15e..342249d 100644
+--- a/spirv_cross.cpp
++++ b/spirv_cross.cpp
+@@ -3628,7 +3628,13 @@ bool Compiler::AnalyzeVariableScopeAccessHandler::handle(Op op, const uint32_t *
+ 		// Might be an access chain which we have to keep track of.
+ 		notify_variable_access(args[1], current_block->self);
+ 		if (access_chain_expressions.count(args[2]))
++		{
+ 			access_chain_expressions.insert(args[1]);
++			// A copy of an access chain points into the same variable: stores through it write the variable (else a
++			// constant-initialized array only written through the copy became a const lookup table).
++			auto &e = compiler.set<SPIRExpression>(args[1], "", args[0], true);
++			e.loaded_from = var ? VariableID(var->self) : VariableID(0);
++		}
+ 
+ 		// Might try to copy a Phi variable here.
+ 		notify_variable_access(args[2], current_block->self);
+diff --git a/spirv_glsl.cpp b/spirv_glsl.cpp
+index 26721bc..c7343a0 100644
+--- a/spirv_glsl.cpp
++++ b/spirv_glsl.cpp
+@@ -13329,6 +13329,9 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
+ 			{
+ 				e.implied_read_expressions = rhs_expr->implied_read_expressions;
+ 				e.expression_dependencies = rhs_expr->expression_dependencies;
++				// A copy of an access chain is the same lvalue (a[i]), not a pointer to dereference (MSL wrote *a[i]).
++				if (pointer)
++					e.access_chain = rhs_expr->access_chain;
+ 			}
+ 		}
+ 		break;
+-- 
+2.50.1 (Apple Git-155)
+

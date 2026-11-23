@@ -1,0 +1,305 @@
+From b9a4e2b8874ba614b13277ddf6e472e1d57b76ce Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Mon, 5 Oct 2026 11:08:45 +0300
+Subject: [PATCH 18/18] MSL: Fix robustBufferAccess2 loads, bounds and image atomic
+ stores
+
+Compile errors in the MSL of DXVK, gamescope and Slang shaders with robustBufferAccess2:
+- The out-of-bounds select of a load used the loaded value in the physical layout of the buffer:
+  'packed_float3x4' selected against 'float3x4(0)' ("incompatible operand types", gamescope's
+  'vec4(color, 1) * u_ctm[colorspaceLayerIdx]'), row-major matrices untransposed. Convert the value to
+  the logical type first (unpack, transpose) and drop the physical layout from the expression.
+- Struct values were zeroed with 'S(0)' ("no matching conversion for functional-style cast from
+  'int'", Slang's _MatrixStorage_float4x4_ColMajor* wrappers): value-initialize them ('S{}'); pointers
+  are zeroed with nullptr. Arrays cannot be selected (arrays in buffers are C arrays): load them into
+  a temporary that is zeroed when out of bounds.
+- Native texture atomic_store() returns void and takes the 4-component value before the coordinates:
+  'u0.atomic_store(3u, 0u).x' ("member reference base type 'void'"). Emit
+  'u0.atomic_store(uint4(value), coord)'.
+
+Wrong bounds:
+- The array stride was read from the element type (SPIRType::self of an array type is its element
+  type), so arrays of structs used 4 bytes instead of their ArrayStride and the clamped index could
+  reach 16 times past the end of the buffer. Look up the array type's own ArrayStride.
+- A runtime array after a header ignored the member offset: bound it by (size - offset) / stride, as
+  OpArrayLength does. Fixed-size arrays are bounded by their declared length too.
+- The bounds check of an access chain was dropped after its first use, so a read-modify-write through
+  one access chain stored out of bounds into the clamped last element. Keep it for every use.
+---
+ spirv_msl.cpp | 132 +++++++++++++++++++++++++++++++++++---------------
+ spirv_msl.hpp |   2 +
+ 2 files changed, 95 insertions(+), 39 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 3d2bd7e..3a1ba85 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -10923,6 +10923,13 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 		uint32_t result_type = ops[0];
+ 		uint32_t id = ops[1];
+ 		uint32_t ptr = ops[2];
++
++		// robustBufferAccess2: an array cannot be selected against a zero value (arrays in buffers are
++		// plain C arrays), so it is loaded into a temporary that is zeroed when out of bounds.
++		bool robust_array_load = robust_access_chains.count(ptr) && is_array(get<SPIRType>(result_type));
++		if (robust_array_load)
++			forced_temporaries.insert(id);
++
+ 		if (is_tessellation_shader())
+ 		{
+ 			if (!emit_tessellation_io_load(ops[0], id, ptr))
+@@ -10936,25 +10943,33 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 			CompilerGLSL::emit_instruction(instruction);
+ 		}
+ 
+-		// Check if this load needs robust zero-select wrapping
++		// Check if this load needs robust zero-select wrapping. The access chain stays in the map: it
++		// may be loaded, stored or used by atomics more than once (read-modify-write).
+ 		auto it = robust_access_chains.find(ptr);
+ 		if (it != robust_access_chains.end())
+ 		{
+ 			auto &info = it->second;
+-			// Get the expression that was just emitted
+ 			auto *expr = maybe_get<SPIRExpression>(id);
+-			if (expr)
++			if (robust_array_load)
+ 			{
+-				auto &loaded_type = get<SPIRType>(result_type);
+-				// Generate a proper zero expression using type constructor
+-				// to_zero_initialized_expression returns {} which doesn't work in ternary
+-				string zero_expr = join(type_to_glsl(loaded_type), "(0)");
+-
+-				// Wrap the expression with a select: (in_bounds) ? loaded_value : zero
+-				expr->expression = join("(", info.bounds_check_condition, " ? ", expr->expression, " : ", zero_expr, ")");
++				statement("if (!(", info.bounds_check_condition, "))");
++				begin_scope();
++				statement(to_name(id), " = {};");
++				end_scope();
++			}
++			else if (expr)
++			{
++				// A forwarded load is still in the physical layout of the buffer (packed vectors and
++				// matrices, remapped physical types, row-major matrices), converted where it is used.
++				// The zero value has the logical type: convert the loaded value first, so both operands
++				// of the select have the same type.
++				string value = to_unpacked_expression(id, false);
++				expr->expression = join("(", info.bounds_check_condition, " ? ", value, " : ",
++				                        robust_zero_expression(get<SPIRType>(result_type)), ")");
++				expr->need_transpose = false;
++				unset_extended_decoration(id, SPIRVCrossDecorationPhysicalTypePacked);
++				unset_extended_decoration(id, SPIRVCrossDecorationPhysicalTypeID);
+ 			}
+-			// Remove from map to avoid double-processing
+-			robust_access_chains.erase(it);
+ 		}
+ 		break;
+ 	}
+@@ -11191,7 +11206,6 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 			pending_robust_buffer_atomic_result_id = id;
+ 			statement("if (", info.bounds_check_condition, ")");
+ 			begin_scope();
+-			robust_access_chains.erase(robust_it);
+ 		}
+ 		emit_atomic_func_op(result_type, id, "atomic_exchange", opcode, mem_sem, mem_sem, false, ptr, val);
+ 		pending_robust_buffer_atomic_result_id = 0;
+@@ -11226,7 +11240,6 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 			pending_robust_buffer_atomic_result_id = id;
+ 			statement("if (", info.bounds_check_condition, ")");
+ 			begin_scope();
+-			robust_access_chains.erase(robust_it);
+ 		}
+ 		emit_atomic_func_op(result_type, id, "atomic_compare_exchange_weak", opcode,
+ 		                    mem_sem_pass, mem_sem_fail, true,
+@@ -11264,7 +11277,6 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 			pending_robust_buffer_atomic_result_id = id;
+ 			statement("if (", info.bounds_check_condition, ")");
+ 			begin_scope();
+-			robust_access_chains.erase(robust_it);
+ 		}
+ 		emit_atomic_func_op(result_type, id, "atomic_load", opcode, mem_sem, mem_sem, false, ptr, 0);
+ 		pending_robust_buffer_atomic_result_id = 0;
+@@ -11296,7 +11308,6 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 			auto &info = robust_it->second;
+ 			statement("if (", info.bounds_check_condition, ")");
+ 			begin_scope();
+-			robust_access_chains.erase(robust_it);
+ 		}
+ 		emit_atomic_func_op(result_type, id, "atomic_store", opcode, mem_sem, mem_sem, false, ptr, val);
+ 		if (robust_atomic)
+@@ -11325,7 +11336,6 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 			/* Emit bounds check: only perform atomic if index < count */                                        \
+ 			statement("if (", info.bounds_check_condition, ")");                                                 \
+ 			begin_scope();                                                                                       \
+-			robust_access_chains.erase(robust_it);                                                               \
+ 		}                                                                                                        \
+ 		emit_atomic_func_op(result_type, id, "atomic_fetch_" #op, opcode,                                        \
+ 		                    mem_sem, mem_sem, false, ptr, val,                                                   \
+@@ -11891,8 +11901,6 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 			// Emit bounds check: only store if index < count
+ 			statement("if (", info.bounds_check_condition, ")");
+ 			begin_scope();
+-			// Remove from map to avoid double-processing
+-			robust_access_chains.erase(robust_it);
+ 		}
+ 
+ 		if (needs_frag_discard_checks() &&
+@@ -13153,6 +13161,8 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+ 		begin_scope();
+ 	}
+ 
++	// Set when the value of a native texture atomic_store() was already emitted (before the coordinates).
++	bool native_image_atomic_store = false;
+ 	if (use_native_image_atomic)
+ 	{
+ 		auto obj_expression = to_expression(obj);
+@@ -13166,6 +13176,7 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+ 			add_spv_func_and_recompile(SPVFuncImplTextureCast);
+ 
+ 		// Will only be false if we're in "force recompile later" mode.
++		native_image_atomic_store = split_index != string::npos && strcmp(op, "atomic_store") == 0;
+ 		if (split_index != string::npos)
+ 		{
+ 			auto coord = obj_expression.substr(split_index + 1);
+@@ -13192,6 +13203,14 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+ 			}
+ 
+ 			exp += join(image_expr, ".", op, "(");
++			if (native_image_atomic_store)
++			{
++				// Metal's texture atomic_store() takes the 4-component value first: atomic_store(color, coord...).
++				auto value_type = type;
++				value_type.basetype = expected_type;
++				value_type.vecsize = 4;
++				exp += join(type_to_glsl(value_type), "(", bitcast_expression(expected_type, op1), "), ");
++			}
+ 			if (ptr_type.storage == StorageClassImage && (res_type->image.arrayed || res_type->image.dim == DimCube))
+ 			{
+ 				switch (res_type->image.dim)
+@@ -13330,7 +13349,7 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+ 	{
+ 		assert(strcmp(op, "atomic_compare_exchange_weak") != 0);
+ 
+-		if (op1)
++		if (op1 && !native_image_atomic_store)
+ 		{
+ 			exp += ", ";
+ 			if (op1_is_literal)
+@@ -13351,8 +13370,8 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+ 
+ 		exp += ")";
+ 
+-		// For some particular reason, atomics return vec4 in Metal ...
+-		if (use_native_image_atomic)
++		// For some particular reason, atomics return vec4 in Metal ... (except atomic_store, which returns void)
++		if (use_native_image_atomic && strcmp(op, "atomic_store") != 0)
+ 			exp += ".x";
+ 
+ 		// Vulkan: (section 9.29: ...  and values returned by atomic instructions in helper invocations are undefined)
+@@ -15513,39 +15532,74 @@ string CompilerMSL::get_robust_buffer_array_length(const SPIRType &type, uint32_
+ 	if (is_runtime_size_array(type))
+ 	{
+ 		string size_expr = buffer_size_expression();
+-		uint32_t stride = get_decoration(type.self, DecorationArrayStride);
+-		if (stride == 0 && type.parent_type)
++		// A runtime array is the last member of the buffer block, its elements start at the member offset.
++		auto &block_type = get_variable_element_type(get<SPIRVariable>(var_id));
++		uint32_t offset = 0;
++		uint32_t stride = 0;
++		if (block_type.basetype == SPIRType::Struct && !block_type.member_types.empty())
+ 		{
+-			auto &elem_type = get<SPIRType>(type.parent_type);
+-			stride = (elem_type.width / 8) * elem_type.vecsize * elem_type.columns;
++			uint32_t last = uint32_t(block_type.member_types.size() - 1);
++			if (is_runtime_size_array(get<SPIRType>(block_type.member_types[last])))
++			{
++				offset = type_struct_member_offset(block_type, last);
++				stride = type_struct_member_array_stride(block_type, last);
++			}
+ 		}
+ 		if (stride == 0)
+-			stride = 4;
+-		return join("(", size_expr, " / ", stride, "u)");
++			stride = get_robust_array_stride(type);
++		if (offset == 0)
++			return join("(", size_expr, " / ", stride, "u)");
++		// Guard against underflow when the buffer is smaller than the offset (e.g. null descriptors).
++		return join("((", size_expr, " < ", offset, "u) ? 0u : ((", size_expr, " - ", offset, "u) / ", stride, "u))");
+ 	}
+ 	else
+ 	{
+-		string declared_length = to_string(to_array_size_literal(type));
+ 		if (msl_options.robust_buffer_access2)
+ 		{
+ 			string size_expr = buffer_size_expression();
+ 			if (!size_expr.empty())
+ 			{
+-				uint32_t stride = get_decoration(type.self, DecorationArrayStride);
+-				if (stride == 0 && type.parent_type)
+-				{
+-					auto &elem_type = get<SPIRType>(type.parent_type);
+-					stride = (elem_type.width / 8) * elem_type.vecsize * elem_type.columns;
+-				}
+-				if (stride == 0)
+-					stride = 4;
+-				return join("(", size_expr, " / ", stride, "u)");
++				// Never beyond the declared length: the elements that fit in the buffer, up to the array size.
++				string declared_length = to_array_size(type, uint32_t(type.array.size() - 1));
++				return join("min(uint(", declared_length, "), (", size_expr, " / ", get_robust_array_stride(type), "u))");
+ 			}
+ 		}
+-		return declared_length;
++		return to_string(to_array_size_literal(type));
+ 	}
+ }
+ 
++// ArrayStride decorates the array type ID, but SPIRType::self of an array type is the ID of its element type
++// (see the parser): look up the ID of this array type.
++uint32_t CompilerMSL::get_robust_array_stride(const SPIRType &type)
++{
++	uint32_t stride = 0;
++	for (auto &id : ir.ids_for_type[TypeType])
++	{
++		if (&get<SPIRType>(id) == &type)
++		{
++			stride = get_decoration(id, DecorationArrayStride);
++			break;
++		}
++	}
++	if (stride == 0 && type.parent_type)
++	{
++		auto &elem_type = get<SPIRType>(type.parent_type);
++		stride = (elem_type.width / 8) * elem_type.vecsize * elem_type.columns;
++	}
++	return stride ? stride : 4;
++}
++
++// The zero value selected by robustBufferAccess2 for an out-of-bounds load of a value of this type.
++string CompilerMSL::robust_zero_expression(const SPIRType &type)
++{
++	if (is_pointer(type))
++		return "nullptr";
++	// Aggregates are value-initialized; T(0) only constructs scalars, vectors and matrices.
++	if (type.basetype == SPIRType::Struct)
++		return join(type_to_glsl(type), "{}");
++	return join(type_to_glsl(type), "(0)");
++}
++
+ // Checks whether the type is a Block all of whose members have DecorationPatch.
+ bool CompilerMSL::is_patch_block(const SPIRType &type)
+ {
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index b9e4dc8..954aec4 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -1194,6 +1194,8 @@ protected:
+ 	// Robust buffer access helpers for robustBufferAccess2
+ 	std::string get_robust_buffer_array_length(const SPIRType &type, uint32_t var_id, const std::string &descriptor_index = "");
+ 	std::string robust_descriptor_index(const std::string &chain_expr, const SPIRVariable &var);
++	uint32_t get_robust_array_stride(const SPIRType &type);
++	std::string robust_zero_expression(const SPIRType &type);
+ 
+ 	bool is_sample_rate() const;
+ 	bool is_intersection_query() const;
+-- 
+2.50.1 (Apple Git-155)
+

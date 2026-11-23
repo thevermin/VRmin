@@ -1,0 +1,124 @@
+From 4db6d583fe49358c324931cb79e53e86f27161d4 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 22:00:41 +0300
+Subject: [PATCH 06/17] MSL: Fix input primitive assembly in the
+ geometry-shader object stage
+
+The object stage that assembles geometry-shader input primitives took the
+vertices of primitive x from x, x+1, ... for list topologies (it multiplied by
+the primitive size only when drawInfo->topoStrip was set, i.e. backwards), so
+every list primitive after the first read the wrong vertices; the strip input
+types ignored drawInfo entirely.
+
+The primitive size now comes from the pipeline's input primitive class and the
+list/strip decision from drawInfo->topoStrip at draw time (topology can be
+dynamic): a list primitive starts at x * N, a strip primitive at x. Odd
+triangles of a triangle strip take their vertices as (n, n+2, n+1) to keep the
+winding, as Vulkan specifies.
+---
+ spirv_msl.cpp | 59 +++++++++++++++++++++++----------------------------
+ 1 file changed, 27 insertions(+), 32 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 75d21ba0..7849e947 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -1992,68 +1992,63 @@ void CompilerMSL::emit_mesh_wrapper()
+ 
+ 		begin_scope();
+ 
+-		if (msl_options.input_primitive_type == Options::PrimitiveTopology::TriangleStrip)
+-		{
+-			statement("int startingIndex = positionInGrid.x;");
+-			statement("int vertexCount = 3;");
+-		}
+-		else if (msl_options.input_primitive_type == Options::PrimitiveTopology::Triangles)
+-		{
+-			statement("int startingIndex = positionInGrid.x;");
+-			statement("if (drawInfo->topoStrip) startingIndex *= 3;");
+-			statement("int vertexCount = 3;");
+-		}
+-		else if (msl_options.input_primitive_type == Options::PrimitiveTopology::Lines)
+-		{
+-			statement("int startingIndex = positionInGrid.x;");
+-			statement("if (drawInfo->topoStrip) startingIndex *= 2;");
+-			statement("int vertexCount = 2;");
+-		}
+-		else if (msl_options.input_primitive_type == Options::PrimitiveTopology::LineStrip)
+-		{
+-			statement("int startingIndex = positionInGrid.x;");
+-			statement("int vertexCount = 2;");
+-		}
+-		else if (msl_options.input_primitive_type == Options::PrimitiveTopology::Points)
+-		{
+-			statement("int startingIndex = positionInGrid.x;");
+-			statement("int vertexCount = 1;");
+-		}
+-		else
++		int vertices_per_primitive = 0;
++		switch (msl_options.input_primitive_type)
+ 		{
++		case Options::PrimitiveTopology::Triangles:
++		case Options::PrimitiveTopology::TriangleStrip:
++			vertices_per_primitive = 3;
++			break;
++		case Options::PrimitiveTopology::Lines:
++		case Options::PrimitiveTopology::LineStrip:
++			vertices_per_primitive = 2;
++			break;
++		case Options::PrimitiveTopology::Points:
++			vertices_per_primitive = 1;
++			break;
++		default:
+ 			SPIRV_CROSS_THROW("Input primitive type not supported");
+ 		}
+ 
++		// One object threadgroup per input primitive. The topology (list or strip) is a draw-time
++		// property (it can be dynamic state), so it comes from drawInfo->topoStrip, not from the
++		// pipeline's input primitive type: a list primitive starts at x * N, a strip one at x.
++		statement("int vertexCount = ", vertices_per_primitive, ";");
++		statement("int startingIndex = drawInfo->topoStrip ? int(positionInGrid.x) : int(positionInGrid.x) * vertexCount;");
++
+ 		statement("int instanceIndex = positionInGrid.y;");
+ 		statement("payload.primitiveId = positionInGrid.x;");
+ 
+ 		statement("for (int i = 0; i < vertexCount; ++i)");
+ 		begin_scope();
+ 		statement("uint vertexIndex;");
++		// Odd triangles of a strip take their vertices in the order (n, n + 2, n + 1) to keep the
++		// winding (Vulkan spec, triangle strips).
++		statement("int element = (drawInfo->topoStrip && vertexCount == 3 && (positionInGrid.x & 1) && i > 0) ? 3 - i : i;");
+ 
+ 		statement("if (drawInfo->indexed)");
+ 		begin_scope();
+ 
+ 		statement(R"END(
+ 		if (drawInfo->indexSize == 1) {
+-			vertexIndex = ((constant uchar *)drawInfo->indexBuffer)[startingIndex + i];
++			vertexIndex = ((constant uchar *)drawInfo->indexBuffer)[startingIndex + element];
+ 			if (vertexIndex == 0xff) {
+ 				return;
+ 			}
+ 		} else if (drawInfo->indexSize == 2) {
+-			vertexIndex = ((constant ushort *)drawInfo->indexBuffer)[startingIndex + i];
++			vertexIndex = ((constant ushort *)drawInfo->indexBuffer)[startingIndex + element];
+ 			if (vertexIndex == 0xffff) {
+ 				return;
+ 			}
+ 		} else {
+-			vertexIndex = ((constant uint *)drawInfo->indexBuffer)[startingIndex + i];
++			vertexIndex = ((constant uint *)drawInfo->indexBuffer)[startingIndex + element];
+ 			if (vertexIndex == 0xffffffff) {
+ 				return;
+ 			}
+ 		})END");
+ 
+ 		end_scope();
+-		statement("else vertexIndex = startingIndex + i;");
++		statement("else vertexIndex = startingIndex + element;");
+ 
+ 		if (stage_in_var_id)
+ 		{
+-- 
+2.50.1 (Apple Git-155)
+

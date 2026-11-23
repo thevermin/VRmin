@@ -1,0 +1,248 @@
+From d6b964f8341fd885ae337d72fb559014fee03e95 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Mon, 5 Oct 2026 19:38:31 +0300
+Subject: [PATCH 26/26] Reject vertex input that Metal's vertex descriptor validation
+ aborts on
+
+Metal validates the vertex descriptor of a render pipeline (and the stage input descriptor of a
+compute pipeline) when the pipeline is created, and an invalid descriptor is not an error but an
+always-on assertion that aborts the process: "Attribute at index 1 references a buffer at index 29
+that has no stride." (STEAMAC-3/X, the whole VM). Every buffer layout an attribute uses needs a
+non-zero stride, whatever its step function, and a step rate that fits the step function
+(constant: 0, per vertex: 1, per instance: not 0).
+
+An attribute whose binding has no VkVertexInputBindingDescription (invalid usage, but guest apps
+send it through Venus) got the default, stride-less layout; with no binding descriptions at all,
+MVKGraphicsPipeline::addVertexInputToShaderConversionConfig() dereferenced a null binding
+description, and the attribute loop read past the binding descriptions. Such pipelines now fail
+with VK_ERROR_INITIALIZATION_FAILED, also with geometry shaders, whose object stage would read an
+unbound Metal buffer.
+
+Before creating the Metal pipeline, the vertex (or stage input) descriptor is checked like Metal
+does, so any remaining inconsistency fails the pipeline instead of aborting. The stride given to a
+zero-stride binding (the maximum offset + size of its attributes) is at least 1 and aligned like
+other strides, and a translated binding for an attribute beyond its binding's stride that has no
+Metal buffer index left fails the pipeline instead of using an invalid index.
+
+Zero strides themselves were already handled: static zero strides become a constant step
+function with the attributes' extent as stride, dynamic strides use MTLBufferLayoutStrideDynamic
+(attributeStride 0 is accepted at bind time), and the geometry shader object stage fetches with
+stride 0.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h  |   3 +
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 143 ++++++++++++++------
+ 2 files changed, 106 insertions(+), 40 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index ccefc9a..12c32e8 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -395,6 +395,9 @@ protected:
+     bool addFragmentShaderToPipeline(T* plDesc, const VkGraphicsPipelineCreateInfo* pCreateInfo, mvk::SPIRVToMSLConversionConfiguration& shaderConfig, SPIRVShaderOutputs& prevOutput, const VkPipelineShaderStageCreateInfo* pFragmentSS, VkPipelineCreationFeedback* pFragmentFB);
+ 	template<class T>
+ 	bool addVertexInputToPipeline(T* inputDesc, const VkPipelineVertexInputStateCreateInfo* pVI, const mvk::SPIRVToMSLConversionConfiguration& shaderConfig);
++	bool verifyVertexInputBindings(const VkPipelineVertexInputStateCreateInfo* pVI, const mvk::SPIRVToMSLConversionConfiguration& shaderConfig);
++	template<class T>
++	bool verifyVertexDescriptor(T* inputDesc, const VkPipelineVertexInputStateCreateInfo* pVI, const mvk::SPIRVToMSLConversionConfiguration& shaderConfig);
+ 	void adjustVertexInputForMultiview(MTLVertexDescriptor* inputDesc, const VkPipelineVertexInputStateCreateInfo* pVI, uint32_t viewCount, uint32_t oldViewCount = 1);
+     void addTessellationToPipeline(MTLRenderPipelineDescriptor* plDesc, const mvk::SPIRVTessReflectionData& reflectData, const VkPipelineTessellationStateCreateInfo* pTS);
+ 	template<typename T>
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index f7e5f45..5af60d8 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -681,6 +681,14 @@ static bool shouldEnableRobustVertexInputs(MVKPipeline* pipeline, const T* pCrea
+ 	return pCreateInfo ? (MVKShaderModule*)pCreateInfo->module : nullptr;
+ }
+ 
++// Returns the description of the vertex buffer binding, or null if the binding is not described.
++static const VkVertexInputBindingDescription* getVertexBindingDescription(const VkPipelineVertexInputStateCreateInfo* pVI, uint32_t binding) {
++	for (uint32_t i = 0; i < pVI->vertexBindingDescriptionCount; i++) {
++		if (pVI->pVertexBindingDescriptions[i].binding == binding) { return &pVI->pVertexBindingDescriptions[i]; }
++	}
++	return nullptr;
++}
++
+ static MVKRenderStateFlags getRenderStateFlags(VkDynamicState vk) {
+ 	switch (vk) {
+ 		case VK_DYNAMIC_STATE_BLEND_CONSTANTS:             return MVKRenderStateFlag::BlendConstants;
+@@ -1341,6 +1349,7 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+     // For mesh pipelines, we need to track which vertex buffers are used
+     // so that bindVertexBuffers() can bind them to the object shader.
+     const VkPipelineVertexInputStateCreateInfo* pVI = pCreateInfo->pVertexInputState;
++    if ( !verifyVertexInputBindings(pVI, shaderConfig) ) { return nullptr; }
+     const VkPipelineVertexInputDivisorStateCreateInfo* pVIDivisors = nullptr;
+     for (const auto* next = (const VkBaseInStructure*)pVI->pNext; next; next = next->pNext) {
+         if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO) {
+@@ -2214,6 +2223,8 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+         }
+     }
+ 
++	if ( !verifyVertexInputBindings(pVI, shaderConfig) ) { return false; }
++
+     // Vertex buffer bindings
+ 	bool isVtxStrideStatic = !_dynamicStateFlags.has(MVKRenderStateFlag::VertexStride);
+ 	int32_t maxBinding = -1;
+@@ -2282,38 +2293,38 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+ 			// If this is the case, fetch a translated artificial buffer binding, using the same MTLBuffer,
+ 			// but that is translated so that the reduced VA offset fits into the binding stride.
+ 			if (isVtxStrideStatic) {
+-				const VkVertexInputBindingDescription* pVKVB = pVI->pVertexBindingDescriptions;
+-				uint32_t attrSize = 0;
+-				for (uint32_t j = 0; j < vbCnt; j++, pVKVB++) {
+-					if (pVKVB->binding == pVKVA->binding) {
+-						attrSize = getPixelFormats()->getBytesPerBlock(pVKVA->format);
+-						if (pVKVB->stride == 0) {
+-							// The step is set to constant, but we need to change stride to be non-zero for metal.
+-							// Look for the maximum offset + size to set as the stride.
+-							uint32_t vbIdx = getMetalBufferIndexForVertexAttributeBinding(pVKVB->binding);
+-							auto vbDesc = inputDesc.layouts[vbIdx];
+-							uint32_t strideLowBound = vaOffset + attrSize;
+-							if (vbDesc.stride < strideLowBound) {
+-								vbDesc.stride = strideLowBound;
+-								_vertexStrides[pVKVB->binding] = strideLowBound;
+-							}
+-						} else if (vaOffset && vaOffset + attrSize > pVKVB->stride) {
+-							// Move vertex attribute offset into the stride. This vertex attribute may be
+-							// combined with other vertex attributes into the same translated buffer binding.
+-							// But if the reduced offset combined with the vertex attribute size still won't
+-							// fit into the buffer binding stride, force the vertex attribute offset to zero,
+-							// effectively dedicating this vertex attribute to its own buffer binding.
+-							uint32_t origOffset = vaOffset;
+-							vaOffset %= pVKVB->stride;
+-							if (vaOffset + attrSize > pVKVB->stride) {
+-								vaOffset = 0;
+-							}
+-							vaBinding = getTranslatedVertexBinding(vaBinding, origOffset - vaOffset, maxBinding);
+-							if (zeroDivisorBindings.count(pVKVB->binding)) {
+-								zeroDivisorBindings.insert(vaBinding);
+-							}
+-						}
+-						break;
++				const VkVertexInputBindingDescription* pVKVB = getVertexBindingDescription(pVI, pVKVA->binding);	// Verified above.
++				uint32_t attrSize = getPixelFormats()->getBytesPerBlock(pVKVA->format);
++				if (pVKVB->stride == 0) {
++					// The step is set to constant, but Metal requires a non-zero stride for any layout an attribute
++					// uses (it asserts otherwise, whatever the step function). Use the maximum offset + size of the
++					// attributes, so the stride is not larger than the underlying buffer permits.
++					uint32_t vbIdx = getMetalBufferIndexForVertexAttributeBinding(pVKVB->binding);
++					auto vbDesc = inputDesc.layouts[vbIdx];
++					uint32_t strideLowBound = (uint32_t)mvkAlignByteCount(max(vaOffset + attrSize, 1u), getMetalFeatures().vertexStrideAlignment);
++					if (vbDesc.stride < strideLowBound) {
++						vbDesc.stride = strideLowBound;
++						_vertexStrides[pVKVB->binding] = strideLowBound;
++					}
++				} else if (vaOffset && vaOffset + attrSize > pVKVB->stride) {
++					// Move vertex attribute offset into the stride. This vertex attribute may be
++					// combined with other vertex attributes into the same translated buffer binding.
++					// But if the reduced offset combined with the vertex attribute size still won't
++					// fit into the buffer binding stride, force the vertex attribute offset to zero,
++					// effectively dedicating this vertex attribute to its own buffer binding.
++					uint32_t origOffset = vaOffset;
++					vaOffset %= pVKVB->stride;
++					if (vaOffset + attrSize > pVKVB->stride) {
++						vaOffset = 0;
++					}
++					vaBinding = getTranslatedVertexBinding(vaBinding, origOffset - vaOffset, maxBinding);
++					if (vaBinding >= getMetalFeatures().maxPerStageBufferCount) {
++						setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Vertex attribute at location %u (offset %u) is beyond the stride (%u) of binding %u, and no Metal buffer index is left for an offset copy of the binding.",
++															 pVKVA->location, origOffset, pVKVB->stride, pVKVB->binding));
++						return false;
++					}
++					if (zeroDivisorBindings.count(pVKVB->binding)) {
++						zeroDivisorBindings.insert(vaBinding);
+ 					}
+ 				}
+ 				if (pVKVB->stride && attrSize > pVKVB->stride) {
+@@ -2367,6 +2378,63 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+         _zeroDivisorVertexBindings.emplace_back(binding, stride);
+     }
+ 
++	return verifyVertexDescriptor(inputDesc, pVI, shaderConfig);
++}
++
++// Every vertex attribute the vertex shader uses must come from a described vertex buffer binding (VUID-VkPipelineVertexInputStateCreateInfo-binding-00615).
++// Guest drivers and apps still send attributes of undescribed bindings: their Metal buffer layout would have no stride,
++// and Metal aborts the process on such a vertex descriptor. Fail the pipeline instead.
++bool MVKGraphicsPipeline::verifyVertexInputBindings(const VkPipelineVertexInputStateCreateInfo* pVI,
++													 const SPIRVToMSLConversionConfiguration& shaderConfig) {
++	for (uint32_t i = 0; i < pVI->vertexAttributeDescriptionCount; i++) {
++		const VkVertexInputAttributeDescription* pVKVA = &pVI->pVertexAttributeDescriptions[i];
++		if (shaderConfig.isShaderInputLocationUsed(pVKVA->location) && !getVertexBindingDescription(pVI, pVKVA->binding)) {
++			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Vertex attribute at location %u uses vertex buffer binding %u, which has no VkVertexInputBindingDescription (%u binding descriptions).",
++												 pVKVA->location, pVKVA->binding, pVI->vertexBindingDescriptionCount));
++			return false;
++		}
++	}
++	return true;
++}
++
++// Checks the vertex descriptor (or compute stage input descriptor) the way Metal validates it when the pipeline is created,
++// where an invalid descriptor is not an error but an assertion that aborts the process: every buffer layout a used
++// attribute reads needs a non-zero stride (whatever its step function), and a step rate consistent with its step function.
++template<class T>
++bool MVKGraphicsPipeline::verifyVertexDescriptor(T* inputDesc,
++												  const VkPipelineVertexInputStateCreateInfo* pVI,
++												  const SPIRVToMSLConversionConfiguration& shaderConfig) {
++	for (uint32_t i = 0; i < pVI->vertexAttributeDescriptionCount; i++) {
++		uint32_t location = pVI->pVertexAttributeDescriptions[i].location;
++		if ( !shaderConfig.isShaderInputLocationUsed(location) ) { continue; }
++
++		auto vaDesc = inputDesc.attributes[location];
++		NSUInteger bufferIndex = vaDesc.bufferIndex;
++		if (bufferIndex >= getMetalFeatures().maxPerStageBufferCount) {
++			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Vertex attribute at location %u uses Metal buffer index %lu, beyond the %u Metal buffers.",
++												 location, (unsigned long)bufferIndex, getMetalFeatures().maxPerStageBufferCount));
++			return false;
++		}
++		auto vbDesc = inputDesc.layouts[bufferIndex];
++		NSUInteger stride = vbDesc.stride;
++		NSUInteger stepRate = vbDesc.stepRate;
++		NSUInteger stepFunction = (NSUInteger)vbDesc.stepFunction;
++		const char* problem = nullptr;
++		if (stride == 0) {
++			problem = "has no stride";
++		} else if (stepFunction == MTLStepFunctionConstant) {
++			if (stepRate != 0) { problem = "has a constant step function and a non-zero step rate"; }
++		} else if (stepRate == 0) {
++			problem = "has a zero step rate";
++		} else if constexpr (std::is_same_v<T, MTLVertexDescriptor>) {
++			if (stepFunction == MTLVertexStepFunctionPerVertex && stepRate != 1) { problem = "steps per vertex with a step rate other than 1"; }
++		}
++		if (problem) {
++			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Vertex attribute at location %u uses Metal vertex buffer layout %lu, which %s (stride %lu, step function %lu, step rate %lu).",
++												 location, (unsigned long)bufferIndex, problem, (unsigned long)stride, (unsigned long)stepFunction, (unsigned long)stepRate));
++			return false;
++		}
++	}
+ 	return true;
+ }
+ 
+@@ -2759,21 +2827,16 @@ static MSLShaderVariableFormat mvkMSLMeshVertexMemoryFormat(MTLVertexFormat mtlF
+     // Set the shader conversion config vertex attribute information
+     shaderConfig.shaderInputs.clear();
+     uint32_t vaCnt = pCreateInfo->pVertexInputState->vertexAttributeDescriptionCount;
+-    uint32_t vbCnt = pCreateInfo->pVertexInputState->vertexBindingDescriptionCount;
+     for (uint32_t vaIdx = 0; vaIdx < vaCnt; vaIdx++) {
+         const VkVertexInputAttributeDescription* pVKVA = &pCreateInfo->pVertexInputState->pVertexAttributeDescriptions[vaIdx];
+-        const VkVertexInputBindingDescription* pVKVB = nullptr;
+-
+-        for (uint32_t vbIdx = 0; vbIdx < vbCnt; vbIdx++) {
+-            pVKVB = &pCreateInfo->pVertexInputState->pVertexBindingDescriptions[vbIdx];
+-            if (pVKVA->binding == pVKVB->binding) break;
+-        }
++        // An attribute whose binding has no description is invalid; addVertexInputToPipeline() rejects the pipeline.
++        const VkVertexInputBindingDescription* pVKVB = getVertexBindingDescription(pCreateInfo->pVertexInputState, pVKVA->binding);
+ 
+         // Set binding and offset from Vulkan vertex attribute
+         mvk::MSLShaderInput si;
+         si.shaderVar.location = pVKVA->location;
+         si.shaderVar.offset = pVKVA->offset;
+-        si.shaderVar.stride = pVKVB->stride;
++        si.shaderVar.stride = pVKVB ? pVKVB->stride : 0;
+ 
+         if (shaderConfig.options.mslOptions.for_mesh_pipeline) {
+             si.shaderVar.vecsize = vertexFormatInfo[pVKVA->format].num_elements;
+-- 
+2.50.1 (Apple Git-155)
+

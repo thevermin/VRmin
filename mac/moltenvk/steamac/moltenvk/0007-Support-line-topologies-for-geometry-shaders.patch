@@ -1,0 +1,95 @@
+From f2e891aead8e6159697e6f9d73d1abb968c7f053 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 22:07:50 +0300
+Subject: [PATCH 07/22] Support line topologies for geometry shaders
+
+The geometry-shader emulation only accepted triangle, triangle strip and
+point topologies; line lists and line strips (zink uses geometry shaders on
+lines, e.g. for line stipple) only logged 'Unsupported topology' and created a
+pipeline with an unset input primitive type that drew nothing. Map line and
+line strip topologies too, and fail pipeline creation with
+VK_ERROR_INITIALIZATION_FAILED for anything else instead of creating a broken
+pipeline.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h  |  1 +
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 38 +++++++++++----------
+ 2 files changed, 21 insertions(+), 18 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index 3ac8bba0..d9f6d1f5 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -360,6 +360,7 @@ protected:
+     void addPrevStageOutputToShaderConversionConfig(mvk::SPIRVToMSLConversionConfiguration& shaderConfig, SPIRVShaderOutputs& outputs);
+     MTLRenderPipelineDescriptor* newMTLRenderPipelineDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo, const mvk::SPIRVTessReflectionData& reflectData, const VkPipelineShaderStageCreateInfo* pVertexSS, VkPipelineCreationFeedback* pVertexFB, const VkPipelineShaderStageCreateInfo* pFragmentSS, VkPipelineCreationFeedback* pFragmentFB);
+ #if MVK_XCODE_14
++    bool setGeometryInputPrimitiveType(mvk::SPIRVToMSLConversionConfiguration& shaderConfig);
+     MTLMeshRenderPipelineDescriptor* newMTLMeshRenderPipelineDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo, const mvk::SPIRVTessReflectionData& reflectData, const VkPipelineShaderStageCreateInfo* pVertexSS, VkPipelineCreationFeedback* pVertexFB, const VkPipelineShaderStageCreateInfo* pGeometrySS, VkPipelineCreationFeedback* pGeometryFB, const VkPipelineShaderStageCreateInfo* pFragmentSS, VkPipelineCreationFeedback* pFragmentFB);
+ #endif
+     MTLComputePipelineDescriptor* newMTLTessVertexStageDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo, const mvk::SPIRVTessReflectionData& reflectData, mvk::SPIRVToMSLConversionConfiguration& shaderConfig, const VkPipelineShaderStageCreateInfo* pVertexSS, VkPipelineCreationFeedback* pVertexFB, const VkPipelineShaderStageCreateInfo* pTessCtlSS, MVKMTLFunction* pVtxFunctions);
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 8115779c..e155777b 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1776,6 +1776,24 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+ 
+ #if MVK_XCODE_14
+ 
++// Sets the input primitive type of the geometry-shader emulation (object + mesh stages)
++// from the pipeline topology. Returns false (pipeline creation fails) if it is not supported.
++bool MVKGraphicsPipeline::setGeometryInputPrimitiveType(SPIRVToMSLConversionConfiguration& shaderConfig) {
++	using Topology = CompilerMSL::Options::PrimitiveTopology;
++	auto& inputType = shaderConfig.options.mslOptions.input_primitive_type;
++	auto mtlPrimitiveType = mvkMTLPrimitiveTypeFromVkPrimitiveTopology(_vkPrimitiveTopology);
++	switch (mtlPrimitiveType) {
++		case MTLPrimitiveTypeTriangleStrip: inputType = Topology::TriangleStrip; return true;
++		case MTLPrimitiveTypeTriangle:      inputType = Topology::Triangles;     return true;
++		case MTLPrimitiveTypeLineStrip:     inputType = Topology::LineStrip;     return true;
++		case MTLPrimitiveTypeLine:          inputType = Topology::Lines;         return true;
++		case MTLPrimitiveTypePoint:         inputType = Topology::Points;        return true;
++		default:
++			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Geometry shaders: unsupported topology %lu.", (unsigned long)mtlPrimitiveType));
++			return false;
++	}
++}
++
+ bool MVKGraphicsPipeline::addVertexShaderToPipeline(MTLMeshRenderPipelineDescriptor* plDesc,
+                                                     const VkGraphicsPipelineCreateInfo* pCreateInfo,
+                                                     SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1800,15 +1818,7 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+ 	shaderConfig.options.mslOptions.robust_buffer_access2 = shouldEnableRobustBufferAccess2(this, pCreateInfo, pVertexSS);
+ 	shaderConfig.options.mslOptions.robust_image_access2 = shouldEnableRobustImageAccess2(this, pCreateInfo, pVertexSS);
+ 
+-	auto mtlPrimitiveType = mvkMTLPrimitiveTypeFromVkPrimitiveTopology(_vkPrimitiveTopology);
+-	if (mtlPrimitiveType == MTLPrimitiveTypeTriangleStrip)
+-		shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::TriangleStrip;
+-	else if (mtlPrimitiveType == MTLPrimitiveTypeTriangle)
+-		shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::Triangles;
+-	else if (mtlPrimitiveType == MTLPrimitiveTypePoint)
+-		shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::Points;
+-	else
+-		reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Unsupported topology: %lu", mtlPrimitiveType);
++	if ( !setGeometryInputPrimitiveType(shaderConfig) ) { return false; }
+ 
+ 	addVertexInputToShaderConversionConfig(shaderConfig, pCreateInfo);
+ 
+@@ -1847,15 +1857,7 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+ 	shaderConfig.options.mslOptions.robust_buffer_access2 = shouldEnableRobustBufferAccess2(this, pCreateInfo, pGeometrySS);
+ 	shaderConfig.options.mslOptions.robust_image_access2 = shouldEnableRobustImageAccess2(this, pCreateInfo, pGeometrySS);
+ 
+-	auto mtlPrimitiveType = mvkMTLPrimitiveTypeFromVkPrimitiveTopology(_vkPrimitiveTopology);
+-	if (mtlPrimitiveType == MTLPrimitiveTypeTriangleStrip)
+-		shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::TriangleStrip;
+-	else if (mtlPrimitiveType == MTLPrimitiveTypeTriangle)
+-		shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::Triangles;
+-	else if (mtlPrimitiveType == MTLPrimitiveTypePoint)
+-		shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::Points;
+-	else
+-		reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Unsupported topology: %lu", mtlPrimitiveType);
++	if ( !setGeometryInputPrimitiveType(shaderConfig) ) { return false; }
+ 
+ 	addPrevStageOutputToShaderConversionConfig(shaderConfig, vertexOutputs);
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,43 @@
+From 9623c9e7c3bc0e4188adf0cc3ab8d753d2ec6408 Mon Sep 17 00:00:00 2001
+From: georgii pl <gp@fx.gl>
+Date: Sun, 1 Nov 2026 11:15:10 +0300
+Subject: [PATCH] MSL: Match extracted SampleMask helper aliases to scalar ABI
+
+STEAMAC-2N: global extraction retained the SPIR-V array type even though entry-point SampleMask inputs and outputs are Metal uint scalars and access chains discard index zero. Helpers consequently declared uint (&gl_SampleMaskIn)[1], bitcast that array to float, and rejected a masked scalar call argument. Correct extracted alias types with the existing builtin type conversion. Pass read-only input aliases by value, since fixed masks and per-sample masks produce rvalues; preserve output references and ordinary explicit array parameters. Locally authored against pinned 939b40b3 plus steamac 0001-0037, not an upstream cherry-pick.
+---
+ spirv_msl.cpp | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 8c8e631..67cb316 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -3869,6 +3869,10 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
+ 			}
+ 			else
+ 			{
++				// Extracted builtin aliases must use the same scalar ABI as the
++				// entry point. In particular SampleMask is an array only in SPIR-V.
++				if (is_builtin && bi_type == BuiltInSampleMask)
++					type_id = ensure_correct_builtin_type(type_id, bi_type);
+ 				uint32_t next_id = ir.increase_bound_by(1);
+ 				func.add_parameter(type_id, next_id, true);
+ 				set<SPIRVariable>(next_id, type_id, StorageClassFunction, 0, arg_id);
+@@ -18701,7 +18705,13 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+ 
+ 	// Physical pointer types are passed by pointer, not reference.
+ 	auto &data_type = get_variable_data_type(var);
+-	bool passed_by_value = arg.alias_global_variable ? false : is_physical_or_buffer_pointer(var_type);
++	bool sample_mask_input = arg.alias_global_variable && has_decoration(var.self, DecorationBuiltIn) &&
++	                         BuiltIn(get_decoration(var.self, DecorationBuiltIn)) == BuiltInSampleMask &&
++	                         var_type.storage == StorageClassInput;
++	// The caller may pass a masked expression, not an lvalue. Inputs are read-only,
++	// while SampleMask outputs must remain references for writes in nested helpers.
++	bool passed_by_value = sample_mask_input ||
++	                       (!arg.alias_global_variable && is_physical_or_buffer_pointer(var_type));
+ 	auto &type = passed_by_value ? var_type : data_type;
+ 
+ 	// If we need to modify the name of the variable, make sure we use the original variable.
+-- 
+2.54.0 (Apple Git-157)
+

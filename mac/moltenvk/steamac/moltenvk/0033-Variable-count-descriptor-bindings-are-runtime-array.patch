@@ -1,0 +1,56 @@
+From d5ad8d3e65a968964db0f5fb28f19557c6b1de89 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Tue, 6 Oct 2026 14:00:00 +0300
+Subject: [PATCH 33/33] Variable-count descriptor bindings are runtime arrays
+ in Metal 3 argument buffers
+
+The variable-count binding of a set (vkd3d-proton's descriptor heaps: up to 1000000 textures, samplers or buffers)
+was declared to SPIRV-Cross with its full count, so the argument buffer struct held array<T, 1000000>. Metal parses
+the members of an argument buffer for each compiled program and builds a table of every array element: 32 MB per
+1000000-descriptor array and program, ~100 MB per vkd3d-proton pipeline (Stellar Blade's VM process reached 250 GB
+and froze). The binding is passed with count 0, so SPIRV-Cross declares a one-element array indexed past its end
+(the set becomes a device argument buffer). The binding is the set's last and its descriptors are one 8-byte
+element each, so the set's layout is unchanged.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 6ef027c..58adde6 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -117,10 +117,13 @@ static void addResourceBindingToShaderConfig(SPIRVToMSLConversionConfiguration&
+                                              uint32_t bindingIndex,
+                                              uint32_t count,
+                                              MVKDescriptorGPULayout layout,
+-                                             MVKSampler* immutableSampler = nullptr)
++                                             MVKSampler* immutableSampler = nullptr,
++                                             bool runtimeArray = false)
+ {
+ 	using SPIRV_CROSS_NAMESPACE::SPIRType;
+ 	if (count == 0) { return; }
++	// Count 0 makes SPIRV-Cross declare a runtime-sized array (one element, indexed past its end).
++	if (runtimeArray) { count = 0; }
+ 
+ 	switch (layout) {
+ 		case MVKDescriptorGPULayout::Texture:
+@@ -199,7 +202,15 @@ static void addResourceBindingToShaderConfig(SPIRVToMSLConversionConfiguration&
+ 
+ 				MVKSampler*const* immSamp = layout->getImmutableSampler(desc);
+ 				MVKDescriptorGPULayout gpuLayout = argbuf ? desc.gpuLayout : getBindingLayout(desc);
+-				addResourceBindingToShaderConfig(shaderConfig, binding.stages[stage], stage, dslIdx, desc.binding, desc.descriptorCount, gpuLayout, immSamp ? *immSamp : nullptr);
++				// Metal 3 argument buffers: a variable-count binding (vkd3d-proton's descriptor heaps, up to 1000000
++				// descriptors) is a runtime array in the shader. Declared with its full count, Metal builds a table
++				// of every element for each program (32 MB per 1000000-descriptor array and program). The binding is
++				// the set's last, its descriptors are one element each (8 bytes), so the layout is the same.
++				bool runtimeArray = layout->argBufMode() == MVKArgumentBufferMode::Metal3 && desc.isVariable() &&
++				                    (gpuLayout == MVKDescriptorGPULayout::Texture || gpuLayout == MVKDescriptorGPULayout::Sampler ||
++				                     gpuLayout == MVKDescriptorGPULayout::Buffer || gpuLayout == MVKDescriptorGPULayout::BufferAuxSize);
++				addResourceBindingToShaderConfig(shaderConfig, binding.stages[stage], stage, dslIdx, desc.binding, desc.descriptorCount,
++				                                 gpuLayout, immSamp ? *immSamp : nullptr, runtimeArray);
+ 				if (desc.perDescriptorResourceCount.dynamicOffset != 0 && used) {
+ 					shaderConfig.dynamicBufferDescriptors.push_back(makeDescriptorBinding(stage, dslIdx, desc.binding, binding.stages[stage].dynamicOffsetBufferIndex));
+ 				}
+-- 
+2.50.1 (Apple Git-155)
+

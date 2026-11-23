@@ -1,0 +1,64 @@
+From 068e642aed1a6b0159f832a3076c721b7f3097f1 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 22:21:11 +0300
+Subject: [PATCH 09/17] MSL: Base vertex and base instance in the
+ geometry-shader object stage
+
+The object stage of the geometry-shader emulation ignored firstVertex /
+vertexOffset and firstInstance: gl_VertexIndex started at 0 and gl_BaseInstance
+was 0. Add baseVertex and baseInstance to the DrawInfo the API passes to the
+object stage, add baseVertex to every vertex index (after the primitive restart
+check), offset instanceIndex by baseInstance, and pass them for
+gl_BaseVertex / gl_BaseInstance.
+---
+ spirv_msl.cpp | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 34cdcaae..1b916373 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -1954,6 +1954,8 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		statement("int32_t indexed;");
+ 		statement("int32_t indexSize;");
+ 		statement("int64_t indexBuffer;");
++		statement("int32_t baseVertex;");
++		statement("uint32_t baseInstance;");
+ 		statement("uint8_t topoStrip;");
+ 
+ 		end_scope(";");
+@@ -2016,7 +2018,7 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		statement("int vertexCount = ", vertices_per_primitive, ";");
+ 		statement("int startingIndex = drawInfo->topoStrip ? int(positionInGrid.x) : int(positionInGrid.x) * vertexCount;");
+ 
+-		statement("int instanceIndex = positionInGrid.y;");
++		statement("int instanceIndex = int(positionInGrid.y + drawInfo->baseInstance);");
+ 		statement("payload.primitiveId = positionInGrid.x;");
+ 
+ 		statement("for (int i = 0; i < vertexCount; ++i)");
+@@ -2049,6 +2051,8 @@ void CompilerMSL::emit_mesh_wrapper()
+ 
+ 		end_scope();
+ 		statement("else vertexIndex = startingIndex + element;");
++		// vertexOffset of indexed draws, firstVertex of non-indexed draws.
++		statement("vertexIndex += uint(drawInfo->baseVertex);");
+ 
+ 		if (stage_in_var_id)
+ 		{
+@@ -2151,7 +2155,12 @@ void CompilerMSL::emit_mesh_wrapper()
+ 					break;
+ 				}
+ 				case BuiltInBaseInstance: {
+-					statement(need_comma ? ", " : "", "0");
++					statement(need_comma ? ", " : "", "drawInfo->baseInstance");
++					need_comma = true;
++					break;
++				}
++				case BuiltInBaseVertex: {
++					statement(need_comma ? ", " : "", "drawInfo->baseVertex");
+ 					need_comma = true;
+ 					break;
+ 				}
+-- 
+2.50.1 (Apple Git-155)
+

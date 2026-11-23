@@ -1,0 +1,69 @@
+From: steamac <steamac@localhost>
+Subject: [PATCH] Preserve full-width Vulkan specialization IDs in Metal and pipeline caches
+
+STEAMAC-6A: SPIRV-Cross 0045 remaps IDs outside Metal uint16 range.
+Persist its mapping with shader conversion results, translate Vulkan map
+entries at specialization, and ignore inactive IDs rather than aliasing
+new compact indices. Update the cereal shape guard for the new map.
+
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
+@@ -264,6 +264,8 @@
+ 		bool needsDepthClipStateBuffer = false;
+ 		bool usesPhysicalStorageBufferAddressesCapability = false;
+ 		std::map<uint32_t, MSLSpecializationMacroInfo> specializationMacros;
++		// Vulkan SpecId -> Metal index for emitted function constants, including identity mappings.
++		std::map<uint32_t, uint32_t> functionConstantIDRemapping;
+ 
+ 	} SPIRVToMSLConversionResultInfo;
+ 
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+@@ -373,6 +373,11 @@
+ 	conversionResult.resultInfo.needsDepthClipStateBuffer = pMSLCompiler && pMSLCompiler->needs_depth_clip_state_buffer();
+ 	conversionResult.resultInfo.usesPhysicalStorageBufferAddressesCapability = usesPhysicalStorageBufferAddressesCapability(pMSLCompiler);
+ 	populateSpecializationMacros(pMSLCompiler, conversionResult.resultInfo.specializationMacros);
++	conversionResult.resultInfo.functionConstantIDRemapping.clear();
++	if (pMSLCompiler) {
++		const auto& mappings = pMSLCompiler->get_msl_function_constant_ids();
++		conversionResult.resultInfo.functionConstantIDRemapping.insert(mappings.begin(), mappings.end());
++	}
+ 
+ 	// When using Metal argument buffers, if the shader is provided with dynamic buffer offsets,
+ 	// then it needs a buffer to hold these dynamic offsets.
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -139,8 +139,13 @@
+ 						// Metal function constant value that matches the Vulkan specialization constantID.
+ 						for (uint32_t specIdx = 0; specIdx < pSpecializationInfo->mapEntryCount; specIdx++) {
+ 							const VkSpecializationMapEntry* pMapEntry = &pSpecializationInfo->pMapEntries[specIdx];
++							auto mapped = _shaderConversionResultInfo.functionConstantIDRemapping.find(pMapEntry->constantID);
++							if (!_shaderConversionResultInfo.functionConstantIDRemapping.empty() &&
++								mapped == _shaderConversionResultInfo.functionConstantIDRemapping.end()) { continue; }
++							uint32_t metalID = mapped == _shaderConversionResultInfo.functionConstantIDRemapping.end()
++								? pMapEntry->constantID : mapped->second;
+ 							for (MTLFunctionConstant* mfc in mtlFCs) {
+-								if (mfc.index == pMapEntry->constantID) {
++								if (mfc.index == metalID) {
+ 									[mtlFCVals setConstantValue: ((char*)pSpecializationInfo->pData + pMapEntry->offset)
+ 														   type: mfc.type
+ 														atIndex: mfc.index];
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -3767,6 +3767,7 @@
+ 	void serialize(Archive & archive, SPIRVToMSLConversionResultInfo& scr) {
+ 		archive(scr.entryPoint,
+ 				scr.specializationMacros,
++				scr.functionConstantIDRemapping,
+ 				scr.isRasterizationDisabled,
+ 				scr.isPositionInvariant,
+ 				scr.needsOutputBuffer,
+@@ -3956,7 +3957,7 @@
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLResourceBinding>(2);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::DescriptorBinding>();
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(110);	// Contains collection
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(39);		// Contains collection
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(55);		// Contains collections
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLSpecializationMacroInfo>(22);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<MVKShaderModuleKey>();
+ 	missingBytes += mvkValidateCerealArchiveSize<MVKCompressor<std::string>>(20);				// Contains collection

@@ -1,0 +1,41 @@
+From dff34fcacec8204623ce0757a05af62486170f92 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Tue, 6 Oct 2026 11:30:00 +0300
+Subject: [PATCH 24/24] Don't declare access chains as potential loop
+ temporaries
+
+A temporary used in several blocks of a loop whose header dominates them is declared before the loop in case the
+loop is emitted as for (;;) with the header inside it. Access chains went into that list too, although they are
+expressions that are never assigned (the scope analysis already skips them when hoisting); GLSL and HLSL drop pointer
+declarations, MSL emitted them. For descriptors (dxil-spirv loads vkd3d-proton heap descriptors in the loop header
+block it wraps a shader in) that is "constant texture3d<float> _45;", which Metal rejects ("automatic variable
+qualified with an address space"; Stellar Blade's fragment pipelines failed and the game exited with "Out of video
+memory"). Only the access chains' indices are declared now.
+---
+ spirv_cross.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/spirv_cross.cpp b/spirv_cross.cpp
+index 2204e39..7c0d15e 100644
+--- a/spirv_cross.cpp
++++ b/spirv_cross.cpp
+@@ -4227,13 +4227,15 @@ void Compiler::analyze_variable_scope(SPIRFunction &entry, AnalyzeVariableScopeA
+ 					block_temporaries.emplace_back(handler.result_id_to_type[var.first], var.first);
+ 				}
+ 			}
+-			else if (blocks.size() > 1)
++			else if (blocks.size() > 1 && !handler.access_chain_expressions.count(var.first))
+ 			{
+ 				// Keep track of the temporary as we might have to declare this temporary.
+ 				// This can happen if the loop header dominates a temporary, but we have a complex fallback loop.
+ 				// In this case, the header is actually inside the for (;;) {} block, and we have problems.
+ 				// What we need to do is hoist the temporaries outside the for (;;) {} block in case the header block
+ 				// declares the temporary.
++				// Access chains are expressions, not temporaries (see above): only their indices are declared. A
++				// declaration of one is never assigned, and pointers to images or samplers cannot be declared (MSL).
+ 				auto &block_temporaries = get<SPIRBlock>(dominating_block).potential_declare_temporary;
+ 				block_temporaries.emplace_back(handler.result_id_to_type[var.first], var.first);
+ 			}
+-- 
+2.50.1 (Apple Git-155)
+

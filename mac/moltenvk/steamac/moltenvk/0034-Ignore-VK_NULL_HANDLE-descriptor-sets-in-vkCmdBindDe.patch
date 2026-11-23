@@ -1,0 +1,64 @@
+From f32e718123a73ba863de8d22268e2c1a96db8f00 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Wed, 7 Oct 2026 17:06:00 +0300
+Subject: [PATCH 34/35] Ignore VK_NULL_HANDLE descriptor sets in
+ vkCmdBindDescriptorSets
+
+STEAMAC-25: Counter-Strike 2 binds five descriptor sets with the fourth one
+VK_NULL_HANDLE. Graphics pipeline libraries make that legal, and guests send
+it through Venus although MoltenVK does not advertise the extension.
+bindDescriptorSets() read the set's variableDescriptorCount when the command
+buffer was submitted: SIGSEGV at address 0x3c on the virglrenderer ring
+thread, which killed the VM process.
+
+Like RADV and ANV, a null set binds nothing: the set bound at that index before
+stays, and it takes no dynamic offsets (dynamicOffsetCount counts the dynamic
+descriptors of the sets in pDescriptorSets).
+---
+ MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index 053699a..53df9d8 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -462,6 +462,7 @@ static void bindDescriptorSets(MVKImplicitBufferData& target,
+ 	VkShaderStageFlags vkStage = mvkVkShaderStageFlagBitsFromMVKShaderStage(stage);
+ 	for (uint32_t i = 0; i < setCount; i++) {
+ 		MVKDescriptorSet* set = sets[i];
++		if ( !set ) { continue; }	// VK_NULL_HANDLE: see MVKCommandEncoderState::bindDescriptorSets().
+ 		MVKDescriptorSetLayout* setLayout = layout->getDescriptorSetLayout(firstSet + i);
+ 		const MVKShaderStageResourceBinding& offsets = layout->getResourceBindingOffsets(firstSet + i).stages[stage];
+ 		const MVKShaderStageResourceBinding& stride = setLayout->totalResourceCount().stages[stage];
+@@ -1195,7 +1196,7 @@ static bool isCompatible(MVKUseResourceHelper::ResourceInfo current, MVKUseResou
+ 		::bindDescriptorSets(_implicitBufferData[stage], stage, layout, firstSet, setCount, sets, dynamicOffsetCount, dynamicOffsets);
+ 	}
+ 	for (uint32_t i = 0; i < setCount; i++) {
+-		_descriptorSets[firstSet + i] = sets[i];
++		if (sets[i]) { _descriptorSets[firstSet + i] = sets[i]; }
+ 	}
+ }
+ 
+@@ -1211,7 +1212,7 @@ static bool isCompatible(MVKUseResourceHelper::ResourceInfo current, MVKUseResou
+ {
+ 	::bindDescriptorSets(_implicitBufferData, kMVKShaderStageCompute, layout, firstSet, setCount, sets, dynamicOffsetCount, dynamicOffsets);
+ 	for (uint32_t i = 0; i < setCount; i++) {
+-		_descriptorSets[firstSet + i] = sets[i];
++		if (sets[i]) { _descriptorSets[firstSet + i] = sets[i]; }
+ 	}
+ }
+ 
+@@ -1982,6 +1983,10 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
+ 	invalidateImplicitBuffer(*this, VK_PIPELINE_BIND_POINT_ALL, MVKNonVolatileImplicitBuffer::PushConstant);
+ }
+ 
++// VK_NULL_HANDLE elements of sets are legal with graphics pipeline libraries, and applications send them
++// through Venus although MoltenVK does not advertise that extension (Counter-Strike 2 binds five sets with
++// the fourth null; the dereference killed the VM process at submission, STEAMAC-25). Like RADV and ANV, a
++// null set binds nothing (the set bound there before stays) and takes no dynamic offsets.
+ void MVKCommandEncoderState::bindDescriptorSets(
+   VkPipelineBindPoint bindPoint,
+   MVKPipelineLayout* layout,
+-- 
+2.54.0 (Apple Git-157)
+

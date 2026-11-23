@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000032 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Tue, 6 Oct 2026 20:20:00 +0300
+Subject: [PATCH 32/32] MSL: Reserve log10 for the Metal standard library
+
+STEAMAC-1R: the compute shader defines an ACES spline helper named log10,
+emitted as float log10(thread const float&). Metal also imports
+metal::log10(float) via using namespace metal; a float lvalue matches both,
+so the call is ambiguous. This is not an integer/half conversion problem.
+
+Add log10 to the existing MSL illegal-function-name set so definitions and
+calls receive the same normal rename. GLSL's reserved list covers log/log2,
+but not this Metal-only name. Keep the user helper's implementation.
+---
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -18914,6 +18914,7 @@
+ 		"fragment",
+ 		"vertex",
+ 		"kernel",
++		"log10",
+ 		"saturate",
+ 		"assert",
+ 		"fmin3",

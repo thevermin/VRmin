@@ -1,0 +1,209 @@
+From 9ae67be952e07cf5eb0f719e2e55a25f4bc1d8ea Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 22:07:50 +0300
+Subject: [PATCH 07/17] MSL: Fix robust buffer access and mesh wrappers for
+ arrays of buffers
+
+zink declares uniform buffers as arrays of blocks indexed dynamically
+('uniform ubo { uint _m0[N]; } uniform_0_32[M]', accessed as
+uniform_0_32[idx]._m0[k]). With robust_buffer_access2 the generated MSL did not
+compile:
+
+- The descriptor array index was clamped and bounds-checked against the buffer
+  size as if it indexed inside a buffer, and the size of an array of buffers
+  (a per-element 'constant uint*') was used as a scalar:
+  '(uniform_0_32BufferSize / 4u)'. Indexing an array of buffer descriptors is
+  now left alone, and accesses inside an element use that element's size,
+  uniform_0_32BufferSize[idx].
+- Interface blocks (gl_PerVertex inputs, push constants) were treated as
+  buffers because they are Block-decorated; only Uniform and StorageBuffer
+  variables are now tracked.
+
+The vertex (object) and geometry (mesh) wrapper entry points of the geometry
+shader emulation passed an array of discrete buffers as a single argument
+('uniform_0_32_1_1') although it is declared and received as one argument per
+element (name_0, name_1, ...).
+---
+ spirv_msl.cpp | 90 ++++++++++++++++++++++++++++++++++++++++++++-------
+ spirv_msl.hpp |  4 ++-
+ 2 files changed, 81 insertions(+), 13 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 7849e947..fae51c64 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -2134,7 +2134,7 @@ void CompilerMSL::emit_mesh_wrapper()
+ 
+ 		for (auto &resource : resources)
+ 		{
+-			statement(need_comma ? ", " : "", resource.name);
++			statement(need_comma ? ", " : "", mesh_wrapper_resource_arg(resource));
+ 			need_comma = true;
+ 		}
+ 		ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var)
+@@ -2283,7 +2283,7 @@ void CompilerMSL::emit_mesh_wrapper()
+ 		auto resources = get_sorted_entry_point_args(false);
+ 
+ 		for (auto &resource : resources)
+-			statement(", ", resource.name);
++			statement(", ", mesh_wrapper_resource_arg(resource));
+ 
+ 		// Builtin arguments, in the order entry_point_args_builtin() declares them.
+ 		ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
+@@ -2309,6 +2309,26 @@ void CompilerMSL::emit_mesh_wrapper()
+ 	}
+ }
+ 
++// Returns the argument(s) a mesh-pipeline wrapper entry point passes to the wrapped stage function
++// for an entry point resource. Arrays of buffers are declared as one argument per element
++// (name_0, name_1, ...) by entry_point_args_discrete_descriptors(), so they are passed that way.
++string CompilerMSL::mesh_wrapper_resource_arg(const Entry_Point_Resource &resource)
++{
++	if (resource.basetype == SPIRType::Struct && resource.var)
++	{
++		auto &type = get_variable_data_type(*resource.var);
++		if (!type.array.empty() && !ir.meta[type.self].members.empty())
++		{
++			uint32_t array_size = get_resource_array_size(type, resource.var->self);
++			string args;
++			for (uint32_t i = 0; i < array_size; i++)
++				args += join(i ? ", " : "", resource.name, "_", i);
++			return args;
++		}
++	}
++	return resource.name;
++}
++
+ // Returns whether the variable is a builtin input of the geometry stage that becomes a
+ // separate entry point argument (rather than a member of the per-vertex stage input).
+ bool CompilerMSL::is_geometry_direct_input_builtin(const SPIRVariable &var)
+@@ -10231,7 +10251,21 @@ void CompilerMSL::access_chain_internal_append_index(std::string &expr, uint32_t
+ 	if (msl_options.robust_buffer_access2 && type)
+ 	{
+ 		auto *var = maybe_get_backing_variable(base);
+-		if (var && buffers_requiring_robust_access.count(var->self))
++
++		// Indexing an array of buffer descriptors (e.g. 'uniform Block ubos[N]') selects a buffer;
++		// it is not an access inside a buffer, and the buffer sizes do not bound it.
++		bool indexes_descriptor_array = false;
++		if (var && is_array(*type))
++		{
++			const SPIRType *elem = type;
++			while (is_array(*elem) && elem->parent_type)
++				elem = &get<SPIRType>(elem->parent_type);
++			indexes_descriptor_array = elem->basetype == SPIRType::Struct &&
++			                           (has_decoration(elem->self, DecorationBlock) ||
++			                            has_decoration(elem->self, DecorationBufferBlock));
++		}
++
++		if (var && buffers_requiring_robust_access.count(var->self) && !indexes_descriptor_array)
+ 		{
+ 			// Only apply to runtime-sized array accesses with runtime indices
+ 			// Fixed-size arrays have compile-time known bounds and don't need runtime checking
+@@ -10241,7 +10275,7 @@ void CompilerMSL::access_chain_internal_append_index(std::string &expr, uint32_t
+ 
+ 			if (is_runtime_array || (is_fixed_array && !index_is_literal))
+ 			{
+-				string count_expr = get_robust_buffer_array_length(*type, var->self);
++				string count_expr = get_robust_buffer_array_length(*type, var->self, robust_descriptor_index(expr, *var));
+ 				string idx_expr = to_unpacked_expression(index, register_expression_read);
+ 
+ 				// Create clamped index: min(idx, max(count - 1, 0))
+@@ -14925,11 +14959,43 @@ string CompilerMSL::get_robust_image_zero_value(const SPIRType &result_type, uin
+ 	}
+ }
+ 
+-string CompilerMSL::get_robust_buffer_array_length(const SPIRType &type, uint32_t var_id)
++// For an access chain into an element of an array of buffers, returns the descriptor index
++// expression (the first subscript after the variable), or an empty string otherwise.
++string CompilerMSL::robust_descriptor_index(const string &chain_expr, const SPIRVariable &var)
+ {
+-	if (is_runtime_size_array(type))
++	if (get_variable_data_type(var).array.empty())
++		return "";
++	string var_expr = to_expression(var.self);
++	size_t start = chain_expr.find(var_expr);
++	if (start == string::npos)
++		return "";
++	start += var_expr.size();
++	if (start >= chain_expr.size() || chain_expr[start] != '[')
++		return "";
++	int depth = 0;
++	for (size_t i = start; i < chain_expr.size(); i++)
+ 	{
++		if (chain_expr[i] == '[')
++			depth++;
++		else if (chain_expr[i] == ']' && --depth == 0)
++			return chain_expr.substr(start + 1, i - start - 1);
++	}
++	return "";
++}
++
++string CompilerMSL::get_robust_buffer_array_length(const SPIRType &type, uint32_t var_id, const string &descriptor_index)
++{
++	// The size of the buffer the access is in: for arrays of buffers, the size of the selected element.
++	auto buffer_size_expression = [&]() -> string {
+ 		string size_expr = to_buffer_size_expression(var_id);
++		if (!descriptor_index.empty() && !size_expr.empty())
++			size_expr = join(size_expr, "[", descriptor_index, "]");
++		return size_expr;
++	};
++
++	if (is_runtime_size_array(type))
++	{
++		string size_expr = buffer_size_expression();
+ 		uint32_t stride = get_decoration(type.self, DecorationArrayStride);
+ 		if (stride == 0 && type.parent_type)
+ 		{
+@@ -14945,7 +15011,7 @@ string CompilerMSL::get_robust_buffer_array_length(const SPIRType &type, uint32_
+ 		string declared_length = to_string(to_array_size_literal(type));
+ 		if (msl_options.robust_buffer_access2)
+ 		{
+-			string size_expr = to_buffer_size_expression(var_id);
++			string size_expr = buffer_size_expression();
+ 			if (!size_expr.empty())
+ 			{
+ 				uint32_t stride = get_decoration(type.self, DecorationArrayStride);
+@@ -20787,12 +20853,12 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
+ 			auto *var = self.maybe_get_backing_variable(ptr);
+ 			if (var)
+ 			{
++				// Only uniform and storage buffers: interface blocks (gl_PerVertex, push constants)
++				// are Block-decorated too but have no buffer size.
+ 				auto &var_type = self.get_variable_data_type(*var);
+-				auto storage = var_type.storage;
+-				bool is_buffer = storage == StorageClassUniform ||
+-				                 storage == StorageClassStorageBuffer ||
+-				                 self.has_decoration(var_type.self, DecorationBlock) ||
+-				                 self.has_decoration(var_type.self, DecorationBufferBlock);
++				bool is_buffer = (var->storage == StorageClassUniform || var->storage == StorageClassStorageBuffer) &&
++				                 (self.has_decoration(var_type.self, DecorationBlock) ||
++				                  self.has_decoration(var_type.self, DecorationBufferBlock));
+ 				if (is_buffer)
+ 				{
+ 					self.buffers_requiring_robust_access.insert(var->self);
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index ee821406..6e1ea33d 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -1170,6 +1170,7 @@ protected:
+ 	std::string to_sampler_expression(uint32_t id);
+ 	std::string to_plane_expression(const std::string &img_expr, uint32_t plane);
+ 	bool is_geometry_direct_input_builtin(const SPIRVariable &var);
++	std::string mesh_wrapper_resource_arg(const Entry_Point_Resource &resource);
+ 	std::string to_swizzle_expression(uint32_t id);
+ 	std::string to_texture_offset_expression(uint32_t id);
+ 	std::string to_buffer_size_expression(uint32_t id);
+@@ -1179,7 +1180,8 @@ protected:
+ 	                                          const std::string &lod_expr, bool include_null_check = true);
+ 	std::string get_robust_image_zero_value(const SPIRType &result_type, uint32_t format_components);
+ 	// Robust buffer access helpers for robustBufferAccess2
+-	std::string get_robust_buffer_array_length(const SPIRType &type, uint32_t var_id);
++	std::string get_robust_buffer_array_length(const SPIRType &type, uint32_t var_id, const std::string &descriptor_index = "");
++	std::string robust_descriptor_index(const std::string &chain_expr, const SPIRVariable &var);
+ 
+ 	bool is_sample_rate() const;
+ 	bool is_intersection_query() const;
+-- 
+2.50.1 (Apple Git-155)
+

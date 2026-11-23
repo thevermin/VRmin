@@ -1,0 +1,37 @@
+From 8f06ee302234292a678acbf12806f8e210d4111f Mon Sep 17 00:00:00 2001
+From: steamac <steamac@localhost>
+Date: Sat, 3 Oct 2026 21:16:47 +0300
+Subject: [PATCH 03/22] Fix Y'CbCr plane count of immutable sampler arrays
+
+ImmutableSamplerPlaneInfo::add() summed the plane counts of all immutable
+samplers of a binding instead of keeping the maximum, although the field is
+documented as the maximum Y'CbCr plane count. A binding with 16 NV12 immutable
+samplers (gamescope's s_ycbcr_samplers[16]) got plane count 32 and was laid out
+as Tex3SampSoA (three texture arrays + samplers), while the shader converter
+sees the 2-plane sampler. The argument-buffer indexes no longer matched and
+SPIRV-Cross failed with 'Argument buffer resource base type could not be
+determined' when padding the argument buffer.
+
+Same code in KhronosGroup/MoltenVK main (MVKDescriptorSet.mm).
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
+index 64fe5f9c..4bacd84a 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
+@@ -236,8 +236,9 @@ static MVKArgumentBufferMode pickArgumentBufferMode(MVKDevice* dev, const VkDesc
+ 			data = 1;
+ 		assert(planeCount() <= 3 && "Max plane count of any supported type is 3");
+ 	}
++	/** Merges in another sampler: keeps the maximum plane count (not the sum) and the non-Y'CbCr flag. */
+ 	void add(ImmutableSamplerPlaneInfo other) {
+-		data = (data + (other.data & 0xfffffffe)) | (other.data & 1);
++		data = std::max(data & 0xfffffffe, other.data & 0xfffffffe) | ((data | other.data) & 1);
+ 	}
+ 	/** Returns the worst case size, when the full details are unknown. */
+ 	static ImmutableSamplerPlaneInfo MaxSize() {
+-- 
+2.50.1 (Apple Git-155)
+
