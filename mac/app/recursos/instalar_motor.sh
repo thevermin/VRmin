@@ -31,8 +31,8 @@ DXMT_URL="https://github.com/thevermin/VRmin/releases/download/v0.58/dxmt-vrmin-
 DXMT_SHA="82246ba1cca170f3f1a424c81477a4c946b661eb590e5236b8f1436fc62dd344"
 DXMT_DIR="$P/dxmt/vrmin-2"
 # (2: también win32u, con Vulkan para SteamVR real: las texturas compartidas por Metal, y FreeType)
-MSYNC_URL="https://github.com/thevermin/VRmin/releases/download/v0.60/wine-msync-vrmin-2.tar.gz"
-MSYNC_SHA="002134eb9372a12842faacbdbd89e5755d3af76f5c6e606f95a3efb67e4e6d97"
+MSYNC_URL="https://github.com/thevermin/VRmin/releases/download/v0.61/wine-msync-vrmin-3.tar.gz"
+MSYNC_SHA="c732cd022fd5eac7824bdb0e6ad3ba35af0f6a7aca9163cc31c5db815004a11b"
 export WINEDEBUG=-all
 
 paso() { echo; say "==> $1" "==> ${2:-$1}"; }

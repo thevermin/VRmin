@@ -17,7 +17,7 @@ WINE_REAL="$WINEDIR/bin/wine"
 WINE="$WINE_REAL"
 WINESERVER="$WINEDIR/bin/wineserver"
 FW="$MOTOR/Frameworks"
-MARCA_MOTOR="gcenx-11.8+msync1+dxmt-vrmin3"   # (vrmin3: también el DXMT de 32 bits)
+MARCA_MOTOR="gcenx-11.8+msync3+dxmt-vrmin3"   # (vrmin3: también el DXMT de 32 bits)
 
 export WINEPREFIX="$P/prefijo"
 export DYLD_FALLBACK_LIBRARY_PATH="$WINEDIR/lib:$FW:$FW/GStreamer.framework/Versions/1.0/lib:/usr/lib"
