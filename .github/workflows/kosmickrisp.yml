@@ -60,6 +60,9 @@ jobs:
           nm -gU pkg/lib/libvulkan_kosmickrisp.dylib | grep ' _vk_icdGetInstanceProcAddr$'
           codesign --force -s - pkg/lib/libvulkan_kosmickrisp.dylib
           cp mesa/docs/license.rst pkg/LICENSE-Mesa.rst 2>/dev/null || true
+          # (la prueba: si KosmicKrisp anda en un programa x86_64 con Rosetta, como el Wine de VRmin)
+          clang -arch x86_64 -mmacosx-version-min=26.0 -I"$(brew --prefix)/include" -I mesa/include vrmin/mac/kosmickrisp/probar.c -o pkg/probar
+          codesign --force -s - pkg/probar
           echo "KosmicKrisp: Mesa $MESA_COMMIT + steamac mac/kosmickrisp/steamac/" > pkg/VERSION.txt
           tar -czf kosmickrisp-vrmin.tar.gz -C pkg .
       - uses: actions/upload-artifact@v4
