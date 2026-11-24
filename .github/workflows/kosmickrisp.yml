@@ -2,7 +2,8 @@ name: KosmicKrisp para VRmin
 
 # KosmicKrisp (el Vulkan de Mesa sobre Metal 4, para macOS 26+) compilado como el de steamac (fxgl/steamac,
 # host/kosmickrisp/build.sh): Mesa ce576c29 con sus arreglos (mac/kosmickrisp/steamac/: geometry shaders, transform
-# feedback y lo que piden DXVK y vkd3d-proton). Para el Wine de VRmin (x86_64, con Rosetta): se compila para x86_64.
+# feedback y lo que piden DXVK y vkd3d-proton). Para el Wine de VRmin (x86_64, con Rosetta): se compila en una Mac
+# Intel (compilado cruzado no se puede: Mesa arma su compilador de shaders con partes del propio driver).
 # Todavía es una prueba: el motor de VRmin no lo usa.
 
 on:
@@ -17,7 +18,7 @@ env:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,21 +44,7 @@ jobs:
       - name: KosmicKrisp (x86_64)
         run: |
           set -e
-          cat > x86_64.txt <<'X'
-          [binaries]
-          c = ['clang', '-arch', 'x86_64']
-          cpp = ['clang++', '-arch', 'x86_64']
-          objc = ['clang', '-arch', 'x86_64']
-          objcpp = ['clang++', '-arch', 'x86_64']
-          ar = 'ar'
-          strip = 'strip'
-          [host_machine]
-          system = 'darwin'
-          cpu_family = 'x86_64'
-          cpu = 'x86_64'
-          endian = 'little'
-          X
-          PATH="$PWD/clc/bin:$PWD/venv/bin:$PATH" MACOSX_DEPLOYMENT_TARGET=26.0 meson setup build mesa --cross-file x86_64.txt \
+          PATH="$PWD/clc/bin:$PWD/venv/bin:$PATH" MACOSX_DEPLOYMENT_TARGET=26.0 meson setup build mesa \
             --buildtype=release -Db_ndebug=true -Dplatforms=macos -Dvulkan-drivers=kosmickrisp -Dgallium-drivers= -Dopengl=false \
             -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dzstd=disabled -Dexpat=disabled \
             -Dllvm=disabled -Dspirv-tools=disabled -Dmesa-clc=system -Dprecomp-compiler=enabled --prefer-static
