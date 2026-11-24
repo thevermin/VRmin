@@ -53,6 +53,15 @@ jobs:
             echo "$sha  msync/wine-msync-vrmin.tar.gz" | sha256sum -c -
             cp msync/wine-msync-vrmin.tar.gz "out/${url##*/}"
           fi
+          # El MoltenVK que pone instalar_motor.sh, igual: el último compilado («MoltenVK para VRmin»)
+          url=$(grep -o '^MVK_URL="[^"]*' mac/app/recursos/instalar_motor.sh | sed 's/^MVK_URL="//')
+          if [ "${url%/*}" = "https://github.com/$GITHUB_REPOSITORY/releases/download/${{ inputs.tag }}" ]; then
+            sha=$(grep -o '^MVK_SHA="[^"]*' mac/app/recursos/instalar_motor.sh | sed 's/^MVK_SHA="//')
+            mk=$(gh run list -R "$GITHUB_REPOSITORY" --workflow moltenvk.yml --branch main --limit 10 --json databaseId,conclusion -q '[.[] | select(.conclusion == "success")][0].databaseId')
+            gh run download "$mk" -R "$GITHUB_REPOSITORY" -n moltenvk-vrmin -D mvk
+            echo "$sha  mvk/moltenvk-vrmin.tar.gz" | sha256sum -c -
+            cp mvk/moltenvk-vrmin.tar.gz "out/${url##*/}"
+          fi
           ls -la out
       - name: Publicar
         run: |

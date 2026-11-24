@@ -27,12 +27,16 @@ ENGINE_APP="Wine Devel.app"
 TPL="Template-1.0.21"
 TPL_URL="$BASE/Template/releases/download/v1.0/$TPL.tar.xz"
 TPL_SHA="bbe996e4e4375318485953d0c7818b7b4b0a4dc1f13303bcc584f99f7602f78d"
-DXMT_URL="https://github.com/thevermin/VRmin/releases/download/v0.58/dxmt-vrmin-2.tar.gz"
-DXMT_SHA="82246ba1cca170f3f1a424c81477a4c946b661eb590e5236b8f1436fc62dd344"
-DXMT_DIR="$P/dxmt/vrmin-2"
+# (3: el DXMT oficial de octubre con los arreglos de steamac, .github/workflows/dxmt.yml)
+DXMT_URL="https://github.com/thevermin/VRmin/releases/download/v0.62/dxmt-vrmin-3.tar.gz"
+DXMT_SHA="1b8a1f3593496171d5baf579ba3e1db4fb15ba914a98a23126ff7fe94bca0f4c"
+DXMT_DIR="$P/dxmt/vrmin-3"
 # (2: también win32u, con Vulkan para SteamVR real: las texturas compartidas por Metal, y FreeType)
 MSYNC_URL="https://github.com/thevermin/VRmin/releases/download/v0.61/wine-msync-vrmin-3.tar.gz"
 MSYNC_SHA="c732cd022fd5eac7824bdb0e6ad3ba35af0f6a7aca9163cc31c5db815004a11b"
+# MoltenVK de VRmin: el fork de UTM (1.4.1 con geometry shaders) con los arreglos de steamac (.github/workflows/moltenvk.yml)
+MVK_URL="https://github.com/thevermin/VRmin/releases/download/v0.62/moltenvk-vrmin-1.tar.gz"
+MVK_SHA="b335b9719cf3be02fc225f733e1697ba6c8b082e03db8a31c091b366e76f488b"
 export WINEDEBUG=-all
 
 paso() { echo; say "==> $1" "==> ${2:-$1}"; }
@@ -131,6 +135,19 @@ if [ "$(cat "$WINEDIR/.msync" 2>/dev/null)" != "$MSYNC_SHA" ]; then
   xattr -dr com.apple.quarantine "$WINEDIR/bin" "$WINEDIR/lib/wine" 2>/dev/null || true
   echo "$MSYNC_SHA" > "$WINEDIR/.msync"
 fi
+# El MoltenVK de VRmin en vez del de Gcenx (que queda como .gcenx). Se pone de nuevo si el motor se bajó otra vez o si
+# cambió (.moltenvk guarda cuál está puesto)
+if [ "$(cat "$WINEDIR/.moltenvk" 2>/dev/null)" != "$MVK_SHA" ]; then
+  paso "Instalando MoltenVK en el motor" "Installing MoltenVK into the engine"
+  bajar "$MVK_URL" moltenvk.tar.gz "$MVK_SHA"
+  L="$WINEDIR/lib/libMoltenVK.dylib"
+  [ -f "$L.gcenx" ] || cp -p "$L" "$L.gcenx"
+  rm -rf mvk && mkdir mvk && tar -xzf moltenvk.tar.gz -C mvk
+  # (a un archivo nuevo y después en su lugar: copiado encima de uno ya usado, macOS lo rechaza al cargarlo)
+  cp mvk/lib/libMoltenVK.dylib "$L.nuevo" && mv -f "$L.nuevo" "$L" && rm -rf mvk moltenvk.tar.gz
+  xattr -d com.apple.quarantine "$L" 2>/dev/null || true
+  echo "$MVK_SHA" > "$WINEDIR/.moltenvk"
+fi
 paso "Instalando DXMT dentro del motor" "Installing DXMT into the engine"
 # (y el de 32 bits: SteamVR, en un juego de 32 bits como Half-Life 2: VR Mod, abre su propio D3D11 en el juego, y
 #  con el D3D11 de 32 bits sin su winemetal.dll el juego se cerraba al iniciar VR)
@@ -146,7 +163,7 @@ done
 #  arranca; pasó con win32u.so)
 W="$WINEDIR/lib/wine/x86_64-unix/winemetal.so"
 cp "$DXMT_DIR/x86_64-unix/winemetal.so" "$W.nuevo" && mv -f "$W.nuevo" "$W"
-rm -rf "$P/dxmt/vrmin-1"   # (el DXMT de VRmin 0.55 a 0.57)
+rm -rf "$P/dxmt/vrmin-1" "$P/dxmt/vrmin-2"   # (los DXMT de VRmin 0.55 a 0.61)
 
 if [ ! -f "$WINEPREFIX/system.reg" ]; then
   paso "Creando el Windows de QuestVRBridge (1-2 minutos)" "Creating VRmin's Windows (1-2 minutes)"
