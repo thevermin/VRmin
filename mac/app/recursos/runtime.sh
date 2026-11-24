@@ -168,7 +168,7 @@ fijo = {
     #  ventana oculta para emparejar controles de Valve, con su propio proceso de navegador de ~400 MB)
     "driver_lighthouse": {"enable": False}, "driver_oculus": {"enable": False},
     "driver_oculus_legacy": {"enable": False}, "driver_vrlink": {"enable": False},
-    "dashboard": {"useNewDesktop": False, "showDesktop": False, "cefMaxFrameRate": 30},
+    "dashboard": {"useNewDesktop": False, "showDesktop": False},
     "collisionBounds": {"CollisionBoundsColorGammaA": 0, "CollisionBoundsFadeDistance": 0},
     "steamvr": {"requireHmd": True, "forcedDriver": "vrmin", "activateMultipleDrivers": False, "enableHomeApp": False,
                 "showMirrorView": False, "startMonitorFromAppLaunch": False, "startOverlayAppsFromDashboard": False,
@@ -180,6 +180,7 @@ fijo = {
 s.setdefault("driver_vrmin", {}).update({"enable": True, "blocked_by_safe_mode": False})
 # (de versiones anteriores de VRmin)
 s.get("dashboard", {}).pop("enableDashboard", None)
+s.get("dashboard", {}).pop("cefMaxFrameRate", None)   # (era 30: las animaciones del menú se veían trabadas)
 s.get("dashboard", {}).pop("allowDashboardAutoLaunchWithSteamVRHome", None)
 s.get("steamvr", {}).pop("forceCEFMode", None)
 s.get("steamvr", {}).pop("allowDashboardAutoLaunchWithSteamVRHome", None)
