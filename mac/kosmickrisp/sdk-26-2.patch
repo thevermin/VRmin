@@ -1,0 +1,79 @@
+diff --git a/src/kosmickrisp/bridge/mtl_command_queue.m b/src/kosmickrisp/bridge/mtl_command_queue.m
+index 2d512e2..ac758b5 100644
+--- a/src/kosmickrisp/bridge/mtl_command_queue.m
++++ b/src/kosmickrisp/bridge/mtl_command_queue.m
+@@ -126,6 +126,7 @@ mtl_command_queue_update_texture_mappings(
+    mtl_command_queue *queue, mtl_texture *texture, mtl_heap *heap,
+    const struct mtl_sparse_texture_mapping *mappings, uint32_t count)
+ {
++#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400   /* (VRmin: needs the macOS 26.4 SDK; never called without it) */
+    @autoreleasepool {
+       id<MTL4CommandQueue> q = (id<MTL4CommandQueue>)queue;
+       MTL4UpdateSparseTextureMappingOperation ops[MTL_SPARSE_MAPPING_BATCH];
+@@ -149,6 +150,7 @@ mtl_command_queue_update_texture_mappings(
+                             count:n];
+       }
+    }
++#endif
+ }
+ 
+ void
+@@ -156,6 +158,7 @@ mtl_command_queue_update_buffer_mappings(
+    mtl_command_queue *queue, mtl_buffer *buffer, mtl_heap *heap,
+    const struct mtl_sparse_buffer_mapping *mappings, uint32_t count)
+ {
++#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400   /* (VRmin: needs the macOS 26.4 SDK; never called without it) */
+    @autoreleasepool {
+       id<MTL4CommandQueue> q = (id<MTL4CommandQueue>)queue;
+       MTL4UpdateSparseBufferMappingOperation ops[MTL_SPARSE_MAPPING_BATCH];
+@@ -176,6 +179,7 @@ mtl_command_queue_update_buffer_mappings(
+                            count:n];
+       }
+    }
++#endif
+ }
+ 
+ void
+diff --git a/src/kosmickrisp/bridge/mtl_device.m b/src/kosmickrisp/bridge/mtl_device.m
+index b982451..dfe78ea 100644
+--- a/src/kosmickrisp/bridge/mtl_device.m
++++ b/src/kosmickrisp/bridge/mtl_device.m
+@@ -335,8 +335,10 @@ mtl_device_supports_placement_sparse(mtl_device *device)
+ {
+    @autoreleasepool {
+       id<MTLDevice> dev = (id<MTLDevice>)device;
++#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400   /* (VRmin: placement sparse needs the macOS 26.4 SDK) */
+       if (@available(macOS 26.4, *))
+          return dev.supportsPlacementSparse;
++#endif
+       return false;
+    }
+ }
+@@ -366,8 +368,12 @@ mtl_new_placement_sparse_texture(mtl_device *device,
+       MTLTextureDescriptor *descriptor = [mtl_new_texture_descriptor(layout) autorelease];
+       descriptor.resourceOptions = MTLResourceStorageModePrivate |
+                                    MTLResourceHazardTrackingModeUntracked;
++#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
+       descriptor.placementSparsePageSize = MTLSparsePageSize64;
+       return [dev newTextureWithDescriptor:descriptor];
++#else
++      return NULL;   /* (never: sparse isn't advertised without the macOS 26.4 SDK) */
++#endif
+    }
+ }
+ 
+@@ -376,10 +382,14 @@ mtl_new_placement_sparse_buffer(mtl_device *device, uint64_t size_B)
+ {
+    @autoreleasepool {
+       id<MTLDevice> dev = (id<MTLDevice>)device;
++#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
+       return [dev newBufferWithLength:size_B
+                               options:MTLResourceStorageModePrivate |
+                                       MTLResourceHazardTrackingModeUntracked
+               placementSparsePageSize:MTLSparsePageSize64];
++#else
++      return NULL;
++#endif
+    }
+ }
+ 

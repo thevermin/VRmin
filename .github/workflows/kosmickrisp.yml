@@ -34,6 +34,7 @@ jobs:
           git init -q mesa && git -C mesa remote add origin "$MESA_REPO"
           git -C mesa fetch -q --depth 1 origin "$MESA_COMMIT" && git -C mesa checkout -q -f --detach "$MESA_COMMIT"
           for p in vrmin/mac/kosmickrisp/steamac/*.patch; do git -C mesa apply --whitespace=nowarn "$GITHUB_WORKSPACE/$p"; done
+          git -C mesa apply "$GITHUB_WORKSPACE/vrmin/mac/kosmickrisp/sdk-26-2.patch"   # (el SDK de los runners es el de macOS 26.2)
       - name: Compilador de shaders (para esta Mac)
         run: |
           set -e
