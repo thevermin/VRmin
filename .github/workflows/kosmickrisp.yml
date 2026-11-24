@@ -60,6 +60,11 @@ jobs:
           nm -gU pkg/lib/libvulkan_kosmickrisp.dylib | grep ' _vk_icdGetInstanceProcAddr$'
           codesign --force -s - pkg/lib/libvulkan_kosmickrisp.dylib
           cp mesa/docs/license.rst pkg/LICENSE-Mesa.rst 2>/dev/null || true
+          # (cómo lo carga el Wine de VRmin: con VRMIN_VULKAN_LIB=<ruta de libvulkan_kk.dylib>)
+          clang -arch x86_64 -mmacosx-version-min=26.0 -dynamiclib -O2 vrmin/mac/kosmickrisp/vulkan_kk.c -o pkg/lib/libvulkan_kk.dylib \
+            -install_name @rpath/libvulkan_kk.dylib
+          nm -gU pkg/lib/libvulkan_kk.dylib | grep -E ' _vkGetInstanceProcAddr$| _vkGetDeviceProcAddr$| _vkCreateMetalSurfaceEXT$'
+          codesign --force -s - pkg/lib/libvulkan_kk.dylib
           # (la prueba: si KosmicKrisp anda en un programa x86_64 con Rosetta, como el Wine de VRmin)
           clang -arch x86_64 -mmacosx-version-min=26.0 -I"$(brew --prefix)/include" -I mesa/include vrmin/mac/kosmickrisp/probar.c -o pkg/probar
           codesign --force -s - pkg/probar

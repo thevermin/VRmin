@@ -31,7 +31,7 @@ index c7c831d..6bd075b 100644
  D3DKMT_HANDLE d3dkmt_open_resource( D3DKMT_HANDLE global, HANDLE shared, D3DKMT_HANDLE *mutex_local, D3DKMT_HANDLE *sync_local )
  {
 diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
-index bf8f6f1..61bcef4 100644
+index bf8f6f1..b242d51 100644
 --- a/dlls/win32u/vulkan.c
 +++ b/dlls/win32u/vulkan.c
 @@ -46,6 +46,18 @@ WINE_DECLARE_DEBUG_CHANNEL(fps);
@@ -449,6 +449,24 @@ index bf8f6f1..61bcef4 100644
  
  failed:
      mem_free( &pool );
+@@ -3030,8 +3207,15 @@ static void vulkan_init_once(void)
+     VkResult res;
+ 
+ #ifdef SONAME_LIBVULKAN
+-    vulkan_handle = dlopen( SONAME_LIBVULKAN, RTLD_NOW );
+-    if (!vulkan_handle) ERR( "Failed to load %s\n", SONAME_LIBVULKAN );
++    {
++        /* VRmin: another Vulkan driver for a game, like KosmicKrisp (VRMIN_VULKAN_LIB: the path of a library with
++         * vkGetInstanceProcAddr and vkGetDeviceProcAddr, mac/kosmickrisp/vulkan_kk.c) */
++        const char *lib = getenv( "VRMIN_VULKAN_LIB" );
++        if (!lib || !*lib) lib = SONAME_LIBVULKAN;
++        vulkan_handle = dlopen( lib, RTLD_NOW );
++        if (!vulkan_handle) ERR( "Failed to load %s\n", lib );
++        else if (lib != SONAME_LIBVULKAN) WARN( "VRmin: Vulkan from %s\n", lib );
++    }
+ #else
+     ERR( "Wine was built without Vulkan support.\n" );
+ #endif
 diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
 index 031e1af..17f0beb 100644
 --- a/dlls/win32u/win32u_private.h
