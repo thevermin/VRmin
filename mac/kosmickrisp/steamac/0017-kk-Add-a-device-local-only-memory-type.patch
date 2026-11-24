@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian Misiak <bmisiak@me.com>
+Date: Thu, 3 Sep 2026 15:56:20 -0700
+Subject: [PATCH 17/19] kk: Add a device-local-only memory type
+
+KosmicKrisp only advertises one memory type, DEVICE_LOCAL | HOST_VISIBLE
+| HOST_COHERENT | HOST_CACHED. That's fine natively, but under Venus every
+host-visible allocation gets turned into a host pointer import so the
+guest can map it, and KosmicKrisp can't build heap textures on top of
+that. Zink then puts every image there and the first blit crashes.
+
+Add a plain DEVICE_LOCAL type on the same heap, before the host-visible
+one so the subset-ordering rule holds, and only report the host-visible
+type from vkGetMemoryHostPointerPropertiesEXT. Same memory either way on
+Apple silicon.
+---
+ src/kosmickrisp/vulkan/kk_device_memory.c   | 3 +--
+ src/kosmickrisp/vulkan/kk_physical_device.c | 9 +++++++++
+ src/kosmickrisp/vulkan/kk_physical_device.h | 1 +
+ 3 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory.c b/src/kosmickrisp/vulkan/kk_device_memory.c
+index ee69e4a..1c979b0 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory.c
++++ b/src/kosmickrisp/vulkan/kk_device_memory.c
+@@ -79,8 +79,7 @@ kk_GetMemoryHostPointerPropertiesEXT(
+    default:
+       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+    }
+-   pMemoryHostPointerProperties->memoryTypeBits =
+-      BITFIELD_MASK(pdev->mem_type_count);
++   pMemoryHostPointerProperties->memoryTypeBits = pdev->host_visible_mem_types;
+ 
+    return VK_SUCCESS;
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 190c873..a6e734f 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -1198,13 +1198,22 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
+       .used = kk_get_sysmem_heap_used,
+    };
+ 
++   /* Must precede the host-visible type: the spec orders a type whose
++    * propertyFlags are a strict subset of another's first. */
+    pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
++      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++      .heapIndex = sysmem_heap_idx,
++   };
++
++   uint32_t host_visible_idx = pdev->mem_type_count++;
++   pdev->mem_types[host_visible_idx] = (VkMemoryType){
+       .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+       .heapIndex = sysmem_heap_idx,
+    };
++   pdev->host_visible_mem_types = BITFIELD_BIT(host_visible_idx);
+ 
+    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
+    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.h b/src/kosmickrisp/vulkan/kk_physical_device.h
+index 283dc9f..004a61a 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.h
++++ b/src/kosmickrisp/vulkan/kk_physical_device.h
+@@ -68,6 +68,7 @@ struct kk_physical_device {
+    // TODO: add mapable VRAM heap if possible
+    struct kk_memory_heap mem_heaps[3];
+    VkMemoryType mem_types[3];
++   uint32_t host_visible_mem_types;
+    uint8_t mem_heap_count;
+    uint8_t mem_type_count;
+ 
+-- 
+2.54.0 (Apple Git-157)
+

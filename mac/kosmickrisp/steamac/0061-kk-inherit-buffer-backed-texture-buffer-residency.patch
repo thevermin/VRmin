@@ -1,0 +1,72 @@
+From d3451afba40c73b9112a7f48d4eb5f215a9a515c Mon Sep 17 00:00:00 2001
+From: steamac <steamac@fxgam.es>
+Date: Sat, 24 Oct 2026 11:26:42 +0300
+Subject: [PATCH] kk: inherit non-sparse texture-buffer residency from its
+ buffer
+
+STEAMAC-3V/4H abort in IOGPUMetalResidencySet addAllocation: +1056.
+On M1 Max this is the failure to grow its resource hash table, capped at
+1,048,576 slots. Reproduced by 1,100,000 views of one small Vulkan buffer.
+Buffer-backed texture buffers share the buffer allocation, which is already
+resident. Do not register redundant view objects; preserve separate sparse
+texture mappings and the base-texture residency required for attachments.
+
+Repro: host/moltenvk/repro/residency_limits.c, with Metal validation, reads
+three views before and after destroying the remaining 1,099,997 views.
+---
+ src/kosmickrisp/bridge/mtl_residency_set.m | 25 ++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/src/kosmickrisp/bridge/mtl_residency_set.m b/src/kosmickrisp/bridge/mtl_residency_set.m
+index eeca751..543be2f 100644
+--- a/src/kosmickrisp/bridge/mtl_residency_set.m
++++ b/src/kosmickrisp/bridge/mtl_residency_set.m
+@@ -8,6 +8,27 @@
+ 
+ #include <Metal/MTLDevice.h>
+ #include <Metal/MTLResidencySet.h>
++#include <Metal/MTLTexture.h>
++
++/* A non-sparse texture buffer is a view of an already resident MTLBuffer,
++ * not another backing allocation. Registering every view separately fills
++ * IOGPUMetalResidencySet's bounded hash table and addAllocation: aborts
++ * (STEAMAC-3V/4H: 1,048,576 table slots on M1 Max).
++ *
++ * Do not apply this to ordinary linear textures: Metal 4 requires the base
++ * texture itself to be registered for attachments. Sparse texture buffers
++ * have independent mappings and no parent buffer, so remain registered too.
++ */
++static bool
++mtl_allocation_inherits_buffer_residency(id<MTLAllocation> allocation)
++{
++   if (![allocation conformsToProtocol:@protocol(MTLTexture)])
++      return false;
++
++   id<MTLTexture> texture = (id<MTLTexture>)allocation;
++   return texture.textureType == MTLTextureTypeTextureBuffer &&
++          texture.buffer != nil;
++}
+ 
+ mtl_residency_set *
+ mtl_new_residency_set(mtl_device *device)
+@@ -35,6 +56,8 @@
+    @autoreleasepool {
+       id<MTLResidencySet> set = (id<MTLResidencySet>)residency_set;
+       id<MTLAllocation> alloc = (id<MTLAllocation>)allocation;
++      if (mtl_allocation_inherits_buffer_residency(alloc))
++         return;
+       [set addAllocation:alloc];
+    }
+ }
+@@ -46,6 +69,8 @@
+    @autoreleasepool {
+       id<MTLResidencySet> set = (id<MTLResidencySet>)residency_set;
+       id<MTLAllocation> alloc = (id<MTLAllocation>)allocation;
++      if (mtl_allocation_inherits_buffer_residency(alloc))
++         return;
+       [set removeAllocation:alloc];
+    }
+ }
+-- 
+2.54.0 (Apple Git-157)
+

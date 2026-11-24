@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Tue, 6 Oct 2026 13:06:56 +0300
+Subject: [PATCH] kk: advertise fillModeNonSolid (polygonMode LINE through
+ Metal's line fill)
+
+DXVK refuses devices without fillModeNonSolid ("Skipping: Device does not
+support required feature 'fillModeNonSolid'", then "No adapters found"),
+so no D3D9/10/11 game started on KosmicKrisp (Unity: "d3d11: failed to
+create factory").
+
+Metal rasterizes triangles as lines with setTriangleFillMode:; set it from
+the rasterization polygon mode whenever it is dirty, like the cull mode.
+VK_POLYGON_MODE_POINT has no Metal equivalent and is drawn as lines, as
+MoltenVK does.
+---
+ src/kosmickrisp/bridge/mtl_encoder.h        |  3 +++
+ src/kosmickrisp/bridge/mtl_encoder.m        | 10 ++++++++++
+ src/kosmickrisp/bridge/mtl_types.h          |  5 +++++
+ src/kosmickrisp/bridge/stubs/mtl_encoder.c  |  6 ++++++
+ src/kosmickrisp/bridge/vk_to_mtl_map.c      | 14 ++++++++++++++
+ src/kosmickrisp/bridge/vk_to_mtl_map.h      |  5 +++++
+ src/kosmickrisp/vulkan/kk_cmd_draw.c        |  4 ++++
+ src/kosmickrisp/vulkan/kk_physical_device.c |  1 +
+ 8 files changed, 48 insertions(+)
+
+diff --git a/src/kosmickrisp/bridge/mtl_encoder.h b/src/kosmickrisp/bridge/mtl_encoder.h
+index 90a4238..65f2018 100644
+--- a/src/kosmickrisp/bridge/mtl_encoder.h
++++ b/src/kosmickrisp/bridge/mtl_encoder.h
+@@ -99,6 +99,9 @@ void mtl_set_front_face_winding(mtl_render_encoder *encoder,
+ 
+ void mtl_set_cull_mode(mtl_render_encoder *encoder, enum mtl_cull_mode mode);
+ 
++void mtl_set_triangle_fill_mode(mtl_render_encoder *encoder,
++                                enum mtl_triangle_fill_mode mode);
++
+ void mtl_set_visibility_result_mode(mtl_render_encoder *encoder,
+                                     enum mtl_visibility_result_mode mode,
+                                     size_t offset);
+diff --git a/src/kosmickrisp/bridge/mtl_encoder.m b/src/kosmickrisp/bridge/mtl_encoder.m
+index 0424743..b356b52 100644
+--- a/src/kosmickrisp/bridge/mtl_encoder.m
++++ b/src/kosmickrisp/bridge/mtl_encoder.m
+@@ -361,6 +361,16 @@
+    }
+ }
+ 
++void
++mtl_set_triangle_fill_mode(mtl_render_encoder *encoder,
++                           enum mtl_triangle_fill_mode mode)
++{
++   @autoreleasepool {
++      id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
++      [enc setTriangleFillMode:(MTLTriangleFillMode)mode];
++   }
++}
++
+ void
+ mtl_set_visibility_result_mode(mtl_render_encoder *encoder,
+                                enum mtl_visibility_result_mode mode,
+diff --git a/src/kosmickrisp/bridge/mtl_types.h b/src/kosmickrisp/bridge/mtl_types.h
+index 26a9794..727a7dd 100644
+--- a/src/kosmickrisp/bridge/mtl_types.h
++++ b/src/kosmickrisp/bridge/mtl_types.h
+@@ -235,6 +235,11 @@ enum mtl_cull_mode {
+    MTL_CULL_MODE_BACK = 2,
+ };
+ 
++enum mtl_triangle_fill_mode {
++   MTL_TRIANGLE_FILL_MODE_FILL = 0,
++   MTL_TRIANGLE_FILL_MODE_LINES = 1,
++};
++
+ enum mtl_visibility_result_mode {
+    MTL_VISIBILITY_RESULT_MODE_DISABLED = 0,
+    MTL_VISIBILITY_RESULT_MODE_BOOLEAN = 1,
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_encoder.c b/src/kosmickrisp/bridge/stubs/mtl_encoder.c
+index 7ef9fe8..38995b5 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_encoder.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_encoder.c
+@@ -179,6 +179,12 @@ mtl_set_cull_mode(mtl_render_encoder *encoder, enum mtl_cull_mode mode)
+ {
+ }
+ 
++void
++mtl_set_triangle_fill_mode(mtl_render_encoder *encoder,
++                           enum mtl_triangle_fill_mode mode)
++{
++}
++
+ void
+ mtl_set_visibility_result_mode(mtl_render_encoder *encoder,
+                                enum mtl_visibility_result_mode mode,
+diff --git a/src/kosmickrisp/bridge/vk_to_mtl_map.c b/src/kosmickrisp/bridge/vk_to_mtl_map.c
+index d47e64d..6dc2d3d 100644
+--- a/src/kosmickrisp/bridge/vk_to_mtl_map.c
++++ b/src/kosmickrisp/bridge/vk_to_mtl_map.c
+@@ -256,6 +256,20 @@ vk_front_face_to_mtl_cull_mode(enum VkCullModeFlagBits mode)
+    }
+ }
+ 
++enum mtl_triangle_fill_mode
++vk_polygon_mode_to_mtl_triangle_fill_mode(enum VkPolygonMode mode)
++{
++   switch (mode) {
++   case VK_POLYGON_MODE_FILL:
++      return MTL_TRIANGLE_FILL_MODE_FILL;
++   case VK_POLYGON_MODE_LINE:
++   case VK_POLYGON_MODE_POINT: // Metal has no point fill mode; lines come closest
++      return MTL_TRIANGLE_FILL_MODE_LINES;
++   default:
++      UNREACHABLE("Unsupported VkPolygonMode");
++   }
++}
++
+ enum mtl_depth_resolve_filter
+ vk_resolve_mode_to_mtl_depth_resolve_filter(
+    enum VkResolveModeFlagBits resolve_mode)
+diff --git a/src/kosmickrisp/bridge/vk_to_mtl_map.h b/src/kosmickrisp/bridge/vk_to_mtl_map.h
+index d16a68b..9334113 100644
+--- a/src/kosmickrisp/bridge/vk_to_mtl_map.h
++++ b/src/kosmickrisp/bridge/vk_to_mtl_map.h
+@@ -20,6 +20,7 @@ enum mtl_sampler_reduction_mode;
+ enum mtl_compare_function;
+ enum mtl_winding;
+ enum mtl_cull_mode;
++enum mtl_triangle_fill_mode;
+ enum mtl_index_type;
+ enum mtl_command_queue_error;
+ enum mtl_depth_resolve_filter;
+@@ -39,6 +40,7 @@ enum VkSamplerReductionMode;
+ enum VkCompareOp;
+ enum VkFrontFace;
+ enum VkCullModeFlagBits;
++enum VkPolygonMode;
+ enum VkResolveModeFlagBits;
+ 
+ /* STRUCTS */
+@@ -84,6 +86,9 @@ enum mtl_winding vk_front_face_to_mtl_winding(enum VkFrontFace face);
+ 
+ enum mtl_cull_mode vk_front_face_to_mtl_cull_mode(enum VkCullModeFlagBits mode);
+ 
++enum mtl_triangle_fill_mode
++vk_polygon_mode_to_mtl_triangle_fill_mode(enum VkPolygonMode mode);
++
+ enum mtl_depth_resolve_filter
+ vk_resolve_mode_to_mtl_depth_resolve_filter(
+    enum VkResolveModeFlagBits resolve_mode);
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index f681a4d..cba5139 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1439,6 +1439,10 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+       }
+    }
+ 
++   if (IS_DIRTY(RS_POLYGON_MODE))
++      mtl_set_triangle_fill_mode(
++         enc, vk_polygon_mode_to_mtl_triangle_fill_mode(dyn->rs.polygon_mode));
++
+    /* We enable raster discard by setting scissor to size (0, 0) */
+    if (!(rast_discard || gfx->is_cull_front_and_back) &&
+        (IS_DIRTY(VP_VIEWPORT_COUNT) || IS_DIRTY(VP_VIEWPORTS) ||
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index a6e734f..ece9815 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -230,6 +230,7 @@ kk_get_device_features(
+       .depthBiasClamp = true,
+       .depthBounds = pdev->info.gpu_apple_family >= 10,
+       .depthClamp = true,
++      .fillModeNonSolid = true,
+       .drawIndirectFirstInstance = true,
+       .dualSrcBlend = true,
+       .fragmentStoresAndAtomics = true,
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,737 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Wed, 7 Oct 2026 13:51:13 +0300
+Subject: [PATCH] kk: residency of sparse loads through texel buffer views
+
+Metal has no sparse read of texture buffers, so sparse loads through texel
+buffer views of sparse residency buffers reported every texel resident
+(vkd3d-proton's CheckAccessFullyMapped after typed buffer loads:
+test_buffer_feedback_instructions, test_sparse_default_mapping).
+
+Sparse residency buffers get a residency texture: an R8Uint placement
+sparse 2D array whose 64 KiB tiles are the buffer's pages, mapped to the
+same heap pages by the same queue mapping updates. Texel buffer descriptors
+grow to 32 bytes with the residency texture and the page lookup of the
+view; sparse loads AND the residency of a sparse_read of their page's tile
+into their code.
+
+Metal crashes in updateTextureMappings when a texture mapping update
+follows a buffer (or texture buffer) mapping update that followed a texture
+mapping update with nothing in between; a signal of an event the queue
+then waits for separates them (a signal alone let later buffer mapping
+updates overtake earlier ones). Buffer binds go in passes (pages, views,
+residency texture) so a submit needs at most one separator.
+---
+ src/kosmickrisp/compiler/nir_to_msl.c         |   8 +-
+ src/kosmickrisp/vulkan/kk_buffer_view.h       |   5 +
+ src/kosmickrisp/vulkan/kk_descriptor_set.c    |   4 +
+ src/kosmickrisp/vulkan/kk_descriptor_types.h  |  22 +-
+ .../vulkan/kk_nir_lower_descriptors.c         |  81 ++++-
+ src/kosmickrisp/vulkan/kk_queue.h             |  18 +-
+ src/kosmickrisp/vulkan/kk_sparse.c            | 295 +++++++++++++++---
+ 7 files changed, 385 insertions(+), 48 deletions(-)
+
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index 6f8b662..cc99c3e 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -2609,9 +2609,11 @@ static bool
+ msl_split_sparse_fetch(nir_builder *b, nir_instr *instr, void *data)
+ {
+    nir_def *def;
+-   /* Multisampled and buffer images are never sparse (no sparseResidency*
+-    * samples features, Vulkan has no sparse texel buffers): their texels are
+-    * all resident and MSL has no sparse read for them. */
++   /* Multisampled images are never sparse (no sparseResidency*Samples
++    * features) and MSL has no sparse read of texture buffers: these reads
++    * are resident here. Texel buffers of sparse buffers get the residency of
++    * their page from the driver (kk_nir_lower_descriptors.c), ANDed into the
++    * code. */
+    bool always_resident;
+    if (instr->type == nir_instr_type_tex && nir_instr_as_tex(instr)->is_sparse) {
+       nir_tex_instr *tex = nir_instr_as_tex(instr);
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.h b/src/kosmickrisp/vulkan/kk_buffer_view.h
+index 4c7de5e..3313328 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.h
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.h
+@@ -36,6 +36,11 @@ struct kk_buffer_view {
+    struct list_head sparse_link;
+    uint64_t sparse_first_page;
+    uint64_t sparse_page_count;
++   /* Residency texture of a sparse residency buffer and the descriptor's
++    * page lookup (struct kk_texel_buffer_descriptor); 0 otherwise. */
++   uint64_t residency_gpu_id;
++   uint32_t residency_page_shift;
++   uint32_t residency_last_page;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_buffer_view, vk.base, VkBufferView,
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set.c b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+index 3a8d74f..18764eb 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -239,6 +239,10 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
+ 
+       desc.image_gpu_resource_id = view->texel_buffer_gpu_id;
+       desc.texel_offset = view->texel_offset;
++      desc.residency_gpu_resource_id = view->residency_gpu_id;
++      desc.residency_first_page = view->sparse_first_page;
++      desc.residency_page_shift = view->residency_page_shift;
++      desc.residency_last_page = view->residency_last_page;
+    }
+    write_desc(set, binding, elem, &desc, sizeof(desc));
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_types.h b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+index 4e42b9a..18cf6f5 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_types.h
++++ b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+@@ -55,16 +55,34 @@ static_assert(sizeof(struct kk_storage_image_descriptor) == 8,
+  * vkd3d-proton): the Metal texture starts at the aligned offset below the
+  * view, and shaders add texel_offset to coordinates (and take it off sizes).
+  * image_gpu_resource_id is first, like in the other image descriptors.
++ *
++ * Views of sparse residency buffers: Metal has no sparse read of texture
++ * buffers, so sparse loads read the residency of their page from the buffer's
++ * residency texture (kk_sparse.c, KK_SPARSE_RESIDENCY_*): texel x of the Metal
++ * texture is in buffer page
++ * min(residency_first_page + (x >> residency_page_shift), residency_last_page).
++ * residency_gpu_resource_id is 0 for other views (always resident).
+  */
+ struct kk_texel_buffer_descriptor {
+    uint64_t image_gpu_resource_id;
+    uint32_t texel_offset;
+-   uint32_t pad;
++   uint32_t residency_first_page;
++   uint64_t residency_gpu_resource_id;
++   uint32_t residency_page_shift;
++   uint32_t residency_last_page;
+ };
+ 
+-static_assert(sizeof(struct kk_texel_buffer_descriptor) == 16,
++static_assert(sizeof(struct kk_texel_buffer_descriptor) == 32,
+               "kk_texel_buffer_descriptor has no holes");
+ 
++/* The residency texture of a sparse residency buffer: an R8Uint 2D array of
++ * 256x256 texel (64 KiB) tiles, one per buffer page, 64 tiles per row and
++ * 64 rows per layer: page p is the tile at texel
++ * ((p % 64) * 256, (p / 64 % 64) * 256) of layer p / 4096. */
++#define KK_SPARSE_RESIDENCY_TILE_PX_LOG2     8u
++#define KK_SPARSE_RESIDENCY_ROW_TILES_LOG2   6u
++#define KK_SPARSE_RESIDENCY_LAYER_TILES_LOG2 12u
++
+ /* This has to match nir_address_format_64bit_bounded_global */
+ struct kk_buffer_address {
+    uint64_t base_addr;
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+index 2ca09b4..d53e155 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -360,6 +360,71 @@ load_resource_deref_desc(nir_builder *b, unsigned num_components,
+                           offset_B, ctx);
+ }
+ 
++/* Residency of texel x (from the start of the Metal texture) of a texel
++ * buffer: Metal has no sparse read of texture buffers, so views of sparse
++ * residency buffers read their page's tile in the buffer's residency texture
++ * (struct kk_texel_buffer_descriptor); other views are always resident. */
++static nir_def *
++load_texel_buffer_residency(nir_builder *b, nir_deref_instr *deref,
++                            nir_def *x, const struct lower_descriptors_ctx *ctx)
++{
++   const unsigned offs =
++      offsetof(struct kk_texel_buffer_descriptor, residency_gpu_resource_id);
++   nir_def *desc = load_resource_deref_desc(b, 4, 32, deref, offs, ctx);
++   nir_def *first_page = load_resource_deref_desc(
++      b, 1, 32, deref,
++      offsetof(struct kk_texel_buffer_descriptor, residency_first_page), ctx);
++
++   nir_def *handle = nir_load_texture_handle_kk(
++      b, 1, 64, load_resource_addr(b, 1, 64, deref, offs, ctx),
++      .dest_type = nir_type_uint32, .image_dim = GLSL_SAMPLER_DIM_2D,
++      .image_array = true, .access = ACCESS_NON_WRITEABLE,
++      .flags = MSL_ACCESS_READ);
++   nir_def *page = nir_umin(
++      b,
++      nir_iadd(b, first_page,
++               nir_ushr(b, nir_u2u32(b, x), nir_channel(b, desc, 2))),
++      nir_channel(b, desc, 3));
++   const unsigned row_mask = (1u << KK_SPARSE_RESIDENCY_ROW_TILES_LOG2) - 1u;
++   const unsigned rows_mask = (1u << (KK_SPARSE_RESIDENCY_LAYER_TILES_LOG2 -
++                                      KK_SPARSE_RESIDENCY_ROW_TILES_LOG2)) -
++                              1u;
++   nir_def *coord = nir_vec4(
++      b,
++      nir_ishl_imm(b, nir_iand_imm(b, page, row_mask),
++                   KK_SPARSE_RESIDENCY_TILE_PX_LOG2),
++      nir_ishl_imm(b,
++                   nir_iand_imm(b,
++                                nir_ushr_imm(b, page,
++                                             KK_SPARSE_RESIDENCY_ROW_TILES_LOG2),
++                                rows_mask),
++                   KK_SPARSE_RESIDENCY_TILE_PX_LOG2),
++      nir_ushr_imm(b, page, KK_SPARSE_RESIDENCY_LAYER_TILES_LOG2),
++      nir_imm_int(b, 0));
++   nir_def *zero = nir_imm_int(b, 0), *resident = nir_imm_int(b, 1);
++   nir_push_if(b, nir_ine_imm(b, nir_ior(b, nir_channel(b, desc, 0),
++                                         nir_channel(b, desc, 1)),
++                              0));
++   nir_def *read = nir_bindless_image_sparse_load(
++      b, 5, 32, handle, coord, zero, zero, .image_dim = GLSL_SAMPLER_DIM_2D,
++      .image_array = true, .dest_type = nir_type_uint32,
++      .access = ACCESS_NON_WRITEABLE);
++   nir_def *code = nir_channel(b, read, 4);
++   nir_pop_if(b, NULL);
++   return nir_if_phi(b, code, resident);
++}
++
++/* ANDs a residency code into the last component of a sparse load's def */
++static void
++and_sparse_residency(nir_builder *b, nir_instr *instr, nir_def *def,
++                     nir_def *residency)
++{
++   b->cursor = nir_after_instr(instr);
++   const unsigned code_comp = def->num_components - 1;
++   nir_def *code = nir_iand(b, nir_channel(b, def, code_comp), residency);
++   nir_def_rewrite_uses_after(def, nir_vector_insert_imm(b, def, code, code_comp));
++}
++
+ static bool
+ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
+                    const struct lower_descriptors_ctx *ctx)
+@@ -396,7 +461,7 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
+    /* Texel buffers: the Metal texture starts texel_offset texels before the
+     * view (struct kk_texel_buffer_descriptor).
+     */
+-   nir_def *texel_offset = NULL;
++   nir_def *texel_offset = NULL, *residency = NULL;
+    if (nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF) {
+       texel_offset = load_resource_deref_desc(
+          b, 1, 32, deref,
+@@ -406,11 +471,16 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
+          nir_def *x = nir_iadd(b, nir_channel(b, coord, 0),
+                                nir_u2uN(b, texel_offset, coord->bit_size));
+          nir_src_rewrite(&intr->src[1], nir_vector_insert_imm(b, coord, x, 0));
++         if (intr->intrinsic == nir_intrinsic_image_deref_sparse_load)
++            residency = load_texel_buffer_residency(b, deref, x, ctx);
+       }
+    }
+ 
+    nir_rewrite_image_intrinsic(intr, handle, nir_image_intrinsic_type_bindless);
+ 
++   if (residency)
++      and_sparse_residency(b, &intr->instr, &intr->def, residency);
++
+    if (texel_offset && intr->intrinsic == nir_intrinsic_bindless_image_size) {
+       b->cursor = nir_after_instr(&intr->instr);
+       nir_def *size = &intr->def;
+@@ -623,6 +693,12 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+                                   nir_u2uN(b, texel_offset, coord->bit_size));
+             nir_src_rewrite(&tex->src[coord_idx].src,
+                             nir_vector_insert_imm(b, coord, x, 0));
++            if (tex->is_sparse) {
++               nir_def *residency = load_texel_buffer_residency(
++                  b, nir_src_as_deref(nir_src_for_ssa(texture)), x, ctx);
++               and_sparse_residency(b, &tex->instr, &tex->def, residency);
++               b->cursor = nir_before_instr(&tex->instr);
++            }
+          }
+       }
+    }
+@@ -861,8 +937,9 @@ kk_nir_lower_descriptors(nir_shader *nir,
+     * TODO: See if we can unify this, not sure if the fast path matters on
+     * Apple. This is inherited from NVK.
+     */
++   /* Sparse texel buffer loads add control flow (load_texel_buffer_residency) */
+    bool pass_lower_descriptors = nir_shader_instructions_pass(
+-      nir, try_lower_descriptors_instr, nir_metadata_control_flow, &ctx);
++      nir, try_lower_descriptors_instr, nir_metadata_none, &ctx);
+ 
+    bool pass_lower_ssbo = nir_shader_intrinsics_pass(
+       nir, lower_ssbo_descriptor, nir_metadata_control_flow, &ctx);
+diff --git a/src/kosmickrisp/vulkan/kk_queue.h b/src/kosmickrisp/vulkan/kk_queue.h
+index 5ebc726..8519605 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.h
++++ b/src/kosmickrisp/vulkan/kk_queue.h
+@@ -17,6 +17,7 @@
+ #include "vk_queue.h"
+ 
+ #include "c11/threads.h"
++#include "util/simple_mtx.h"
+ 
+ struct kk_queue {
+    struct vk_queue vk;
+@@ -32,12 +33,19 @@ struct kk_queue {
+    mtx_t mutex;
+    cnd_t cond;
+ 
+-   /* A one page placement sparse buffer and the heap page it maps after
+-    * vkQueueBindSparse unmaps pages (kk_sparse.c) */
++   /* vkQueueBindSparse (kk_sparse.c): a one page placement sparse buffer and
++    * the heap page it maps after unmaps of buffer pages, and the event that
++    * separates texture mapping updates from earlier buffer mapping updates.
++    * lock orders the queue's mapping updates. */
+    struct {
+-      mtl_buffer *buffer;
+-      struct kk_bo *bo;
+-   } sparse_flush;
++      mtl_buffer *flush_buffer;
++      struct kk_bo *flush_bo;
++      mtl_event *separator;
++      uint64_t separator_value;
++      simple_mtx_t lock;
++      bool texture_mapped;
++      bool buffer_after_texture;
++   } sparse;
+ };
+ 
+ static inline struct kk_device *
+diff --git a/src/kosmickrisp/vulkan/kk_sparse.c b/src/kosmickrisp/vulkan/kk_sparse.c
+index d3888e6..54fed37 100644
+--- a/src/kosmickrisp/vulkan/kk_sparse.c
++++ b/src/kosmickrisp/vulkan/kk_sparse.c
+@@ -8,6 +8,7 @@
+ #include "kk_bo.h"
+ #include "kk_buffer.h"
+ #include "kk_buffer_view.h"
++#include "kk_descriptor_types.h"
+ #include "kk_device.h"
+ #include "kk_device_memory.h"
+ #include "kk_format.h"
+@@ -228,6 +229,58 @@ kk_sparse_memory_heap(const struct kk_device_memory *mem)
+    return mem ? mem->bo->mtl_handle : NULL;
+ }
+ 
++/* Mapping updates on the Metal queue. Metal (macOS 27.0.1, M1 Max) crashes in
++ * MTL4CommandQueue updateTextureMappings (a NULL dereference in the AGX
++ * compute context) when a mapping update of a texture follows one of a buffer
++ * or texture buffer that followed one of a texture, with no other operation
++ * on the queue in between. An event signal in between avoids the crash, but
++ * alone it let later buffer mapping updates overtake earlier ones (vkd3d-
++ * proton's remap stress lost unmaps); the queue also waits for it. */
++static void
++kk_sparse_update_texture(struct kk_queue *queue, mtl_texture *texture,
++                         mtl_heap *heap,
++                         const struct mtl_sparse_texture_mapping *mappings,
++                         uint32_t count)
++{
++   simple_mtx_lock(&queue->sparse.lock);
++   if (queue->sparse.buffer_after_texture) {
++      mtl_signal_event(queue->mtl_handle, queue->sparse.separator,
++                       ++queue->sparse.separator_value);
++      mtl_wait_for_event(queue->mtl_handle, queue->sparse.separator,
++                         queue->sparse.separator_value);
++      queue->sparse.buffer_after_texture = false;
++   }
++   queue->sparse.texture_mapped = true;
++   mtl_command_queue_update_texture_mappings(queue->mtl_handle, texture, heap,
++                                             mappings, count);
++   simple_mtx_unlock(&queue->sparse.lock);
++}
++
++static void
++kk_sparse_update_texture_buffer(
++   struct kk_queue *queue, mtl_texture *texture, mtl_heap *heap,
++   const struct mtl_sparse_texture_mapping *mappings, uint32_t count)
++{
++   simple_mtx_lock(&queue->sparse.lock);
++   queue->sparse.buffer_after_texture |= queue->sparse.texture_mapped;
++   mtl_command_queue_update_texture_mappings(queue->mtl_handle, texture, heap,
++                                             mappings, count);
++   simple_mtx_unlock(&queue->sparse.lock);
++}
++
++static void
++kk_sparse_update_buffer(struct kk_queue *queue, mtl_buffer *buffer,
++                        mtl_heap *heap,
++                        const struct mtl_sparse_buffer_mapping *mappings,
++                        uint32_t count)
++{
++   simple_mtx_lock(&queue->sparse.lock);
++   queue->sparse.buffer_after_texture |= queue->sparse.texture_mapped;
++   mtl_command_queue_update_buffer_mappings(queue->mtl_handle, buffer, heap,
++                                            mappings, count);
++   simple_mtx_unlock(&queue->sparse.lock);
++}
++
+ /* What vkQueueBindSparse mapped to each page of a sparse buffer, so its texel
+  * buffer views (placement sparse texture buffers: Metal makes no texture from
+  * a placement sparse buffer, newTextureWithDescriptor returns nil) can be
+@@ -235,7 +288,15 @@ kk_sparse_memory_heap(const struct kk_device_memory *mem)
+  * are the buffer's 64 KiB pages, linearly. Mapped heaps are retained: memory
+  * may be freed while pages still map it (vkd3d-proton does), and a later view
+  * maps those pages too. Shared by the buffer and its views, any of which may
+- * be destroyed last. */
++ * be destroyed last.
++ *
++ * Sparse residency buffers also have a residency texture for sparse loads
++ * through their views (Metal has no sparse read of texture buffers): an
++ * R8Uint placement sparse 2D array whose 64 KiB tiles are the buffer's pages
++ * (KK_SPARSE_RESIDENCY_*), mapped to the same heap pages by the same queue
++ * mapping updates, so a sparse_read of a page's tile has the page's
++ * residency, ordered with the page's data. Its texels alias the page's bytes
++ * and are never used. */
+ struct kk_sparse_buffer_page {
+    mtl_heap *heap; /* NULL: unmapped */
+    uint64_t heap_page;
+@@ -246,10 +307,93 @@ struct kk_sparse_buffer {
+    /* Orders page updates and the views' Metal mapping updates */
+    simple_mtx_t lock;
+    struct list_head views;
++   mtl_texture *residency;
++   uint64_t residency_gpu_id;
+    uint64_t page_count;
+    struct kk_sparse_buffer_page pages[];
+ };
+ 
++#define KK_SPARSE_RESIDENCY_ROW_TILES   (1u << KK_SPARSE_RESIDENCY_ROW_TILES_LOG2)
++#define KK_SPARSE_RESIDENCY_LAYER_TILES (1u << KK_SPARSE_RESIDENCY_LAYER_TILES_LOG2)
++
++static VkResult
++kk_sparse_buffer_residency_init(struct kk_device *dev,
++                                struct kk_sparse_buffer *sparse)
++{
++   const uint64_t pages = sparse->page_count;
++   const uint32_t tile_px = 1u << KK_SPARSE_RESIDENCY_TILE_PX_LOG2;
++   const uint64_t rows = DIV_ROUND_UP(MIN2(pages, KK_SPARSE_RESIDENCY_LAYER_TILES),
++                                      KK_SPARSE_RESIDENCY_ROW_TILES);
++   const uint64_t layers = DIV_ROUND_UP(pages, KK_SPARSE_RESIDENCY_LAYER_TILES);
++   if (layers > 2048u)
++      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                       "sparse residency buffer of %" PRIu64 " pages",
++                       pages);
++
++   const struct kk_va_format *va = kk_get_va_format(PIPE_FORMAT_R8_UINT);
++   struct kk_image_layout layout = {
++      .width_px = MIN2(pages, KK_SPARSE_RESIDENCY_ROW_TILES) * tile_px,
++      .height_px = rows * tile_px,
++      .depth_px = 1u,
++      .layers = layers,
++      .type = MTL_TEXTURE_TYPE_2D_ARRAY,
++      .sample_count_sa = 1u,
++      .levels = 1u,
++      .usage = MTL_TEXTURE_USAGE_SHADER_READ,
++      .format = {.pipe = PIPE_FORMAT_R8_UINT, .mtl = va->mtl_pixel_format},
++   };
++   struct mtl_size tile = mtl_placement_sparse_tile_size(dev->mtl_handle, &layout);
++   if (tile.x != tile_px || tile.y != tile_px || tile.z != 1u)
++      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                       "R8Uint sparse tiles are %ux%ux%u, not 256x256x1",
++                       (unsigned)tile.x, (unsigned)tile.y, (unsigned)tile.z);
++
++   sparse->residency = mtl_new_placement_sparse_texture(dev->mtl_handle, &layout);
++   if (sparse->residency == NULL)
++      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                       "Metal failed to create the residency texture of a "
++                       "sparse buffer of %" PRIu64 " pages",
++                       pages);
++   kk_device_add_allocation_to_residency_set(dev, sparse->residency);
++   sparse->residency_gpu_id = mtl_texture_get_gpu_resource_id(sparse->residency);
++   return VK_SUCCESS;
++}
++
++/* Maps (heap) or unmaps (NULL) the residency texture tiles of count buffer
++ * pages from page first, to heap pages from heap_first */
++static void
++kk_sparse_buffer_map_residency(struct kk_queue *queue,
++                               struct kk_sparse_buffer *sparse, mtl_heap *heap,
++                               uint64_t first, uint64_t count,
++                               uint64_t heap_first)
++{
++   if (sparse->residency == NULL)
++      return;
++
++   struct mtl_sparse_texture_mapping mappings[16];
++   uint32_t n = 0u;
++   for (uint64_t p = first; p < first + count;) {
++      const uint64_t x = p % KK_SPARSE_RESIDENCY_ROW_TILES;
++      const uint64_t len =
++         MIN2(KK_SPARSE_RESIDENCY_ROW_TILES - x, first + count - p);
++      mappings[n++] = (struct mtl_sparse_texture_mapping){
++         .unmap = heap == NULL,
++         .origin = {x, (p / KK_SPARSE_RESIDENCY_ROW_TILES) %
++                          (KK_SPARSE_RESIDENCY_LAYER_TILES /
++                           KK_SPARSE_RESIDENCY_ROW_TILES),
++                    0},
++         .size = {len, 1, 1},
++         .slice = p / KK_SPARSE_RESIDENCY_LAYER_TILES,
++         .heap_offset = heap ? heap_first + (p - first) : 0u,
++      };
++      p += len;
++      if (n == ARRAY_SIZE(mappings) || p == first + count) {
++         kk_sparse_update_texture(queue, sparse->residency, heap, mappings, n);
++         n = 0u;
++      }
++   }
++}
++
+ VkResult
+ kk_buffer_sparse_init(struct kk_device *dev, struct kk_buffer *buffer)
+ {
+@@ -266,6 +410,14 @@ kk_buffer_sparse_init(struct kk_device *dev, struct kk_buffer *buffer)
+    simple_mtx_init(&sparse->lock, mtx_plain);
+    list_inithead(&sparse->views);
+    sparse->page_count = page_count;
++   if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT) {
++      VkResult result = kk_sparse_buffer_residency_init(dev, sparse);
++      if (result != VK_SUCCESS) {
++         simple_mtx_destroy(&sparse->lock);
++         vk_free(&dev->vk.alloc, sparse);
++         return result;
++      }
++   }
+    buffer->sparse = sparse;
+    return VK_SUCCESS;
+ }
+@@ -281,6 +433,10 @@ kk_sparse_buffer_unref(struct kk_device *dev, struct kk_sparse_buffer *sparse)
+       if (sparse->pages[p].heap)
+          mtl_release(sparse->pages[p].heap);
+    }
++   if (sparse->residency) {
++      kk_device_remove_allocation_from_residency_set(dev, sparse->residency);
++      mtl_release(sparse->residency);
++   }
+    simple_mtx_destroy(&sparse->lock);
+    vk_free(&dev->vk.alloc, sparse);
+ }
+@@ -314,6 +470,15 @@ kk_buffer_view_sparse_init(struct kk_device *dev, struct kk_buffer_view *view,
+    view->sparse_page_count =
+       MIN2(DIV_ROUND_UP(layout->width_px * texel_B, KK_SPARSE_PAGE_SIZE_B),
+            sparse->page_count - first_page);
++   if (sparse->residency) {
++      /* Views of sparse buffers keep texels within pages (kk_buffer_view.c):
++       * Metal's texture buffer formats are 1 to 16 bytes, powers of two. */
++      assert(util_is_power_of_two_nonzero64(texel_B));
++      view->residency_gpu_id = sparse->residency_gpu_id;
++      view->residency_page_shift =
++         util_logbase2(KK_SPARSE_PAGE_SIZE_B) - util_logbase2_64(texel_B);
++      view->residency_last_page = sparse->page_count - 1u;
++   }
+ 
+    simple_mtx_lock(&sparse->lock);
+    /* Map what the buffer maps, after its earlier mapping updates (the same
+@@ -335,9 +500,9 @@ kk_buffer_view_sparse_init(struct kk_device *dev, struct kk_buffer_view *view,
+             .size = {n, 1, 1},
+             .heap_offset = pages[p].heap_page,
+          };
+-         mtl_command_queue_update_texture_mappings(
+-            dev->queue.mtl_handle, view->mtl_texel_buffer_handle,
+-            pages[p].heap, &mapping, 1u);
++         kk_sparse_update_texture_buffer(&dev->queue,
++                                         view->mtl_texel_buffer_handle,
++                                         pages[p].heap, &mapping, 1u);
+          p += n;
+       }
+    }
+@@ -363,10 +528,17 @@ kk_buffer_view_sparse_finish(struct kk_device *dev, struct kk_buffer_view *view)
+    kk_sparse_buffer_unref(dev, sparse);
+ }
+ 
+-/* Returns whether a page was unmapped */
++/* Buffer binds of a submit go in passes, each over every bind of the submit:
++ * the buffer's pages (recorded), its texel buffer views, then its residency
++ * texture, so the texture mapping updates of a submit need at most one
++ * separator (kk_sparse_update_texture). Heaps the pages no longer map are
++ * appended to `released` and released after the submit's last mapping update:
++ * the residency texture and the views map them until their passes (memory
++ * may already be freed). Returns whether a page was unmapped. */
+ static bool
+-kk_sparse_bind_buffer(struct kk_queue *queue,
+-                      const VkSparseBufferMemoryBindInfo *info)
++kk_sparse_bind_buffer_pages(struct kk_queue *queue,
++                            const VkSparseBufferMemoryBindInfo *info,
++                            struct util_dynarray *released)
+ {
+    VK_FROM_HANDLE(kk_buffer, buffer, info->buffer);
+    struct kk_sparse_buffer *sparse = buffer->sparse;
+@@ -389,7 +561,7 @@ kk_sparse_bind_buffer(struct kk_queue *queue,
+          if (heap)
+             mtl_retain(heap);
+          if (page->heap)
+-            mtl_release(page->heap);
++            util_dynarray_append(released, page->heap);
+          *page = (struct kk_sparse_buffer_page){
+             .heap = heap,
+             .heap_page = heap ? heap_first + p : 0u,
+@@ -402,8 +574,40 @@ kk_sparse_bind_buffer(struct kk_queue *queue,
+          .length = count,
+          .heap_offset = heap_first,
+       };
+-      mtl_command_queue_update_buffer_mappings(
+-         queue->mtl_handle, buffer->metal.handle, heap, &mapping, 1u);
++      kk_sparse_update_buffer(queue, buffer->metal.handle, heap, &mapping, 1u);
++      simple_mtx_unlock(&sparse->lock);
++
++      unmapped |= heap == NULL;
++   }
++
++   return unmapped;
++}
++
++static void
++kk_sparse_bind_buffer_textures(struct kk_queue *queue,
++                               const VkSparseBufferMemoryBindInfo *info,
++                               bool residency)
++{
++   VK_FROM_HANDLE(kk_buffer, buffer, info->buffer);
++   struct kk_sparse_buffer *sparse = buffer->sparse;
++
++   for (uint32_t i = 0; i < info->bindCount; ++i) {
++      const VkSparseMemoryBind *bind = &info->pBinds[i];
++      VK_FROM_HANDLE(kk_device_memory, mem, bind->memory);
++      mtl_heap *heap = kk_sparse_memory_heap(mem);
++
++      const uint64_t first = bind->resourceOffset / KK_SPARSE_PAGE_SIZE_B;
++      const uint64_t count = DIV_ROUND_UP(bind->size, KK_SPARSE_PAGE_SIZE_B);
++      const uint64_t heap_first =
++         mem ? bind->memoryOffset / KK_SPARSE_PAGE_SIZE_B : 0u;
++
++      simple_mtx_lock(&sparse->lock);
++      if (residency) {
++         kk_sparse_buffer_map_residency(queue, sparse, heap, first, count,
++                                        heap_first);
++         simple_mtx_unlock(&sparse->lock);
++         continue;
++      }
+ 
+       list_for_each_entry(struct kk_buffer_view, view, &sparse->views,
+                           sparse_link) {
+@@ -420,16 +624,11 @@ kk_sparse_bind_buffer(struct kk_queue *queue,
+             .size = {end - start, 1, 1},
+             .heap_offset = heap ? heap_first + (start - first) : 0u,
+          };
+-         mtl_command_queue_update_texture_mappings(
+-            queue->mtl_handle, view->mtl_texel_buffer_handle, heap,
+-            &view_mapping, 1u);
++         kk_sparse_update_texture_buffer(
++            queue, view->mtl_texel_buffer_handle, heap, &view_mapping, 1u);
+       }
+       simple_mtx_unlock(&sparse->lock);
+-
+-      unmapped |= heap == NULL;
+    }
+-
+-   return unmapped;
+ }
+ 
+ /* Metal (macOS 27.0.1, M1 Max) holds back unmaps of placement sparse buffer
+@@ -439,17 +638,23 @@ kk_sparse_bind_buffer(struct kk_queue *queue,
+ VkResult
+ kk_queue_sparse_init(struct kk_device *dev, struct kk_queue *queue)
+ {
++   simple_mtx_init(&queue->sparse.lock, mtx_plain);
++
++   queue->sparse.separator = mtl_new_event(dev->mtl_handle);
++   if (queue->sparse.separator == NULL)
++      return vk_error(queue, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++
+    VkResult result = kk_alloc_sparse_bo(dev, &queue->vk.base,
+                                         KK_SPARSE_PAGE_SIZE_B,
+-                                        &queue->sparse_flush.bo);
++                                        &queue->sparse.flush_bo);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+-   queue->sparse_flush.buffer =
++   queue->sparse.flush_buffer =
+       mtl_new_placement_sparse_buffer(dev->mtl_handle, KK_SPARSE_PAGE_SIZE_B);
+-   if (queue->sparse_flush.buffer == NULL)
++   if (queue->sparse.flush_buffer == NULL)
+       return vk_error(queue, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+-   kk_device_add_allocation_to_residency_set(dev, queue->sparse_flush.buffer);
++   kk_device_add_allocation_to_residency_set(dev, queue->sparse.flush_buffer);
+ 
+    return VK_SUCCESS;
+ }
+@@ -457,24 +662,31 @@ kk_queue_sparse_init(struct kk_device *dev, struct kk_queue *queue)
+ void
+ kk_queue_sparse_finish(struct kk_device *dev, struct kk_queue *queue)
+ {
+-   if (queue->sparse_flush.buffer) {
++   if (queue->sparse.flush_buffer) {
+       kk_device_remove_allocation_from_residency_set(
+-         dev, queue->sparse_flush.buffer);
+-      mtl_release(queue->sparse_flush.buffer);
++         dev, queue->sparse.flush_buffer);
++      mtl_release(queue->sparse.flush_buffer);
+    }
+-   if (queue->sparse_flush.bo)
+-      kk_destroy_bo(dev, queue->sparse_flush.bo);
++   if (queue->sparse.flush_bo)
++      kk_destroy_bo(dev, queue->sparse.flush_bo);
++   if (queue->sparse.separator)
++      mtl_release(queue->sparse.separator);
++   if (dev->vk.enabled_features.sparseBinding)
++      simple_mtx_destroy(&queue->sparse.lock);
+ }
+ 
++/* Metal (macOS 27.0.1, M1 Max) holds back unmaps of placement sparse buffer
++ * pages until the queue maps a page of a resident resource: unmapped pages
++ * kept reading and writing their old memory. Mapping the queue's resident one
++ * page buffer applies them. */
+ static void
+ kk_sparse_apply_unmaps(struct kk_queue *queue)
+ {
+    const struct mtl_sparse_buffer_mapping mapping = {
+       .length = 1u,
+    };
+-   mtl_command_queue_update_buffer_mappings(
+-      queue->mtl_handle, queue->sparse_flush.buffer,
+-      queue->sparse_flush.bo->mtl_handle, &mapping, 1u);
++   kk_sparse_update_buffer(queue, queue->sparse.flush_buffer,
++                           queue->sparse.flush_bo->mtl_handle, &mapping, 1u);
+ }
+ 
+ /* Page `page` of the opaque layout (see struct kk_image_sparse) as the start
+@@ -543,9 +755,9 @@ kk_sparse_bind_image_opaque(struct kk_queue *queue,
+          p += mapping.size.x;
+       }
+ 
+-      mtl_command_queue_update_texture_mappings(
+-         queue->mtl_handle, image->planes[0].mtl_handle,
+-         kk_sparse_memory_heap(mem), util_dynarray_begin(mappings),
++      kk_sparse_update_texture(
++         queue, image->planes[0].mtl_handle, kk_sparse_memory_heap(mem),
++         util_dynarray_begin(mappings),
+          util_dynarray_num_elements(mappings,
+                                     struct mtl_sparse_texture_mapping));
+    }
+@@ -576,9 +788,8 @@ kk_sparse_bind_image(struct kk_queue *queue,
+          .slice = bind->subresource.arrayLayer,
+          .heap_offset = mem ? bind->memoryOffset / KK_SPARSE_PAGE_SIZE_B : 0u,
+       };
+-      mtl_command_queue_update_texture_mappings(
+-         queue->mtl_handle, image->planes[0].mtl_handle,
+-         kk_sparse_memory_heap(mem), &mapping, 1u);
++      kk_sparse_update_texture(queue, image->planes[0].mtl_handle,
++                               kk_sparse_memory_heap(mem), &mapping, 1u);
+    }
+ }
+ 
+@@ -586,9 +797,17 @@ void
+ kk_queue_bind_sparse(struct kk_queue *queue,
+                      const struct vk_queue_submit *submit)
+ {
++   struct util_dynarray released;
++   util_dynarray_init(&released, NULL);
+    bool unmapped = false;
++   for (uint32_t i = 0; i < submit->buffer_bind_count; ++i) {
++      unmapped |= kk_sparse_bind_buffer_pages(queue, &submit->buffer_binds[i],
++                                              &released);
++   }
+    for (uint32_t i = 0; i < submit->buffer_bind_count; ++i)
+-      unmapped |= kk_sparse_bind_buffer(queue, &submit->buffer_binds[i]);
++      kk_sparse_bind_buffer_textures(queue, &submit->buffer_binds[i], false);
++   for (uint32_t i = 0; i < submit->buffer_bind_count; ++i)
++      kk_sparse_bind_buffer_textures(queue, &submit->buffer_binds[i], true);
+ 
+    struct util_dynarray mappings;
+    util_dynarray_init(&mappings, NULL);
+@@ -602,4 +821,8 @@ kk_queue_bind_sparse(struct kk_queue *queue,
+ 
+    if (unmapped)
+       kk_sparse_apply_unmaps(queue);
++
++   util_dynarray_foreach(&released, mtl_heap *, heap)
++      mtl_release(*heap);
++   util_dynarray_fini(&released);
+ }

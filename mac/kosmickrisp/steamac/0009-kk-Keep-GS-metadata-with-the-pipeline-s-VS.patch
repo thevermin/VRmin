@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Willie Abrams <willie@pobox.com>
+Date: Thu, 1 Oct 2026 14:05:23 -0500
+Subject: [PATCH 09/19] kk: Keep GS metadata with the pipeline's VS
+
+Use the GS info saved in the vertex shader rather than looking up the
+bound geometry shader. That also lets draws find the info for a GS the
+driver adds for transform feedback.
+
+Assisted-by: Claude Code
+---
+ src/kosmickrisp/vulkan/kk_cmd_draw.c | 44 ++++++++++++++++++----------
+ src/kosmickrisp/vulkan/kk_shader.c   |  1 +
+ src/kosmickrisp/vulkan/kk_shader.h   |  4 +++
+ 3 files changed, 33 insertions(+), 16 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 3ff27fd..222b13c 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -833,13 +833,26 @@ kk_calculate_vbo_clamp(uint64_t vbuf, uint64_t sink, enum pipe_format format,
+    }
+ }
+ 
++/* The VS keeps the pipeline's GS info. Return NULL if the pipeline has no
++ * GS. */
++static const struct poly_gs_info *
++kk_gs_info(struct kk_cmd_buffer *cmd)
++{
++   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
++   if (vs && (vs->info.vs.additional_stages_bits &
++              BITFIELD_BIT(MESA_SHADER_GEOMETRY)))
++      return &vs->info.vs.gs;
++
++   return NULL;
++}
++
+ /* The GS output primitive if one is bound, otherwise the input topology */
+ static enum mesa_prim
+ kk_rast_prim(struct kk_cmd_buffer *cmd)
+ {
+-   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
++   const struct poly_gs_info *gs = kk_gs_info(cmd);
+    if (gs)
+-      return gs->info.gs.mode;
++      return gs->mode;
+ 
+    return vk_topology_to_mesa(
+       cmd->vk.dynamic_graphics_state.ia.primitive_topology);
+@@ -1285,9 +1298,9 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
+    bool indirect = kk_grid_is_indirect(draw->grid) ||
+                    cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+    struct kk_graphics_state *gfx = &cmd->state.gfx;
+-   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+-   enum poly_gs_shape shape = gs->info.gs.shape;
+-   uint32_t max_indices = gs->info.gs.max_indices;
++   const struct poly_gs_info *gs = kk_gs_info(cmd);
++   enum poly_gs_shape shape = gs->shape;
++   uint32_t max_indices = gs->max_indices;
+ 
+    enum mesa_prim mode = kk_gs_in_prim(cmd);
+    if (restart)
+@@ -1320,9 +1333,9 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
+ 
+    if (shape == POLY_GS_SHAPE_STATIC_INDEXED) {
+       /* Metal has no 8-bit indices and restarts 16-bit ones at 0xFFFF */
+-      uint16_t indices[ARRAY_SIZE(gs->info.gs.topology)];
++      uint16_t indices[ARRAY_SIZE(gs->topology)];
+       for (uint32_t i = 0u; i < max_indices; ++i) {
+-         uint8_t index = gs->info.gs.topology[i];
++         uint8_t index = gs->topology[i];
+          indices[i] = index == UINT8_MAX ? UINT16_MAX : index;
+       }
+ 
+@@ -1362,7 +1375,7 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+    }
+ 
+    if (IS_DIRTY(RS_CULL_MODE) || IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) ||
+-       IS_SHADER_DIRTY(GEOMETRY)) {
++       IS_SHADER_DIRTY(VERTEX) || IS_SHADER_DIRTY(GEOMETRY)) {
+       /* Only disable rendering if primitive type is culled. */
+       gfx->is_cull_front_and_back =
+          dyn->rs.cull_mode == VK_CULL_MODE_FRONT_AND_BACK &&
+@@ -1755,7 +1768,7 @@ build_per_draw_upload_mask(struct kk_cmd_buffer *cmd)
+    }
+ 
+    /* So does a GS */
+-   if (cmd->state.shaders[MESA_SHADER_GEOMETRY]) {
++   if (kk_gs_info(cmd)) {
+       mask |= BITFIELD_BIT(MESA_SHADER_GEOMETRY);
+    }
+ 
+@@ -2202,10 +2215,10 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+    struct kk_graphics_state *gfx = &cmd->state.gfx;
+    struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+    struct kk_shader *tes = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+-   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
++   const struct poly_gs_info *gs = kk_gs_info(cmd);
+    uint64_t vertex_params = gfx->per_draw_data.vertex_params;
+    uint64_t geometry_params = gfx->per_draw_data.geometry_params;
+-   enum poly_gs_shape shape = gs->info.gs.shape;
++   enum poly_gs_shape shape = gs->shape;
+    struct kk_grid grid_vs, grid_gs;
+ 
+    enum mesa_prim mode = kk_gs_in_prim(cmd);
+@@ -2225,7 +2238,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+          .vs_outputs =
+             tes ? tes->info.tess.tes_outputs : vs->info.vs.outputs_written,
+          .prim = mode,
+-         .max_indices = gs->info.gs.max_indices,
++         .max_indices = gs->max_indices,
+          .shape = shape,
+       };
+ 
+@@ -2269,7 +2282,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+    kk_dispatch_compute(enc, grid_gs, local_size);
+ 
+    struct kk_draw_data rast = {
+-      .primitive_type = mesa_prim_to_mtl_primitive_type(gs->info.gs.mode),
++      .primitive_type = mesa_prim_to_mtl_primitive_type(gs->mode),
+    };
+ 
+    if (poly_gs_indexed(shape)) {
+@@ -2295,8 +2308,7 @@ build_draw_data(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+                 uint32_t draw_id)
+ {
+    /* Emulated stages rasterize a primitive of their own */
+-   bool emulated = cmd->state.shaders[MESA_SHADER_TESS_EVAL] ||
+-                   cmd->state.shaders[MESA_SHADER_GEOMETRY];
++   bool emulated = cmd->state.shaders[MESA_SHADER_TESS_EVAL] || kk_gs_info(cmd);
+    struct kk_draw_data draw = {
+       .index.gpu = data->index_buffer,
+       .index.el_size_B = data->index_buffer_el_size_B,
+@@ -2347,7 +2359,7 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+       return;
+ 
+    bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+-   bool geom = cmd->state.shaders[MESA_SHADER_GEOMETRY];
++   bool geom = kk_gs_info(cmd);
+ 
+    /* Unroll geometry. Skip draw if we fail. */
+    if (requires_unroll(cmd, data) && !kk_unroll_geometry(cmd, data))
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index c498dd9..f8944b7 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -1448,6 +1448,7 @@ gather_graphics_pipeline_create_info(
+ 
+       if (s->info.stage == MESA_SHADER_GEOMETRY) {
+          kk_msl_copy(&vs->gs_main, &s->gs_main);
++         info->vs.gs = s->info.gs;
+          gs = s;
+       }
+    }
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index a6f5e3b..316cca6 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -88,6 +88,10 @@ struct kk_shader_info {
+          bool has_ds;
+          bool has_depth_write;
+          bool has_stencil_test;
++
++         /* Application or generated GS info, valid when additional_stages_bits
++          * includes a geometry shader */
++         struct poly_gs_info gs;
+       } vs;
+ 
+       struct {
+-- 
+2.54.0 (Apple Git-157)
+

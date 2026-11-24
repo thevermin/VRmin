@@ -1,0 +1,376 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Mon, 12 Oct 2026 20:00:00 +0300
+Subject: [PATCH] kk: R32G32B32 uniform texel buffers; views of formats
+ without texel buffer support read as null descriptors
+
+STEAMAC-2Z (1.9, The Witcher 3 on an M3 Max, two users, five crashes): the
+VM process crashed in kk_CreateBufferView (EXC_BAD_ACCESS at 0xa, reading
+texel_buffer.write of the NULL kk_get_va_format result) when the game
+started. vkd3d-proton creates typed buffer views without checking the
+format's features: structured buffers of 12-byte strides get
+R32G32B32_UINT texel buffer views (vkd3d_structured_srv_to_texel_buffer_
+dxgi_format), and typed SRVs may be R32G32B32_FLOAT. Venus forwards them,
+and Metal has no 3-component pixel format.
+
+Uniform texel buffers of R32G32B32_UINT/SINT/SFLOAT are now supported (and
+advertised): the Metal texture is an R32 texture buffer of three texels per
+element, the texel offset counts R32 texels and the descriptor's
+texel_offset has KK_TEXEL_BUFFER_RGB32 set. Texel fetches through a
+descriptor with the flag read 3 * x + offset and the next two texels and
+return (r, g, b, 1); size queries divide by 3. Elements whose texels would
+wrap 32 bits stay out of bounds. Other texel buffers pay one AND, one
+compare, a select and a uniform branch per fetch.
+
+Views of formats no texture buffer can back (no Metal format or no texel
+buffer read support, R32G32B32 in sparse buffers) are invalid usage; they
+are created without a texture and their descriptors are null descriptors,
+with one warning per format ("kk: texel buffer views of VK_FORMAT_... are
+not supported; they read as null descriptors"). Failing the creation would
+only move the problem: Venus creates views asynchronously, and the guest's
+next use of the missing view would kill its context.
+
+Repro: host/moltenvk/repro/texel_buffer.c 4 (tb_rgb32.comp).
+---
+ src/kosmickrisp/vulkan/kk_buffer_view.c           | 79 +++++++++++++++++++++--
+ src/kosmickrisp/vulkan/kk_descriptor_set.c        | 10 ++-
+ src/kosmickrisp/vulkan/kk_descriptor_types.h      |  8 +++
+ src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c | 74 ++++++++++++++++++---
+ src/kosmickrisp/vulkan/kk_physical_device.c       |  2 +-
+ src/kosmickrisp/vulkan/kk_private.h               |  1 +
+ 6 files changed, 152 insertions(+), 22 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.c b/src/kosmickrisp/vulkan/kk_buffer_view.c
+index 5674962..2d24aa3 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.c
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.c
+@@ -8,6 +8,7 @@
+ #include "kk_buffer_view.h"
+ 
+ #include "kk_buffer.h"
++#include "kk_descriptor_types.h"
+ #include "kk_device.h"
+ #include "kk_entrypoints.h"
+ #include "kk_format.h"
+@@ -19,8 +20,32 @@
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ #include "kosmickrisp/bridge/mtl_format.h"
+ 
++#include "util/log.h"
++#include "vk_enum_to_str.h"
+ #include "vk_format.h"
+ 
++#include <stdatomic.h>
++
++/* Metal has no 3-component pixel formats: uniform texel buffers of
++ * R32G32B32 formats are R32 texture buffers of three texels per element
++ * (struct kk_texel_buffer_descriptor, KK_TEXEL_BUFFER_RGB32). vkd3d-proton
++ * views structured buffers of 12-byte strides as R32G32B32_UINT texel
++ * buffers. Returns the R32 format, PIPE_FORMAT_NONE for other formats. */
++static enum pipe_format
++kk_texel_buffer_rgb32_component(enum pipe_format format)
++{
++   switch (format) {
++   case PIPE_FORMAT_R32G32B32_UINT:
++      return PIPE_FORMAT_R32_UINT;
++   case PIPE_FORMAT_R32G32B32_SINT:
++      return PIPE_FORMAT_R32_SINT;
++   case PIPE_FORMAT_R32G32B32_FLOAT:
++      return PIPE_FORMAT_R32_FLOAT;
++   default:
++      return PIPE_FORMAT_NONE;
++   }
++}
++
+ VkFormatFeatureFlags2
+ kk_get_buffer_format_features(struct kk_physical_device *pdev,
+                               VkFormat vk_format)
+@@ -47,12 +72,32 @@ kk_get_buffer_format_features(struct kk_physical_device *pdev,
+          features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
+    }
+ 
++   if (kk_texel_buffer_rgb32_component(p_format) != PIPE_FORMAT_NONE)
++      features |= VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT;
++
+    if (kk_vbo_supports_format(p_format))
+       features |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+ 
+    return features;
+ }
+ 
++/* A view no Metal texture buffer can back: vkd3d-proton creates typed views
++ * without checking the format's features (and Venus forwards them), so one
++ * reached the driver and dereferenced the missing format (STEAMAC-2Z). The view
++ * gets no texture; its descriptors read as null descriptors (zero). */
++static void
++kk_buffer_view_warn_unsupported(VkFormat format, bool sparse)
++{
++   static atomic_uint warned[8];
++   const unsigned bit = 1u << (format & 31);
++   if ((uint32_t)format < 256 &&
++       (atomic_fetch_or(&warned[format >> 5], bit) & bit))
++      return;
++   mesa_logw("kk: texel buffer views of %s%s are not supported; they read "
++             "as null descriptors",
++             vk_Format_to_str(format), sparse ? " in sparse buffers" : "");
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+                     const VkAllocationCallbacks *pAllocator,
+@@ -64,12 +109,25 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+    if (!view)
+       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
++   struct kk_buffer *buffer =
++      container_of(view->vk.buffer, struct kk_buffer, vk);
+    enum pipe_format p_format = vk_format_to_pipe_format(view->vk.format);
++   const enum pipe_format rgb32_component =
++      kk_texel_buffer_rgb32_component(p_format);
++   const bool rgb32 = rgb32_component != PIPE_FORMAT_NONE;
++   if (rgb32)
++      p_format = rgb32_component;
+    const struct kk_va_format *supported_format = kk_get_va_format(p_format);
+ 
+-   /* If we reached here, we support reading at least */
++   if (!supported_format || !supported_format->texel_buffer.read ||
++       (rgb32 && buffer->sparse)) {
++      kk_buffer_view_warn_unsupported(view->vk.format, buffer->sparse);
++      *pBufferView = kk_buffer_view_to_handle(view);
++      return VK_SUCCESS;
++   }
++
+    enum mtl_texture_usage usage = MTL_TEXTURE_USAGE_SHADER_READ;
+-   if (supported_format->texel_buffer.write)
++   if (supported_format->texel_buffer.write && !rgb32)
+       usage |= MTL_TEXTURE_USAGE_SHADER_WRITE;
+ 
+    /* Only these formats allow atomics for texel buffers */
+@@ -80,9 +138,8 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+    /* Metal needs texture buffers at KK_MIN_TEXEL_BUFFER_ALIGNMENT; views may
+     * start at any texel. Start the texture at the aligned offset below the
+     * view, texel_offset texels earlier (shaders add it to coordinates).
++    * R32G32B32 views count R32 texels.
+     */
+-   struct kk_buffer *buffer =
+-      container_of(view->vk.buffer, struct kk_buffer, vk);
+    const uint64_t mtl_offset = kk_buffer_mtl_offset(buffer, view->vk.offset);
+    uint64_t texture_offset =
+       mtl_offset & ~(uint64_t)(KK_MIN_TEXEL_BUFFER_ALIGNMENT - 1);
+@@ -99,9 +156,16 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+       texture_offset = mtl_offset;
+    }
+    view->texel_offset = (mtl_offset - texture_offset) / texel_B;
++   uint64_t width_px = view->vk.elements + view->texel_offset;
++   if (rgb32) {
++      /* Texels past maxTexelBufferElements read as out of bounds */
++      width_px = MIN2(view->vk.elements * 3u + view->texel_offset,
++                      KK_MAX_TEXEL_BUFFER_ELEMENTS);
++      view->texel_offset |= KK_TEXEL_BUFFER_RGB32;
++   }
+ 
+    struct kk_image_layout layout = {
+-      .width_px = view->vk.elements + view->texel_offset,
++      .width_px = width_px,
+       .height_px = 1u,
+       .depth_px = 1u,
+       .layers = 1u,
+@@ -159,10 +223,11 @@ kk_DestroyBufferView(VkDevice _device, VkBufferView bufferView,
+ 
+    if (view->sparse)
+       kk_buffer_view_sparse_finish(dev, view);
+-   else
++   else if (view->mtl_texel_buffer_handle)
+       kk_device_remove_texture_from_residency_set(
+          dev, view->mtl_texel_buffer_handle);
+-   mtl_release(view->mtl_texel_buffer_handle);
++   if (view->mtl_texel_buffer_handle)
++      mtl_release(view->mtl_texel_buffer_handle);
+    vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set.c b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+index 7c8e91b..ea16440 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -261,12 +261,10 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
+                        uint32_t elem)
+ {
+    struct kk_texel_buffer_descriptor desc = {};
+-   if (bufferView != VK_NULL_HANDLE) {
+-      VK_FROM_HANDLE(kk_buffer_view, view, bufferView);
+-
+-      assert(view->mtl_texel_buffer_handle);
+-      assert(view->texel_buffer_gpu_id);
+-
++   /* Views of formats no texture buffer backs have no texture
++    * (kk_CreateBufferView): null descriptors */
++   VK_FROM_HANDLE(kk_buffer_view, view, bufferView);
++   if (view != NULL && view->mtl_texel_buffer_handle != NULL) {
+       desc.image_gpu_resource_id = view->texel_buffer_gpu_id;
+       desc.texel_offset = view->texel_offset;
+       desc.residency_gpu_resource_id = view->residency_gpu_id;
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_types.h b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+index 6d01dec..9e4af9b 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_types.h
++++ b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+@@ -82,6 +82,12 @@ static_assert(sizeof(struct kk_storage_image_descriptor) == 16,
+  * texture is in buffer page
+  * min(residency_first_page + (x >> residency_page_shift), residency_last_page).
+  * residency_gpu_resource_id is 0 for other views (always resident).
++ *
++ * Views of R32G32B32 formats (no Metal pixel format, uniform texel buffers
++ * only): the Metal texture is an R32 texture buffer of three texels per
++ * element, texel_offset counts those texels and has KK_TEXEL_BUFFER_RGB32 set;
++ * fetches read texels 3 * x + texel_offset + {0, 1, 2} (alpha 1), size queries
++ * divide by 3. Never set for views of sparse buffers.
+  */
+ struct kk_texel_buffer_descriptor {
+    uint64_t image_gpu_resource_id;
+@@ -95,6 +101,8 @@ struct kk_texel_buffer_descriptor {
+ static_assert(sizeof(struct kk_texel_buffer_descriptor) == 32,
+               "kk_texel_buffer_descriptor has no holes");
+ 
++#define KK_TEXEL_BUFFER_RGB32 (1u << 31)
++
+ /* The residency texture of a sparse residency buffer: an R8Uint 2D array of
+  * 256x256 texel (64 KiB) tiles, one per buffer page, 64 tiles per row and
+  * 64 rows per layer: page p is the tile at texel
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+index 00eec64..a2e6c6c 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -899,6 +899,47 @@ lower_sampled_view_residency(nir_builder *b, nir_tex_instr *tex,
+                             nir_if_phi(b, view_code, other_code));
+ }
+ 
++/* Texel fetch `tex` (at Metal texel x) from an R32G32B32 texel buffer when
++ * rgb32 (struct kk_texel_buffer_descriptor, KK_TEXEL_BUFFER_RGB32): tex reads
++ * the red R32 texel, copies of it green and blue at x + 1 and x + 2; alpha is
++ * 1, the residency code is tex's. */
++static void
++lower_rgb32_texel_fetch(nir_builder *b, nir_tex_instr *tex, nir_def *rgb32,
++                        nir_def *x)
++{
++   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
++   nir_def *coord = tex->src[coord_idx].src.ssa;
++
++   b->cursor = nir_after_instr(&tex->instr);
++   nir_def *first = nir_mov(b, &tex->def);
++   const unsigned n = first->num_components;
++   const unsigned colors = n - (tex->is_sparse ? 1u : 0u);
++   nir_def *comps[NIR_MAX_VEC_COMPONENTS];
++
++   nir_push_if(b, rgb32);
++   for (unsigned c = 0; c < n; c++)
++      comps[c] = nir_channel(b, first, c);
++   for (unsigned c = 1; c < MIN2(colors, 3u); c++) {
++      nir_def *texel = nir_vector_insert_imm(b, coord, nir_iadd_imm(b, x, c), 0);
++      nir_tex_instr *copy =
++         nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
++      nir_builder_instr_insert(b, &copy->instr);
++      set_tex_src(copy, nir_tex_src_coord, texel);
++      comps[c] = nir_channel(b, &copy->def, 0);
++   }
++   if (colors > 3u) {
++      comps[3] =
++         nir_alu_type_get_base_type(tex->dest_type) == nir_type_float
++            ? nir_imm_floatN_t(b, 1.0, first->bit_size)
++            : nir_imm_intN_t(b, 1, first->bit_size);
++   }
++   nir_def *rgb = nir_vec(b, comps, n);
++   nir_pop_if(b, NULL);
++
++   nir_def_rewrite_uses_after_instr(&tex->def, nir_if_phi(b, rgb, first),
++                                    nir_def_instr(first));
++}
++
+ static bool
+ lower_tex(nir_builder *b, nir_tex_instr *tex,
+           const struct lower_descriptors_ctx *ctx)
+@@ -999,35 +1040,52 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+       nir_tex_instr_add_src(tex, nir_tex_src_texture_handle, handle);
+ 
+       /* Texel buffers: the Metal texture starts texel_offset texels before
+-       * the view (struct kk_texel_buffer_descriptor).
++       * the view; R32G32B32 views are R32 textures of three texels per
++       * element (struct kk_texel_buffer_descriptor).
+        */
+       if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
+-         nir_def *texel_offset = load_resource_deref_desc(
++         nir_def *desc_offset = load_resource_deref_desc(
+             b, 1, 32, nir_src_as_deref(nir_src_for_ssa(texture)),
+             plane_offset_B +
+                offsetof(struct kk_texel_buffer_descriptor, texel_offset),
+             ctx);
++         nir_def *rgb32 = nir_test_mask(b, desc_offset, KK_TEXEL_BUFFER_RGB32);
++         nir_def *texel_offset =
++            nir_iand_imm(b, desc_offset, ~KK_TEXEL_BUFFER_RGB32);
+          const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+          if (tex->op == nir_texop_txs) {
+             b->cursor = nir_after_instr(&tex->instr);
+             nir_def *size = &tex->def;
+             nir_def *x = nir_isub(b, nir_channel(b, size, 0),
+                                   nir_u2uN(b, texel_offset, size->bit_size));
++            x = nir_bcsel(b, rgb32, nir_udiv_imm(b, x, 3), x);
+             nir_def_rewrite_uses_after(size,
+                                        nir_vector_insert_imm(b, size, x, 0));
+             b->cursor = nir_before_instr(&tex->instr);
+          } else if (coord_idx >= 0) {
+             nir_def *coord = tex->src[coord_idx].src.ssa;
+-            nir_def *x = nir_iadd(b, nir_channel(b, coord, 0),
+-                                  nir_u2uN(b, texel_offset, coord->bit_size));
++            nir_def *i = nir_channel(b, coord, 0);
++            nir_def *offset = nir_u2uN(b, texel_offset, coord->bit_size);
++            /* Elements whose texels would wrap stay out of bounds (all three
++             * texels, lower_rgb32_texel_fetch) */
++            const uint64_t max = u_uintN_max(coord->bit_size);
++            nir_def *rgb32_x = nir_bcsel(
++               b, nir_ult_imm(b, i, (max - 6u) / 3u),
++               nir_iadd(b, nir_imul_imm(b, i, 3), offset),
++               nir_imm_intN_t(b, max - 2u, coord->bit_size));
++            nir_def *x =
++               nir_bcsel(b, rgb32, rgb32_x, nir_iadd(b, i, offset));
+             nir_src_rewrite(&tex->src[coord_idx].src,
+                             nir_vector_insert_imm(b, coord, x, 0));
+-            if (tex->is_sparse) {
+-               nir_def *residency = load_texel_buffer_residency(
++            nir_def *residency = NULL;
++            if (tex->is_sparse)
++               residency = load_texel_buffer_residency(
+                   b, nir_src_as_deref(nir_src_for_ssa(texture)), x, ctx);
++            if (tex->op == nir_texop_txf)
++               lower_rgb32_texel_fetch(b, tex, rgb32, x);
++            if (residency)
+                and_sparse_residency(b, &tex->instr, &tex->def, residency);
+-               b->cursor = nir_before_instr(&tex->instr);
+-            }
++            b->cursor = nir_before_instr(&tex->instr);
+          }
+       }
+    }
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index b5cb097..7f421b0 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -575,7 +575,7 @@ kk_get_device_properties(
+       .maxImageDimension3D = kk_image_max_dimension(pdev, VK_IMAGE_TYPE_3D),
+       .maxImageDimensionCube = kk_image_max_dimension(pdev, VK_IMAGE_TYPE_2D),
+       .maxImageArrayLayers = 2048,
+-      .maxTexelBufferElements = 16384 * 16384,
++      .maxTexelBufferElements = KK_MAX_TEXEL_BUFFER_ELEMENTS,
+       .maxUniformBufferRange = 65536,
+       .maxStorageBufferRange = UINT32_MAX,
+       .maxPushConstantsSize = KK_MAX_PUSH_SIZE,
+diff --git a/src/kosmickrisp/vulkan/kk_private.h b/src/kosmickrisp/vulkan/kk_private.h
+index b9f18bf..9aa8fe1 100644
+--- a/src/kosmickrisp/vulkan/kk_private.h
++++ b/src/kosmickrisp/vulkan/kk_private.h
+@@ -22,6 +22,7 @@
+ #define KK_MAX_SAMPLES                   8
+ #define KK_MIN_SSBO_ALIGNMENT            16
+ #define KK_MIN_TEXEL_BUFFER_ALIGNMENT    16
++#define KK_MAX_TEXEL_BUFFER_ELEMENTS     (16384u * 16384u)
+ #define KK_MIN_UBO_ALIGNMENT             64
+ #define KK_MAX_VIEWPORTS                 16
+ #define KK_MAX_DESCRIPTOR_SIZE           64

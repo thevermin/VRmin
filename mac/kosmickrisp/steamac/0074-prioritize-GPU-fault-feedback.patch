@@ -1,0 +1,47 @@
+From: steamac <steamac@local>
+Date: Sun, 1 Nov 2026 12:00:00 +0000
+Subject: [PATCH] kosmickrisp: prioritize GPU fault evidence before victims (STEAMAC-G)
+
+The 24-line in-flight cap is shared across all devices. A compositor with
+many successful records can exhaust it before the game whose command
+buffer hung is visited, also suppressing its shader excerpts. The 1.9.4
+9c30f771 report shows 82 omitted records; seven of 25 KK timeout reports
+only name InnocentVictim outcomes. Visit actual fault feedback first,
+then pending/victim feedback, then successful overlapping work. Keep
+the same bounded output and no GPU behavior changes.
+
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -101,6 +101,7 @@
+    double failed_start, failed_feedback;
+    int64_t now;
+    unsigned pending, lines, skipped, hangs;
++   unsigned pass;
+    struct kk_cb_record hang[2];
+ };
+ 
+@@ -148,6 +149,13 @@
+       const struct kk_queue_record *r =
+          &queue->records[(queue->commit_seq + k) % KK_QUEUE_RECORDS];
+       if (!kk_queue_record_in_flight(r, dev, s))
++         continue;
++      /* Faults must precede innocent victims and successful compositor work:
++       * otherwise the 24-line cap can hide the culprit and its shader excerpts. */
++      const bool culprit = r->done && strcmp(r->outcome, "ok") &&
++                           strcmp(r->outcome, "InnocentVictim");
++      const unsigned pass = culprit ? 0u : !r->done || strcmp(r->outcome, "ok") ? 1u : 2u;
++      if (pass != s->pass)
+          continue;
+       if (s->lines == KK_QUEUE_IN_FLIGHT_LINES) {
+          s->skipped++;
+@@ -275,7 +283,8 @@
+       os_time_sleep(5000);
+    } while (os_time_get_nano() < deadline);
+ 
+-   kk_device_foreach(kk_queue_log_in_flight, &s);
++   for (s.pass = 0u; s.pass < 3u; s.pass++)
++      kk_device_foreach(kk_queue_log_in_flight, &s);
+    if (s.skipped)
+       mesa_loge("kk: with it: %u more command buffers", s.skipped);
+    else if (s.lines == 0u)

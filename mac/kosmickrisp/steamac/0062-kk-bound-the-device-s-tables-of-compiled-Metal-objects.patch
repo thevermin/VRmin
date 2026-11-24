@@ -1,0 +1,816 @@
+From b721e7d83c316533d27510d0ef606ec90dcbf52e Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Fri, 23 Oct 2026 12:16:35 +0200
+Subject: [PATCH] kk: bound the device's tables of compiled Metal objects
+
+The device's tables of compiled MSL libraries (0050) and Metal pipeline
+states (0052) only grew: every library kept a strdup of its whole MSL
+source as the key plus the retained MTLLibrary, and every pipeline state
+ever built stayed in the table after the application destroyed its
+pipeline. A title that creates and destroys pipelines for hours grew the
+process without bound.
+
+Both are now instances of one bounded table (struct kk_metal_cache):
+entries are kept in use order and the least recently used ones past
+kk_metal_cache::max (4096 per table, MESA_KK_METAL_CACHE_MAX) are
+dropped, releasing the table's reference; a pipeline still using the
+object holds its own. Libraries are keyed by the blake3 digest of their
+source instead of the source, and the pipeline keys name their libraries
+by the same digests rather than by address, since a library may have been
+dropped and another compiled at its address. The single-flight behaviour
+is unchanged: an entry without an object is a compile in flight that
+other callers wait for, and a failed compile drops the entry (its key is
+freed by the table's key destructor). Publishing requires the reservation's
+exact key pointer as well as an empty object: if allocation in find failed,
+another thread may have reserved an equal key while this caller compiled.
+It must not publish into that thread's reservation or free its live key.
+
+kk_CreateDevice sets up the three tables in one step
+(kk_metal_caches_init) before the compile pool and returns
+VK_ERROR_OUT_OF_HOST_MEMORY when it fails, tearing down only what was
+initialised, preserving 0050's failure cleanup; a missing Metal compiler is
+VK_ERROR_INITIALIZATION_FAILED.
+
+Generated-by: LLM
+---
+ src/kosmickrisp/vulkan/kk_device.c |  30 +-
+ src/kosmickrisp/vulkan/kk_device.h |  60 ++--
+ src/kosmickrisp/vulkan/kk_shader.c | 442 ++++++++++++++++-------------
+ src/kosmickrisp/vulkan/kk_shader.h |   6 +-
+ 4 files changed, 283 insertions(+), 255 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 70a4a19..c3541fc 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -391,18 +391,13 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    dev->vk.command_buffer_ops = &kk_cmd_buffer_ops;
+    dev->vk.command_dispatch_table = &dev->vk.dispatch_table;
+    dev->vk.get_timestamp = kk_get_timestamp;
+-   mtx_init(&dev->msl_libraries_lock, mtx_plain);
+-   cnd_init(&dev->msl_libraries_cnd);
+-   dev->msl_libraries =
+-      _mesa_hash_table_create(NULL /* ralloc context, not vk.alloc */, _mesa_hash_string,
+-                              _mesa_key_string_equal);
+-   if (dev->msl_libraries == NULL) {
++   /* Compiled MSL libraries and Metal pipeline states are shared between equal
++    * pipelines and the pool compiles into them: both are set up before any
++    * pipeline is created. */
++   if (!kk_metal_caches_init(dev)) {
+       result = VK_ERROR_OUT_OF_HOST_MEMORY;
+       goto fail_device;
+    }
+-   /* Metal pipeline states are shared between equal pipelines and the pool
+-    * compiles into them; both are set up before any pipeline is created. */
+-   kk_metal_pipelines_init(dev);
+    /* Programs are compiled by a pool of threads, not on the ring thread */
+    kk_compile_pool_init(dev);
+ 
+@@ -488,11 +483,8 @@ fail_compiler:
+    kk_release_compiler(dev);
+ fail_init:
+    kk_compile_pool_finish(dev);
+-   kk_metal_pipelines_finish(dev);
+-   _mesa_hash_table_destroy(dev->msl_libraries, NULL);
++   kk_metal_caches_finish(dev);
+ fail_device:
+-   cnd_destroy(&dev->msl_libraries_cnd);
+-   mtx_destroy(&dev->msl_libraries_lock);
+    vk_device_finish(&dev->vk);
+ fail_alloc:
+    vk_free(&dev->vk.alloc, dev);
+@@ -543,18 +535,10 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+     * afterwards either) and the compiler goes away last. */
+    kk_compile_pool_finish(dev);
+ 
+-   /* Compiled Metal pipeline states and MSL libraries are held for the
+-    * device's lifetime. */
+-   kk_metal_pipelines_finish(dev);
+-   hash_table_foreach(dev->msl_libraries, entry) {
+-      mtl_release(entry->data);
+-      free((char *)entry->key);
+-   }
+-   _mesa_hash_table_destroy(dev->msl_libraries, NULL);
++   /* The compiled Metal objects the tables still hold go with the device */
++   kk_metal_caches_finish(dev);
+ 
+    kk_release_compiler(dev);
+-   cnd_destroy(&dev->msl_libraries_cnd);
+-   mtx_destroy(&dev->msl_libraries_lock);
+ 
+    vk_device_finish(&dev->vk);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 16426b0..0eba6fc 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -78,30 +78,43 @@ struct kk_precompiled_cache {
+    struct kk_precompiled_shader shaders[LIBKK_NUM_PROGRAMS];
+ };
+ 
++/* A bounded table of compiled Metal objects (MSL libraries, pipeline states)
++ * shared by a device's pipelines, kept in kk_shader.c. Lookups and publishes
++ * take its lock, which is never held across a compile (that would serialize
++ * the compile pool); an entry without an object is a compile in flight that
++ * other callers wait for on cnd. */
++struct kk_metal_cache {
++   struct hash_table *table;
++   /* Entries by use, least recently used first; their count and the bound */
++   struct list_head lru;
++   uint32_t count;
++   uint32_t max;
++   void (*free_key)(void *key);
++   mtx_t lock;
++   cnd_t cnd;
++};
++
+ struct kk_device {
+    struct vk_device vk;
+ 
+    mtl_device *mtl_handle;
+    mtl_compiler *mtl_compiler_handle;
+ 
+-   /* Compiled MSL libraries by source string. A title asks for the same program
+-    * once per pipeline (Dragon's Dogma 2: ~100 times per program), and every
+-    * request otherwise costs a Metal compile call plus the guest round trip to
+-    * reach it (FEX -> vkd3d -> Venus -> virglrenderer -> here): Metal answers
+-    * from its own cache in fractions of a millisecond, but the round trip is
+-    * milliseconds each time. The libraries are retained here for the device's
+-    * lifetime and their source strings are owned by the table. */
+-   struct hash_table *msl_libraries;
+-
+-   /* Metal pipeline states by what the Metal pipeline is built from, so that
+-    * two pipelines with the same programs and the same state share one. The
+-    * compiler spends its time here, not in the library: a title that rebuilds
+-    * its pipeline set every launch compiles the same program tens of times
+-    * (Dragon's Dogma 2: 26,452 program compiles for 4,594 distinct programs in
+-    * one run). Keys own their entry-point names; the states and the keys are
+-    * held for the device's lifetime (kk_metal_pipelines_init). */
+-   struct hash_table *metal_render_pipelines;
+-   struct hash_table *metal_compute_pipelines;
++   /* Compiled Metal objects shared between a device's pipelines (kk_shader.c):
++    * MSL libraries by the blake3 digest of their source, and Metal pipeline
++    * states by what they are built from. A title asks for the same program once
++    * per pipeline (Dragon's Dogma 2: ~100 times per program, 26,452 program
++    * compiles for 4,594 distinct programs in one run), and every request
++    * otherwise costs a Metal compile call plus the guest round trip to reach it
++    * (FEX -> vkd3d -> Venus -> virglrenderer -> here); the compiler spends its
++    * time in the pipeline states. Each table is bounded (kk_metal_cache::max):
++    * past it the least recently used entries are dropped, so a title that
++    * creates and destroys pipelines for hours does not grow the process without
++    * bound. Set up before any pipeline is created and torn down after the
++    * compile pool (kk_metal_caches_init). */
++   struct kk_metal_cache msl_libraries;
++   struct kk_metal_cache metal_render_pipelines;
++   struct kk_metal_cache metal_compute_pipelines;
+ 
+    /* Dispatch table exposed to the user. Required since we need to record all
+     * commands due to Metal limitations */
+@@ -149,17 +162,6 @@ struct kk_device {
+    uint32_t compile_thread_count;
+    thrd_t *compile_threads;
+ 
+-   /* Serializes the compiled-library table (msl_libraries) and the Metal
+-    * pipeline tables, which the compile pool shares. Not held across a
+-    * compile: that would serialize the pool. */
+-   mtx_t msl_libraries_lock;
+-   mtx_t metal_pipelines_lock;
+-   /* Signalled when a table entry stops being compiled: the pool has many
+-    * workers asking for the same program at once, and only one of them should
+-    * compile it (kk_get_msl_library, kk_find_metal_render_pipeline). */
+-   cnd_t msl_libraries_cnd;
+-   cnd_t metal_pipelines_cnd;
+-
+    /* os_time_get_nano() at creation (command queue error diagnostics) */
+    int64_t created_ns;
+    /* In the process' list of devices alive (kk_device_foreach) */
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 6719982..d7b3e7e 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -1396,9 +1396,166 @@ get_empty_nir(struct kk_device *dev, mesa_shader_stage stage,
+  * hashing or holding the MSL again. The entry-point names are copied into the
+  * key, because the shader owns its own and outlives nothing here.
+  */
++/* --- bounded tables of compiled Metal objects ------------------------------
++ * The device shares its compiled MSL libraries and Metal pipeline states
++ * between pipelines (kk_device::msl_libraries and the pipeline tables): a
++ * title asks for the same program once per pipeline, and the compile pool
++ * starts many pipelines with the same programs at once. An entry without an
++ * object is a compile in flight: one caller compiles, the others wait for it
++ * (one MTL4Compiler compiles them one at a time anyway). The tables are
++ * bounded: past kk_metal_cache::max entries the least recently used ones are
++ * dropped, releasing the table's reference (a pipeline still using the object
++ * holds its own). */
++struct kk_metal_cache_entry {
++   struct list_head lru_link;
++   void *key;
++   /* A retained Metal object, or NULL while the caller that reserved the entry
++    * compiles it */
++   void *object;
++};
++
++/* Entries per table. Dragon's Dogma 2 compiles ~4,600 distinct programs in a
++ * run (two libraries each at most); past this the oldest are compiled again
++ * when asked for. MESA_KK_METAL_CACHE_MAX overrides it. */
++#define KK_METAL_CACHE_MAX 4096u
++
++static bool
++kk_metal_cache_init(struct kk_metal_cache *c, uint32_t (*hash)(const void *),
++                    bool (*equal)(const void *, const void *),
++                    void (*free_key)(void *), uint32_t max)
++{
++   c->table = _mesa_hash_table_create(NULL, hash, equal);
++   if (c->table == NULL)
++      return false;
++   list_inithead(&c->lru);
++   c->count = 0;
++   c->max = max;
++   c->free_key = free_key;
++   mtx_init(&c->lock, mtx_plain);
++   cnd_init(&c->cnd);
++   return true;
++}
++
++/* Under c->lock */
++static void
++kk_metal_cache_drop(struct kk_metal_cache *c, struct kk_metal_cache_entry *e)
++{
++   _mesa_hash_table_remove_key(c->table, e->key);
++   list_del(&e->lru_link);
++   c->count--;
++   if (e->object != NULL)
++      mtl_release(e->object);
++   c->free_key(e->key);
++   free(e);
++}
++
++static void
++kk_metal_cache_finish(struct kk_metal_cache *c)
++{
++   if (c->table == NULL)
++      return;
++   list_for_each_entry_safe(struct kk_metal_cache_entry, e, &c->lru, lru_link)
++      kk_metal_cache_drop(c, e);
++   _mesa_hash_table_destroy(c->table, NULL);
++   c->table = NULL;
++   cnd_destroy(&c->cnd);
++   mtx_destroy(&c->lock);
++}
++
++/* A reference to the object for key, or NULL when this caller has to compile
++ * it. A caller that gets NULL owns the table's reservation for the key and
++ * publishes with kk_metal_cache_publish(); a caller that gets an object has
++ * had its key freed for it. */
++static void *
++kk_metal_cache_find(struct kk_metal_cache *c, void *key)
++{
++   mtx_lock(&c->lock);
++   struct hash_entry *entry = _mesa_hash_table_search(c->table, key);
++   /* An entry without an object is another caller's compile in flight */
++   while (entry != NULL &&
++          ((struct kk_metal_cache_entry *)entry->data)->object == NULL) {
++      cnd_wait(&c->cnd, &c->lock);
++      entry = _mesa_hash_table_search(c->table, key);
++   }
++   void *object = NULL;
++   if (entry != NULL) {
++      struct kk_metal_cache_entry *e = entry->data;
++      object = mtl_retain(e->object);
++      list_del(&e->lru_link);
++      list_addtail(&e->lru_link, &c->lru);
++   } else {
++      /* Reserve the key: the placeholder keeps anyone else off it. Out of
++       * memory nothing is reserved and the caller compiles on its own. */
++      struct kk_metal_cache_entry *e = calloc(1, sizeof(*e));
++      if (e != NULL) {
++         e->key = key;
++         list_addtail(&e->lru_link, &c->lru);
++         c->count++;
++         _mesa_hash_table_insert(c->table, key, e);
++      }
++   }
++   mtx_unlock(&c->lock);
++   if (object != NULL)
++      c->free_key(key);
++   return object;
++}
++
++/* Takes ownership of the reserved key and one reference to object, or of the
++ * key alone when object is NULL (the compile failed; nobody waits forever on
++ * it, and the next caller tries again). Drops the least recently used entries
++ * past the bound. */
++static void
++kk_metal_cache_publish(struct kk_metal_cache *c, void *key, void *object)
++{
++   mtx_lock(&c->lock);
++   struct hash_entry *entry = _mesa_hash_table_search(c->table, key);
++   struct kk_metal_cache_entry *e = entry != NULL ? entry->data : NULL;
++   if (e != NULL && e->object == NULL && e->key == key) {
++      if (object != NULL) {
++         e->object = mtl_retain(object);
++         list_del(&e->lru_link);
++         list_addtail(&e->lru_link, &c->lru);
++      } else {
++         kk_metal_cache_drop(c, e); /* frees the key */
++      }
++   } else {
++      /* Nothing was reserved (kk_metal_cache_find out of memory) */
++      c->free_key(key);
++   }
++   list_for_each_entry_safe(struct kk_metal_cache_entry, old, &c->lru,
++                            lru_link) {
++      if (c->count <= c->max)
++         break;
++      /* An entry being compiled is published later; its caller holds its key */
++      if (old->object != NULL)
++         kk_metal_cache_drop(c, old);
++   }
++   cnd_broadcast(&c->cnd);
++   mtx_unlock(&c->lock);
++}
++
++/* MSL libraries by the digest of their source. The pipeline keys below name
++ * their libraries by the same digests rather than by address: a library may
++ * have been dropped from the table and another compiled at its address. */
++struct kk_msl_library_key {
++   blake3_hash source;
++};
++
++static uint32_t
++kk_msl_library_key_hash(const void *key)
++{
++   return _mesa_hash_data(key, sizeof(struct kk_msl_library_key));
++}
++
++static bool
++kk_msl_library_key_equal(const void *a, const void *b)
++{
++   return memcmp(a, b, sizeof(struct kk_msl_library_key)) == 0;
++}
++
+ struct kk_metal_render_key {
+-   mtl_library *vs_library;
+-   mtl_library *fs_library;
++   blake3_hash vs_source;
++   blake3_hash fs_source;
+    char *vs_entrypoint;
+    char *fs_entrypoint;
+    enum mtl_primitive_topology_class topology;
+@@ -1408,14 +1565,15 @@ struct kk_metal_render_key {
+ };
+ 
+ struct kk_metal_compute_key {
+-   mtl_library *library;
++   blake3_hash source;
+    char *entrypoint;
+    uint32_t max_total_threads;
+ };
+ 
+ static void
+-kk_metal_render_key_free(struct kk_metal_render_key *key)
++kk_metal_render_key_free(void *_key)
+ {
++   struct kk_metal_render_key *key = _key;
+    free(key->vs_entrypoint);
+    free(key->fs_entrypoint);
+    free(key);
+@@ -1425,14 +1583,15 @@ static struct kk_metal_render_key *
+ kk_metal_render_key_create(struct kk_shader *vs,
+                            const struct msl_compile_data *vs_data,
+                            const struct msl_compile_data *fs_data,
+-                           mtl_library *vs_library, mtl_library *fs_library)
++                           const blake3_hash vs_source,
++                           const blake3_hash fs_source)
+ {
+    struct kk_metal_render_key *key = calloc(1, sizeof(*key));
+    if (key == NULL)
+       return NULL;
+ 
+-   key->vs_library = vs_library;
+-   key->fs_library = fs_library;
++   memcpy(key->vs_source, vs_source, sizeof(key->vs_source));
++   memcpy(key->fs_source, fs_source, sizeof(key->fs_source));
+    key->vs_entrypoint = strdup(vs_data->entrypoint_name);
+    key->fs_entrypoint = strdup(fs_data->entrypoint_name);
+    /* What kk_compile_graphics_pipeline puts on the Metal descriptor */
+@@ -1454,10 +1613,10 @@ static uint32_t
+ kk_metal_render_key_hash(const void *key)
+ {
+    const struct kk_metal_render_key *k = key;
+-   uint32_t hash = _mesa_hash_pointer(k->vs_library);
++   uint32_t hash = _mesa_hash_data(k->vs_source, sizeof(k->vs_source));
+    hash = _mesa_hash_data_with_seed(k->vs_entrypoint,
+                                     strlen(k->vs_entrypoint), hash);
+-   hash = _mesa_hash_pointer(k->fs_library) ^ (hash * 0x9e3779b1u);
++   hash = _mesa_hash_data_with_seed(k->fs_source, sizeof(k->fs_source), hash);
+    hash = _mesa_hash_data_with_seed(k->fs_entrypoint,
+                                     strlen(k->fs_entrypoint), hash);
+    hash = _mesa_hash_data_with_seed(&k->topology, sizeof(k->topology), hash);
+@@ -1474,8 +1633,8 @@ kk_metal_render_key_equal(const void *a, const void *b)
+ {
+    const struct kk_metal_render_key *x = a;
+    const struct kk_metal_render_key *y = b;
+-   return x->vs_library == y->vs_library &&
+-          x->fs_library == y->fs_library &&
++   return memcmp(x->vs_source, y->vs_source, sizeof(x->vs_source)) == 0 &&
++          memcmp(x->fs_source, y->fs_source, sizeof(x->fs_source)) == 0 &&
+           x->topology == y->topology &&
+           x->raster_sample_count == y->raster_sample_count &&
+           x->max_amplification == y->max_amplification &&
+@@ -1485,21 +1644,22 @@ kk_metal_render_key_equal(const void *a, const void *b)
+ }
+ 
+ static void
+-kk_metal_compute_key_free(struct kk_metal_compute_key *key)
++kk_metal_compute_key_free(void *_key)
+ {
++   struct kk_metal_compute_key *key = _key;
+    free(key->entrypoint);
+    free(key);
+ }
+ 
+ static struct kk_metal_compute_key *
+-kk_metal_compute_key_create(mtl_library *library, const char *entrypoint,
++kk_metal_compute_key_create(const blake3_hash source, const char *entrypoint,
+                             uint32_t max_total_threads)
+ {
+    struct kk_metal_compute_key *key = calloc(1, sizeof(*key));
+    if (key == NULL)
+       return NULL;
+ 
+-   key->library = library;
++   memcpy(key->source, source, sizeof(key->source));
+    key->entrypoint = strdup(entrypoint);
+    key->max_total_threads = max_total_threads;
+    if (key->entrypoint == NULL) {
+@@ -1513,7 +1673,7 @@ static uint32_t
+ kk_metal_compute_key_hash(const void *key)
+ {
+    const struct kk_metal_compute_key *k = key;
+-   uint32_t hash = _mesa_hash_pointer(k->library);
++   uint32_t hash = _mesa_hash_data(k->source, sizeof(k->source));
+    hash = _mesa_hash_data_with_seed(k->entrypoint, strlen(k->entrypoint), hash);
+    return _mesa_hash_data_with_seed(&k->max_total_threads,
+                                     sizeof(k->max_total_threads), hash);
+@@ -1524,196 +1684,73 @@ kk_metal_compute_key_equal(const void *a, const void *b)
+ {
+    const struct kk_metal_compute_key *x = a;
+    const struct kk_metal_compute_key *y = b;
+-   return x->library == y->library &&
++   return memcmp(x->source, y->source, sizeof(x->source)) == 0 &&
+           x->max_total_threads == y->max_total_threads &&
+           strcmp(x->entrypoint, y->entrypoint) == 0;
+ }
+ 
+ /* The tables are created with the device: shaders are compiled into them from
+  * the pool, which starts right after. */
+-void
+-kk_metal_pipelines_init(struct kk_device *dev)
++bool
++kk_metal_caches_init(struct kk_device *dev)
+ {
+-   mtx_init(&dev->metal_pipelines_lock, mtx_plain);
+-   cnd_init(&dev->metal_pipelines_cnd);
+-   dev->metal_render_pipelines =
+-      _mesa_hash_table_create(NULL /* ralloc context, not vk.alloc */, kk_metal_render_key_hash,
+-                              kk_metal_render_key_equal);
+-   dev->metal_compute_pipelines =
+-      _mesa_hash_table_create(NULL /* ralloc context, not vk.alloc */, kk_metal_compute_key_hash,
+-                              kk_metal_compute_key_equal);
+-}
++   uint32_t max = KK_METAL_CACHE_MAX;
++   const char *env = getenv("MESA_KK_METAL_CACHE_MAX");
++   if (env != NULL)
++      max = MAX2(1, atoi(env));
+ 
+-void
+-kk_metal_pipelines_finish(struct kk_device *dev)
+-{
+-   if (dev->metal_render_pipelines != NULL) {
+-      hash_table_foreach(dev->metal_render_pipelines, entry) {
+-         mtl_release(entry->data);
+-         kk_metal_render_key_free((struct kk_metal_render_key *)entry->key);
+-      }
+-      _mesa_hash_table_destroy(dev->metal_render_pipelines, NULL);
++   if (!kk_metal_cache_init(&dev->msl_libraries, kk_msl_library_key_hash,
++                            kk_msl_library_key_equal, free, max))
++      return false;
++   if (!kk_metal_cache_init(&dev->metal_render_pipelines,
++                            kk_metal_render_key_hash,
++                            kk_metal_render_key_equal,
++                            kk_metal_render_key_free, max) ||
++       !kk_metal_cache_init(&dev->metal_compute_pipelines,
++                            kk_metal_compute_key_hash,
++                            kk_metal_compute_key_equal,
++                            kk_metal_compute_key_free, max)) {
++      kk_metal_caches_finish(dev);
++      return false;
+    }
+-   if (dev->metal_compute_pipelines != NULL) {
+-      hash_table_foreach(dev->metal_compute_pipelines, entry) {
+-         mtl_release(entry->data);
+-         kk_metal_compute_key_free((struct kk_metal_compute_key *)entry->key);
+-      }
+-      _mesa_hash_table_destroy(dev->metal_compute_pipelines, NULL);
+-   }
+-   cnd_destroy(&dev->metal_pipelines_cnd);
+-   mtx_destroy(&dev->metal_pipelines_lock);
+-}
+-
+-/* A reference to the shared pipeline state for key, or NULL when this caller
+- * has to compile it. Waiting while another worker compiles it is the point:
+- * the pool starts many pipelines with the same programs at once, and one
+- * MTL4Compiler compiles them one at a time anyway. A caller that gets NULL owns
+- * the table's reservation for the key and publishes with
+- * kk_publish_metal_render_pipeline(); a caller that gets a state has had its key
+- * freed for it. */
+-static mtl_render_pipeline_state *
+-kk_find_metal_render_pipeline(struct kk_device *dev,
+-                              struct kk_metal_render_key *key)
+-{
+-   mtx_lock(&dev->metal_pipelines_lock);
+-   struct hash_entry *entry =
+-      _mesa_hash_table_search(dev->metal_render_pipelines, key);
+-   /* An entry without a pipeline is another worker's compile in flight */
+-   while (entry != NULL && entry->data == NULL) {
+-      cnd_wait(&dev->metal_pipelines_cnd, &dev->metal_pipelines_lock);
+-      entry = _mesa_hash_table_search(dev->metal_render_pipelines, key);
+-   }
+-   mtl_render_pipeline_state *state =
+-      entry != NULL ? mtl_retain(entry->data) : NULL;
+-   if (state == NULL && entry == NULL)
+-      _mesa_hash_table_insert(dev->metal_render_pipelines, key, NULL);
+-   mtx_unlock(&dev->metal_pipelines_lock);
+-   if (state != NULL)
+-      kk_metal_render_key_free(key);
+-   return state;
++   return true;
+ }
+ 
+-/* Takes ownership of the reserved key and one reference to state, or of the key
+- * alone when state is NULL (the compile failed and the next worker tries). */
+-static void
+-kk_publish_metal_render_pipeline(struct kk_device *dev,
+-                                 struct kk_metal_render_key *key,
+-                                 mtl_render_pipeline_state *state)
+-{
+-   mtx_lock(&dev->metal_pipelines_lock);
+-   struct hash_entry *entry =
+-      _mesa_hash_table_search(dev->metal_render_pipelines, key);
+-   if (entry != NULL && entry->data == NULL) {
+-      if (state != NULL)
+-         entry->data = mtl_retain(state);
+-      else {
+-         kk_metal_render_key_free((struct kk_metal_render_key *)entry->key);
+-         _mesa_hash_table_remove(dev->metal_render_pipelines, entry);
+-      }
+-   }
+-   cnd_broadcast(&dev->metal_pipelines_cnd);
+-   mtx_unlock(&dev->metal_pipelines_lock);
++void
++kk_metal_caches_finish(struct kk_device *dev)
++{
++   kk_metal_cache_finish(&dev->metal_render_pipelines);
++   kk_metal_cache_finish(&dev->metal_compute_pipelines);
++   kk_metal_cache_finish(&dev->msl_libraries);
+ }
+ 
+-static mtl_compute_pipeline_state *
+-kk_find_metal_compute_pipeline(struct kk_device *dev,
+-                               struct kk_metal_compute_key *key)
++/* The compiled library of an MSL source, from the device's table or compiled
++ * into it (kk_device::msl_libraries): a title asks for the same program once
++ * per pipeline, and while Metal's own cache answers each request in fractions
++ * of a millisecond, every request still pays the guest round trip to reach it.
++ * Returns a reference the caller releases, like mtl_new_library does, and the
++ * source's digest, which names the library in the pipeline keys. */
++static mtl_library *
++kk_get_msl_library(struct kk_device *device, const char *source,
++                   blake3_hash source_digest)
+ {
+-   mtx_lock(&dev->metal_pipelines_lock);
+-   struct hash_entry *entry =
+-      _mesa_hash_table_search(dev->metal_compute_pipelines, key);
+-   while (entry != NULL && entry->data == NULL) {
+-      cnd_wait(&dev->metal_pipelines_cnd, &dev->metal_pipelines_lock);
+-      entry = _mesa_hash_table_search(dev->metal_compute_pipelines, key);
+-   }
+-   mtl_compute_pipeline_state *state =
+-      entry != NULL ? mtl_retain(entry->data) : NULL;
+-   if (state == NULL && entry == NULL)
+-      _mesa_hash_table_insert(dev->metal_compute_pipelines, key, NULL);
+-   mtx_unlock(&dev->metal_pipelines_lock);
+-   if (state != NULL)
+-      kk_metal_compute_key_free(key);
+-   return state;
+-}
++   _mesa_blake3_compute(source, strlen(source), source_digest);
+ 
+-static void
+-kk_publish_metal_compute_pipeline(struct kk_device *dev,
+-                                  struct kk_metal_compute_key *key,
+-                                  mtl_compute_pipeline_state *state)
+-{
+-   mtx_lock(&dev->metal_pipelines_lock);
+-   struct hash_entry *entry =
+-      _mesa_hash_table_search(dev->metal_compute_pipelines, key);
+-   if (entry != NULL && entry->data == NULL) {
+-      if (state != NULL)
+-         entry->data = mtl_retain(state);
+-      else {
+-         kk_metal_compute_key_free((struct kk_metal_compute_key *)entry->key);
+-         _mesa_hash_table_remove(dev->metal_compute_pipelines, entry);
+-      }
+-   }
+-   cnd_broadcast(&dev->metal_pipelines_cnd);
+-   mtx_unlock(&dev->metal_pipelines_lock);
+-}
++   struct kk_msl_library_key *key = malloc(sizeof(*key));
++   if (key == NULL)
++      return NULL;
++   memcpy(key->source, source_digest, sizeof(key->source));
+ 
+-/* The compiled library of an MSL source, kept for the device's lifetime: a title
+- * asks for the same program once per pipeline (Dragon's Dogma 2: ~100 times per
+- * program), and while Metal's own cache answers each request in fractions of a
+- * millisecond, every request still pays the guest round trip to reach it
+- * (FEX -> vkd3d -> Venus -> virglrenderer -> here). Returns a reference the
+- * caller releases, like mtl_new_library does. */
+-static mtl_library *
+-kk_get_msl_library(struct kk_device *device, const char *source)
+-{
+-   /* The compile pool shares this table, and the lock guards the table only.
+-    * Holding it across mtl_new_library would make the pool compile one library
+-    * at a time, which is exactly what the pool exists to avoid. */
+-   mtx_lock(&device->msl_libraries_lock);
+-   struct hash_entry *entry = _mesa_hash_table_search(device->msl_libraries,
+-                                                      source);
+-   /* An entry without a library is a source another worker is compiling: wait
+-    * for it rather than compile the same MSL a second time. Sixteen workers
+-    * asking for the same program at once is the normal case (a title starts
+-    * every pipeline of a burst with the same shaders). */
+-   while (entry != NULL && entry->data == NULL) {
+-      cnd_wait(&device->msl_libraries_cnd, &device->msl_libraries_lock);
+-      entry = _mesa_hash_table_search(device->msl_libraries, source);
+-   }
+-   mtl_library *cached = entry != NULL ? mtl_retain(entry->data) : NULL;
+-   if (cached == NULL) {
+-      /* Compile this source: the placeholder keeps anyone else off it */
+-      char *key = strdup(source);
+-      if (key == NULL) {
+-         mtx_unlock(&device->msl_libraries_lock);
+-         return NULL;
+-      }
+-      entry = _mesa_hash_table_insert(device->msl_libraries, key, NULL);
+-   }
+-   mtx_unlock(&device->msl_libraries_lock);
+-   if (cached != NULL)
+-      return cached;
++   mtl_library *library = kk_metal_cache_find(&device->msl_libraries, key);
++   if (library != NULL)
++      return library;
+ 
+    struct kk_physical_device *pdev = kk_device_physical(device);
+-   mtl_library *library = mtl_new_library(
+-      device->mtl_compiler_handle, source, pdev->info.msl_version,
+-      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+-
+-   mtx_lock(&device->msl_libraries_lock);
+-   /* The placeholder is looked up again: the table may have moved its entries
+-    * while the lock was dropped. */
+-   entry = _mesa_hash_table_search(device->msl_libraries, source);
+-   if (entry != NULL && entry->data == NULL) {
+-      if (library != NULL)
+-         entry->data = mtl_retain(library);
+-      else {
+-         /* Nobody waits forever on a source that cannot be compiled */
+-         free((char *)entry->key);
+-         _mesa_hash_table_remove(device->msl_libraries, entry);
+-      }
+-   }
+-   cnd_broadcast(&device->msl_libraries_cnd);
+-   mtx_unlock(&device->msl_libraries_lock);
++   library = mtl_new_library(device->mtl_compiler_handle, source,
++                             pdev->info.msl_version, MTL_MATH_MODE_FAST,
++                             MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
++   /* Takes the key, which this caller no longer owns */
++   kk_metal_cache_publish(&device->msl_libraries, key, library);
+    return library;
+ }
+ 
+@@ -1723,21 +1760,22 @@ kk_compile_compute_pipeline(struct kk_device *device, mtl_compiler *compiler,
+                             uint32_t local_size_threads,
+                             mtl_compute_pipeline_state **pipe)
+ {
+-   mtl_library *library = kk_get_msl_library(device, data->code);
++   blake3_hash source;
++   mtl_library *library = kk_get_msl_library(device, data->code, source);
+    if (library == NULL)
+       return VK_ERROR_INVALID_SHADER_NV;
+ 
+    struct kk_metal_compute_key *key = kk_metal_compute_key_create(
+-      library, data->entrypoint_name, local_size_threads);
++      source, data->entrypoint_name, local_size_threads);
+    if (key == NULL) {
+       mtl_release(library);
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+ 
+    /* A compute pipeline with the same kernel and threadgroup size is the same
+-    * Metal pipeline (kk_metal_pipelines_init) */
++    * Metal pipeline (kk_metal_caches_init) */
+    mtl_compute_pipeline_state *pipeline =
+-      kk_find_metal_compute_pipeline(device, key);
++      kk_metal_cache_find(&device->metal_compute_pipelines, key);
+    if (pipeline == NULL) {
+       mtl_function_descriptor *function =
+          mtl_new_library_function_descriptor(library, data->entrypoint_name);
+@@ -1745,7 +1783,7 @@ kk_compile_compute_pipeline(struct kk_device *device, mtl_compiler *compiler,
+                                                 local_size_threads);
+       mtl_release(function);
+       /* Takes the key, which this caller no longer owns */
+-      kk_publish_metal_compute_pipeline(device, key, pipeline);
++      kk_metal_cache_publish(&device->metal_compute_pipelines, key, pipeline);
+       if (pipeline == NULL) {
+          mtl_release(library);
+          return VK_ERROR_INVALID_SHADER_NV;
+@@ -2030,12 +2068,15 @@ kk_compile_graphics_pipeline(struct kk_device *device, mtl_compiler *compiler,
+    }
+ 
+    const struct msl_compile_data *vs_data = &vs->msl_data[vs_stage];
+-   mtl_library *vertex_library = kk_get_msl_library(device, vs_data->code);
++   blake3_hash vs_source, fs_source;
++   mtl_library *vertex_library =
++      kk_get_msl_library(device, vs_data->code, vs_source);
+    if (vertex_library == NULL)
+       return VK_ERROR_INVALID_SHADER_NV;
+ 
+    const struct msl_compile_data *fs_data = &vs->msl_data[MESA_SHADER_FRAGMENT];
+-   mtl_library *fragment_library = kk_get_msl_library(device, fs_data->code);
++   mtl_library *fragment_library =
++      kk_get_msl_library(device, fs_data->code, fs_source);
+    if (fragment_library == NULL) {
+       mtl_release(vertex_library);
+       return VK_ERROR_INVALID_SHADER_NV;
+@@ -2048,10 +2089,9 @@ kk_compile_graphics_pipeline(struct kk_device *device, mtl_compiler *compiler,
+    }
+ 
+    /* A render pipeline built from the same two programs and state is the same
+-    * Metal pipeline (kk_metal_pipelines_init) */
+-   struct kk_metal_render_key *key =
+-      kk_metal_render_key_create(vs, vs_data, fs_data, vertex_library,
+-                                 fragment_library);
++    * Metal pipeline (kk_metal_caches_init) */
++   struct kk_metal_render_key *key = kk_metal_render_key_create(
++      vs, vs_data, fs_data, vs_source, fs_source);
+    if (key == NULL) {
+       mtl_release(fragment_library);
+       mtl_release(vertex_library);
+@@ -2059,7 +2099,7 @@ kk_compile_graphics_pipeline(struct kk_device *device, mtl_compiler *compiler,
+    }
+ 
+    mtl_render_pipeline_state *render =
+-      kk_find_metal_render_pipeline(device, key);
++      kk_metal_cache_find(&device->metal_render_pipelines, key);
+    if (render == NULL) {
+       mtl_function_descriptor *vertex_function =
+          mtl_new_library_function_descriptor(vertex_library,
+@@ -2107,7 +2147,7 @@ kk_compile_graphics_pipeline(struct kk_device *device, mtl_compiler *compiler,
+       mtl_release(vertex_function);
+ 
+       /* Takes the key, which this caller no longer owns */
+-      kk_publish_metal_render_pipeline(device, key, render);
++      kk_metal_cache_publish(&device->metal_render_pipelines, key, render);
+       if (render == NULL) {
+          mtl_release(fragment_library);
+          mtl_release(vertex_library);
+@@ -2505,7 +2545,7 @@ kk_compile_program(struct kk_device *dev, struct kk_shader *s,
+  * cores. The first use of a program compiles it if it is still queued, or waits
+  * for the worker compiling it; its destruction leaves it to that worker.
+  * The pool shares the Metal compiler (safe to use concurrently) and the
+- * device's compiled-library table (`msl_libraries_lock`). */
++ * device's tables of compiled Metal objects (kk_metal_caches_init). */
+ static int
+ kk_compile_worker(void *data)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index 0efb9d6..4c5860e 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -248,8 +248,10 @@ VkResult kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
+                                struct kk_shader **shader_out);
+ 
+ /* The device's shared Metal pipeline states (kk_shader.c) */
+-void kk_metal_pipelines_init(struct kk_device *dev);
+-void kk_metal_pipelines_finish(struct kk_device *dev);
++/* The device's tables of compiled Metal objects (kk_device::msl_libraries and
++ * the pipeline state tables); init returns false out of memory. */
++bool kk_metal_caches_init(struct kk_device *dev);
++void kk_metal_caches_finish(struct kk_device *dev);
+ 
+ void kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd,
+                                 struct kk_shader *shader);
+-- 
+2.54.0 (Apple Git-157)
+

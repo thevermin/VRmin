@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: junminlee2004 <junminlee2004@gmail.com>
+Date: Wed, 30 Sep 2026 20:35:02 -0400
+Subject: [PATCH 08/19] kk: Run geometry shader side effects in the compute
+ pass
+
+---
+ src/kosmickrisp/vulkan/kk_shader.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index a4c9092..c498dd9 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -1117,8 +1117,10 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+       }
+    } else if (stage == MESA_SHADER_GEOMETRY) {
+       nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
++      /* Keeps work that only feeds side effects out of the rasterization VS,
++       * where the GPU watchdog resets long vertex work */
+       NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs,
+-               &shader->info.gs, false);
++               &shader->info.gs, true);
+ 
+       /* Only transform feedback and pipeline statistics need these, and KK
+        * exposes neither */
+-- 
+2.54.0 (Apple Git-157)
+

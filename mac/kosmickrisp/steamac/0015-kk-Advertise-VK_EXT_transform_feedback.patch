@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Willie Abrams <willie@pobox.com>
+Date: Thu, 1 Oct 2026 14:07:20 -0500
+Subject: [PATCH 15/19] kk: Advertise VK_EXT_transform_feedback
+
+Enable transformFeedback and geometryStreams. Also set
+transformFeedbackStreamsLinesTriangles: poly handles a multistream GS
+that outputs lines or triangles.
+
+Assisted-by: Claude Code
+---
+ docs/features.txt                           | 2 +-
+ src/kosmickrisp/vulkan/kk_physical_device.c | 7 ++++++-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/docs/features.txt b/docs/features.txt
+index 72f41a5..3acac37 100644
+--- a/docs/features.txt
++++ b/docs/features.txt
+@@ -707,7 +707,7 @@ Khronos extensions that are not part of any Vulkan version:
+   VK_EXT_surface_maintenance1                           DONE (anv, hk, kk, lvp, nvk, panvk, pvr, radv, tu, v3dv, vn)
+   VK_EXT_swapchain_colorspace                           DONE (anv, hk, kk, lvp, nvk, panvk, pvr, radv, tu, v3dv, vn)
+   VK_EXT_swapchain_maintenance1                         DONE (anv, hk, kk, lvp, nvk, panvk, pvr, radv, tu, v3dv, vn)
+-  VK_EXT_transform_feedback                             DONE (anv, hasvk, hk, lvp, nvk, radv, tu, vn)
++  VK_EXT_transform_feedback                             DONE (anv, hasvk, hk, kk, lvp, nvk, radv, tu, vn)
+   VK_EXT_vertex_attribute_divisor                       DONE (anv, dzn, hasvk, hk, kk, lvp, nvk, panvk, pvr, radv, tu, v3dv, vn)
+   VK_EXT_vertex_attribute_robustness                    DONE (kk, vn)
+   VK_EXT_vertex_input_dynamic_state                     DONE (anv, hk, lvp, nvk, panvk, radv, tu, vn)
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 72d86f1..190c873 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -204,6 +204,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+ #ifdef KK_USE_WSI_PLATFORM
+       .EXT_swapchain_maintenance1 = true,
+ #endif
++      .EXT_transform_feedback = true,
+       .EXT_vertex_attribute_robustness = true,
+ 
+       .GOOGLE_decorate_string = true,
+@@ -515,6 +516,10 @@ kk_get_device_features(
+       .shaderSharedFloat32AtomicAdd =
+          pdev->info.msl_version >= MTL_LANGUAGE_VERSION_4_1,
+ 
++      /* VK_EXT_transform_feedback */
++      .transformFeedback = true,
++      .geometryStreams = true,
++
+       /* VK_EXT_vertex_attribute_robustness */
+       .vertexAttributeRobustness = true,
+ 
+@@ -890,7 +895,7 @@ kk_get_device_properties(
+       .maxTransformFeedbackBufferDataSize = 512,
+       .maxTransformFeedbackBufferDataStride = 2048,
+       .transformFeedbackQueries = true,
+-      .transformFeedbackStreamsLinesTriangles = false,
++      .transformFeedbackStreamsLinesTriangles = true,
+       .transformFeedbackRasterizationStreamSelect = true,
+       .transformFeedbackDraw = true,
+ 
+-- 
+2.54.0 (Apple Git-157)
+

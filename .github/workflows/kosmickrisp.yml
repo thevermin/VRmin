@@ -1,0 +1,80 @@
+name: KosmicKrisp para VRmin
+
+# KosmicKrisp (el Vulkan de Mesa sobre Metal 4, para macOS 26+) compilado como el de steamac (fxgl/steamac,
+# host/kosmickrisp/build.sh): Mesa ce576c29 con sus arreglos (mac/kosmickrisp/steamac/: geometry shaders, transform
+# feedback y lo que piden DXVK y vkd3d-proton). Para el Wine de VRmin (x86_64, con Rosetta): se compila para x86_64.
+# Todavía es una prueba: el motor de VRmin no lo usa.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['mac/kosmickrisp/**', '.github/workflows/kosmickrisp.yml']
+
+env:
+  MESA_REPO: https://gitlab.freedesktop.org/mesa/mesa.git
+  MESA_COMMIT: ce576c29ed90822ea15564e1e60cb48e455881bb
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: vrmin
+      - name: "Herramientas (Xcode 26: Metal 4)"
+        run: |
+          x=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1); echo "Xcode: $x"; sudo xcode-select -s "$x"; xcodebuild -version
+          brew install meson ninja pkgconf llvm spirv-llvm-translator spirv-tools glslang >/dev/null
+          python3 -m venv venv && venv/bin/pip -q install mako==1.3.10 pyyaml==6.0.3 packaging==25.0
+      - name: Mesa y arreglos
+        run: |
+          set -e
+          git init -q mesa && git -C mesa remote add origin "$MESA_REPO"
+          git -C mesa fetch -q --depth 1 origin "$MESA_COMMIT" && git -C mesa checkout -q -f --detach "$MESA_COMMIT"
+          for p in vrmin/mac/kosmickrisp/steamac/*.patch; do git -C mesa apply --whitespace=nowarn "$GITHUB_WORKSPACE/$p"; done
+      - name: Compilador de shaders (para esta Mac)
+        run: |
+          set -e
+          PATH="$PWD/venv/bin:$PATH:$(brew --prefix llvm)/bin" meson setup build-clc mesa --prefix="$PWD/clc" --buildtype=release -Db_ndebug=true \
+            -Dplatforms= -Dvulkan-drivers= -Dgallium-drivers= -Dopengl=false -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dzstd=disabled \
+            -Dllvm=enabled -Dshared-llvm=enabled -Dmesa-clc=enabled -Dinstall-mesa-clc=true -Dprecomp-compiler=enabled -Dinstall-precomp-compiler=true
+          PATH="$PWD/venv/bin:$PATH:$(brew --prefix llvm)/bin" ninja -C build-clc install >/dev/null
+      - name: KosmicKrisp (x86_64)
+        run: |
+          set -e
+          cat > x86_64.txt <<'X'
+          [binaries]
+          c = ['clang', '-arch', 'x86_64']
+          cpp = ['clang++', '-arch', 'x86_64']
+          objc = ['clang', '-arch', 'x86_64']
+          objcpp = ['clang++', '-arch', 'x86_64']
+          ar = 'ar'
+          strip = 'strip'
+          [host_machine]
+          system = 'darwin'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          X
+          PATH="$PWD/clc/bin:$PWD/venv/bin:$PATH" MACOSX_DEPLOYMENT_TARGET=26.0 meson setup build mesa --cross-file x86_64.txt \
+            --buildtype=release -Db_ndebug=true -Dplatforms=macos -Dvulkan-drivers=kosmickrisp -Dgallium-drivers= -Dopengl=false \
+            -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dzstd=disabled -Dexpat=disabled \
+            -Dllvm=disabled -Dspirv-tools=disabled -Dmesa-clc=system -Dprecomp-compiler=enabled --prefer-static
+          PATH="$PWD/clc/bin:$PWD/venv/bin:$PATH" MACOSX_DEPLOYMENT_TARGET=26.0 ninja -C build
+      - name: Paquete
+        run: |
+          set -e
+          mkdir -p pkg/lib
+          cp build/src/kosmickrisp/vulkan/libvulkan_kosmickrisp.dylib pkg/lib/
+          install_name_tool -id @rpath/libvulkan_kosmickrisp.dylib pkg/lib/libvulkan_kosmickrisp.dylib
+          lipo -info pkg/lib/libvulkan_kosmickrisp.dylib; otool -L pkg/lib/libvulkan_kosmickrisp.dylib
+          nm -gU pkg/lib/libvulkan_kosmickrisp.dylib | grep ' _vk_icdGetInstanceProcAddr$'
+          codesign --force -s - pkg/lib/libvulkan_kosmickrisp.dylib
+          cp mesa/docs/license.rst pkg/LICENSE-Mesa.rst 2>/dev/null || true
+          echo "KosmicKrisp: Mesa $MESA_COMMIT + steamac mac/kosmickrisp/steamac/" > pkg/VERSION.txt
+          tar -czf kosmickrisp-vrmin.tar.gz -C pkg .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kosmickrisp-vrmin
+          path: kosmickrisp-vrmin.tar.gz

@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Willie Abrams <willie@pobox.com>
+Date: Mon, 5 Oct 2026 18:28:52 -0500
+Subject: [PATCH 16/19] kk: Allow tiled images in host pointer imports
+
+Memory imported from a host pointer has no MTLHeap, so binding a tiled
+image to it hit an assert in kk_image_plane_bind, and the format query
+only offered host allocations for linear images. Venus in virglrenderer
+imports every guest allocation as host memory on kk, which has a single
+memory type, so guest images hit this.
+
+Give such memory a private heap the first time a tiled image is bound.
+Tiled contents are opaque to the host, so they don't need to live in the
+imported pages. Buffers and linear images keep using the imported
+buffer, and the format query now offers host allocations for tiled
+images too.
+
+Assisted-by: Claude Code
+---
+ src/kosmickrisp/vulkan/kk_bo.c            |  6 +++---
+ src/kosmickrisp/vulkan/kk_bo.h            |  3 +++
+ src/kosmickrisp/vulkan/kk_buffer.c        |  6 +++---
+ src/kosmickrisp/vulkan/kk_device_memory.c | 11 ++++++----
+ src/kosmickrisp/vulkan/kk_image.c         | 25 ++++++++++++++++-------
+ 5 files changed, 34 insertions(+), 17 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_bo.c b/src/kosmickrisp/vulkan/kk_bo.c
+index 5562b61..4c32471 100644
+--- a/src/kosmickrisp/vulkan/kk_bo.c
++++ b/src/kosmickrisp/vulkan/kk_bo.c
+@@ -81,11 +81,11 @@ fail_heap:
+ void
+ kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
+ {
+-   /* We may only have a mapped buffer, for example if the memory was imported
+-    * from a host pointer */
++   /* A host pointer import keeps its buffer resident, and has a heap only once
++    * a tiled image was bound to it */
+    if (bo->mtl_handle)
+       kk_device_remove_heap_from_residency_set(dev, bo->mtl_handle);
+-   else
++   if (bo->host_import)
+       kk_device_remove_buffer_from_residency_set(dev, bo->map);
+ 
+    mtl_release(bo->map);
+diff --git a/src/kosmickrisp/vulkan/kk_bo.h b/src/kosmickrisp/vulkan/kk_bo.h
+index d1590b9..7bdd5ba 100644
+--- a/src/kosmickrisp/vulkan/kk_bo.h
++++ b/src/kosmickrisp/vulkan/kk_bo.h
+@@ -23,6 +23,9 @@ struct kk_bo {
+    uint64_t size_B;
+    uint64_t gpu; // GPU address
+    void *cpu;    // CPU address
++   /* map was imported from a host pointer; mtl_handle, if set, is a private
++    * heap that only backs tiled images */
++   bool host_import;
+ };
+ 
+ struct kk_ptr {
+diff --git a/src/kosmickrisp/vulkan/kk_buffer.c b/src/kosmickrisp/vulkan/kk_buffer.c
+index 73fd1f5..1301f3f 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_buffer.c
+@@ -155,13 +155,13 @@ kk_bind_buffer_memory(struct kk_device *dev, const VkBindBufferMemoryInfo *info)
+    VK_FROM_HANDLE(kk_device_memory, mem, info->memory);
+    VK_FROM_HANDLE(kk_buffer, buffer, info->buffer);
+ 
+-   if (mem->bo->mtl_handle) {
++   if (!mem->bo->host_import) {
+       buffer->metal.handle = mtl_new_buffer_with_length(
+          mem->bo->mtl_handle, buffer->vk.size, info->memoryOffset);
+       buffer->metal.offset = 0u;
+    } else {
+-      /* If the memory is not heap backed, for example if we imported a host
+-       * pointer, use the mapped buffer directly and retain a reference */
++      /* A host pointer import uses its mapped buffer directly, even once a
++       * tiled image gave it a private heap, and retains a reference */
+       buffer->metal.handle = mem->bo->map;
+       buffer->metal.offset = info->memoryOffset;
+       mtl_retain(buffer->metal.handle);
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory.c b/src/kosmickrisp/vulkan/kk_device_memory.c
+index e658bd7..ee69e4a 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory.c
++++ b/src/kosmickrisp/vulkan/kk_device_memory.c
+@@ -130,10 +130,12 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+          mem->bo->size_B = mtl_heap_get_size(mem->bo->mtl_handle);
+          kk_device_add_heap_to_residency_set(dev, mem->bo->mtl_handle);
+       } else if (import_host) {
+-         /* We can't create a heap from a host pointer. The imported memory will
+-          * only be usable for buffers */
++         /* We can't create a heap from a host pointer. Buffers and linear
++          * images use the imported buffer; tiled images get a private heap
++          * when first bound (kk_image_plane_bind) */
+          mem->bo->map = mtl_new_buffer_with_bytes_no_copy(
+             dev->mtl_handle, host_info->pHostPointer, mem->vk.size);
++         mem->bo->host_import = true;
+          mem->bo->size_B = mtl_buffer_get_length(mem->bo->map);
+          kk_device_add_buffer_to_residency_set(dev, mem->bo->map);
+       }
+@@ -295,8 +297,9 @@ kk_GetMemoryMetalHandleEXT(
+           VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT);
+    VK_FROM_HANDLE(kk_device_memory, mem, pGetMetalHandleInfo->memory);
+ 
+-   /* In some cases, such as host pointer imports, we don't have a MTLHeap */
+-   if (!mem->bo->mtl_handle)
++   /* A host pointer import has no MTLHeap to export; a private heap there only
++    * backs tiled images */
++   if (mem->bo->host_import)
+       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+ 
+    /* From the Vulkan spec of vkGetMemoryMetalHandleEXT:
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index de27a6d..5b1a685 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -16,6 +16,8 @@
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ #include "kosmickrisp/bridge/vk_to_mtl_map.h"
+ 
++#include "util/u_atomic.h"
++
+ #include "vk_enum_defines.h"
+ #include "vk_enum_to_str.h"
+ #include "vk_format.h"
+@@ -400,14 +402,10 @@ kk_GetPhysicalDeviceImageFormatProperties2(
+          ext_mem_props = &kk_mtlheap_mem_props;
+          break;
+       case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
+-      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT: {
+-         if (pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR) {
+-            return vk_errorf(pdev, VK_ERROR_FORMAT_NOT_SUPPORTED,
+-                             "host memory import image must be linear");
+-         }
++      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT:
++         /* Tiled images get a private heap when bound (kk_image_plane_bind) */
+          ext_mem_props = &kk_host_mem_props;
+          break;
+-      }
+       default:
+          /* From the Vulkan 1.3.256 spec:
+           *
+@@ -852,7 +850,20 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+                                &plane_align_B);
+    *offset_B = align64(*offset_B, plane_align_B);
+ 
+-   assert(plane->layout.linear || mem->bo->mtl_handle);
++   /* Memory imported from a host pointer has no heap, which tiled textures
++    * need. Give it a private heap of its size on the first tiled bind: tiled
++    * contents are opaque to the host, so they needn't live in the imported
++    * pages. Binds may race, so only one heap is kept. */
++   if (!plane->layout.linear && !mem->bo->mtl_handle) {
++      mtl_heap *heap =
++         mtl_new_heap(dev->mtl_handle, mem->bo->size_B, KK_MTL_RESOURCE_OPTIONS);
++      if (!heap)
++         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      if (p_atomic_cmpxchg_ptr(&mem->bo->mtl_handle, NULL, heap) == NULL)
++         kk_device_add_heap_to_residency_set(dev, heap);
++      else
++         mtl_release(heap);
++   }
+ 
+    /* Linear textures in Metal need to be allocated through a buffer... */
+    plane->mem = mem;
+-- 
+2.54.0 (Apple Git-157)
+

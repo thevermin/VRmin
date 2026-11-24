@@ -1,0 +1,1563 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Mon, 12 Oct 2026 22:07:42 +0300
+Subject: [PATCH] kk: unroll direct non-indexed draws on the CPU; name what a
+ failed command buffer contained
+
+STEAMAC-G. A draw whose fragment shader reads a flat varying with the last
+vertex provoking (zink keeps GL's) is unrolled into indices that rotate the
+last vertex first. The unroll kernel ended the render pass around every such
+draw: the attachments stored, a compute pass, the attachments loaded again.
+Steam's web helper composites its first frame that way, 12 rectangles into
+its LINEAR window buffer (host memory): 13 render passes over the whole
+2560x1600 window, 43 ms of GPU time on an M1 Max, about a second after Steam's
+hellovr_vulkan probe, which is where M3 and later GPUs lost the device (its
+command buffer a victim of the GPU's recovery after 50-120 ms, another one
+blamed with Hang). Direct draws without an index buffer now get the same
+indices written by the CPU at recording (indexed indirect draws from the
+command buffer's upload memory, as the kernel wrote them): one render pass,
+0.37 ms instead of 27 ms for 11 such draws into a 2560x1600 LINEAR host import.
+
+Command queue error diagnostics: command buffers keep a record of what they
+encoded (render passes and how many multisampled, compute encoders, draws and
+dispatches with the indirect ones, KosmicKrisp operations: meta clears,
+blits, resolves, copies, fills, query resets/copies, queries, timestamps,
+events, GS/tessellation passes, conditional rendering; the libkk kernels; the
+MSL hashes of the programs bound, with L/D/S/A/B/W features: loops, discard,
+SIMD-group/quad operations, atomics, barriers, texture writes). The queue
+keeps the records of its last 16 commits and their outcome (the IOGPU reason
+parsed from the error's userInfo: Hang, InnocentVictim, ...). A failure
+prints its command buffer's record; the first one in the process also waits
+up to 300 ms for the feedback of every command buffer of every device still
+on the GPU and names them with their outcome and GPU time (the one that hung
+is blamed "Hang", the others are victims), then logs an excerpt of the MSL of
+programs with loops, atomics or barriers of the ones that hung. Reading
+os_log is dropped: its IOGPU and Metal warning messages are <private>, the
+rest repeated the userInfo, and its 2-4 s delayed the device loss line past
+other devices' failures. MESA_KK_DEBUG=cbs logs every command buffer's record
+and outcome; MESA_KK_DEBUG=msl prints each MSL's hash.
+---
+ src/kosmickrisp/bridge/meson.build            |   2 +-
+ src/kosmickrisp/bridge/mtl_command_queue.h    |  11 -
+ src/kosmickrisp/bridge/mtl_command_queue.m    |  38 ---
+ .../bridge/stubs/mtl_command_queue.c          |   8 -
+ src/kosmickrisp/vulkan/kk_cb_record.c         | 265 ++++++++++++++++++
+ src/kosmickrisp/vulkan/kk_cb_record.h         | 112 ++++++++
+ src/kosmickrisp/vulkan/kk_cmd_buffer.c        |  10 +
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h        |   3 +
+ src/kosmickrisp/vulkan/kk_cmd_clear.c         |   2 +
+ src/kosmickrisp/vulkan/kk_cmd_copy.c          |   4 +
+ src/kosmickrisp/vulkan/kk_cmd_dispatch.c      |  10 +-
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          |  96 ++++++-
+ src/kosmickrisp/vulkan/kk_cmd_meta.c          |   5 +
+ src/kosmickrisp/vulkan/kk_debug.c             |   1 +
+ src/kosmickrisp/vulkan/kk_debug.h             |   3 +
+ src/kosmickrisp/vulkan/kk_device.c            |  21 +-
+ src/kosmickrisp/vulkan/kk_device.h            |   7 +
+ src/kosmickrisp/vulkan/kk_event.c             |   2 +
+ src/kosmickrisp/vulkan/kk_query_pool.c        |   4 +
+ src/kosmickrisp/vulkan/kk_queue.c             | 233 ++++++++++++++-
+ src/kosmickrisp/vulkan/kk_queue.h             |  21 ++
+ src/kosmickrisp/vulkan/kk_shader.c            |  59 +++-
+ src/kosmickrisp/vulkan/kk_shader.h            |   3 +
+ src/kosmickrisp/vulkan/meson.build            |   2 +
+ 24 files changed, 837 insertions(+), 85 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/kk_cb_record.c
+ create mode 100644 src/kosmickrisp/vulkan/kk_cb_record.h
+
+diff --git a/src/kosmickrisp/bridge/meson.build b/src/kosmickrisp/bridge/meson.build
+index d225783..03ba43b 100644
+--- a/src/kosmickrisp/bridge/meson.build
++++ b/src/kosmickrisp/bridge/meson.build
+@@ -54,7 +54,7 @@ mtl_bridge_dependencies = [
+ if host_machine.system() == 'darwin'
+   mtl_bridge_dependencies += dependency(
+     'appleframeworks',
+-    modules : ['Foundation', 'OSLog']
++    modules : ['Foundation']
+   )
+ endif
+ 
+diff --git a/src/kosmickrisp/bridge/mtl_command_queue.h b/src/kosmickrisp/bridge/mtl_command_queue.h
+index ff85237..313846d 100644
+--- a/src/kosmickrisp/bridge/mtl_command_queue.h
++++ b/src/kosmickrisp/bridge/mtl_command_queue.h
+@@ -20,17 +20,6 @@ mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
+                                         mtl_feedback_handler_callback callback,
+                                         void *data, uint64_t tag);
+ 
+-/* Calls cb for the error and fault messages that the process' GPU frameworks
+- * (Metal, IOGPU, AGX) logged to os_log in the last `seconds` (at most
+- * max_lines, oldest first): Metal 4 reports a GPU page fault, a hang, a
+- * timeout and the discard of a victim of another command buffer's recovery
+- * all as MTL4CommandQueueErrorTimeout, the IOGPU reason only goes to os_log.
+- * Reading the log takes about a second. */
+-void mtl_log_recent_gpu_errors(double seconds, unsigned max_lines,
+-                               void (*cb)(const char *sender,
+-                                          const char *message, void *data),
+-                               void *data);
+-
+ /* MTL4CommandQueue */
+ mtl_command_queue *mtl_new_command_queue(mtl_device *device);
+ 
+diff --git a/src/kosmickrisp/bridge/mtl_command_queue.m b/src/kosmickrisp/bridge/mtl_command_queue.m
+index 2c752cd..2d512e2 100644
+--- a/src/kosmickrisp/bridge/mtl_command_queue.m
++++ b/src/kosmickrisp/bridge/mtl_command_queue.m
+@@ -8,7 +8,6 @@
+ 
+ #include <Metal/MTLDevice.h>
+ #include <Metal/MTLCommandQueue.h>
+-#include <OSLog/OSLog.h>
+ 
+ #include <mach/mach_time.h>
+ 
+@@ -68,43 +67,6 @@
+    }
+ }
+ 
+-void
+-mtl_log_recent_gpu_errors(double seconds, unsigned max_lines,
+-                          void (*cb)(const char *sender, const char *message,
+-                                     void *data),
+-                          void *data)
+-{
+-   @autoreleasepool {
+-      NSError *error = nil;
+-      OSLogStore *store =
+-         [OSLogStore storeWithScope:OSLogStoreCurrentProcessIdentifier
+-                              error:&error];
+-      if (!store)
+-         return;
+-      OSLogPosition *position =
+-         [store positionWithDate:[NSDate dateWithTimeIntervalSinceNow:-seconds]];
+-      NSPredicate *predicate = [NSPredicate
+-         predicateWithFormat:@"messageType == error OR messageType == fault"];
+-      OSLogEnumerator *entries =
+-         [store entriesEnumeratorWithOptions:0
+-                                    position:position
+-                                   predicate:predicate
+-                                       error:&error];
+-      unsigned lines = 0u;
+-      for (OSLogEntry *entry in entries) {
+-         if (![entry isKindOfClass:[OSLogEntryLog class]])
+-            continue;
+-         NSString *sender = ((OSLogEntryLog *)entry).sender;
+-         if (![sender containsString:@"Metal"] &&
+-             ![sender containsString:@"IOGPU"] && ![sender hasPrefix:@"AGX"])
+-            continue;
+-         cb(sender.UTF8String, entry.composedMessage.UTF8String, data);
+-         if (++lines == max_lines)
+-            break;
+-      }
+-   }
+-}
+-
+ /* MTL4CommandQueue */
+ mtl_command_queue *
+ mtl_new_command_queue(mtl_device *device)
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_command_queue.c b/src/kosmickrisp/bridge/stubs/mtl_command_queue.c
+index 7fb681b..6d85914 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_command_queue.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_command_queue.c
+@@ -20,14 +20,6 @@ mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
+ {
+ }
+ 
+-void
+-mtl_log_recent_gpu_errors(double seconds, unsigned max_lines,
+-                          void (*cb)(const char *sender, const char *message,
+-                                     void *data),
+-                          void *data)
+-{
+-}
+-
+ /* MTL4CommandQueue */
+ mtl_command_queue *
+ mtl_new_command_queue(mtl_device *device)
+diff --git a/src/kosmickrisp/vulkan/kk_cb_record.c b/src/kosmickrisp/vulkan/kk_cb_record.c
+new file mode 100644
+index 0000000..9a47028
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_cb_record.c
+@@ -0,0 +1,265 @@
++/*
++ * Copyright 2026 steamac
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "kk_cb_record.h"
++
++#include "libkk_shaders.h"
++
++#include "util/hash_table.h"
++#include "util/log.h"
++#include "util/macros.h"
++#include "util/simple_mtx.h"
++
++#include <assert.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++
++void
++kk_cb_record_program(struct kk_cb_record *record,
++                     const struct kk_cb_program *program)
++{
++   for (uint32_t i = 0u; i < record->program_count; i++) {
++      const struct kk_cb_program *p = &record->programs[i];
++      if (p->hash[0] == program->hash[0] && p->hash[1] == program->hash[1] &&
++          p->compute == program->compute)
++         return;
++   }
++   if (record->program_count < KK_CB_RECORD_PROGRAMS)
++      record->programs[record->program_count++] = *program;
++   else
++      kk_cb_record_count(&record->programs_dropped);
++}
++
++/* The patterns nir_to_msl emits for each feature; a loop is
++ * "for (uint64_t no_crash ..." or, with KK_WORKAROUND_2 disabled,
++ * "while (true)". */
++static const struct {
++   const char *pattern;
++   enum kk_msl_feature feature;
++} kk_msl_patterns[] = {
++   {"no_crash", KK_MSL_LOOP},
++   {"while (true)", KK_MSL_LOOP},
++   {"discard_fragment", KK_MSL_DISCARD},
++   {"simd_", KK_MSL_SIMD},
++   {"quad_", KK_MSL_SIMD},
++   {"atomic_", KK_MSL_ATOMIC},
++   {"_barrier(", KK_MSL_BARRIER},
++   {".write(", KK_MSL_WRITE},
++};
++
++void
++kk_msl_digest(const char *code, uint32_t *hash, uint8_t *features)
++{
++   *hash = code ? _mesa_hash_string(code) : 0u;
++   *features = 0u;
++   if (code == NULL)
++      return;
++   for (uint32_t i = 0u; i < ARRAY_SIZE(kk_msl_patterns); i++) {
++      if (strstr(code, kk_msl_patterns[i].pattern))
++         *features |= kk_msl_patterns[i].feature;
++   }
++}
++
++#define KK_MSL_EXCERPTS       128u
++#define KK_MSL_EXCERPT_LENGTH 480u
++#define KK_MSL_EXCERPT_BEFORE 96u
++
++/* Programs whose MSL could spin or wait on other threads */
++#define KK_MSL_EXCERPT_FEATURES (KK_MSL_LOOP | KK_MSL_ATOMIC | KK_MSL_BARRIER)
++
++static struct {
++   simple_mtx_t lock;
++   uint32_t next;
++   struct {
++      uint32_t hash;
++      bool logged;
++      char text[KK_MSL_EXCERPT_LENGTH + 1u];
++   } entries[KK_MSL_EXCERPTS];
++} kk_msl_excerpts = {.lock = SIMPLE_MTX_INITIALIZER};
++
++void
++kk_msl_note_excerpt(uint32_t hash, uint8_t features, const char *code)
++{
++   if (!(features & KK_MSL_EXCERPT_FEATURES) || code == NULL)
++      return;
++
++   /* From a little before the first loop, atomic or barrier */
++   const char *first = NULL;
++   for (uint32_t i = 0u; i < ARRAY_SIZE(kk_msl_patterns); i++) {
++      if (!(kk_msl_patterns[i].feature & KK_MSL_EXCERPT_FEATURES))
++         continue;
++      const char *at = strstr(code, kk_msl_patterns[i].pattern);
++      if (at && (first == NULL || at < first))
++         first = at;
++   }
++   const char *start = first - MIN2((size_t)(first - code),
++                                    (size_t)KK_MSL_EXCERPT_BEFORE);
++
++   simple_mtx_lock(&kk_msl_excerpts.lock);
++   for (uint32_t i = 0u; i < KK_MSL_EXCERPTS; i++) {
++      if (kk_msl_excerpts.entries[i].hash == hash &&
++          kk_msl_excerpts.entries[i].text[0]) {
++         simple_mtx_unlock(&kk_msl_excerpts.lock);
++         return;
++      }
++   }
++   uint32_t slot = kk_msl_excerpts.next++ % KK_MSL_EXCERPTS;
++   kk_msl_excerpts.entries[slot].hash = hash;
++   kk_msl_excerpts.entries[slot].logged = false;
++   /* One line, runs of whitespace collapsed */
++   char *out = kk_msl_excerpts.entries[slot].text;
++   size_t n = 0u;
++   for (const char *c = start; *c && n < KK_MSL_EXCERPT_LENGTH; c++) {
++      const bool space = *c == ' ' || *c == '\n' || *c == '\t';
++      if (space && (n == 0u || out[n - 1u] == ' '))
++         continue;
++      out[n++] = space ? ' ' : *c;
++   }
++   out[n] = '\0';
++   simple_mtx_unlock(&kk_msl_excerpts.lock);
++}
++
++unsigned
++kk_cb_record_log_excerpts(const struct kk_cb_record *record,
++                          unsigned max_lines)
++{
++   unsigned lines = 0u;
++   simple_mtx_lock(&kk_msl_excerpts.lock);
++   for (uint32_t p = 0u; p < record->program_count && lines < max_lines; p++) {
++      for (uint32_t h = 0u; h < 2u && lines < max_lines; h++) {
++         const uint32_t hash = record->programs[p].hash[h];
++         if (hash == 0u)
++            continue;
++         for (uint32_t i = 0u; i < KK_MSL_EXCERPTS; i++) {
++            if (kk_msl_excerpts.entries[i].hash != hash ||
++                !kk_msl_excerpts.entries[i].text[0] ||
++                kk_msl_excerpts.entries[i].logged)
++               continue;
++            kk_msl_excerpts.entries[i].logged = true;
++            mesa_loge("kk: MSL %08x from its first loop, atomic or barrier: %s",
++                      hash, kk_msl_excerpts.entries[i].text);
++            lines++;
++            break;
++         }
++      }
++   }
++   simple_mtx_unlock(&kk_msl_excerpts.lock);
++   return lines;
++}
++
++static const char *const kk_cb_op_names[KK_CB_OP_COUNT] = {
++   [KK_CB_OP_CLEAR_ATTACHMENTS] = "clear-attachments",
++   [KK_CB_OP_CLEAR_IMAGE] = "clear-image",
++   [KK_CB_OP_BLIT_IMAGE] = "blit-image",
++   [KK_CB_OP_RESOLVE_IMAGE] = "resolve-image",
++   [KK_CB_OP_RESOLVE_RENDERING] = "resolve-rendering",
++   [KK_CB_OP_COPY] = "copy",
++   [KK_CB_OP_FILL_UPDATE] = "fill/update",
++   [KK_CB_OP_QUERY_RESET] = "query-reset",
++   [KK_CB_OP_QUERY_COPY] = "query-copy",
++   [KK_CB_OP_QUERY] = "query",
++   [KK_CB_OP_TIMESTAMP] = "timestamp",
++   [KK_CB_OP_EVENT] = "event",
++   [KK_CB_OP_GS_TESS] = "gs/tess",
++   [KK_CB_OP_CONDITIONAL] = "conditional",
++};
++
++static const char *const kk_precomp_names[LIBKK_NUM_PROGRAMS] = {
++   [LIBKK_PREDICATE_INDIRECT_GT_DRAW_ID] = "predicate_gt_draw_id",
++   [LIBKK_PREDICATE_INDIRECT_EQ_ZERO] = "predicate_eq_zero",
++   [LIBKK_PREDICATE_INDIRECT_NEQ_ZERO] = "predicate_neq_zero",
++   [LIBKK_DRAW_BYTE_COUNT] = "draw_byte_count",
++   [LIBKK_UNROLL_GEOMETRY] = "unroll_geometry",
++   [LIBKK_UNROLL_RESTART] = "unroll_restart",
++   [LIBKK_UNROLL_ADJACENCY] = "unroll_adjacency",
++   [LIBKK_PREFIX_SUM_TESS] = "prefix_sum_tess",
++   [LIBKK_GS_SETUP_INDIRECT] = "gs_setup_indirect",
++   [LIBKK_PREFIX_SUM_GEOM] = "prefix_sum_geom",
++   [LIBKK_RESET_QUERY] = "reset_query",
++   [LIBKK_WRITE_U32_ARRAY] = "write_u32_array",
++   [LIBKK_WRITE_U32] = "write_u32",
++   [LIBKK_COPY_XFB_COUNTERS] = "copy_xfb_counters",
++   [LIBKK_COPY_QUERIES] = "copy_queries",
++   [LIBKK_TESS_SETUP_INDIRECT] = "tess_setup_indirect",
++   [LIBKK_TESS_ISOLINE] = "tess_isoline",
++   [LIBKK_TESS_TRI] = "tess_tri",
++   [LIBKK_TESS_QUAD] = "tess_quad",
++};
++static_assert(LIBKK_NUM_PROGRAMS <= 32, "precomp is a 32-bit mask");
++
++struct kk_out {
++   char *p;
++   size_t left;
++};
++
++static void PRINTFLIKE(2, 3)
++kk_out_printf(struct kk_out *out, const char *fmt, ...)
++{
++   if (out->left <= 1u)
++      return;
++   va_list args;
++   va_start(args, fmt);
++   int n = vsnprintf(out->p, out->left, fmt, args);
++   va_end(args);
++   if (n < 0)
++      return;
++   const size_t used = MIN2((size_t)n, out->left - 1u);
++   out->p += used;
++   out->left -= used;
++}
++
++void
++kk_cb_record_format(const struct kk_cb_record *r, char *buf, size_t size)
++{
++   struct kk_out out = {buf, size};
++   buf[0] = '\0';
++
++   kk_out_printf(&out, "%u render passes", r->render_passes);
++   if (r->msaa_render_passes)
++      kk_out_printf(&out, " (%u at %ux)", r->msaa_render_passes,
++                    r->max_samples);
++   kk_out_printf(&out,
++                 ", %u compute encoders, %u draws (%u indirect), %u "
++                 "dispatches (%u indirect)",
++                 r->compute_encoders, r->draws, r->indirect_draws,
++                 r->dispatches, r->indirect_dispatches);
++   if (r->ops) {
++      kk_out_printf(&out, "; ops");
++      for (uint32_t i = 0u; i < KK_CB_OP_COUNT; i++) {
++         if (r->ops & (1u << i))
++            kk_out_printf(&out, " %s", kk_cb_op_names[i]);
++      }
++   }
++   if (r->precomp) {
++      kk_out_printf(&out, "; kernels");
++      for (uint32_t i = 0u; i < LIBKK_NUM_PROGRAMS; i++) {
++         if (r->precomp & (1u << i))
++            kk_out_printf(&out, " %s", kk_precomp_names[i]);
++      }
++   }
++   if (r->program_count) {
++      kk_out_printf(&out, "; programs (MSL hashes, LDSABW features)");
++      for (uint32_t i = 0u; i < r->program_count; i++) {
++         const struct kk_cb_program *p = &r->programs[i];
++         char features[KK_MSL_FEATURE_COUNT + 1u];
++         uint32_t n = 0u;
++         for (uint32_t f = 0u; f < KK_MSL_FEATURE_COUNT; f++) {
++            if (p->features & (1u << f))
++               features[n++] = "LDSABW"[f];
++         }
++         features[n] = '\0';
++         if (p->compute)
++            kk_out_printf(&out, " c:%08x", p->hash[0]);
++         else
++            kk_out_printf(&out, " r%s:%08x/%08x", p->pre_render ? "+" : "",
++                          p->hash[0], p->hash[1]);
++         if (n)
++            kk_out_printf(&out, ":%s", features);
++      }
++      if (r->programs_dropped)
++         kk_out_printf(&out, " +%u more", r->programs_dropped);
++   }
++}
+diff --git a/src/kosmickrisp/vulkan/kk_cb_record.h b/src/kosmickrisp/vulkan/kk_cb_record.h
+new file mode 100644
+index 0000000..7b17e81
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_cb_record.h
+@@ -0,0 +1,112 @@
++/*
++ * Copyright 2026 steamac
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef KK_CB_RECORD_H
++#define KK_CB_RECORD_H 1
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/* What a command buffer contained, for command queue errors: the queue keeps
++ * the record of its last commits (kk_queue_log_failure prints the failed one
++ * and every command buffer of the process still in flight) and
++ * MESA_KK_DEBUG=cbs logs every commit's. Recording only counts and ORs bits;
++ * programs are noted when the bound Metal pipeline changes. */
++
++/* MSL features of a program that can keep the GPU from making progress
++ * (kk_msl_digest) */
++enum kk_msl_feature {
++   KK_MSL_LOOP = 1u << 0,    /* L: a loop */
++   KK_MSL_DISCARD = 1u << 1, /* D: discard_fragment */
++   KK_MSL_SIMD = 1u << 2,    /* S: SIMD-group or quad operations */
++   KK_MSL_ATOMIC = 1u << 3,  /* A: atomics */
++   KK_MSL_BARRIER = 1u << 4, /* B: threadgroup or SIMD-group barriers */
++   KK_MSL_WRITE = 1u << 5,   /* W: texture writes */
++   KK_MSL_FEATURE_COUNT = 6,
++};
++
++/* Work KosmicKrisp encodes for Vulkan commands other than draws and
++ * dispatches */
++enum kk_cb_op {
++   KK_CB_OP_CLEAR_ATTACHMENTS,
++   KK_CB_OP_CLEAR_IMAGE,
++   KK_CB_OP_BLIT_IMAGE,
++   KK_CB_OP_RESOLVE_IMAGE,
++   KK_CB_OP_RESOLVE_RENDERING,
++   KK_CB_OP_COPY,
++   KK_CB_OP_FILL_UPDATE,
++   KK_CB_OP_QUERY_RESET,
++   KK_CB_OP_QUERY_COPY,
++   KK_CB_OP_QUERY,
++   KK_CB_OP_TIMESTAMP,
++   KK_CB_OP_EVENT,
++   KK_CB_OP_GS_TESS,
++   KK_CB_OP_CONDITIONAL,
++   KK_CB_OP_COUNT,
++};
++
++#define KK_CB_RECORD_PROGRAMS 8u
++
++/* A Metal pipeline: render (vertex and fragment function MSL hashes) or
++ * compute (kernel MSL hash, 0). */
++struct kk_cb_program {
++   uint32_t hash[2];
++   uint8_t features; /* enum kk_msl_feature of all its functions */
++   bool compute;
++   /* Render pipelines with compute passes before them (GS, tessellation) */
++   bool pre_render;
++};
++
++struct kk_cb_record {
++   uint16_t render_passes;
++   uint16_t msaa_render_passes;
++   uint16_t compute_encoders;
++   uint16_t draws;
++   uint16_t indirect_draws;
++   uint16_t dispatches;
++   uint16_t indirect_dispatches;
++   uint8_t max_samples;
++   uint8_t program_count;
++   /* Programs bound past programs[] */
++   uint16_t programs_dropped;
++   uint32_t ops;     /* BITFIELD_BIT(enum kk_cb_op) */
++   uint32_t precomp; /* BITFIELD_BIT(enum libkk_program) */
++   struct kk_cb_program programs[KK_CB_RECORD_PROGRAMS];
++};
++
++static inline void
++kk_cb_record_count(uint16_t *counter)
++{
++   if (*counter != UINT16_MAX)
++      (*counter)++;
++}
++
++static inline void
++kk_cb_record_op(struct kk_cb_record *record, enum kk_cb_op op)
++{
++   record->ops |= 1u << op;
++}
++
++void kk_cb_record_program(struct kk_cb_record *record,
++                          const struct kk_cb_program *program);
++
++/* Hash and features of a program's MSL */
++void kk_msl_digest(const char *code, uint32_t *hash, uint8_t *features);
++
++/* Keeps an excerpt of the MSL of programs with loops, atomics or barriers
++ * (from the first loop, atomic or barrier) for kk_cb_record_log_excerpts. */
++void kk_msl_note_excerpt(uint32_t hash, uint8_t features, const char *code);
++
++/* One line: the record's encoders, draws, dispatches, operations and
++ * programs. */
++void kk_cb_record_format(const struct kk_cb_record *record, char *out,
++                         size_t size);
++
++/* Logs the kept MSL excerpts of the record's programs not logged before in the
++ * process, at most max_lines; returns the number logged. */
++unsigned kk_cb_record_log_excerpts(const struct kk_cb_record *record,
++                                   unsigned max_lines);
++
++#endif /* KK_CB_RECORD_H */
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index f412d6b..29b0046 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -218,6 +218,7 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+    cmd->one_time_submit =
+       pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    cmd->replay = false;
++   memset(&cmd->record, 0, sizeof(cmd->record));
+ 
+    /* vk_command_buffer_begin will reset the command buffer meaning the
+     * allocator may be returned to the pool. Request a new one. */
+@@ -289,6 +290,12 @@ cs_start_render(struct kk_cmd_buffer *cmd)
+ 
+    kk_encoder_update_debug(cmd, cmd->metal.render);
+    kk_encoder_wait_for_sparse_binds(cmd, cmd->metal.render);
++   kk_cb_record_count(&cmd->record.render_passes);
++   if (state->render.samples > 1u) {
++      kk_cb_record_count(&cmd->record.msaa_render_passes);
++      cmd->record.max_samples =
++         MAX2(cmd->record.max_samples, state->render.samples);
++   }
+    /* Starting a new render pass means we already flushed and no barrier is
+     * needed. */
+    state->render.write_available = false;
+@@ -344,6 +351,7 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
+       mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
+       kk_encoder_update_debug(cmd, cmd->metal.compute);
+       kk_encoder_wait_for_sparse_binds(cmd, cmd->metal.compute);
++      kk_cb_record_count(&cmd->record.compute_encoders);
+    }
+ 
+    return cmd->metal.compute;
+@@ -824,6 +832,7 @@ kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
+ {
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+    struct kk_precompiled_shader *prog = &dev->precompiled_cache.shaders[idx];
++   cmd->record.precomp |= BITFIELD_BIT(idx);
+ 
+    mtl_compute_encoder *encoder = cs_get_compute(cmd);
+    mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
+@@ -895,6 +904,7 @@ kk_CmdBeginConditionalRendering2EXT(
+    const VkConditionalRenderingBeginInfo2EXT *pConditionalRenderingBegin)
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   kk_cb_record_op(&cmd->record, KK_CB_OP_CONDITIONAL);
+ 
+    cmd->state.cond_render.address =
+       pConditionalRenderingBegin->addressRange.address;
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 6919023..6b6b916 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -310,6 +310,9 @@ struct kk_cmd_buffer {
+     * one of them holds a reduction sampler at submission, the command buffer
+     * is re-recorded. */
+    struct util_dynarray minmax_uab_sets;
++
++   /* What the command buffer encoded, for command queue errors (kk_queue) */
++   struct kk_cb_record record;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(kk_cmd_buffer, vk.base, VkCommandBuffer,
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_clear.c b/src/kosmickrisp/vulkan/kk_cmd_clear.c
+index 3d47aec..ca49987 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_clear.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_clear.c
+@@ -43,6 +43,8 @@ clear_image(struct kk_cmd_buffer *cmd, struct kk_image *image,
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+    ASSERTED VkResult result;
+ 
++   kk_cb_record_op(&cmd->record, KK_CB_OP_CLEAR_IMAGE);
++
+    for (uint32_t r = 0; r < range_count; r++) {
+       const uint32_t level_count =
+          vk_image_subresource_level_count(&image->vk, &ranges[r]);
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_copy.c b/src/kosmickrisp/vulkan/kk_cmd_copy.c
+index 67bb33f..3177ced 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_copy.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_copy.c
+@@ -25,6 +25,7 @@ kk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(kk_buffer, src, pCopyBufferInfo->srcBuffer);
+    VK_FROM_HANDLE(kk_buffer, dst, pCopyBufferInfo->dstBuffer);
++   kk_cb_record_op(&cmd->record, KK_CB_OP_COPY);
+ 
+    mtl_compute_encoder *encoder = cs_get_compute(cmd);
+    for (uint32_t i = 0; i < pCopyBufferInfo->regionCount; i++) {
+@@ -90,6 +91,7 @@ kk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(kk_buffer, buffer, pCopyBufferToImageInfo->srcBuffer);
+    VK_FROM_HANDLE(kk_image, image, pCopyBufferToImageInfo->dstImage);
++   kk_cb_record_op(&cmd->record, KK_CB_OP_COPY);
+ 
+    mtl_compute_encoder *encoder = cs_get_compute(cmd);
+    for (int r = 0; r < pCopyBufferToImageInfo->regionCount; r++) {
+@@ -120,6 +122,7 @@ kk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(kk_image, image, pCopyImageToBufferInfo->srcImage);
+    VK_FROM_HANDLE(kk_buffer, buffer, pCopyImageToBufferInfo->dstBuffer);
++   kk_cb_record_op(&cmd->record, KK_CB_OP_COPY);
+ 
+    mtl_compute_encoder *encoder = cs_get_compute(cmd);
+    for (unsigned r = 0; r < pCopyImageToBufferInfo->regionCount; r++) {
+@@ -355,6 +358,7 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(kk_image, src, pCopyImageInfo->srcImage);
+    VK_FROM_HANDLE(kk_image, dst, pCopyImageInfo->dstImage);
++   kk_cb_record_op(&cmd->record, KK_CB_OP_COPY);
+ 
+    size_t buffer_size = 0u;
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_dispatch.c b/src/kosmickrisp/vulkan/kk_cmd_dispatch.c
+index daae042..5b873f7 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_dispatch.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_dispatch.c
+@@ -34,10 +34,11 @@ kk_flush_compute_state(struct kk_cmd_buffer *cmd)
+       kk_cmd_bind_root_to_argument_table(cmd, desc->root.addr);
+ 
+    /* The CS's program with or without sampler min/max emulation */
+-   mtl_compute_set_pipeline_state(
+-      encoder,
+-      kk_cmd_shader_pipeline(cmd, cmd->state.shaders[MESA_SHADER_COMPUTE], desc)
+-         ->cs);
++   const struct kk_pipeline_handles *pipe =
++      kk_cmd_shader_pipeline(cmd, cmd->state.shaders[MESA_SHADER_COMPUTE], desc);
++   mtl_compute_set_pipeline_state(encoder, pipe->cs);
++   kk_cb_record_program(&cmd->record, &pipe->record);
++   kk_cb_record_count(&cmd->record.dispatches);
+ }
+ 
+ static void
+@@ -132,6 +133,7 @@ kk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
+    struct kk_shader *cs = cmd->state.shaders[MESA_SHADER_COMPUTE];
+    struct mtl_size local_size = cs->info.cs.local_size;
+ 
++   kk_cb_record_count(&cmd->record.indirect_dispatches);
+    mtl_compute_encoder *encoder = cs_get_compute(cmd);
+    if (cmd->state.cond_render.enabled) {
+       struct kk_ptr patched =
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index f703a66..46ea34e 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -22,6 +22,7 @@
+ #include "kosmickrisp/libkk/kk_tessellator.h"
+ 
+ #include "poly/geometry.h"
++#include "poly/prim.h"
+ #include "poly/tessellator.h"
+ 
+ #include "vulkan/runtime/vk_render_pass.h"
+@@ -643,6 +644,7 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
+    memset(render, 0, sizeof(*render));
+ 
+    if (need_meta_resolve) {
++      kk_cb_record_op(&cmd->record, KK_CB_OP_RESOLVE_RENDERING);
+       kk_meta_resolve_rendering(cmd, &vk_render);
+    }
+ }
+@@ -1613,6 +1615,7 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
+    if (pipe != gfx->pipe) {
+       gfx->pipe = pipe;
+       cmd->state.dirty_shaders |= BITFIELD_BIT(MESA_SHADER_VERTEX);
++      kk_cb_record_program(&cmd->record, &pipe->record);
+    }
+ 
+    kk_flush_render_pass(cmd);
+@@ -1716,13 +1719,14 @@ kk_predicate_draws(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    return true;
+ }
+ 
+-/* Points the draw at the 32-bit heap indices an unroll kernel wrote */
++/* Points the draw at the 32-bit indices and indexed indirect draws an unroll
++ * wrote */
+ static void
+-kk_set_unrolled_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+-                     enum mesa_prim prim, uint64_t out_draws)
++kk_set_unrolled_draw(struct kk_draw_command *data, enum mesa_prim prim,
++                     struct kk_addr_range indices, uint64_t out_draws)
+ {
+    data->prim = prim;
+-   data->index_buffer = kk_heap_indices(cmd);
++   data->index_buffer = indices;
+    data->restart_index = UINT32_MAX;
+    data->index_buffer_el_size_B = 4u;
+    data->indirect = true;
+@@ -1733,11 +1737,84 @@ kk_set_unrolled_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+    data->indirect_command.stride = sizeof(VkDrawIndexedIndirectCommand);
+ }
+ 
++/* Indices of a direct draw without an index buffer the CPU writes: the
++ * unroll kernel ends the render pass (its attachments are stored, loaded
++ * again after it), which here costs more than the draw. */
++#define KK_CPU_UNROLL_MAX_INDICES (1u << 20)
++
++/* Direct draws without an index buffer unroll to indices known at recording,
++ * the same the unroll kernel writes: the decomposed primitives' vertex IDs,
++ * the last vertex rotated first when it is provoking. STEAMAC-G: zink keeps
++ * GL's last provoking vertex, so a flat varying unrolled every such draw, and
++ * the first compositor frame of Steam's web helper ran 12 render passes over
++ * its whole window for 12 rectangles. Returns false to leave the draw to the
++ * kernel. */
++static bool
++kk_unroll_geometry_cpu(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
++{
++   if (data->indirect || data->indexed)
++      return false;
++
++   const enum mesa_prim prim = u_decomposed_prim(data->prim);
++   const uint32_t per_prim = mesa_vertices_per_prim(prim);
++   uint32_t total = 0u;
++   for (uint32_t i = 0u; i < data->draw_count; i++) {
++      total += u_decomposed_prims_for_vertices(data->prim,
++                                               data->draws[i].vertexCount) *
++               per_prim;
++      if (total > KK_CPU_UNROLL_MAX_INDICES)
++         return false;
++   }
++
++   struct kk_ptr out_draws = kk_pool_alloc(
++      cmd, data->draw_count * sizeof(VkDrawIndexedIndirectCommand), 4u);
++   struct kk_ptr indices =
++      kk_pool_alloc(cmd, MAX2(total, 1u) * sizeof(uint32_t), 4u);
++   if (unlikely(!out_draws.gpu || !indices.gpu))
++      return false;
++
++   VkDrawIndexedIndirectCommand *draws = out_draws.cpu;
++   uint32_t *out = indices.cpu;
++   uint32_t first = 0u;
++   for (uint32_t i = 0u; i < data->draw_count; i++) {
++      const VkDrawIndirectCommand *in = &data->draws[i];
++      const uint32_t prims =
++         u_decomposed_prims_for_vertices(data->prim, in->vertexCount);
++      for (uint32_t p = 0u; p < prims; p++) {
++         for (uint32_t v = 0u; v < per_prim; v++) {
++            const uint32_t x = poly_output_vertex_id_for_topology(
++               data->prim, data->flatshade_first, true, v);
++            out[first + p * per_prim + x] = poly_vertex_id_for_topology(
++               data->prim, data->flatshade_first, p, v, prims);
++         }
++      }
++      draws[i] = (VkDrawIndexedIndirectCommand){
++         .indexCount = prims * per_prim,
++         .instanceCount = in->instanceCount,
++         .firstIndex = first,
++         .vertexOffset = (int32_t)in->firstVertex,
++         .firstInstance = in->firstInstance,
++      };
++      first += prims * per_prim;
++   }
++
++   kk_set_unrolled_draw(data, prim,
++                        (struct kk_addr_range){
++                           .addr = indices.gpu,
++                           .range = MAX2(total, 1u) * sizeof(uint32_t),
++                        },
++                        out_draws.gpu);
++   return true;
++}
++
+ /* Unrolling will always be done through indirect rendering, so if this is
+  * called from non-indirect calls, we will fake it. */
+ static bool
+ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ {
++   if (kk_unroll_geometry_cpu(cmd, data))
++      return true;
++
+    if (unlikely(!kk_convert_to_indirect_draw(cmd, data)))
+       return false;
+ 
+@@ -1769,8 +1846,8 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    libkk_unroll_geometry_struct(cmd, kk_grid_1d(1024 * data->draw_count), true,
+                                 info);
+ 
+-   kk_set_unrolled_draw(cmd, data, u_decomposed_prim(data->prim),
+-                        out_draws.gpu);
++   kk_set_unrolled_draw(data, u_decomposed_prim(data->prim),
++                        kk_heap_indices(cmd), out_draws.gpu);
+ 
+    return true;
+ }
+@@ -1805,7 +1882,8 @@ kk_unroll_adjacency(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    libkk_unroll_adjacency_struct(cmd, kk_grid_1d(1024 * data->draw_count), true,
+                                  info);
+ 
+-   kk_set_unrolled_draw(cmd, data, u_reduced_prim(data->prim), out_draws.gpu);
++   kk_set_unrolled_draw(data, u_reduced_prim(data->prim), kk_heap_indices(cmd),
++                        out_draws.gpu);
+ 
+    return true;
+ }
+@@ -1890,7 +1968,9 @@ kk_dispatch_draw(struct kk_cmd_buffer *cmd, struct kk_draw_data data)
+ {
+    mtl_render_encoder *enc = cs_get_render(cmd);
+ 
++   kk_cb_record_count(&cmd->record.draws);
+    if (kk_grid_is_indirect(data.grid)) {
++      kk_cb_record_count(&cmd->record.indirect_draws);
+       if (data.index.el_size_B) {
+          struct kk_addr_range index_range =
+             kk_sanitize_index_range(cmd, data.index.gpu);
+@@ -2218,6 +2298,7 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
+    /* First launch the VS and TCS */
+ 
+    mtl_compute_encoder *enc = cs_get_compute(cmd);
++   kk_cb_record_op(&cmd->record, KK_CB_OP_GS_TESS);
+    {
+       mtl_compute_pipeline_state *pipeline = gfx->pipe->gfx.pre_render[0];
+       struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
+@@ -2351,6 +2432,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+    uint32_t pre_render_count = pipe->gfx.pre_render_count;
+    struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
+    mtl_compute_encoder *enc = cs_get_compute(cmd);
++   kk_cb_record_op(&cmd->record, KK_CB_OP_GS_TESS);
+ 
+    mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                     MTL_STAGE_DISPATCH);
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_meta.c b/src/kosmickrisp/vulkan/kk_cmd_meta.c
+index 9163df5..4b766d7 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_meta.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_meta.c
+@@ -209,6 +209,7 @@ kk_CmdFillMemoryKHR(VkCommandBuffer commandBuffer,
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+ 
+    struct kk_meta_save save;
++   kk_cb_record_op(&cmd->record, KK_CB_OP_FILL_UPDATE);
+    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE,
+                  "meta:vkCmdFillMemoryKHR");
+    vk_meta_fill_memory(&cmd->vk, &dev->meta, dstRange, dstFlags, data);
+@@ -225,6 +226,7 @@ kk_CmdUpdateMemoryKHR(VkCommandBuffer commandBuffer,
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+ 
+    struct kk_meta_save save;
++   kk_cb_record_op(&cmd->record, KK_CB_OP_FILL_UPDATE);
+    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE,
+                  "meta:vkCmdUpdateMemoryKHR");
+    vk_meta_update_memory(&cmd->vk, &dev->meta, pDstRange, dstFlags, dataSize,
+@@ -240,6 +242,7 @@ kk_CmdBlitImage2(VkCommandBuffer commandBuffer,
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+ 
+    struct kk_meta_save save;
++   kk_cb_record_op(&cmd->record, KK_CB_OP_BLIT_IMAGE);
+    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                  "meta:vkCmdBlitImage2");
+    vk_meta_blit_image2(&cmd->vk, &dev->meta, pBlitImageInfo);
+@@ -254,6 +257,7 @@ kk_CmdResolveImage2(VkCommandBuffer commandBuffer,
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+ 
+    struct kk_meta_save save;
++   kk_cb_record_op(&cmd->record, KK_CB_OP_RESOLVE_IMAGE);
+    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                  "meta:vkCmdResolveImage2");
+    vk_meta_resolve_image2(&cmd->vk, &dev->meta, pResolveImageInfo);
+@@ -288,6 +292,7 @@ kk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   kk_cb_record_op(&cmd->record, KK_CB_OP_CLEAR_ATTACHMENTS);
+ 
+    struct vk_meta_rendering_info render_info;
+    kk_meta_init_render(cmd, &render_info);
+diff --git a/src/kosmickrisp/vulkan/kk_debug.c b/src/kosmickrisp/vulkan/kk_debug.c
+index 59d6aef..5d4bd51 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.c
++++ b/src/kosmickrisp/vulkan/kk_debug.c
+@@ -13,6 +13,7 @@ const struct debug_named_value debug_flags[] = {
+    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
+    {"minmax", KK_DEBUG_MINMAX},
+    {"commits", KK_DEBUG_COMMITS},
++   {"cbs", KK_DEBUG_CBS},
+    {NULL, 0},
+ };
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_debug.h b/src/kosmickrisp/vulkan/kk_debug.h
+index e0d8fe1..e34471a 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.h
++++ b/src/kosmickrisp/vulkan/kk_debug.h
+@@ -18,6 +18,9 @@ enum kk_debug {
+    /* Log command buffers that started late, ran long on the GPU or completed
+     * late, and device creations/destructions with their application */
+    KK_DEBUG_COMMITS = 1ull << 4,
++   /* Log every command buffer's record (encoders, draws, dispatches,
++    * operations, kernels and program MSL hashes) when its feedback comes */
++   KK_DEBUG_CBS = 1ull << 5,
+ };
+ 
+ extern enum kk_debug kk_mesa_debug_flags;
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index e1d81d0..f726d89 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -259,13 +259,18 @@ kk_device_app_name(const struct kk_device *dev, char *name, size_t size)
+ 
+ /* Device creations and destructions in the process: a command queue error
+  * logs how long ago the last ones were, which tells whether another guest
+- * device came or went right before. */
++ * device came or went right before, and the command buffers of every device
++ * in flight. */
+ static struct {
+    simple_mtx_t lock;
+    uint32_t alive;
+    int64_t created_ns, destroyed_ns;
+    char created_app[64], destroyed_app[64];
+-} kk_device_lifecycle = {.lock = SIMPLE_MTX_INITIALIZER};
++   struct list_head devices;
++} kk_device_lifecycle = {
++   .lock = SIMPLE_MTX_INITIALIZER,
++   .devices = {&kk_device_lifecycle.devices, &kk_device_lifecycle.devices},
++};
+ 
+ static void
+ kk_device_note_lifecycle(struct kk_device *dev, bool created)
+@@ -279,10 +284,12 @@ kk_device_note_lifecycle(struct kk_device *dev, bool created)
+       kk_device_lifecycle.alive++;
+       kk_device_lifecycle.created_ns = now;
+       memcpy(kk_device_lifecycle.created_app, app, sizeof(app));
++      list_addtail(&dev->lifecycle_link, &kk_device_lifecycle.devices);
+    } else {
+       kk_device_lifecycle.alive--;
+       kk_device_lifecycle.destroyed_ns = now;
+       memcpy(kk_device_lifecycle.destroyed_app, app, sizeof(app));
++      list_del(&dev->lifecycle_link);
+    }
+    const uint32_t alive = kk_device_lifecycle.alive;
+    simple_mtx_unlock(&kk_device_lifecycle.lock);
+@@ -320,6 +327,16 @@ kk_device_log_lifecycle(void)
+    simple_mtx_unlock(&kk_device_lifecycle.lock);
+ }
+ 
++void
++kk_device_foreach(void (*cb)(struct kk_device *dev, void *data), void *data)
++{
++   simple_mtx_lock(&kk_device_lifecycle.lock);
++   list_for_each_entry(struct kk_device, dev, &kk_device_lifecycle.devices,
++                       lifecycle_link)
++      cb(dev, data);
++   simple_mtx_unlock(&kk_device_lifecycle.lock);
++}
++
+ static VkResult
+ kk_get_timestamp(struct vk_device *device, uint64_t *timestamp)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 27f6627..ae873ab 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -115,6 +115,8 @@ struct kk_device {
+ 
+    /* os_time_get_nano() at creation (command queue error diagnostics) */
+    int64_t created_ns;
++   /* In the process' list of devices alive (kk_device_foreach) */
++   struct list_head lifecycle_link;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+@@ -158,6 +160,11 @@ void kk_device_app_name(const struct kk_device *dev, char *name, size_t size);
+ /* Logs the devices alive in the process (every guest device under
+  * virglrenderer) and the last ones created and destroyed. */
+ void kk_device_log_lifecycle(void);
++/* Calls cb for every device alive in the process (they stay alive until it
++ * returns): cb must not wait for anything a device's creation or destruction
++ * could hold. */
++void kk_device_foreach(void (*cb)(struct kk_device *dev, void *data),
++                       void *data);
+ 
+ /* Required to create a sampler */
+ mtl_sampler *kk_sampler_create(struct kk_device *dev,
+diff --git a/src/kosmickrisp/vulkan/kk_event.c b/src/kosmickrisp/vulkan/kk_event.c
+index 3e6db31..b97dda2 100644
+--- a/src/kosmickrisp/vulkan/kk_event.c
++++ b/src/kosmickrisp/vulkan/kk_event.c
+@@ -95,6 +95,7 @@ kk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
+ {
+    VK_FROM_HANDLE(kk_event, event, _event);
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   kk_cb_record_op(&cmd->record, KK_CB_OP_EVENT);
+    kk_cmd_write(cmd, (struct libkk_imm_write){event->addr, VK_EVENT_SET});
+ }
+ 
+@@ -104,6 +105,7 @@ kk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
+ {
+    VK_FROM_HANDLE(kk_event, event, _event);
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   kk_cb_record_op(&cmd->record, KK_CB_OP_EVENT);
+    kk_cmd_write(cmd, (struct libkk_imm_write){event->addr, VK_EVENT_RESET});
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_query_pool.c b/src/kosmickrisp/vulkan/kk_query_pool.c
+index caa6963..5d1682b 100644
+--- a/src/kosmickrisp/vulkan/kk_query_pool.c
++++ b/src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -387,6 +387,7 @@ kk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
++   kk_cb_record_op(&cmd->record, KK_CB_OP_QUERY_RESET);
+ 
+    assert(cmd->metal.render == NULL);
+ 
+@@ -461,6 +462,7 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
++   kk_cb_record_op(&cmd->record, KK_CB_OP_TIMESTAMP);
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+    assert(kk_pool_is_ts(pool) && pool->ts.chunks);
+ 
+@@ -526,6 +528,7 @@ kk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
++   kk_cb_record_op(&cmd->record, KK_CB_OP_QUERY);
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+ 
+    /* GS emulation adds to this query until it ends. */
+@@ -683,6 +686,7 @@ kk_CmdCopyQueryPoolResultsToMemoryKHR(
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
++   kk_cb_record_op(&cmd->record, KK_CB_OP_QUERY_COPY);
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+ 
+    /* Timestamp results are resolved into the pool BO on a deferred command
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index fe53f6f..a705b5e 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -21,6 +21,9 @@
+ 
+ #include "vk_cmd_queue.h"
+ 
++#include <ctype.h>
++#include <string.h>
++
+ struct kk_commit_data {
+    struct kk_queue *queue;
+    struct kk_cmd_buffer *cmd;
+@@ -44,17 +47,140 @@ kk_queue_release_cmd_buffer_locked(struct kk_queue *queue,
+    util_dynarray_append(&queue->free_cmd_buffers, &cmd->vk);
+ }
+ 
++/* The IOGPU reason of a command queue error, from its userInfo
++ * ("... (00000003:kIOGPUCommandBufferCallbackErrorHang) ..." gives "Hang"),
++ * else the Metal error; "ok" without an error. */
++static void
++kk_queue_feedback_outcome(const struct mtl_feedback_data *data, char *out,
++                          size_t size)
++{
++   static const char reason[] = "kIOGPUCommandBufferCallbackError";
++
++   if (data->error == MTL_COMMAND_QUEUE_ERROR_NONE) {
++      snprintf(out, size, "ok");
++      return;
++   }
++   const char *at = data->error_info ? strstr(data->error_info, reason) : NULL;
++   size_t n = 0u;
++   if (at) {
++      at += sizeof(reason) - 1u;
++      for (; n + 1u < size && isalnum((unsigned char)at[n]); n++)
++         out[n] = at[n];
++   }
++   if (n)
++      out[n] = '\0';
++   else
++      snprintf(out, size, "%s", mtl_command_queue_error_to_string(data->error));
++}
++
++/* A commit's GPU time relative to the failed command buffer's start */
++static void
++kk_queue_format_gpu_time(const struct kk_queue_record *r, double failed_start,
++                         char *out, size_t size)
++{
++   if (r->gpu_start <= 0.0)
++      snprintf(out, size, "never started");
++   else if (failed_start <= 0.0)
++      snprintf(out, size, "ran %.1f ms", (r->gpu_end - r->gpu_start) * 1000.0);
++   else if (r->gpu_end < r->gpu_start || r->gpu_end - r->gpu_start > 1000.0)
++      snprintf(out, size, "started %+.1f ms, no end",
++               (r->gpu_start - failed_start) * 1000.0);
++   else
++      snprintf(out, size, "%+.1f to %+.1f ms",
++               (r->gpu_start - failed_start) * 1000.0,
++               (r->gpu_end - failed_start) * 1000.0);
++}
++
++#define KK_QUEUE_IN_FLIGHT_LINES 24u
++#define KK_QUEUE_IN_FLIGHT_WAIT_NS (300ll * 1000 * 1000)
++
++struct kk_queue_in_flight {
++   const struct kk_device *failed_dev;
++   uint64_t failed_seq;
++   /* GPU start of the failed command buffer, its feedback (host seconds) */
++   double failed_start, failed_feedback;
++   int64_t now;
++   unsigned pending, lines, skipped, hangs;
++   struct kk_cb_record hang[2];
++};
++
++/* Commits of the process other than the failed one that were on the GPU
++ * with it: still awaiting feedback, failed, or ran while it did. */
++static bool
++kk_queue_record_in_flight(const struct kk_queue_record *r,
++                          const struct kk_device *dev,
++                          const struct kk_queue_in_flight *s)
++{
++   if (r->seq == 0u || r->commit_ns > s->now ||
++       (dev == s->failed_dev && r->seq == s->failed_seq))
++      return false;
++   if (!r->done || strcmp(r->outcome, "ok"))
++      return true;
++   return r->gpu_end >= s->failed_start && r->gpu_start <= s->failed_feedback;
++}
++
+ static void
+-kk_queue_log_gpu_error(const char *sender, const char *message, void *data)
++kk_queue_count_in_flight(struct kk_device *dev, void *data)
+ {
+-   mesa_loge("kk: os_log %s: %s", sender, message);
++   struct kk_queue_in_flight *s = data;
++   if (!dev->has_queue)
++      return;
++   mtx_lock(&dev->queue.mutex);
++   for (uint32_t i = 0u; i < KK_QUEUE_RECORDS; i++) {
++      const struct kk_queue_record *r = &dev->queue.records[i];
++      s->pending += !r->done && kk_queue_record_in_flight(r, dev, s);
++   }
++   mtx_unlock(&dev->queue.mutex);
++}
++
++static void
++kk_queue_log_in_flight(struct kk_device *dev, void *data)
++{
++   struct kk_queue_in_flight *s = data;
++   if (!dev->has_queue)
++      return;
++   char app[64];
++   kk_device_app_name(dev, app, sizeof(app));
++
++   struct kk_queue *queue = &dev->queue;
++   mtx_lock(&queue->mutex);
++   for (uint32_t k = 1u; k <= KK_QUEUE_RECORDS; k++) {
++      const struct kk_queue_record *r =
++         &queue->records[(queue->commit_seq + k) % KK_QUEUE_RECORDS];
++      if (!kk_queue_record_in_flight(r, dev, s))
++         continue;
++      if (s->lines == KK_QUEUE_IN_FLIGHT_LINES) {
++         s->skipped++;
++         continue;
++      }
++      s->lines++;
++      char text[448], gpu[48];
++      kk_cb_record_format(&r->cb, text, sizeof(text));
++      if (r->done) {
++         kk_queue_format_gpu_time(r, s->failed_start, gpu, sizeof(gpu));
++         mesa_loge("kk: with it: command buffer %" PRIu64 " of %s, %s, GPU "
++                   "%s: %s",
++                   r->seq, app, r->outcome, gpu, text);
++      } else {
++         mesa_loge("kk: with it: command buffer %" PRIu64 " of %s, no "
++                   "feedback, committed %.1f ms ago: %s",
++                   r->seq, app, (s->now - r->commit_ns) / 1e6, text);
++      }
++      if (!strcmp(r->outcome, "Hang") && s->hangs < ARRAY_SIZE(s->hang))
++         s->hang[s->hangs++] = r->cb;
++   }
++   mtx_unlock(&queue->mutex);
+ }
+ 
+ /* STEAMAC-G: a command queue error has to tell GPU work that ran too long
+  * from a command buffer that never started (a semaphore wait, the GPU busy
+- * elsewhere) and name what came right before: the queue's last completed
+- * work and the last guest device created or destroyed in the process. Never
+- * signalled semaphore waits submitted before their signal are listed. */
++ * elsewhere), name what the command buffer contained and what came right
++ * before: the queue's last completed work and the last guest device created
++ * or destroyed in the process. Never signalled semaphore waits submitted
++ * before their signal are listed. The first error in the process also names
++ * every command buffer of the process that was on the GPU with it and their
++ * outcome: GPU recovery fails all of them, the one that hung with "Hang", the
++ * others as innocent victims. */
+ static void
+ kk_queue_log_failure(struct kk_queue *queue,
+                      const struct mtl_feedback_data *data)
+@@ -68,6 +194,12 @@ kk_queue_log_failure(struct kk_queue *queue,
+    const uint64_t committed = queue->commit_seq;
+    const uint32_t awaiting = queue->feedbacks_pending;
+    const double last_gpu_end = queue->last_gpu_end;
++   const struct kk_queue_record *record =
++      &queue->records[data->tag % KK_QUEUE_RECORDS];
++   const bool recorded = record->seq == data->tag;
++   const struct kk_cb_record cb = record->cb;
++   char outcome[sizeof(record->outcome)];
++   memcpy(outcome, record->outcome, sizeof(outcome));
+    mtx_unlock(&queue->mutex);
+ 
+    mesa_loge("kk: command buffer %" PRIu64 " of %s failed %.1f ms after its "
+@@ -94,7 +226,13 @@ kk_queue_log_failure(struct kk_queue *queue,
+    } else {
+       mesa_loge("kk: no command buffer of the queue completed before");
+    }
+-   if (data->error_info)
++   if (recorded) {
++      char text[448];
++      kk_cb_record_format(&cb, text, sizeof(text));
++      mesa_loge("kk: it failed with %s and had %s", outcome, text);
++   }
++   if (data->error_info && !(recorded && strcmp(outcome, "ok") &&
++                             strstr(data->error_info, outcome)))
+       mesa_loge("kk: Metal error info: %s", data->error_info);
+ 
+    mtx_lock(&queue->mutex);
+@@ -115,11 +253,42 @@ kk_queue_log_failure(struct kk_queue *queue,
+ 
+    kk_device_log_lifecycle();
+ 
+-   /* Once per process: reading os_log takes about a second, and the first
+-    * failure names the cause (later ones are often its victims). */
+-   static bool os_log_read;
+-   if (!p_atomic_xchg(&os_log_read, true))
+-      mtl_log_recent_gpu_errors(10.0, 16u, kk_queue_log_gpu_error, NULL);
++   /* Once per process: the first error names the cause, later ones are
++    * mostly its victims. The other command buffers' feedback comes on other
++    * threads: wait a little for their outcome. */
++   static bool first_logged;
++   if (p_atomic_xchg(&first_logged, true))
++      return;
++   struct kk_queue_in_flight s = {
++      .failed_dev = dev,
++      .failed_seq = data->tag,
++      .failed_start = data->gpu_start,
++      .failed_feedback = data->feedback_time,
++      .now = now,
++   };
++   const int64_t deadline = now + KK_QUEUE_IN_FLIGHT_WAIT_NS;
++   do {
++      s.pending = 0u;
++      kk_device_foreach(kk_queue_count_in_flight, &s);
++      if (s.pending == 0u)
++         break;
++      os_time_sleep(5000);
++   } while (os_time_get_nano() < deadline);
++
++   kk_device_foreach(kk_queue_log_in_flight, &s);
++   if (s.skipped)
++      mesa_loge("kk: with it: %u more command buffers", s.skipped);
++   else if (s.lines == 0u)
++      mesa_loge("kk: no other command buffer of the process was on the GPU "
++                "with it");
++
++   /* The MSL of programs that could spin or wait, of the command buffers
++    * that hung or else of the failed one */
++   unsigned excerpts = 0u;
++   for (unsigned i = 0u; i < s.hangs; i++)
++      excerpts += kk_cb_record_log_excerpts(&s.hang[i], 3u - excerpts);
++   if (recorded && excerpts < 3u)
++      kk_cb_record_log_excerpts(&cb, 3u - excerpts);
+ }
+ 
+ /* MESA_KK_DEBUG=commits */
+@@ -140,11 +309,45 @@ kk_queue_log_slow_commit(struct kk_queue *queue,
+              data->tag, app, delay_ms, gpu_ms, feedback_ms);
+ }
+ 
++/* The commit's outcome, for kk_queue_log_failure and MESA_KK_DEBUG=cbs */
++static void
++kk_queue_note_feedback(struct kk_queue *queue,
++                       const struct mtl_feedback_data *data)
++{
++   struct kk_queue_record *record =
++      &queue->records[data->tag % KK_QUEUE_RECORDS];
++   char outcome[sizeof(record->outcome)];
++   kk_queue_feedback_outcome(data, outcome, sizeof(outcome));
++
++   mtx_lock(&queue->mutex);
++   const bool recorded = record->seq == data->tag;
++   if (recorded) {
++      memcpy(record->outcome, outcome, sizeof(outcome));
++      record->gpu_start = data->gpu_start;
++      record->gpu_end = data->gpu_end;
++      record->done = true;
++   }
++   const struct kk_cb_record cb = record->cb;
++   mtx_unlock(&queue->mutex);
++
++   if (KK_DEBUG(CBS) && recorded) {
++      char app[64], text[448];
++      kk_device_app_name(kk_queue_device(queue), app, sizeof(app));
++      kk_cb_record_format(&cb, text, sizeof(text));
++      mesa_logi("kk: command buffer %" PRIu64 " of %s: %s, started %.2f ms "
++                "after its commit, %.2f ms on the GPU: %s",
++                data->tag, app, outcome,
++                (data->gpu_start - data->commit_time) * 1000.0,
++                (data->gpu_end - data->gpu_start) * 1000.0, text);
++   }
++}
++
+ static void
+ kk_queue_check_feedback(struct kk_queue *queue, struct mtl_feedback_data *data)
+ {
+    struct kk_device *dev = kk_queue_device(queue);
+ 
++   kk_queue_note_feedback(queue, data);
+    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
+       kk_queue_log_failure(queue, data);
+       vk_device_set_lost(
+@@ -241,6 +444,13 @@ kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
+    mtx_lock(&queue->mutex);
+    const uint64_t seq = ++queue->commit_seq;
+    queue->feedbacks_pending++;
++   struct kk_queue_record *record = &queue->records[seq % KK_QUEUE_RECORDS];
++   record->seq = seq;
++   record->commit_ns = os_time_get_nano();
++   record->done = false;
++   record->outcome[0] = '\0';
++   record->gpu_start = record->gpu_end = 0.0;
++   record->cb = cmd->record;
+    mtx_unlock(&queue->mutex);
+ 
+    mtl_commit_options *options = mtl_new_commit_options();
+@@ -451,6 +661,7 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
+ 
+    queue->free_cmd_buffers = UTIL_DYNARRAY_INIT;
+    memset(queue->pending_waits, 0, sizeof(queue->pending_waits));
++   memset(queue->records, 0, sizeof(queue->records));
+    queue->pending_wait_next = 0;
+    queue->commits_in_flight = 0u;
+    queue->feedbacks_pending = 0u;
+diff --git a/src/kosmickrisp/vulkan/kk_queue.h b/src/kosmickrisp/vulkan/kk_queue.h
+index 78f3beb..2f98b0e 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.h
++++ b/src/kosmickrisp/vulkan/kk_queue.h
+@@ -10,6 +10,7 @@
+ 
+ #include "kk_private.h"
+ 
++#include "kk_cb_record.h"
+ #include "kk_cmd_pool.h"
+ 
+ #include "kosmickrisp/bridge/mtl_types.h"
+@@ -20,6 +21,20 @@
+ #include "util/simple_mtx.h"
+ 
+ #define KK_QUEUE_PENDING_WAITS 8u
++#define KK_QUEUE_RECORDS       16u
++
++/* A commit's command buffer record and, once its feedback handler ran, its
++ * outcome */
++struct kk_queue_record {
++   uint64_t seq; /* 0: unused */
++   int64_t commit_ns;
++   bool done;
++   /* The IOGPU reason of its command queue error ("Hang", "InnocentVictim",
++    * ...), "ok" when it completed */
++   char outcome[32];
++   double gpu_start, gpu_end;
++   struct kk_cb_record cb;
++};
+ 
+ struct kk_queue {
+    struct vk_queue vk;
+@@ -44,6 +59,12 @@ struct kk_queue {
+    uint64_t commit_seq;
+    double last_gpu_end;
+ 
++   /* Under `mutex`: the records of the last KK_QUEUE_RECORDS commits, at
++    * seq % KK_QUEUE_RECORDS. A command queue error prints the failed command
++    * buffer's and those of every command buffer of the process in flight
++    * (kk_queue_log_failure). */
++   struct kk_queue_record records[KK_QUEUE_RECORDS];
++
+    /* The last KK_QUEUE_PENDING_WAITS semaphore waits that were not signalled
+     * yet when submitted (wait before signal), retained, under `mutex`: a
+     * command queue error names the ones still unsignalled. Metal ends a queue
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 503184f..50c3f59 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -1060,8 +1060,13 @@ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
+    ralloc_steal(NULL, (void *)entrypoint_name);
+    data->entrypoint_name = (char *)entrypoint_name;
+ 
+-   if (KK_DEBUG(MSL))
+-      mesa_logi("%s\n", data->code);
++   if (KK_DEBUG(MSL)) {
++      /* The hash command buffer records name it by (kk_cb_record) */
++      uint32_t hash;
++      uint8_t features;
++      kk_msl_digest(data->code, &hash, &features);
++      mesa_logi("kk: MSL %08x %s:\n%s\n", hash, entrypoint_name, data->code);
++   }
+ 
+    ralloc_free(nir);
+ }
+@@ -1964,6 +1969,52 @@ kk_build_shaders(struct kk_device *dev, uint32_t shader_count,
+    return VK_SUCCESS;
+ }
+ 
++static void
++kk_digest_msl(struct kk_cb_program *record,
++              const struct msl_compile_data *data, int slot)
++{
++   if (data->code == NULL)
++      return;
++   uint32_t hash;
++   uint8_t features;
++   kk_msl_digest(data->code, &hash, &features);
++   kk_msl_note_excerpt(hash, features, data->code);
++   if (slot >= 0)
++      record->hash[slot] = hash;
++   record->features |= features;
++}
++
++/* STEAMAC-G: the MSL hashes and features command buffer records name a
++ * program by: its kernel, or its Metal vertex function (the stage before the
++ * FS) and FS, with the features of the compute passes before it. */
++static void
++kk_digest_program(struct kk_shader *s)
++{
++   struct kk_cb_program *record = &s->pipeline.record;
++   *record = (struct kk_cb_program){
++      .compute = s->info.stage == MESA_SHADER_COMPUTE,
++   };
++   if (record->compute) {
++      kk_digest_msl(record, &s->msl_data[MESA_SHADER_COMPUTE], 0);
++      return;
++   }
++
++   const uint32_t pre = s->info.vs.additional_stages_bits &
++                        ~BITFIELD_BIT(MESA_SHADER_FRAGMENT);
++   const mesa_shader_stage vs_stage =
++      pre ? (mesa_shader_stage)(util_last_bit(pre) - 1u) : MESA_SHADER_VERTEX;
++   record->pre_render = pre != 0u;
++   kk_digest_msl(record, &s->msl_data[vs_stage], 0);
++   kk_digest_msl(record, &s->msl_data[MESA_SHADER_FRAGMENT], 1);
++   u_foreach_bit(stage, pre | BITFIELD_BIT(MESA_SHADER_VERTEX)) {
++      if (stage != vs_stage)
++         kk_digest_msl(record, &s->msl_data[stage], -1);
++   }
++   kk_digest_msl(record, &s->gs_main, -1);
++   kk_digest_msl(record, &s->gs_count, -1);
++   kk_digest_msl(record, &s->pre_gs, -1);
++}
++
+ /* Creates the Metal pipelines of a program (its VS or CS). */
+ static VkResult
+ kk_compile_program(struct kk_device *dev, struct kk_shader *s)
+@@ -1979,8 +2030,10 @@ kk_compile_program(struct kk_device *dev, struct kk_shader *s)
+    } else {
+       result = kk_compile_graphics_pipeline(dev, s);
+    }
+-   if (result == VK_SUCCESS)
++   if (result == VK_SUCCESS) {
++      kk_digest_program(s);
+       p_atomic_set(&s->pipeline_ready, true);
++   }
+    return result;
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index 2ee4ed5..e502672 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -8,6 +8,7 @@
+ #ifndef KK_SHADER_H
+ #define KK_SHADER_H 1
+ 
++#include "kk_cb_record.h"
+ #include "kk_device_memory.h"
+ #include "kk_private.h"
+ 
+@@ -143,6 +144,8 @@ struct kk_pipeline_handles {
+       } gfx;
+       mtl_compute_pipeline_state *cs;
+    };
++   /* MSL hashes and features command buffer records name it by */
++   struct kk_cb_program record;
+ };
+ 
+ struct msl_compile_data {
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 82d7a20..3f33fa2 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -56,6 +56,8 @@ kk_files = files(
+   'kk_buffer_view.c',
+   'kk_buffer.h',
+   'kk_buffer.c',
++  'kk_cb_record.h',
++  'kk_cb_record.c',
+   'kk_cmd_buffer.h',
+   'kk_cmd_buffer.c',
+   'kk_cmd_clear.c',
+-- 
+2.54.0 (Apple Git-157)
+

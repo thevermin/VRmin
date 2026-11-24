@@ -1,0 +1,43 @@
+From: steamac <steamac@fxgam.es>
+Date: Sun, 1 Nov 2026 11:20:00 +0000
+Subject: [PATCH] kosmickrisp: clamp expanded compressed-copy extents to the mip edge
+
+STEAMAC-5E/5F crash in the buffer-to-texture leg of CmdCopyImage2.
+The event does not retain its formats, so this is not proof of the
+reported input, but a valid RG32_UINT -> 1x1 BC1 copy reproduces a
+Metal validation abort at the same encoder entry point on M1 Max:
+(destinationOrigin.x + sourceSize.width)(4) must be <= width(1).
+
+Block expansion must stop at the destination mip edge, including
+sub-block mip tails. Clamp all dimensions after format conversion.
+The sentry-image-copy compressed suite round-trips 1/2/4/8 BC1
+shapes byte-for-byte with Metal API validation after this change.
+
+---
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_copy.c b/src/kosmickrisp/vulkan/kk_cmd_copy.c
+--- a/src/kosmickrisp/vulkan/kk_cmd_copy.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_copy.c
+@@ -214,11 +214,16 @@
+       dst_size.z *= util_format_get_blockdepth(dst_format);
+    }
+ 
+-   /* After adjusting for compression, sanitize destination extents for 1D/2D */
+-   if (dst_plane->layout.height_px == 1)
+-      dst_size.y = 1;
+-   if (dst_plane->layout.depth_px == 1)
+-      dst_size.z = 1;
++   /* A block copied to a compressed mip tail can cover fewer texels than
++    * the block dimensions. Vulkan permits that edge copy; Metal requires
++    * sourceSize to stop at the destination mip's edge, not at the padded
++    * block boundary (e.g. one RG32 texel -> a 1x1 BC1 mip).
++    */
++   const VkExtent3D dst_extent =
++      vk_image_mip_level_extent(&dst->vk, region->dstSubresource.mipLevel);
++   dst_size.x = MIN2(dst_size.x, dst_extent.width - region->dstOffset.x);
++   dst_size.y = MIN2(dst_size.y, dst_extent.height - region->dstOffset.y);
++   dst_size.z = MIN2(dst_size.z, dst_extent.depth - region->dstOffset.z);
+ 
+    struct mtl_origin src_origin =
+       vk_offset_3d_to_mtl_origin(&region->srcOffset);
+-- 
+2.50.1

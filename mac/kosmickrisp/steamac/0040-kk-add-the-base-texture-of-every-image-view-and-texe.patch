@@ -1,0 +1,312 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Wed, 7 Oct 2026 23:30:00 +0300
+Subject: [PATCH] kk: add the base texture of every image, view and texel
+ buffer texture to the residency set
+
+STEAMAC-G: M3/M4/M5 lose KosmicKrisp devices with
+MTL4CommandQueueErrorTimeout right after Steam's UI starts (zink's first
+4x MSAA targets, new tiled BGRA8 and linear host-buffer window images) or
+after a window resize (gamescope recreating its linear output images).
+
+Metal 4 takes an attachment as resident only when its base texture object
+is in a residency set of the command buffer or queue; the heap it was
+placed in, the buffer it was made from (host pointer imports) or the view
+that is bound do not count. KosmicKrisp only added heaps and buffers, so
+Metal API validation reported every render pass ("Attachment texture ...
+is not added to any residency set on the command buffer or command
+queue", 9033 times in one Steam boot). On an M1 Max it renders anyway.
+
+Image planes add the base texture (parentTexture chain) of their texture
+and of the 2D array alias of 3D images when bound, sparse images when
+created; block-texel view subresource textures and texel buffer view
+textures when created. Each is removed before its release (a residency
+set keeps a removed allocation alive until its next commit). Planes that
+alias a swapchain image or a drawable add nothing; a plane rebound to a
+drawable removes what it added.
+---
+ src/kosmickrisp/bridge/mtl_texture.h       |  5 ++++
+ src/kosmickrisp/bridge/mtl_texture.m       |  9 ++++++
+ src/kosmickrisp/bridge/stubs/mtl_texture.c |  6 ++++
+ src/kosmickrisp/vulkan/kk_buffer_view.c    |  4 +++
+ src/kosmickrisp/vulkan/kk_device.c         | 16 +++++++++++
+ src/kosmickrisp/vulkan/kk_device.h         |  9 ++++++
+ src/kosmickrisp/vulkan/kk_image.c          | 33 ++++++++++++++++++----
+ src/kosmickrisp/vulkan/kk_image.h          | 11 ++++++++
+ src/kosmickrisp/vulkan/kk_image_view.c     |  7 ++++-
+ src/kosmickrisp/vulkan/kk_wsi.c            |  4 +++
+ 10 files changed, 97 insertions(+), 7 deletions(-)
+
+diff --git a/src/kosmickrisp/bridge/mtl_texture.h b/src/kosmickrisp/bridge/mtl_texture.h
+index 53e016e..8501828 100644
+--- a/src/kosmickrisp/bridge/mtl_texture.h
++++ b/src/kosmickrisp/bridge/mtl_texture.h
+@@ -16,6 +16,11 @@ struct kk_view_layout;
+ 
+ /* Utils*/
+ uint64_t mtl_texture_get_gpu_resource_id(mtl_texture *texture);
++/* The texture a view was made from (parentTexture, recursively), else the
++ * texture itself. Not retained. Metal 4 validation accepts an attachment only
++ * when this base texture is in a residency set; the heap it was placed in or
++ * the buffer it was made from do not count. */
++mtl_texture *mtl_texture_get_base(mtl_texture *texture);
+ 
+ /* Texture view creation */
+ mtl_texture *mtl_new_texture_view_with(mtl_texture *texture,
+diff --git a/src/kosmickrisp/bridge/mtl_texture.m b/src/kosmickrisp/bridge/mtl_texture.m
+index c410a42..d000860 100644
+--- a/src/kosmickrisp/bridge/mtl_texture.m
++++ b/src/kosmickrisp/bridge/mtl_texture.m
+@@ -23,6 +23,15 @@
+    }
+ }
+ 
++mtl_texture *
++mtl_texture_get_base(mtl_texture *texture)
++{
++   id<MTLTexture> tex = (id<MTLTexture>)texture;
++   while (tex.parentTexture)
++      tex = tex.parentTexture;
++   return tex;
++}
++
+ /* TODO_KOSMICKRISP This should be part of the mapping */
+ static uint32_t
+ mtl_texture_view_type(uint32_t type, uint8_t sample_count)
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_texture.c b/src/kosmickrisp/bridge/stubs/mtl_texture.c
+index b05c000..6636261 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_texture.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_texture.c
+@@ -13,6 +13,12 @@ mtl_texture_get_gpu_resource_id(mtl_texture *texture)
+    return 0u;
+ }
+ 
++mtl_texture *
++mtl_texture_get_base(mtl_texture *texture)
++{
++   return texture;
++}
++
+ /* Texture view creation */
+ mtl_texture *
+ mtl_new_texture_view_with(mtl_texture *texture,
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.c b/src/kosmickrisp/vulkan/kk_buffer_view.c
+index 51d2048..5674962 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.c
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.c
+@@ -137,6 +137,7 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+          vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
+          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+       }
++      kk_device_add_texture_to_residency_set(dev, view->mtl_texel_buffer_handle);
+    }
+    view->texel_buffer_gpu_id =
+       mtl_texture_get_gpu_resource_id(view->mtl_texel_buffer_handle);
+@@ -158,6 +159,9 @@ kk_DestroyBufferView(VkDevice _device, VkBufferView bufferView,
+ 
+    if (view->sparse)
+       kk_buffer_view_sparse_finish(dev, view);
++   else
++      kk_device_remove_texture_from_residency_set(
++         dev, view->mtl_texel_buffer_handle);
+    mtl_release(view->mtl_texel_buffer_handle);
+    vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 78b70f6..e1d81d0 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -564,6 +564,22 @@ kk_device_remove_allocation_from_residency_set(struct kk_device *dev,
+    simple_mtx_unlock(&dev->residency_set.mutex);
+ }
+ 
++void
++kk_device_add_texture_to_residency_set(struct kk_device *dev,
++                                       mtl_texture *texture)
++{
++   kk_device_add_allocation_to_residency_set(dev,
++                                             mtl_texture_get_base(texture));
++}
++
++void
++kk_device_remove_texture_from_residency_set(struct kk_device *dev,
++                                            mtl_texture *texture)
++{
++   kk_device_remove_allocation_from_residency_set(
++      dev, mtl_texture_get_base(texture));
++}
++
+ void
+ kk_device_make_resources_resident(struct kk_device *dev)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 256760c..27f6627 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -141,6 +141,15 @@ void kk_device_add_allocation_to_residency_set(struct kk_device *dev,
+                                                mtl_allocation *allocation);
+ void kk_device_remove_allocation_from_residency_set(
+    struct kk_device *dev, mtl_allocation *allocation);
++/* Textures made from a heap or a buffer (and the base of views made from such
++ * a texture): Metal 4 takes an attachment as resident only when its base
++ * texture object is in a residency set, its heap or buffer does not count.
++ * Every texture the driver makes this way is added once by its owner and
++ * removed before its release. */
++void kk_device_add_texture_to_residency_set(struct kk_device *dev,
++                                            mtl_texture *texture);
++void kk_device_remove_texture_from_residency_set(struct kk_device *dev,
++                                                 mtl_texture *texture);
+ void kk_device_make_resources_resident(struct kk_device *dev);
+ 
+ /* The guest application of a device ("gamescope", "steamwebhelper (mesa
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index 26bed10..74c7c0c 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -651,11 +651,35 @@ kk_image_plane_size_align_B(struct kk_device *dev, const struct kk_image *image,
+    *align_B_out = plane->layout.align_B;
+ }
+ 
++static void
++kk_image_plane_add_to_residency_set(struct kk_device *dev,
++                                    struct kk_image_plane *plane)
++{
++   if (plane->mtl_handle)
++      kk_device_add_texture_to_residency_set(dev, plane->mtl_handle);
++   if (plane->mtl_handle_array)
++      kk_device_add_texture_to_residency_set(dev, plane->mtl_handle_array);
++   plane->resident = true;
++}
++
++void
++kk_image_plane_remove_from_residency_set(struct kk_device *dev,
++                                         struct kk_image_plane *plane)
++{
++   if (plane->mtl_handle)
++      kk_device_remove_texture_from_residency_set(dev, plane->mtl_handle);
++   if (plane->mtl_handle_array)
++      kk_device_remove_texture_from_residency_set(dev, plane->mtl_handle_array);
++   plane->resident = false;
++}
++
+ static void
+ kk_image_plane_finish(struct kk_device *dev, struct kk_image_plane *plane,
+                       VkImageCreateFlags create_flags,
+                       const VkAllocationCallbacks *pAllocator)
+ {
++   if (plane->resident)
++      kk_image_plane_remove_from_residency_set(dev, plane);
+    if (plane->mtl_handle != NULL)
+       mtl_release(plane->mtl_handle);
+    if (plane->mtl_handle_array != NULL)
+@@ -701,8 +725,7 @@ kk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
+ 
+    /* Sparse textures map heap pages, the texture itself must be resident */
+    if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
+-      kk_device_add_allocation_to_residency_set(dev,
+-                                                image->planes[0].mtl_handle);
++      kk_image_plane_add_to_residency_set(dev, &image->planes[0]);
+ 
+    *pImage = kk_image_to_handle(image);
+ 
+@@ -719,10 +742,6 @@ kk_DestroyImage(VkDevice device, VkImage _image,
+    if (!image)
+       return;
+ 
+-   if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
+-      kk_device_remove_allocation_from_residency_set(
+-         dev, image->planes[0].mtl_handle);
+-
+    kk_image_finish(dev, image, pAllocator);
+    vk_free2(&dev->vk.alloc, pAllocator, image);
+ }
+@@ -1021,6 +1040,8 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+                                 image->vk.base.object_name);
+    }
+ 
++   kk_image_plane_add_to_residency_set(dev, plane);
++
+    *offset_B += plane_size_B;
+ 
+    return VK_SUCCESS;
+diff --git a/src/kosmickrisp/vulkan/kk_image.h b/src/kosmickrisp/vulkan/kk_image.h
+index c4f14d2..bec0cce 100644
+--- a/src/kosmickrisp/vulkan/kk_image.h
++++ b/src/kosmickrisp/vulkan/kk_image.h
+@@ -17,6 +17,7 @@
+ 
+ #include "vk_image.h"
+ 
++struct kk_device;
+ struct kk_device_memory;
+ struct kk_physical_device;
+ struct kk_queue;
+@@ -40,6 +41,11 @@ struct kk_image_plane {
+    /* Metal handle with 2D array type for 3D images */
+    mtl_texture *mtl_handle_array;
+    uint64_t addr;
++   /* The base textures of mtl_handle and mtl_handle_array were added to the
++    * device's residency set by this plane (bound to memory, or sparse) and
++    * are removed when it is finished. Not set for planes that alias a
++    * swapchain image's or a drawable's textures. */
++   bool resident;
+ };
+ 
+ /* Sparse images (VK_IMAGE_CREATE_SPARSE_BINDING_BIT) are Metal placement
+@@ -160,10 +166,15 @@ kk_image_memory_aspects_to_plane(ASSERTED const struct kk_image *image,
+    }
+ }
+ 
++/* A new texture of the plane's memory (not a view of mtl_handle): the caller
++ * owns it and its residency (kk_device_add_texture_to_residency_set). */
+ mtl_texture *kk_image_plane_create_texture(struct kk_image_plane *plane,
+                                            struct kk_image_layout *layout,
+                                            uint64_t offset_B);
+ 
++void kk_image_plane_remove_from_residency_set(struct kk_device *dev,
++                                              struct kk_image_plane *plane);
++
+ void kk_image_set_label(struct kk_image *image, const char *label);
+ 
+ #endif
+diff --git a/src/kosmickrisp/vulkan/kk_image_view.c b/src/kosmickrisp/vulkan/kk_image_view.c
+index 5f54202..5ab63e8 100644
+--- a/src/kosmickrisp/vulkan/kk_image_view.c
++++ b/src/kosmickrisp/vulkan/kk_image_view.c
+@@ -170,6 +170,8 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+          mtl_handle = kk_image_plane_create_texture(plane, &subres_layout,
+                                                     subres_offset_B);
+          view->planes[view_plane].mtl_handle_subres = mtl_handle;
++         if (mtl_handle)
++            kk_device_add_texture_to_residency_set(dev, mtl_handle);
+ 
+          /* Adjust for new base texture pointing to subresource */
+          view_layout.base_level = 0u;
+@@ -281,8 +283,11 @@ kk_image_view_finish(struct kk_device *dev, struct kk_image_view *view)
+       if (view->planes[plane].mtl_handle_render)
+          mtl_release(view->planes[plane].mtl_handle_render);
+ 
+-      if (view->planes[plane].mtl_handle_subres)
++      if (view->planes[plane].mtl_handle_subres) {
++         kk_device_remove_texture_from_residency_set(
++            dev, view->planes[plane].mtl_handle_subres);
+          mtl_release(view->planes[plane].mtl_handle_subres);
++      }
+ 
+       if (view->planes[plane].mtl_handle_residency_sampled)
+          mtl_release(view->planes[plane].mtl_handle_residency_sampled);
+diff --git a/src/kosmickrisp/vulkan/kk_wsi.c b/src/kosmickrisp/vulkan/kk_wsi.c
+index d863766..09178da 100644
+--- a/src/kosmickrisp/vulkan/kk_wsi.c
++++ b/src/kosmickrisp/vulkan/kk_wsi.c
+@@ -57,6 +57,10 @@ kk_bind_drawable_to_vkimage(VkImage vk_image, void *drawable)
+    /* This should only be called for swapchain binding. */
+    assert(image->plane_count == 1);
+    struct kk_image_plane *plane = &image->planes[0];
++   /* Drawable textures are resident through the layer's residency set */
++   if (plane->resident)
++      kk_image_plane_remove_from_residency_set(
++         container_of(image->vk.base.device, struct kk_device, vk), plane);
+    if (plane->mtl_handle)
+       mtl_release(plane->mtl_handle);
+    if (plane->mtl_handle_array)

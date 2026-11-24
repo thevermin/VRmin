@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Wed, 7 Oct 2026 12:48:43 +0300
+Subject: [PATCH] kk: apply unmaps of sparse buffer pages
+
+Metal holds back MTL4CommandQueue updateBufferMappings unmaps (and
+unmaps of placement sparse texture buffers) until the queue maps a page
+of a resident resource: an unmap that ended a vkQueueBindSparse kept the
+page mapped, reads returned the old memory and writes reached it
+(vkd3d-proton's test_update_tile_mappings_remap_stress: NULL tile ranges
+following mapped ones in an UpdateTileMappings batch). Unmaps followed by
+a map, and unmaps of 2D placement sparse textures, were applied.
+
+Each queue with sparseBinding gets a resident one page placement sparse
+buffer and a one page heap; a bind submit that unmapped buffer pages ends
+by mapping that page, which applies them. Metal's behavior was the same
+for a nil heap, the previously mapped heap, a copy of mappings from an
+unmapped buffer, a residency set commit, a wait, or a map on a
+non-resident buffer.
+---
+ src/kosmickrisp/vulkan/kk_queue.c  | 10 +++++
+ src/kosmickrisp/vulkan/kk_queue.h  |  7 ++++
+ src/kosmickrisp/vulkan/kk_sparse.c | 59 +++++++++++++++++++++++++++++-
+ src/kosmickrisp/vulkan/kk_sparse.h |  4 ++
+ 4 files changed, 78 insertions(+), 2 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index ab6584c..429d8c7 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -300,6 +300,14 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
+ 
+    queue->vk.driver_submit = kk_queue_submit;
+ 
++   if (dev->vk.enabled_features.sparseBinding) {
++      result = kk_queue_sparse_init(dev, queue);
++      if (result != VK_SUCCESS) {
++         kk_queue_finish(dev, queue);
++         return result;
++      }
++   }
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -309,6 +317,8 @@ kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
+    /* There may be in-flight command buffers, wait for them to finish. */
+    kk_queue_wait_for_commits(queue);
+ 
++   kk_queue_sparse_finish(dev, queue);
++
+    mtl_command_queue_remove_residency_set(queue->mtl_handle,
+                                           dev->residency_set.handle);
+    mtl_release(queue->mtl_handle);
+diff --git a/src/kosmickrisp/vulkan/kk_queue.h b/src/kosmickrisp/vulkan/kk_queue.h
+index ddc9a3c..5ebc726 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.h
++++ b/src/kosmickrisp/vulkan/kk_queue.h
+@@ -31,6 +31,13 @@ struct kk_queue {
+    uint32_t commits_in_flight;
+    mtx_t mutex;
+    cnd_t cond;
++
++   /* A one page placement sparse buffer and the heap page it maps after
++    * vkQueueBindSparse unmaps pages (kk_sparse.c) */
++   struct {
++      mtl_buffer *buffer;
++      struct kk_bo *bo;
++   } sparse_flush;
+ };
+ 
+ static inline struct kk_device *
+diff --git a/src/kosmickrisp/vulkan/kk_sparse.c b/src/kosmickrisp/vulkan/kk_sparse.c
+index e0f4f62..9132718 100644
+--- a/src/kosmickrisp/vulkan/kk_sparse.c
++++ b/src/kosmickrisp/vulkan/kk_sparse.c
+@@ -5,6 +5,7 @@
+ 
+ #include "kk_sparse.h"
+ 
++#include "kk_bo.h"
+ #include "kk_buffer.h"
+ #include "kk_device.h"
+ #include "kk_device_memory.h"
+@@ -223,11 +224,13 @@ kk_sparse_memory_heap(const struct kk_device_memory *mem)
+    return mem ? mem->bo->mtl_handle : NULL;
+ }
+ 
+-static void
++/* Returns whether a page was unmapped */
++static bool
+ kk_sparse_bind_buffer(struct kk_queue *queue,
+                       const VkSparseBufferMemoryBindInfo *info)
+ {
+    VK_FROM_HANDLE(kk_buffer, buffer, info->buffer);
++   bool unmapped = false;
+ 
+    for (uint32_t i = 0; i < info->bindCount; ++i) {
+       const VkSparseMemoryBind *bind = &info->pBinds[i];
+@@ -243,7 +246,55 @@ kk_sparse_bind_buffer(struct kk_queue *queue,
+                                                buffer->metal.handle,
+                                                kk_sparse_memory_heap(mem),
+                                                &mapping, 1u);
++      unmapped |= mem == NULL;
++   }
++
++   return unmapped;
++}
++
++/* Metal (macOS 27.0.1, M1 Max) holds back unmaps of placement sparse buffer
++ * pages until the queue maps a page of a resident resource: unmapped pages
++ * kept reading and writing their old memory. Mapping the queue's resident one
++ * page buffer applies them. */
++VkResult
++kk_queue_sparse_init(struct kk_device *dev, struct kk_queue *queue)
++{
++   VkResult result = kk_alloc_sparse_bo(dev, &queue->vk.base,
++                                        KK_SPARSE_PAGE_SIZE_B,
++                                        &queue->sparse_flush.bo);
++   if (result != VK_SUCCESS)
++      return result;
++
++   queue->sparse_flush.buffer =
++      mtl_new_placement_sparse_buffer(dev->mtl_handle, KK_SPARSE_PAGE_SIZE_B);
++   if (queue->sparse_flush.buffer == NULL)
++      return vk_error(queue, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   kk_device_add_allocation_to_residency_set(dev, queue->sparse_flush.buffer);
++
++   return VK_SUCCESS;
++}
++
++void
++kk_queue_sparse_finish(struct kk_device *dev, struct kk_queue *queue)
++{
++   if (queue->sparse_flush.buffer) {
++      kk_device_remove_allocation_from_residency_set(
++         dev, queue->sparse_flush.buffer);
++      mtl_release(queue->sparse_flush.buffer);
+    }
++   if (queue->sparse_flush.bo)
++      kk_destroy_bo(dev, queue->sparse_flush.bo);
++}
++
++static void
++kk_sparse_apply_unmaps(struct kk_queue *queue)
++{
++   const struct mtl_sparse_buffer_mapping mapping = {
++      .length = 1u,
++   };
++   mtl_command_queue_update_buffer_mappings(
++      queue->mtl_handle, queue->sparse_flush.buffer,
++      queue->sparse_flush.bo->mtl_handle, &mapping, 1u);
+ }
+ 
+ /* Page `page` of the opaque layout (see struct kk_image_sparse) as the start
+@@ -355,8 +406,9 @@ void
+ kk_queue_bind_sparse(struct kk_queue *queue,
+                      const struct vk_queue_submit *submit)
+ {
++   bool unmapped = false;
+    for (uint32_t i = 0; i < submit->buffer_bind_count; ++i)
+-      kk_sparse_bind_buffer(queue, &submit->buffer_binds[i]);
++      unmapped |= kk_sparse_bind_buffer(queue, &submit->buffer_binds[i]);
+ 
+    struct util_dynarray mappings;
+    util_dynarray_init(&mappings, NULL);
+@@ -367,4 +419,7 @@ kk_queue_bind_sparse(struct kk_queue *queue,
+ 
+    for (uint32_t i = 0; i < submit->image_bind_count; ++i)
+       kk_sparse_bind_image(queue, &submit->image_binds[i]);
++
++   if (unmapped)
++      kk_sparse_apply_unmaps(queue);
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_sparse.h b/src/kosmickrisp/vulkan/kk_sparse.h
+index ec35b6f..7f2989d 100644
+--- a/src/kosmickrisp/vulkan/kk_sparse.h
++++ b/src/kosmickrisp/vulkan/kk_sparse.h
+@@ -36,6 +36,10 @@ void kk_image_get_sparse_memory_requirements(
+    const struct kk_image *image, uint32_t *count,
+    VkSparseImageMemoryRequirements2 *requirements);
+ 
++/* Resources of vkQueueBindSparse on the queue (sparseBinding enabled) */
++VkResult kk_queue_sparse_init(struct kk_device *dev, struct kk_queue *queue);
++void kk_queue_sparse_finish(struct kk_device *dev, struct kk_queue *queue);
++
+ /* vkQueueBindSparse binds of a submit, as Metal 4 queue mapping updates */
+ void kk_queue_bind_sparse(struct kk_queue *queue,
+                           const struct vk_queue_submit *submit);

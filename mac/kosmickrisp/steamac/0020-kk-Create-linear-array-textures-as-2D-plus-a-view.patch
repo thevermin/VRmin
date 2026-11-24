@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian Misiak <bmisiak@me.com>
+Date: Thu, 3 Sep 2026 15:56:20 -0700
+Subject: [PATCH 20/21] kk: Create linear array textures as 2D plus a view
+
+Metal refuses to create a buffer-backed texture with any type but 2D and
+aborts the process instead of returning nil. We type input attachments
+as 2D arrays, so a linear image with INPUT_ATTACHMENT usage (mutter's
+window buffers, for one) took down the render server on bind.
+
+Create the linear texture as 2D and hand back a 2D array view, the same
+way image views already do it.
+---
+ src/kosmickrisp/vulkan/kk_image.c | 29 ++++++++++++++++++++++++++---
+ 1 file changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index af15f6b..10562e0 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -859,9 +859,32 @@ kk_image_plane_create_texture(struct kk_image_plane *plane,
+                               struct kk_image_layout *layout, uint64_t offset_B)
+ {
+    uint64_t mem_offset_B = plane->mem_offset_B + offset_B;
+-   if (plane->layout.linear)
+-      return mtl_new_texture_with_descriptor_linear(plane->mem->bo->map, layout,
+-                                                    mem_offset_B);
++   if (plane->layout.linear) {
++      /* Metal requires buffer-backed textures to be plain 2D, so a linear
++       * array layout gets a 2D texture and an array view of it. */
++      if (layout->type != MTL_TEXTURE_TYPE_2D_ARRAY || layout->layers != 1)
++         return mtl_new_texture_with_descriptor_linear(plane->mem->bo->map,
++                                                       layout, mem_offset_B);
++
++      struct kk_image_layout layout_2d = *layout;
++      layout_2d.type = MTL_TEXTURE_TYPE_2D;
++      mtl_texture *texture = mtl_new_texture_with_descriptor_linear(
++         plane->mem->bo->map, &layout_2d, mem_offset_B);
++      if (!texture)
++         return NULL;
++
++      const struct kk_view_layout view_layout = {
++         .view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
++         .sample_count_sa = 1,
++         .format.pipe = layout->format.pipe,
++         .format.mtl = layout->format.mtl,
++         .num_levels = 1,
++         .array_len = 1,
++      };
++      mtl_texture *view = mtl_new_texture_view_with_no_swizzle(texture, &view_layout);
++      mtl_release(texture);
++      return view;
++   }
+ 
+    return mtl_new_texture_with_descriptor(plane->mem->bo->mtl_handle, layout,
+                                           mem_offset_B);
+-- 
+2.54.0 (Apple Git-157)
+

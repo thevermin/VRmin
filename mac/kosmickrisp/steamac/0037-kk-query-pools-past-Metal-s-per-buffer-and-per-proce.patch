@@ -1,0 +1,831 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Wed, 7 Oct 2026 17:29:08 +0300
+Subject: [PATCH] kk: query pools past Metal's per-buffer and per-process
+ limits
+
+Every occlusion query of a device lived in one Metal visibility result
+buffer of 32768 entries (Metal's maximum visibility query offset is 256 KB),
+so vkCreateQueryPool failed once a device had 32768 live occlusion queries.
+Timestamp pools took Metal counter heaps of their own, and Metal allows 32
+counter heaps per process ("Maximum number of sample buffers"; newCounterHeap
+fails with "too many heaps already allocated in this process or on the
+system"). Under virglrenderer every guest application's device lives in the
+VMM process, so the 33rd timestamp pool of the whole VM failed. Venus
+creates pools asynchronously: the failed pool became an unknown object and
+the guest's next vkCmdBeginQuery / vkCmdResetQueryPool on it was a CS error
+that killed its GPU context (Dota 2 and Counter-Strike 2 on M3/M4/M5).
+
+Occlusion results now live in chunks of 32768 created as pools need them
+(up to 16 per device, 524288 queries); a pool of up to one chunk takes its
+queries from a single chunk. Pools keep 32-bit indices and libkk's reset and
+copy kernels find a chunk through the device's chunk table. A render pass
+writes visibility results to the chunk of its active query; beginning a query
+of another chunk restarts the Metal render pass with that chunk.
+
+Timestamp pools take chunks of 32 entries of counter heaps of 4096 created
+once for the process and shared by all devices (up to 32 heaps, 131072
+entries), instead of heaps of their own.
+---
+ src/kosmickrisp/libkk/kk_query.cl       |  33 ++--
+ src/kosmickrisp/libkk/kk_query.h        |   7 +
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h  |  11 +-
+ src/kosmickrisp/vulkan/kk_cmd_draw.c    |  22 ++-
+ src/kosmickrisp/vulkan/kk_device.c      |   7 +-
+ src/kosmickrisp/vulkan/kk_device.h      |   2 +-
+ src/kosmickrisp/vulkan/kk_private.h     |   1 -
+ src/kosmickrisp/vulkan/kk_query_pool.c  | 228 ++++++++++++++++--------
+ src/kosmickrisp/vulkan/kk_query_pool.h  |  14 +-
+ src/kosmickrisp/vulkan/kk_query_table.c | 142 +++++++++++++++
+ src/kosmickrisp/vulkan/kk_query_table.h |  40 +++++
+ 11 files changed, 399 insertions(+), 108 deletions(-)
+
+diff --git a/src/kosmickrisp/libkk/kk_query.cl b/src/kosmickrisp/libkk/kk_query.cl
+index 464f1da..1788c72 100644
+--- a/src/kosmickrisp/libkk/kk_query.cl
++++ b/src/kosmickrisp/libkk/kk_query.cl
+@@ -11,15 +11,19 @@
+ #include "kk_query.h"
+ 
+ static inline global uint64_t *
+-query_report(global uint64_t *results, global uint16_t *oq_index,
+-             uint reports_per_query, uint query)
++query_report(global uint64_t *results, global uint32_t *oq_index,
++             global uint64_t *oq_chunks, uint reports_per_query, uint query)
+ {
+-   /* For occlusion queries, results[] points to the device global heap. We
+-    * need to remap indices according to the query pool's allocation.
++   /* Occlusion queries are indices into the device's result chunks, remapped
++    * by the query pool's allocation.
+     */
+-   uint result_index = oq_index ? oq_index[query] : query;
++   if (oq_index) {
++      uint index = oq_index[query];
++      return (global uint64_t *)oq_chunks[index / KK_OQ_CHUNK_QUERIES] +
++             (index % KK_OQ_CHUNK_QUERIES);
++   }
+ 
+-   return results + (result_index * reports_per_query);
++   return results + (query * reports_per_query);
+ }
+ 
+ /**
+@@ -28,7 +32,8 @@ query_report(global uint64_t *results, global uint16_t *oq_index,
+  */
+ KERNEL(1)
+ libkk_reset_query(global uint32_t *availability, global uint64_t *results,
+-                  global uint16_t *oq_index, uint32_t first_query,
++                  global uint32_t *oq_index, global uint64_t *oq_chunks,
++                  uint32_t first_query,
+                   uint16_t reports_per_query, int set_available)
+ {
+    uint32_t query = first_query + cl_global_id.x;
+@@ -41,7 +46,7 @@ libkk_reset_query(global uint32_t *availability, global uint64_t *results,
+    }
+ 
+    global uint64_t *report =
+-      query_report(results, oq_index, reports_per_query, query);
++      query_report(results, oq_index, oq_chunks, reports_per_query, query);
+ 
+    /* XXX: is this supposed to happen on the begin? */
+    for (unsigned j = 0; j < reports_per_query; ++j) {
+@@ -72,7 +77,8 @@ libkk_copy_xfb_counters(constant struct libkk_xfb_counter_copy *copy)
+ 
+ KERNEL(1)
+ libkk_copy_queries(global uint32_t *availability, global uint64_t *results,
+-                   global uint16_t *oq_index, uint64_t dst_addr,
++                   global uint32_t *oq_index, global uint64_t *oq_chunks,
++                   uint64_t dst_addr,
+                    uint64_t dst_stride, uint32_t first_query,
+                    VkQueryResultFlagBits flags, uint16_t reports_per_query)
+ {
+@@ -87,14 +93,11 @@ libkk_copy_queries(global uint32_t *availability, global uint64_t *results,
+       available = (results[query] != LIBKK_QUERY_UNAVAILABLE);
+ 
+    if (available || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
+-      /* For occlusion queries, results[] points to the device global heap. We
+-       * need to remap indices according to the query pool's allocation.
+-       */
+-      uint result_index = oq_index ? oq_index[query] : query;
+-      uint idx = result_index * reports_per_query;
++      global uint64_t *report =
++         query_report(results, oq_index, oq_chunks, reports_per_query, query);
+ 
+       for (unsigned i = 0; i < reports_per_query; ++i) {
+-         vk_write_query(dst, i, flags, results[idx + i]);
++         vk_write_query(dst, i, flags, report[i]);
+       }
+    }
+ 
+diff --git a/src/kosmickrisp/libkk/kk_query.h b/src/kosmickrisp/libkk/kk_query.h
+index a3947fc..70973e9 100644
+--- a/src/kosmickrisp/libkk/kk_query.h
++++ b/src/kosmickrisp/libkk/kk_query.h
+@@ -23,4 +23,11 @@ struct libkk_imm_write {
+ 
+ #define LIBKK_QUERY_UNAVAILABLE (uint64_t)((int64_t)-1)
+ 
++/* Occlusion query results live in chunks of 32768 64-bit values: Metal's
++ * maximum visibility query offset is 256 KB (Metal feature set tables, Apple7
++ * and later), so one visibility result buffer holds 32768 queries. A pool's
++ * queries are indices into the device's chunks; libkk finds a chunk's address
++ * in the device's chunk table. */
++#define KK_OQ_CHUNK_QUERIES 32768u
++
+ #endif /* KK_QUERY_H */
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 0ce07e0..6919023 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -166,10 +166,15 @@ struct kk_graphics_state {
+    struct {
+       enum mtl_visibility_result_mode mode;
+ 
+-      /* If enabled, index of the current occlusion query in the occlusion heap.
+-       * There can only be one active at a time (hardware constraint).
++      /* If enabled, index of the current occlusion query in its chunk of the
++       * occlusion heap (kk_oq_heap). There can only be one active at a time
++       * (hardware constraint).
+        */
+-      uint16_t index;
++      uint32_t index;
++      /* Chunk of the current occlusion query */
++      uint32_t chunk;
++      /* Chunk the render pass descriptor writes visibility results to */
++      uint32_t pass_chunk;
+    } occlusion;
+ 
+    /* Index buffer */
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index f832c8c..f703a66 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -429,9 +429,12 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+                render->stencil_att.resolve_mode));
+    }
+ 
+-   /* Set global visibility buffer */
++   /* Visibility results go to the chunk of the occlusion heap the active
++    * query (or the last one) is in; kk_flush_render_pass switches chunks. */
++   cmd->state.gfx.occlusion.pass_chunk = cmd->state.gfx.occlusion.chunk;
+    mtl_render_pass_descriptor_set_visibility_buffer(
+-      pass_descriptor, dev->occlusion_queries.bo->map);
++      pass_descriptor,
++      dev->occlusion_queries.chunks[cmd->state.gfx.occlusion.chunk].bo->map);
+ 
+    // TODO_KOSMICKRISP Fragment shading rate support goes here if Metal supports
+    // it
+@@ -956,6 +959,21 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
+    bool needs_restart = kk_flush_sample_locations(cmd);
+    bool color_attachment_map_changed = false;
+ 
++   /* An occlusion query of another chunk of the occlusion heap: Metal writes
++    * the visibility results of a render pass to one buffer, so the pass
++    * restarts writing to that chunk. */
++   struct kk_graphics_state *gfx = &cmd->state.gfx;
++   if ((gfx->dirty & KK_DIRTY_OCCLUSION) &&
++       gfx->occlusion.mode != MTL_VISIBILITY_RESULT_MODE_DISABLED &&
++       gfx->occlusion.chunk != gfx->occlusion.pass_chunk) {
++      struct kk_device *dev = kk_cmd_buffer_device(cmd);
++      mtl_render_pass_descriptor_set_visibility_buffer(
++         gfx->render_pass_descriptor,
++         dev->occlusion_queries.chunks[gfx->occlusion.chunk].bo->map);
++      gfx->occlusion.pass_chunk = gfx->occlusion.chunk;
++      needs_restart = true;
++   }
++
+    if (IS_DIRTY(COLOR_ATTACHMENT_MAP)) {
+       if (memcmp(render->color_map, dyn->cal.color_map,
+                  render->color_att_count * sizeof(render->color_map[0])) != 0) {
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index b82ecec..eceb2f1 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -319,8 +319,7 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    if (result != VK_SUCCESS)
+       goto fail_mem_cache;
+ 
+-   result = kk_query_table_init(dev, &dev->occlusion_queries,
+-                                KK_MAX_OCCLUSION_QUERIES);
++   result = kk_oq_heap_init(dev, &dev->occlusion_queries);
+    if (result != VK_SUCCESS)
+       goto fail_meta;
+ 
+@@ -345,7 +344,7 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+ fail_sampler_heap:
+    kk_destroy_sampler_heap(dev, &dev->samplers);
+ fail_query_table:
+-   kk_query_table_finish(dev, &dev->occlusion_queries);
++   kk_oq_heap_finish(dev, &dev->occlusion_queries);
+ fail_meta:
+    kk_device_finish_meta(dev);
+ fail_mem_cache:
+@@ -384,7 +383,7 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    /* Meta first since it may destroy Vulkan objects */
+    kk_device_finish_meta(dev);
+    kk_device_finish_lib(dev);
+-   kk_query_table_finish(dev, &dev->occlusion_queries);
++   kk_oq_heap_finish(dev, &dev->occlusion_queries);
+    kk_destroy_sampler_heap(dev, &dev->samplers);
+ 
+    /* Geometry heap */
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index bfaeca8..926728e 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -87,7 +87,7 @@ struct kk_device {
+    struct vk_device_dispatch_table exposed_dispatch_table;
+ 
+    struct kk_sampler_heap samplers;
+-   struct kk_query_table occlusion_queries;
++   struct kk_oq_heap occlusion_queries;
+ 
+    /* Track all heaps the user allocated so we can set them all as resident when
+     * recording as required by Metal. */
+diff --git a/src/kosmickrisp/vulkan/kk_private.h b/src/kosmickrisp/vulkan/kk_private.h
+index 9687584..b9f18bf 100644
+--- a/src/kosmickrisp/vulkan/kk_private.h
++++ b/src/kosmickrisp/vulkan/kk_private.h
+@@ -34,7 +34,6 @@
+ #define KK_SSBO_BOUNDS_CHECK_ALIGNMENT 4
+ #define KK_MAX_MULTIVIEW_VIEW_COUNT    32
+ #define KK_TEXTURE_BUFFER_WIDTH        (1u << 14)
+-#define KK_MAX_OCCLUSION_QUERIES       (32768)
+ #define KK_MIN_SAMPLE_LOCATION         (0.0f)
+ #define KK_MAX_SAMPLE_LOCATION         (0.9375f)
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_query_pool.c b/src/kosmickrisp/vulkan/kk_query_pool.c
+index 842e6b3..caa6963 100644
+--- a/src/kosmickrisp/vulkan/kk_query_pool.c
++++ b/src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -21,14 +21,113 @@
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ 
++#include "util/bitset.h"
++#include "util/simple_mtx.h"
++
++/* Metal allows 32 counter heaps per process (Metal feature set tables:
++ * "Maximum number of sample buffers", 32 on every Apple family; newCounterHeap
++ * then fails with "there are too many heaps already allocated in this process
++ * or on the system"). Every Vulkan device of the process shares that budget:
++ * under virglrenderer, every guest application's device. Timestamp pools take
++ * chunks of KK_TS_CHUNK entries of counter heaps created once for the process
++ * and shared by all devices, instead of heaps of their own.
++ */
++#define KK_TS_HEAP_COUNT      32u
++#define KK_TS_CHUNK           32u
++#define KK_TS_CHUNKS_PER_HEAP (KK_TS_HEAP_MAX_ENTRIES / KK_TS_CHUNK)
++#define KK_TS_CHUNK_COUNT     (KK_TS_HEAP_COUNT * KK_TS_CHUNKS_PER_HEAP)
++
++static struct {
++   simple_mtx_t mutex;
++   mtl_device *device;
++   uint32_t heap_count;
++   mtl_counter_heap *heaps[KK_TS_HEAP_COUNT];
++   BITSET_DECLARE(used, KK_TS_CHUNK_COUNT);
++} kk_ts_slots = {.mutex = SIMPLE_MTX_INITIALIZER};
++
++static uint32_t
++kk_ts_free_chunks_locked(void)
++{
++   uint32_t used = 0;
++   for (uint32_t c = 0; c < kk_ts_slots.heap_count * KK_TS_CHUNKS_PER_HEAP; c++)
++      used += BITSET_TEST(kk_ts_slots.used, c);
++   return kk_ts_slots.heap_count * KK_TS_CHUNKS_PER_HEAP - used;
++}
++
++/* Picks `count` free chunks into `chunks`, creating shared heaps as needed. */
++static VkResult
++kk_ts_alloc_chunks(struct kk_device *dev, uint16_t *chunks, uint32_t count)
++{
++   VkResult result = VK_SUCCESS;
++
++   simple_mtx_lock(&kk_ts_slots.mutex);
++
++   if (kk_ts_slots.device == NULL)
++      kk_ts_slots.device = dev->mtl_handle;
++   if (kk_ts_slots.device != dev->mtl_handle) {
++      result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                         "timestamp counter heaps belong to another MTLDevice");
++      goto unlock;
++   }
++
++   uint32_t free_chunks = kk_ts_free_chunks_locked();
++   while (free_chunks < count && kk_ts_slots.heap_count < KK_TS_HEAP_COUNT) {
++      mtl_counter_heap *heap =
++         mtl_new_timestamp_counter_heap(dev->mtl_handle, KK_TS_HEAP_MAX_ENTRIES);
++      if (heap == NULL)
++         break;
++      kk_ts_slots.heaps[kk_ts_slots.heap_count++] = heap;
++      free_chunks += KK_TS_CHUNKS_PER_HEAP;
++   }
++   if (free_chunks < count) {
++      result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                         "out of timestamp counter heap entries (%u of %u "
++                         "heaps of %u)",
++                         kk_ts_slots.heap_count, KK_TS_HEAP_COUNT,
++                         KK_TS_HEAP_MAX_ENTRIES);
++      goto unlock;
++   }
++
++   uint32_t n = 0;
++   for (uint32_t c = 0; n < count; c++) {
++      if (!BITSET_TEST(kk_ts_slots.used, c)) {
++         BITSET_SET(kk_ts_slots.used, c);
++         chunks[n++] = c;
++      }
++   }
++
++unlock:
++   simple_mtx_unlock(&kk_ts_slots.mutex);
++   return result;
++}
++
++static void
++kk_ts_free_chunks(const uint16_t *chunks, uint32_t count)
++{
++   simple_mtx_lock(&kk_ts_slots.mutex);
++   for (uint32_t i = 0; i < count; i++)
++      BITSET_CLEAR(kk_ts_slots.used, chunks[i]);
++   simple_mtx_unlock(&kk_ts_slots.mutex);
++}
++
++/* The shared counter heap entry of timestamp query `query`. */
++static mtl_counter_heap *
++kk_ts_slot(const struct kk_query_pool *pool, uint32_t query, uint32_t *index)
++{
++   uint32_t slot =
++      pool->ts.chunks[query / KK_TS_CHUNK] * KK_TS_CHUNK + query % KK_TS_CHUNK;
++   *index = slot % KK_TS_HEAP_MAX_ENTRIES;
++   return kk_ts_slots.heaps[slot / KK_TS_HEAP_MAX_ENTRIES];
++}
++
+ struct kk_query_report {
+    uint64_t value;
+ };
+ 
+-uint16_t *
++uint32_t *
+ kk_pool_index_ptr(const struct kk_query_pool *pool)
+ {
+-   return (uint16_t *)((uint8_t *)pool->bo->cpu + pool->index_start);
++   return (uint32_t *)((uint8_t *)pool->bo->cpu + pool->index_start);
+ }
+ 
+ static uint32_t
+@@ -76,12 +175,13 @@ static uint64_t
+ kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
+                      uint32_t query)
+ {
+-   struct kk_bo *bo =
+-      kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
++   if (kk_pool_is_oq(pool)) {
++      uint32_t index = kk_pool_index_ptr(pool)[query];
++      return kk_oq_heap_chunk_bo(&dev->occlusion_queries, index)->gpu +
++             (index % KK_OQ_CHUNK_QUERIES) * sizeof(uint64_t);
++   }
+ 
+-   uint32_t index =
+-      kk_pool_is_oq(pool) ? kk_pool_index_ptr(pool)[query] : query;
+-   return bo->gpu + pool->query_start + (index * pool->query_stride);
++   return pool->bo->gpu + pool->query_start + (query * pool->query_stride);
+ }
+ 
+ static uint64_t
+@@ -95,14 +195,16 @@ static struct kk_query_report *
+ kk_query_report_map(struct kk_device *dev, struct kk_query_pool *pool,
+                     uint32_t query)
+ {
+-   struct kk_bo *bo =
+-      kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
+-
+-   uint32_t index =
+-      kk_pool_is_oq(pool) ? kk_pool_index_ptr(pool)[query] : query;
++   if (kk_pool_is_oq(pool)) {
++      uint32_t index = kk_pool_index_ptr(pool)[query];
++      return (struct kk_query_report *)kk_oq_heap_chunk_bo(
++                &dev->occlusion_queries, index)
++                ->cpu +
++             index % KK_OQ_CHUNK_QUERIES;
++   }
+ 
+-   return (struct kk_query_report *)(bo->cpu + pool->query_start +
+-                                     index * pool->query_stride);
++   return (struct kk_query_report *)(pool->bo->cpu + pool->query_start +
++                                     query * pool->query_stride);
+ }
+ 
+ static void
+@@ -155,7 +257,7 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
+    uint32_t index_size = 0;
+    if (!kk_pool_is_ts(pool)) {
+       availability_size = pool->vk.query_count * sizeof(uint32_t);
+-      index_size = sizeof(uint16_t) * pool->vk.query_count;
++      index_size = sizeof(uint32_t) * pool->vk.query_count;
+    }
+ 
+    pool->index_start = align(availability_size, sizeof(struct kk_query_report));
+@@ -165,7 +267,7 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
+    uint32_t reports_per_query = kk_reports_per_query(pool);
+    pool->query_stride = reports_per_query * sizeof(struct kk_query_report);
+ 
+-   /* For occlusion queries, results come from the global visibility buffer */
++   /* Occlusion results live in the device's chunks (kk_oq_heap) */
+    if (kk_pool_is_oq(pool)) {
+       pool->query_start = 0;
+    } else {
+@@ -180,52 +282,36 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
+    }
+ 
+    if (kk_pool_is_oq(pool)) {
+-      uint16_t *remap_index = kk_pool_index_ptr(pool);
+-
+-      for (unsigned i = 0; i < pool->vk.query_count; ++i) {
+-         uint64_t zero = 0;
+-         unsigned index;
+-
+-         VkResult result =
+-            kk_query_table_add(dev, &dev->occlusion_queries, zero, &index);
+-
+-         if (result != VK_SUCCESS) {
+-            kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool),
+-                                pAllocator);
+-            return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+-         }
+-
+-         /* We increment as we go so we can clean up properly if we run out */
+-         remap_index[pool->oq.queries++] = index;
++      result = kk_oq_heap_alloc(dev, &dev->occlusion_queries,
++                                pool->vk.query_count, kk_pool_index_ptr(pool));
++      if (result != VK_SUCCESS) {
++         kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool), pAllocator);
++         return result;
+       }
++      pool->oq.queries = pool->vk.query_count;
+    } else if (kk_pool_is_ts(pool)) {
+-      /* Timestamps are sampled into Metal counter heaps (one entry per query,
+-       * KK_TS_HEAP_MAX_ENTRIES per heap) and resolved into `bo` after the GPU
++      /* Timestamps are sampled into entries of the process' shared Metal
++       * counter heaps (kk_ts_slots) and resolved into `bo` after the GPU
+        * writes them. vkd3d-proton creates pools of 8192.
+        */
+-      pool->ts.heap_count =
+-         DIV_ROUND_UP(pool->vk.query_count, KK_TS_HEAP_MAX_ENTRIES);
+-      pool->ts.heaps =
++      const uint32_t chunk_count =
++         DIV_ROUND_UP(pool->vk.query_count, KK_TS_CHUNK);
++      pool->ts.chunks =
+          vk_zalloc2(&dev->vk.alloc, pAllocator,
+-                    pool->ts.heap_count * sizeof(*pool->ts.heaps), 8,
++                    chunk_count * sizeof(*pool->ts.chunks), 8,
+                     VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+-      if (pool->ts.heaps == NULL) {
+-         pool->ts.heap_count = 0;
++      if (pool->ts.chunks == NULL) {
+          kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool), pAllocator);
+          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+       }
+-      for (uint32_t h = 0; h < pool->ts.heap_count; h++) {
+-         const uint32_t entries =
+-            MIN2(pool->vk.query_count - h * KK_TS_HEAP_MAX_ENTRIES,
+-                 KK_TS_HEAP_MAX_ENTRIES);
+-         pool->ts.heaps[h] =
+-            mtl_new_timestamp_counter_heap(dev->mtl_handle, entries);
+-         if (pool->ts.heaps[h] == NULL) {
+-            kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool),
+-                                pAllocator);
+-            return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+-         }
++      result = kk_ts_alloc_chunks(dev, pool->ts.chunks, chunk_count);
++      if (result != VK_SUCCESS) {
++         vk_free2(&dev->vk.alloc, pAllocator, pool->ts.chunks);
++         pool->ts.chunks = NULL;
++         kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool), pAllocator);
++         return result;
+       }
++      pool->ts.chunk_count = chunk_count;
+    }
+ 
+    if (pCreateInfo->flags & VK_QUERY_POOL_CREATE_RESET_BIT_KHR)
+@@ -247,16 +333,11 @@ kk_DestroyQueryPool(VkDevice device, VkQueryPool queryPool,
+       return;
+ 
+    if (kk_pool_is_oq(pool)) {
+-      uint16_t *remap_index = kk_pool_index_ptr(pool);
+-      for (unsigned i = 0; i < pool->oq.queries; ++i) {
+-         kk_query_table_remove(dev, &dev->occlusion_queries, remap_index[i]);
+-      }
+-   } else if (kk_pool_is_ts(pool)) {
+-      for (uint32_t h = 0; h < pool->ts.heap_count; h++) {
+-         if (pool->ts.heaps[h])
+-            mtl_release(pool->ts.heaps[h]);
+-      }
+-      vk_free2(&dev->vk.alloc, pAllocator, pool->ts.heaps);
++      kk_oq_heap_free(&dev->occlusion_queries, kk_pool_index_ptr(pool),
++                      pool->oq.queries);
++   } else if (kk_pool_is_ts(pool) && pool->ts.chunks) {
++      kk_ts_free_chunks(pool->ts.chunks, pool->ts.chunk_count);
++      vk_free2(&dev->vk.alloc, pAllocator, pool->ts.chunks);
+    }
+ 
+    kk_destroy_bo(dev, pool->bo);
+@@ -280,13 +361,11 @@ emit_zero_queries(struct kk_cmd_buffer *cmd, struct kk_query_pool *pool,
+                   bool set_available)
+ {
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+-   struct kk_bo *results_bo =
+-      kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
+-
+    struct libkk_reset_query_args info = {
+       .availability = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu,
+-      .results = results_bo->gpu + pool->query_start,
++      .results = pool->bo->gpu + pool->query_start,
+       .oq_index = kk_pool_is_oq(pool) ? pool->bo->gpu + pool->index_start : 0u,
++      .oq_chunks = dev->occlusion_queries.chunk_table->gpu,
+ 
+       .first_query = first_index,
+       .reports_per_query = kk_reports_per_query(pool),
+@@ -383,14 +462,14 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+-   assert(kk_pool_is_ts(pool) && pool->ts.heaps);
++   assert(kk_pool_is_ts(pool) && pool->ts.chunks);
+ 
+    uint32_t count = kk_mv_query_count(cmd);
+    enum mtl_render_stages mtl_stage =
+       kk_pipeline_stages_to_mtl_render_stage(stage);
+ 
+-   mtl_counter_heap *heap = pool->ts.heaps[query / KK_TS_HEAP_MAX_ENTRIES];
+-   uint32_t heap_index = query % KK_TS_HEAP_MAX_ENTRIES;
++   uint32_t heap_index;
++   mtl_counter_heap *heap = kk_ts_slot(pool, query, &heap_index);
+ 
+    if (cmd->metal.render) {
+       /* If we've already issued a timestamp write for a render stage, reuse it
+@@ -460,8 +539,9 @@ kk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+                                       ? MTL_VISIBILITY_RESULT_MODE_COUNTING
+                                       : MTL_VISIBILITY_RESULT_MODE_BOOLEAN;
+    cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
+-   uint16_t *remap_index = kk_pool_index_ptr(pool);
+-   cmd->state.gfx.occlusion.index = remap_index[query];
++   uint32_t oq_index = kk_pool_index_ptr(pool)[query];
++   cmd->state.gfx.occlusion.index = oq_index % KK_OQ_CHUNK_QUERIES;
++   cmd->state.gfx.occlusion.chunk = oq_index / KK_OQ_CHUNK_QUERIES;
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -616,13 +696,11 @@ kk_CmdCopyQueryPoolResultsToMemoryKHR(
+     * for the compute job to copy results to the bo. */
+    mtl_barrier_after_queue_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_DISPATCH);
+ 
+-   struct kk_bo *results_bo =
+-      kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
+-
+    struct libkk_copy_queries_args args = {
+       .availability = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu,
+-      .results = results_bo->gpu + pool->query_start,
++      .results = pool->bo->gpu + pool->query_start,
+       .oq_index = kk_pool_is_oq(pool) ? pool->bo->gpu + pool->index_start : 0u,
++      .oq_chunks = dev->occlusion_queries.chunk_table->gpu,
+       .dst_addr = pDstRange->address,
+       .dst_stride = pDstRange->stride,
+       .first_query = firstQuery,
+diff --git a/src/kosmickrisp/vulkan/kk_query_pool.h b/src/kosmickrisp/vulkan/kk_query_pool.h
+index 25d9b8c..489a937 100644
+--- a/src/kosmickrisp/vulkan/kk_query_pool.h
++++ b/src/kosmickrisp/vulkan/kk_query_pool.h
+@@ -18,12 +18,12 @@
+ #define KK_TS_HEAP_MAX_ENTRIES 4096u
+ 
+ struct kk_ts_state {
+-   /* Metal 4 counter heaps backing VK_QUERY_TYPE_TIMESTAMP pools, query q in
+-    * heaps[q / KK_TS_HEAP_MAX_ENTRIES] at q % KK_TS_HEAP_MAX_ENTRIES.
+-    * Timestamps are sampled into them and later resolved into `bo` (see
+-    * kk_query_pool.c). NULL for non-timestamp pools. */
+-   mtl_counter_heap **heaps;
+-   uint32_t heap_count;
++   /* Chunks of the process' shared Metal 4 counter heaps backing a
++    * VK_QUERY_TYPE_TIMESTAMP pool (kk_ts_slots in kk_query_pool.c): query q
++    * is entry q % KK_TS_CHUNK of chunk chunks[q / KK_TS_CHUNK]. Timestamps
++    * are sampled there and later resolved into `bo`. */
++   uint16_t *chunks;
++   uint32_t chunk_count;
+ };
+ 
+ struct kk_oq_state {
+@@ -48,6 +48,6 @@ struct kk_query_pool {
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_query_pool, vk.base, VkQueryPool,
+                                VK_OBJECT_TYPE_QUERY_POOL)
+ 
+-uint16_t *kk_pool_index_ptr(const struct kk_query_pool *pool);
++uint32_t *kk_pool_index_ptr(const struct kk_query_pool *pool);
+ 
+ #endif /* KK_QUERY_POOL_H */
+diff --git a/src/kosmickrisp/vulkan/kk_query_table.c b/src/kosmickrisp/vulkan/kk_query_table.c
+index 8a0833e..8dc24fd 100644
+--- a/src/kosmickrisp/vulkan/kk_query_table.c
++++ b/src/kosmickrisp/vulkan/kk_query_table.c
+@@ -239,3 +239,145 @@ kk_query_table_remove(struct kk_device *dev, struct kk_query_table *table,
+ 
+    simple_mtx_unlock(&table->mutex);
+ }
++
++static VkResult kk_oq_heap_add_chunk_locked(struct kk_device *dev,
++                                            struct kk_oq_heap *heap);
++
++VkResult
++kk_oq_heap_init(struct kk_device *dev, struct kk_oq_heap *heap)
++{
++   memset(heap, 0, sizeof(*heap));
++   simple_mtx_init(&heap->mutex, mtx_plain);
++
++   VkResult result =
++      kk_alloc_bo(dev, &dev->vk.base, KK_OQ_MAX_CHUNKS * sizeof(uint64_t), 8,
++                  &heap->chunk_table);
++   if (result != VK_SUCCESS) {
++      simple_mtx_destroy(&heap->mutex);
++      return result;
++   }
++   memset(heap->chunk_table->cpu, 0, KK_OQ_MAX_CHUNKS * sizeof(uint64_t));
++
++   /* Render passes always have chunk 0 as visibility buffer to start with */
++   result = kk_oq_heap_add_chunk_locked(dev, heap);
++   if (result != VK_SUCCESS) {
++      kk_oq_heap_finish(dev, heap);
++      return result;
++   }
++   return VK_SUCCESS;
++}
++
++void
++kk_oq_heap_finish(struct kk_device *dev, struct kk_oq_heap *heap)
++{
++   for (uint32_t c = 0; c < heap->chunk_count; c++) {
++      kk_destroy_bo(dev, heap->chunks[c].bo);
++      vk_free(&dev->vk.alloc, heap->chunks[c].free);
++   }
++   if (heap->chunk_table)
++      kk_destroy_bo(dev, heap->chunk_table);
++   simple_mtx_destroy(&heap->mutex);
++}
++
++static uint32_t
++kk_oq_chunk_available(const struct kk_oq_chunk *chunk)
++{
++   return chunk->free_count + (KK_OQ_CHUNK_QUERIES - chunk->next);
++}
++
++static VkResult
++kk_oq_heap_add_chunk_locked(struct kk_device *dev, struct kk_oq_heap *heap)
++{
++   if (heap->chunk_count == KK_OQ_MAX_CHUNKS)
++      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                       "out of occlusion queries (%u chunks of %u)",
++                       KK_OQ_MAX_CHUNKS, KK_OQ_CHUNK_QUERIES);
++
++   struct kk_oq_chunk *chunk = &heap->chunks[heap->chunk_count];
++   VkResult result =
++      kk_alloc_bo(dev, &dev->vk.base, KK_OQ_CHUNK_QUERIES * sizeof(uint64_t),
++                  256, &chunk->bo);
++   if (result != VK_SUCCESS)
++      return result;
++
++   chunk->free = vk_alloc(&dev->vk.alloc, KK_OQ_CHUNK_QUERIES * sizeof(uint32_t),
++                          4, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   if (chunk->free == NULL) {
++      kk_destroy_bo(dev, chunk->bo);
++      chunk->bo = NULL;
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++   }
++   chunk->next = 0;
++   chunk->free_count = 0;
++
++   ((uint64_t *)heap->chunk_table->cpu)[heap->chunk_count] = chunk->bo->gpu;
++   heap->chunk_count++;
++   return VK_SUCCESS;
++}
++
++static uint32_t
++kk_oq_chunk_take(struct kk_oq_heap *heap, uint32_t c)
++{
++   struct kk_oq_chunk *chunk = &heap->chunks[c];
++   uint32_t local =
++      chunk->free_count ? chunk->free[--chunk->free_count] : chunk->next++;
++   ((uint64_t *)chunk->bo->cpu)[local] = 0;
++   return c * KK_OQ_CHUNK_QUERIES + local;
++}
++
++VkResult
++kk_oq_heap_alloc(struct kk_device *dev, struct kk_oq_heap *heap,
++                 uint32_t count, uint32_t *indices)
++{
++   VkResult result = VK_SUCCESS;
++
++   simple_mtx_lock(&heap->mutex);
++
++   uint32_t available = 0;
++   for (uint32_t c = 0; c < heap->chunk_count; c++)
++      available += kk_oq_chunk_available(&heap->chunks[c]);
++
++   if (count <= KK_OQ_CHUNK_QUERIES) {
++      /* One chunk, so draws of one pool never restart the render pass */
++      uint32_t c = 0;
++      while (c < heap->chunk_count &&
++             kk_oq_chunk_available(&heap->chunks[c]) < count)
++         c++;
++      if (c == heap->chunk_count) {
++         result = kk_oq_heap_add_chunk_locked(dev, heap);
++         if (result != VK_SUCCESS)
++            goto unlock;
++      }
++      for (uint32_t i = 0; i < count; i++)
++         indices[i] = kk_oq_chunk_take(heap, c);
++   } else {
++      while (available < count) {
++         result = kk_oq_heap_add_chunk_locked(dev, heap);
++         if (result != VK_SUCCESS)
++            goto unlock;
++         available += KK_OQ_CHUNK_QUERIES;
++      }
++      uint32_t i = 0;
++      for (uint32_t c = 0; i < count; c++) {
++         while (i < count && kk_oq_chunk_available(&heap->chunks[c]))
++            indices[i++] = kk_oq_chunk_take(heap, c);
++      }
++   }
++
++unlock:
++   simple_mtx_unlock(&heap->mutex);
++   return result;
++}
++
++void
++kk_oq_heap_free(struct kk_oq_heap *heap, const uint32_t *indices,
++                uint32_t count)
++{
++   simple_mtx_lock(&heap->mutex);
++   for (uint32_t i = 0; i < count; i++) {
++      struct kk_oq_chunk *chunk =
++         &heap->chunks[indices[i] / KK_OQ_CHUNK_QUERIES];
++      chunk->free[chunk->free_count++] = indices[i] % KK_OQ_CHUNK_QUERIES;
++   }
++   simple_mtx_unlock(&heap->mutex);
++}
+diff --git a/src/kosmickrisp/vulkan/kk_query_table.h b/src/kosmickrisp/vulkan/kk_query_table.h
+index a7d0be2..1562ed6 100644
+--- a/src/kosmickrisp/vulkan/kk_query_table.h
++++ b/src/kosmickrisp/vulkan/kk_query_table.h
+@@ -12,6 +12,8 @@
+ 
+ #include "kk_bo.h"
+ 
++#include "kosmickrisp/libkk/kk_query.h"
++
+ #include "util/bitset.h"
+ #include "util/simple_mtx.h"
+ 
+@@ -54,4 +56,42 @@ VkResult kk_query_table_insert(struct kk_device *dev,
+ void kk_query_table_remove(struct kk_device *dev, struct kk_query_table *table,
+                            uint32_t index);
+ 
++/* Occlusion query results of a device: chunks of KK_OQ_CHUNK_QUERIES 64-bit
++ * values, each a Metal visibility result buffer of its own (Metal's maximum
++ * visibility query offset is 256 KB), created as pools need them. A render
++ * pass writes the chunk of its active query; a query of another chunk
++ * restarts the Metal render pass with that chunk (kk_flush_render_pass).
++ * Pools of up to one chunk get their queries from a single chunk.
++ */
++#define KK_OQ_MAX_CHUNKS 16u
++
++struct kk_oq_chunk {
++   struct kk_bo *bo;
++   uint32_t next;       /**< Queries below `next` were allocated before */
++   uint32_t free_count; /**< Entries of `free` */
++   uint32_t *free;      /**< Freed queries (chunk-local) */
++};
++
++struct kk_oq_heap {
++   simple_mtx_t mutex;
++   uint32_t chunk_count;
++   struct kk_oq_chunk chunks[KK_OQ_MAX_CHUNKS];
++   /* GPU addresses of the chunks (uint64_t each), for libkk's query kernels */
++   struct kk_bo *chunk_table;
++};
++
++VkResult kk_oq_heap_init(struct kk_device *dev, struct kk_oq_heap *heap);
++void kk_oq_heap_finish(struct kk_device *dev, struct kk_oq_heap *heap);
++/* Allocates `count` zeroed queries into `indices` (all or none). */
++VkResult kk_oq_heap_alloc(struct kk_device *dev, struct kk_oq_heap *heap,
++                          uint32_t count, uint32_t *indices);
++void kk_oq_heap_free(struct kk_oq_heap *heap, const uint32_t *indices,
++                     uint32_t count);
++
++static inline struct kk_bo *
++kk_oq_heap_chunk_bo(struct kk_oq_heap *heap, uint32_t index)
++{
++   return heap->chunks[index / KK_OQ_CHUNK_QUERIES].bo;
++}
++
+ #endif /* KK_QUERY_TABLE_H */

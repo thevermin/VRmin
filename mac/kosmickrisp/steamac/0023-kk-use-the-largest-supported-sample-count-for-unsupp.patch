@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Tue, 6 Oct 2026 13:31:22 +0300
+Subject: [PATCH] kk: use the largest supported sample count for unsupported
+ ones
+
+Apple GPUs support 1, 2 and 4 samples, and KosmicKrisp reports exactly
+these. Apps and guest drivers still ask for 8 (D3D games through DXVK and
+Venus); Metal fails such render pipelines, and under virglrenderer the
+draws using them are dropped.
+
+Graphics pipelines use the largest supported count not above
+rasterizationSamples (with a warning), which also sets the render pass
+default count, and image layouts do the same for the texture, so they stay
+consistent. As MoltenVK does (steamac MoltenVK patch 0024).
+---
+ src/kosmickrisp/vulkan/kk_image_layout.c    |  4 +++-
+ src/kosmickrisp/vulkan/kk_physical_device.h | 13 +++++++++++++
+ src/kosmickrisp/vulkan/kk_shader.c          |  8 ++++++++
+ 3 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_image_layout.c b/src/kosmickrisp/vulkan/kk_image_layout.c
+index f91bfa8..f34d440 100644
+--- a/src/kosmickrisp/vulkan/kk_image_layout.c
++++ b/src/kosmickrisp/vulkan/kk_image_layout.c
+@@ -235,7 +235,9 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
+    layout->swizzle.green = supported_format->unswizzle.green;
+    layout->swizzle.blue = supported_format->unswizzle.blue;
+    layout->swizzle.alpha = supported_format->unswizzle.alpha;
+-   layout->sample_count_sa = image->samples;
++   /* Unsupported counts (8) as the pipelines get them: Metal cannot create
++    * such textures. */
++   layout->sample_count_sa = kk_supported_sample_count(pdev, image->samples);
+ 
+    /*
+     * Metal requires adding MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW if we are going
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.h b/src/kosmickrisp/vulkan/kk_physical_device.h
+index 004a61a..2fbafa9 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.h
++++ b/src/kosmickrisp/vulkan/kk_physical_device.h
+@@ -87,6 +87,19 @@ kk_min_cbuf_alignment()
+    return 16;
+ }
+ 
++/* The largest sample count the device supports that is not above samples
++ * (Apple GPUs: 1, 2, 4). Apps and guest drivers (D3D games through DXVK and
++ * Venus) still ask for 8, and Metal fails such pipelines and textures.
++ */
++static inline uint32_t
++kk_supported_sample_count(const struct kk_physical_device *pdev,
++                          uint32_t samples)
++{
++   const VkSampleCountFlags mask =
++      pdev->info.supported_sample_counts & ((samples << 1) - 1);
++   return mask ? 1u << (31 - __builtin_clz(mask)) : 1u;
++}
++
+ VK_DEFINE_HANDLE_CASTS(kk_physical_device, vk.base, VkPhysicalDevice,
+                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 533ba5f..48ce7e1 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -1953,6 +1953,14 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+                                      local_size_threads, &s->pipeline.cs);
+    } else {
+       gather_graphics_pipeline_create_info(state, shaders, total_shaders);
++      struct kk_shader *vs = shaders[0];
++      const uint32_t samples =
++         kk_supported_sample_count(kk_device_physical(dev), vs->info.vs.sample_count);
++      if (samples != vs->info.vs.sample_count) {
++         mesa_logw("kk: rasterizationSamples %u is not supported, using %u",
++                   vs->info.vs.sample_count, samples);
++         vs->info.vs.sample_count = samples;
++      }
+       result = kk_compile_graphics_pipeline(dev, shaders[0]);
+    }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

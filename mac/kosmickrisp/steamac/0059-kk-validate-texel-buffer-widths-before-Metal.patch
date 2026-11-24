@@ -1,0 +1,151 @@
+From 41d1b77a579952a2e85aea1037dcef9e6a3751f4 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@fxgam.es>
+Date: Sat, 24 Oct 2026 11:26:12 +0300
+Subject: [PATCH] kk: validate texel buffer widths before Metal
+
+Metal aborts when ordinary or placement sparse texture buffers have zero
+width or more than 2^28 texels (STEAMAC-3S/3Z/3J/3F/4B/3K/3G/3R). Keep
+those widths out of both constructors without failing vkCreateBufferView:
+Venus creates buffer views asynchronously, so a failure never reaches the
+guest and the first descriptor update naming the view kills its command
+stream. Dragon's Dogma 2 hits this at the end of loading a save because
+vkd3d-proton creates typed views over whole RE Engine buffers.
+
+A zero-element view is a null descriptor, like an unsupported format. Clamp
+an oversized view to what Metal can actually hold after computing its
+alignment prefix: (2^28 - texel_offset) / (rgb32 ? 3 : 1). The advertised
+maxTexelBufferElements reserves a sparse page and RGB32 expansion so every
+valid maximum-size view fits, but is not a clamp for one-texel formats.
+R32 views beyond that conservative limit keep all representable elements.
+The truncated tail reads out of bounds. Log each invalid-width case once.
+
+Repro: texture_descriptors.c covers zero and oversized widths, alignment,
+RGB32 expansion, partial last texels, and an R32 view beyond the RGB32 limit.
+
+Generated-by: LLM
+---
+ src/kosmickrisp/vulkan/kk_buffer_view.c | 61 ++++++++++++++++++++++---
+ src/kosmickrisp/vulkan/kk_private.h     |  6 ++-
+ 2 files changed, 59 insertions(+), 8 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.c b/src/kosmickrisp/vulkan/kk_buffer_view.c
+index 2d24aa3..ab9c8eb 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.c
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.c
+@@ -7,6 +7,8 @@
+ 
+ #include "kk_buffer_view.h"
+ 
++#include <inttypes.h>
++
+ #include "kk_buffer.h"
+ #include "kk_descriptor_types.h"
+ #include "kk_device.h"
+@@ -98,6 +100,29 @@ kk_buffer_view_warn_unsupported(VkFormat format, bool sparse)
+              vk_Format_to_str(format), sparse ? " in sparse buffers" : "");
+ }
+ 
++/* Once per process each: the guest's own usage error, not a driver fault */
++static void
++kk_buffer_view_warn_zero_elements(VkFormat format)
++{
++   static atomic_bool warned;
++   if (atomic_exchange(&warned, true))
++      return;
++   mesa_logw("kk: a texel buffer view of %s has zero elements; it reads as a "
++             "null descriptor",
++             vk_Format_to_str(format));
++}
++
++static void
++kk_buffer_view_warn_oversized(VkFormat format, uint64_t elements, uint64_t limit)
++{
++   static atomic_bool warned;
++   if (atomic_exchange(&warned, true))
++      return;
++   mesa_logw("kk: a texel buffer view of %s has %" PRIu64 " elements, past "
++             "Metal's limit for this view (%" PRIu64 "); it is narrowed",
++             vk_Format_to_str(format), elements, limit);
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+                     const VkAllocationCallbacks *pAllocator,
+@@ -126,6 +151,24 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+       return VK_SUCCESS;
+    }
+ 
++   /* VK_WHOLE_SIZE rounds down to complete texels; it can produce zero
++    * elements. The guest may also exceed maxTexelBufferElements (including
++    * with VK_WHOLE_SIZE, VUID 04059; vkd3d-proton makes typed views over a
++    * buffer's whole range without clamping). An unrepresentable width must
++    * not reach either Metal constructor, which aborts, and must not fail
++    * here: under Venus vkCreateBufferView is asynchronous
++    * (vn_async_vkCreateBufferView), so the guest never learns of an error and
++    * the first descriptor update that names the view is a command-stream
++    * error that kills the guest process (Dragon's Dogma 2 at the end of
++    * loading a save). A view of zero elements is a null descriptor, as an
++    * unsupported format is; a view past Metal's capacity for its format and
++    * alignment prefix is narrowed, and texels past it read out of bounds. */
++   if (view->vk.elements == 0) {
++      kk_buffer_view_warn_zero_elements(view->vk.format);
++      *pBufferView = kk_buffer_view_to_handle(view);
++      return VK_SUCCESS;
++   }
++
+    enum mtl_texture_usage usage = MTL_TEXTURE_USAGE_SHADER_READ;
+    if (supported_format->texel_buffer.write && !rgb32)
+       usage |= MTL_TEXTURE_USAGE_SHADER_WRITE;
+@@ -156,13 +199,17 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+       texture_offset = mtl_offset;
+    }
+    view->texel_offset = (mtl_offset - texture_offset) / texel_B;
+-   uint64_t width_px = view->vk.elements + view->texel_offset;
+-   if (rgb32) {
+-      /* Texels past maxTexelBufferElements read as out of bounds */
+-      width_px = MIN2(view->vk.elements * 3u + view->texel_offset,
+-                      KK_MAX_TEXEL_BUFFER_ELEMENTS);
++   const uint64_t per_element = rgb32 ? 3u : 1u;
++   const uint64_t max_elements =
++      (KK_MTL_MAX_TEXEL_BUFFER_ELEMENTS - view->texel_offset) / per_element;
++   const uint64_t elements = MIN2(view->vk.elements, max_elements);
++   if (elements < view->vk.elements)
++      kk_buffer_view_warn_oversized(view->vk.format, view->vk.elements,
++                                    max_elements);
++   const uint64_t width_px = elements * per_element + view->texel_offset;
++   assert(width_px <= KK_MTL_MAX_TEXEL_BUFFER_ELEMENTS);
++   if (rgb32)
+       view->texel_offset |= KK_TEXEL_BUFFER_RGB32;
+-   }
+ 
+    struct kk_image_layout layout = {
+       .width_px = width_px,
+@@ -183,7 +230,7 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+             .blue = supported_format->unswizzle.blue,
+             .alpha = supported_format->unswizzle.alpha,
+          },
+-      .linear_stride_B = view->vk.range + (mtl_offset - texture_offset),
++      .linear_stride_B = width_px * texel_B,
+    };
+    if (buffer->sparse) {
+       VkResult result = kk_buffer_view_sparse_init(
+diff --git a/src/kosmickrisp/vulkan/kk_private.h b/src/kosmickrisp/vulkan/kk_private.h
+index 9aa8fe1..8b84ae8 100644
+--- a/src/kosmickrisp/vulkan/kk_private.h
++++ b/src/kosmickrisp/vulkan/kk_private.h
+@@ -22,7 +22,11 @@
+ #define KK_MAX_SAMPLES                   8
+ #define KK_MIN_SSBO_ALIGNMENT            16
+ #define KK_MIN_TEXEL_BUFFER_ALIGNMENT    16
+-#define KK_MAX_TEXEL_BUFFER_ELEMENTS     (16384u * 16384u)
++/* Metal texture buffers have at most 2^28 texels. Reserve an alignment
++ * prefix (a sparse page) and three R32 texels per RGB32 Vulkan element. */
++#define KK_MTL_MAX_TEXEL_BUFFER_ELEMENTS (1u << 28)
++#define KK_MAX_TEXEL_BUFFER_ELEMENTS                                            \
++   ((KK_MTL_MAX_TEXEL_BUFFER_ELEMENTS - KK_SPARSE_PAGE_SIZE_B) / 3u)
+ #define KK_MIN_UBO_ALIGNMENT             64
+ #define KK_MAX_VIEWPORTS                 16
+ #define KK_MAX_DESCRIPTOR_SIZE           64
+-- 
+2.54.0 (Apple Git-157)
+

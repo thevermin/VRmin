@@ -1,0 +1,318 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Willie Abrams <willie@pobox.com>
+Date: Thu, 1 Oct 2026 14:06:55 -0500
+Subject: [PATCH 11/19] kk: Add a passthrough GS for transform feedback
+
+Use poly's passthrough GS to capture outputs when the application has no
+GS. hk picks one at draw time; kk adds it during shader compilation,
+before building the Metal pipelines.
+
+The generated GS takes points, lines or triangles. Unroll adjacency
+first, and keep the previous stage's output types for the Metal
+vertex/fragment interface.
+
+Assisted-by: Claude Code
+---
+ src/kosmickrisp/vulkan/kk_cmd_draw.c |  39 ++++---
+ src/kosmickrisp/vulkan/kk_shader.c   | 149 +++++++++++++++++++++++----
+ 2 files changed, 155 insertions(+), 33 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index fcaa6b0..5aee977 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -833,8 +833,8 @@ kk_calculate_vbo_clamp(uint64_t vbuf, uint64_t sink, enum pipe_format format,
+    }
+ }
+ 
+-/* The VS keeps the pipeline's GS info. Return NULL if the pipeline has no
+- * GS. */
++/* The VS keeps the pipeline's GS info, including a passthrough GS added
++ * for transform feedback. Return NULL if the pipeline has no GS. */
+ static const struct poly_gs_info *
+ kk_gs_info(struct kk_cmd_buffer *cmd)
+ {
+@@ -1286,8 +1286,15 @@ kk_gs_in_prim(struct kk_cmd_buffer *cmd)
+    if (cmd->state.shaders[MESA_SHADER_TESS_EVAL])
+       return cmd->state.gfx.tess.prim;
+ 
+-   return vk_topology_to_mesa(
+-      cmd->vk.dynamic_graphics_state.ia.primitive_topology);
++   enum mesa_prim prim =
++      vk_topology_to_mesa(cmd->vk.dynamic_graphics_state.ia.primitive_topology);
++
++   /* Unroll adjacency to lines or triangles before the passthrough GS. */
++   if (!cmd->state.shaders[MESA_SHADER_GEOMETRY] &&
++       mesa_prim_has_adjacency(prim))
++      return u_reduced_prim(prim);
++
++   return prim;
+ }
+ 
+ static uint64_t
+@@ -2007,13 +2014,15 @@ requires_unroll_flatshade(struct kk_cmd_buffer *cmd,
+ static bool
+ requires_unroll(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ {
+-   /* No need to unroll for tessellation. Robustness is handled by tessellator,
+-    * restart is not supported for patch lists, and flat-shading does not have a
+-    * well-defined vertex used when tessellating. A GS reads any index size and
+-    * topology through poly's bounds-checked input assembly, and
+-    * kk_draw_without_restart unrolls restart before it runs. */
++   /* Tessellation doesn't need unrolling: the tessellator handles robustness,
++    * patch lists don't restart, and tessellation has no well-defined provoking
++    * vertex. A GS handles index sizes and topologies through poly's
++    * bounds-checked input assembly, with restart already unrolled by
++    * kk_draw_without_restart. A passthrough GS still needs adjacency unrolled,
++    * just like a draw without a GS. */
+    bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+-   bool geom = cmd->state.shaders[MESA_SHADER_GEOMETRY];
++   bool geom = cmd->state.shaders[MESA_SHADER_GEOMETRY] ||
++               (kk_gs_info(cmd) && !mesa_prim_has_adjacency(data->prim));
+    if (tess || geom)
+       return false;
+ 
+@@ -2413,6 +2422,12 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    data->flatshade_first =
+       dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
+ 
++   /* Keep the vertex order when unrolling adjacency; the passthrough GS
++    * handles the provoking vertex itself. */
++   if (kk_gs_info(cmd) && !cmd->state.shaders[MESA_SHADER_GEOMETRY] &&
++       mesa_prim_has_adjacency(data->prim))
++      data->flatshade_first = true;
++
+    /* Convert to indirect and process predicates. Skip draw if we fail. */
+    if (data->predicate_count > 0 && !kk_predicate_draws(cmd, data))
+       return;
+@@ -2424,8 +2439,8 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    if (requires_unroll(cmd, data) && !kk_unroll_geometry(cmd, data))
+       return;
+ 
+-   if (!geom && mesa_prim_has_adjacency(data->prim) &&
+-       !kk_unroll_adjacency(cmd, data))
++   if (!cmd->state.shaders[MESA_SHADER_GEOMETRY] &&
++       mesa_prim_has_adjacency(data->prim) && !kk_unroll_adjacency(cmd, data))
+       return;
+ 
+    /* Patch lists do not restart, so only a GS fed by the input assembly needs
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 660f9ee..533ba5f 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -103,6 +103,8 @@ has_static_depth_stencil_state(const struct vk_graphics_pipeline_state *state)
+ 
+ struct kk_vs_key {
+    bool is_points;
++   /* Topology class, which picks the passthrough GS input */
++   enum mesa_prim reduced_prim;
+    struct vk_vertex_input_state vi;
+ };
+ 
+@@ -113,6 +115,8 @@ kk_populate_vs_key(struct kk_vs_key *key,
+    memset(key, 0, sizeof(*key));
+    key->is_points =
+       (state->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST);
++   key->reduced_prim =
++      u_reduced_prim(vk_topology_to_mesa(state->ia->primitive_topology));
+    key->vi = *state->vi;
+ }
+ 
+@@ -1726,6 +1730,68 @@ kk_forward_tes_primitive_id(nir_shader *tes, nir_shader *gs)
+    nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
+ }
+ 
++static bool
++gather_output_type(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   nir_alu_type *types = data;
++   if (intr->intrinsic != nir_intrinsic_store_output)
++      return false;
++
++   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
++   for (unsigned i = 0; i < sem.num_slots; ++i)
++      types[sem.location + i] = nir_intrinsic_src_type(intr);
++   return false;
++}
++
++/* Add a passthrough GS so poly can capture the last stage's outputs.
++ * prim is the point, line or triangle list it takes as input. */
++static nir_shader *
++kk_xfb_passthrough_gs(const nir_shader *last, enum mesa_prim prim)
++{
++   uint16_t xfb_outputs = last->xfb_info->output_count;
++   struct poly_passthrough_gs_key *key =
++      calloc(1, poly_passthrough_gs_key_size(xfb_outputs));
++
++   key->prim = prim;
++   key->outputs = last->info.outputs_written;
++   key->clip_distance_array_size = last->info.clip_distance_array_size;
++   key->cull_distance_array_size = last->info.cull_distance_array_size;
++
++   for (uint32_t i = 0; i < NUM_TOTAL_VARYING_SLOTS; i++) {
++      unsigned num_comps = 0;
++      switch (i) {
++      case VARYING_SLOT_TESS_LEVEL_OUTER:
++      case VARYING_SLOT_TESS_LEVEL_INNER:
++      case VARYING_SLOT_BOUNDING_BOX1:
++         num_comps = 4;
++         break;
++      default:
++         num_comps = nir_slot_num_components(i, MESA_SHADER_VERTEX);
++         break;
++      }
++      key->output_components[i] = num_comps ?: 4;
++      key->output_types[i] = nir_type_float32;
++   }
++
++   /* Keep the stored types for the Metal vertex/fragment interface. */
++   nir_shader_intrinsics_pass((nir_shader *)last, gather_output_type,
++                              nir_metadata_all, key->output_types);
++
++   memcpy(key->xfb_stride, last->info.xfb_stride, sizeof(key->xfb_stride));
++   memcpy(&key->xfb_info, last->xfb_info, nir_xfb_info_size(xfb_outputs));
++
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_GEOMETRY, last->options, "xfb passthrough");
++   poly_nir_passthrough_gs(&b, key);
++   free(key);
++
++   nir_shader *gs = b.shader;
++   gs->info.io_lowered = true;
++   gs->info.next_stage = MESA_SHADER_FRAGMENT;
++   nir_shader_gather_info(gs, b.impl);
++   return gs;
++}
++
+ static VkResult
+ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+                    struct vk_shader_compile_info *infos,
+@@ -1740,22 +1806,36 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+ 
+    enum kk_feature_key features = kk_make_feature_key(enabled_features);
+ 
+-   /* Vulkan doesn't enforce a fragment shader to build pipelines. We may need
+-    * to create one. */
+-   nir_shader *nir_shaders[shader_count + 1u];
+-   struct kk_shader *shaders[shader_count + 1u];
++   /* Leave room for a generated fragment shader and an XFB passthrough GS. */
++   nir_shader *nir_shaders[shader_count + 2u];
++   struct kk_shader *shaders[shader_count + 2u];
++   bool generated[shader_count + 2u];
++
++   /* Capture the last pre-rasterization stage, adding a passthrough GS if
++    * the application doesn't have one. */
++   uint32_t last_vtg = 0u;
++   for (uint32_t i = 0u; i < shader_count; ++i) {
++      if (infos[i].stage == MESA_SHADER_VERTEX ||
++          infos[i].stage == MESA_SHADER_TESS_EVAL ||
++          infos[i].stage == MESA_SHADER_GEOMETRY)
++         last_vtg = i;
++   }
++   bool xfb_gs = state && infos[last_vtg].nir->xfb_info &&
++                 infos[last_vtg].stage != MESA_SHADER_GEOMETRY;
+ 
+    /* Lower shaders, notably lowering IO. This is a prerequisite for intershader
+     * optimization. */
+    const struct vk_pipeline_robustness_state *vertex_robustness = &rs_none;
++   uint32_t total_shaders = 0u;
+    for (uint32_t i = 0u; i < shader_count; ++i) {
+       const struct vk_shader_compile_info *info = &infos[i];
+       nir_shader *nir = info->nir;
+ 
+       /* Stages before the tessellator or a GS run as compute */
+       bool emulated_stage =
+-         info->next_stage_mask & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+-                                  VK_SHADER_STAGE_GEOMETRY_BIT);
++         (info->next_stage_mask & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
++                                   VK_SHADER_STAGE_GEOMETRY_BIT)) ||
++         (xfb_gs && i == last_vtg);
+ 
+       msl_preprocess_nir_workarounds(nir, pdev->settings.disabled_workarounds);
+       kk_lower_nir(dev, nir, emulated_stage, info->robustness,
+@@ -1770,17 +1850,46 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+          NIR_PASS(_, nir, nir_io_add_intrinsic_xfb_info);
+       }
+ 
+-      nir_shaders[i] = nir;
++      generated[total_shaders] = false;
++      nir_shaders[total_shaders++] = nir;
++
++      if (xfb_gs && i == last_vtg) {
++         enum mesa_prim prim;
++         if (nir->info.stage == MESA_SHADER_TESS_EVAL) {
++            /* The TCS may supply the primitive mode or point mode. */
++            const nir_shader *tcs = nir_shaders[total_shaders - 2u];
++            enum tess_primitive_mode mode =
++               nir->info.tess._primitive_mode ?: tcs->info.tess._primitive_mode;
++            if (nir->info.tess.point_mode || tcs->info.tess.point_mode)
++               prim = MESA_PRIM_POINTS;
++            else if (mode == TESS_PRIMITIVE_ISOLINES)
++               prim = MESA_PRIM_LINES;
++            else
++               prim = MESA_PRIM_TRIANGLES;
++         } else {
++            /* Adjacency is unrolled first, so this works for any topology
++             * in the same class. */
++            prim = u_reduced_prim(
++               vk_topology_to_mesa(state->ia->primitive_topology));
++         }
++
++         nir_shader *gs = kk_xfb_passthrough_gs(nir, prim);
++         NIR_PASS(_, gs, nir_opt_constant_folding);
++         NIR_PASS(_, gs, nir_io_add_intrinsic_xfb_info);
++         nir->info.next_stage = MESA_SHADER_GEOMETRY;
++
++         generated[total_shaders] = true;
++         nir_shaders[total_shaders++] = gs;
++      }
+    }
+ 
+    /* Since we don't support GPL nor shader objects and Metal render pipelines
+     * require both vertex and fragment, we may need to provide a pass-through
+     * fragment. */
+-   uint32_t total_shaders = shader_count;
+    if (state && infos[shader_count - 1u].stage != MESA_SHADER_FRAGMENT) {
+-      nir_shaders[shader_count] =
++      generated[total_shaders] = true;
++      nir_shaders[total_shaders++] =
+          get_empty_nir(dev, MESA_SHADER_FRAGMENT, state, features);
+-      total_shaders += 1u;
+    }
+ 
+    /* nir_opt_varyings_bulk removes a GS primitive ID output that the FS does
+@@ -1845,22 +1954,20 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+    } else {
+       gather_graphics_pipeline_create_info(state, shaders, total_shaders);
+       result = kk_compile_graphics_pipeline(dev, shaders[0]);
+-
+-      /* Free generated fragment shader */
+-      if (shader_count != total_shaders)
+-         kk_shader_destroy(&dev->vk, shaders[shader_count], pAllocator);
+    }
+ 
+-   if (result != VK_SUCCESS) {
+-      for (uint32_t i = 0; i < shader_count; i++) {
++   /* The VS has the pipeline data now, so free the generated shaders. */
++   uint32_t out_count = 0u;
++   for (uint32_t i = 0; i < total_shaders; i++) {
++      if (generated[i] || result != VK_SUCCESS)
+          kk_shader_destroy(&dev->vk, shaders[i], pAllocator);
+-      }
++      else
++         shaders_out[out_count++] = &shaders[i]->vk;
++   }
+ 
+-      /* Memset the output array */
++   /* Clear the output array on failure. */
++   if (result != VK_SUCCESS)
+       memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
+-   } else {
+-      memcpy(shaders_out, shaders, shader_count * sizeof(*shaders_out));
+-   }
+ 
+    return result;
+ }
+-- 
+2.54.0 (Apple Git-157)
+

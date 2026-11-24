@@ -1,0 +1,543 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Tue, 13 Oct 2026 20:41:10 +0300
+Subject: [PATCH] kk: a Metal command buffer of its own only for render passes
+ with pre_gfx work
+
+STEAMAC-G. 0044 started every render encoder that followed other encoders in
+a Metal command buffer of its own, so that the pre_gfx pass (unroll kernels,
+draw predicates) of its draws could be committed right before it. A Metal
+command buffer costs GPU time of its own (~55 us on an M1 Max): Steam's web
+helper's command buffer of 77 blits (vk_meta: a render pass each) took
+12.6 ms instead of 6.5 ms with 0042, its longest one 13.6 ms instead of 7.0.
+
+Render encoders now start a Metal command buffer only in renderings whose
+draws recorded pre_gfx work, and the pre_gfx pass goes at the end of the Metal
+command buffer the render encoder started after (kept open with the pool's
+other allocator until the render encoder ends), not into a third one; a
+render encoder that is the first of its Metal command buffer still gets one
+of its own committed before it. A rendering's first render encoder starts at
+its first use when it would follow other encoders: the pre_gfx work of the
+first draw goes ahead of it into the Metal command buffer being encoded (it
+takes the attachments' load actions then; a rendering without draws starts
+it at its end, a color attachment map change before it). A rendering whose
+first pre_gfx work comes after its render encoder started behind other
+encoders ends that once (as before 0044 for every such draw), its next render
+encoder starts a Metal command buffer. Deferred writes after a render encoder and
+timestamp writes no longer count as pre_gfx work. Command buffer records (MESA_KK_DEBUG=cbs,
+queue errors) count their Metal command buffers.
+
+host/moltenvk/repro provoking_last.c 5: a clear, 8 blits and 8 render passes
+of direct draws in one command buffer: one Metal command buffer (0044: one per
+render pass after the first),
+1.7 ms of GPU time (0001-0045: 2.2-4.3 ms, 0001-0042: 1.7 ms); indexed draws
+2 Metal command buffers, 1 render pass.
+---
+ src/kosmickrisp/vulkan/kk_cb_record.c  |   4 +-
+ src/kosmickrisp/vulkan/kk_cb_record.h  |   2 +
+ src/kosmickrisp/vulkan/kk_cmd_buffer.c | 184 ++++++++++++++++---------
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h |  26 +++-
+ src/kosmickrisp/vulkan/kk_cmd_draw.c   |  82 +++++++----
+ src/kosmickrisp/vulkan/kk_query_pool.c |   2 +-
+ 6 files changed, 196 insertions(+), 104 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_cb_record.c b/src/kosmickrisp/vulkan/kk_cb_record.c
+index 9a47028..8f200af 100644
+--- a/src/kosmickrisp/vulkan/kk_cb_record.c
++++ b/src/kosmickrisp/vulkan/kk_cb_record.c
+@@ -223,9 +223,9 @@ kk_cb_record_format(const struct kk_cb_record *r, char *buf, size_t size)
+                     r->max_samples);
+    kk_out_printf(&out,
+                  ", %u compute encoders, %u draws (%u indirect), %u "
+-                 "dispatches (%u indirect)",
++                 "dispatches (%u indirect), %u Metal command buffers",
+                  r->compute_encoders, r->draws, r->indirect_draws,
+-                 r->dispatches, r->indirect_dispatches);
++                 r->dispatches, r->indirect_dispatches, r->metal_cmd_bufs);
+    if (r->ops) {
+       kk_out_printf(&out, "; ops");
+       for (uint32_t i = 0u; i < KK_CB_OP_COUNT; i++) {
+diff --git a/src/kosmickrisp/vulkan/kk_cb_record.h b/src/kosmickrisp/vulkan/kk_cb_record.h
+index 7b17e81..707883b 100644
+--- a/src/kosmickrisp/vulkan/kk_cb_record.h
++++ b/src/kosmickrisp/vulkan/kk_cb_record.h
+@@ -67,6 +67,8 @@ struct kk_cb_record {
+    uint16_t indirect_draws;
+    uint16_t dispatches;
+    uint16_t indirect_dispatches;
++   /* Metal command buffers committed for it */
++   uint16_t metal_cmd_bufs;
+    uint8_t max_samples;
+    uint8_t program_count;
+    /* Programs bound past programs[] */
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index c5a4a6e..237a15f 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -85,6 +85,9 @@ end_recording(struct kk_cmd_buffer *cmd)
+       return;
+ 
+    cs_end(cmd);
++   cmd->record.metal_cmd_bufs = MIN2(
++      util_dynarray_num_elements(&cmd->metal.cmd_bufs, mtl_command_buffer *),
++      UINT16_MAX);
+    mtl_end_command_buffer(cmd->metal.cmd_buf);
+    struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
+    kk_cmd_pool_return_allocator(pool, cmd->metal.allocator);
+@@ -306,17 +309,31 @@ kk_encoder_wait_for_sparse_binds(struct kk_cmd_buffer *cmd,
+                                      MTL_STAGE_ALL);
+ }
+ 
+-/* Ends cmd_buf and continues in a new Metal command buffer (on failure in
+- * cmd_buf, which cmd_buf_used tells) */
++/* The Metal command buffer of the pre_gfx pass of a render encoder starting
++ * now (cs_start_render): cmd_buf stays open for it (cmd_buf with an encoder,
++ * the render encoder would follow it) and the render encoder starts the next
++ * one, which takes the other allocator. On failure the render encoder goes on
++ * in cmd_buf, which cmd_buf_used tells. */
+ static void
+-kk_cmd_next_cmd_buf(struct kk_cmd_buffer *cmd)
++kk_cmd_next_cmd_buf_after_pre_gfx(struct kk_cmd_buffer *cmd)
+ {
+-   mtl_command_buffer *next = kk_cmd_pool_get_cmd_buf(kk_cmd_buffer_pool(cmd));
++   struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
++   assert(cmd->metal.pre_gfx.cmd_buf == NULL);
++
++   if (cmd->metal.pre_gfx.allocator == NULL)
++      cmd->metal.pre_gfx.allocator = kk_cmd_pool_get_allocator(pool);
++   if (cmd->metal.pre_gfx.allocator == NULL)
++      return;
++   mtl_command_buffer *next = kk_cmd_pool_get_cmd_buf(pool);
+    if (next == NULL)
+       return;
+ 
+-   mtl_end_command_buffer(cmd->metal.cmd_buf);
+-   mtl_begin_command_buffer(next, cmd->metal.allocator);
++   mtl_command_allocator *allocator = cmd->metal.pre_gfx.allocator;
++   cmd->metal.pre_gfx.allocator = cmd->metal.allocator;
++   cmd->metal.pre_gfx.cmd_buf = cmd->metal.cmd_buf;
++   cmd->metal.allocator = allocator;
++
++   mtl_begin_command_buffer(next, allocator);
+    if (cmd->vk.base.object_name)
+       mtl_command_buffer_set_label(next, cmd->vk.base.object_name);
+    util_dynarray_append(&cmd->metal.cmd_bufs, next);
+@@ -324,6 +341,33 @@ kk_cmd_next_cmd_buf(struct kk_cmd_buffer *cmd)
+    cmd->metal.cmd_buf_used = false;
+ }
+ 
++/* A Metal command buffer of its own for the pre_gfx pass of the open render
++ * encoder, the first encoder of cmd_buf: committed right before cmd_buf */
++static bool
++kk_cmd_new_pre_gfx_cmd_buf(struct kk_cmd_buffer *cmd)
++{
++   struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
++
++   if (cmd->metal.pre_gfx.allocator == NULL)
++      cmd->metal.pre_gfx.allocator = kk_cmd_pool_get_allocator(pool);
++   if (cmd->metal.pre_gfx.allocator == NULL)
++      return false;
++   mtl_command_buffer *cmd_buf = kk_cmd_pool_get_cmd_buf(pool);
++   if (cmd_buf == NULL)
++      return false;
++
++   mtl_begin_command_buffer(cmd_buf, cmd->metal.pre_gfx.allocator);
++   if (cmd->vk.base.object_name)
++      mtl_command_buffer_set_label(cmd_buf, cmd->vk.base.object_name);
++   util_dynarray_append(&cmd->metal.cmd_bufs, cmd->metal.cmd_buf);
++   mtl_command_buffer **cmd_bufs = util_dynarray_begin(&cmd->metal.cmd_bufs);
++   const unsigned count =
++      util_dynarray_num_elements(&cmd->metal.cmd_bufs, mtl_command_buffer *);
++   cmd_bufs[count - 2u] = cmd_buf;
++   cmd->metal.pre_gfx.cmd_buf = cmd_buf;
++   return true;
++}
++
+ void
+ cs_start_render(struct kk_cmd_buffer *cmd)
+ {
+@@ -334,10 +378,14 @@ cs_start_render(struct kk_cmd_buffer *cmd)
+    /* Ensure no other active encoder, aka compute */
+    cs_end(cmd);
+ 
+-   /* The render encoder starts a Metal command buffer, so that its pre_gfx
+-    * pass can be committed right before it (cs_get_pre_gfx) */
+-   if (cmd->metal.cmd_buf_used)
+-      kk_cmd_next_cmd_buf(cmd);
++   /* A rendering whose draws recorded pre_gfx work (cs_get_pre_gfx) starts
++    * its render encoders that would follow other encoders in a Metal command
++    * buffer of their own, so that the pre_gfx pass can run before them. Only
++    * those: a Metal command buffer costs GPU time of its own (~55 us on an M1
++    * Max; with one per render pass, Steam's web helper's blits took twice as
++    * long). */
++   if (cmd->metal.cmd_buf_used && state->render.pre_gfx)
++      kk_cmd_next_cmd_buf_after_pre_gfx(cmd);
+    cmd->metal.render_first = !cmd->metal.cmd_buf_used;
+    cmd->metal.cmd_buf_used = true;
+ 
+@@ -352,6 +400,12 @@ cs_start_render(struct kk_cmd_buffer *cmd)
+       cmd->record.max_samples =
+          MAX2(cmd->record.max_samples, state->render.samples);
+    }
++   /* The first render encoder of the rendering takes its attachments' load
++    * actions, later ones load what the earlier ones stored */
++   if (state->render.first_start) {
++      state->render.first_start = false;
++      kk_render_pass_descriptor_load_attachments(cmd);
++   }
+    /* Starting a new render pass means we already flushed and no barrier is
+     * needed. */
+    state->render.write_available = false;
+@@ -381,9 +435,13 @@ cs_get_render(struct kk_cmd_buffer *cmd)
+    struct kk_graphics_state *gfx = &cmd->state.gfx;
+ 
+    if (gfx->need_to_start_render_pass) {
+-      gfx->render.samples = gfx->pipeline_sample_count;
+-      mtl_render_pass_descriptor_set_default_raster_sample_count(
+-         cmd->state.gfx.render_pass_descriptor, gfx->render.samples);
++      /* Rendering without attachments takes the pipeline's sample count. The
++       * first start of one with attachments keeps theirs. */
++      if (!gfx->render.first_start) {
++         gfx->render.samples = gfx->pipeline_sample_count;
++         mtl_render_pass_descriptor_set_default_raster_sample_count(
++            cmd->state.gfx.render_pass_descriptor, gfx->render.samples);
++      }
+       gfx->need_to_start_render_pass = false;
+       cs_start_render(cmd);
+    }
+@@ -414,69 +472,62 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
+    return cmd->metal.compute;
+ }
+ 
+-/* The compute encoder of pre_gfx work (kk_dispatch_precomp): while a render
+- * encoder is open, a compute pass in a Metal command buffer of its own that
+- * cs_end commits right before the render encoder's, which starts with it
+- * (cs_start_render). The render encoder goes on, where ending it for a compute
+- * pass would store its attachments and load them again after (STEAMAC-G: the
+- * unroll kernel of every indexed draw with a flat varying and the last vertex
+- * provoking did, the web helper's frames ran up to 37 render passes). Other
+- * work, and work outside render passes, uses cs_get_compute. */
++/* The compute encoder of pre_gfx work (kk_dispatch_precomp, draws only). The
++ * render encoder goes on, where ending it for a compute pass would store its
++ * attachments and load them again after (STEAMAC-G: the unroll kernel of every
++ * indexed draw with a flat varying and the last vertex provoking did, the web
++ * helper's frames ran up to 37 render passes): the work goes into a compute
++ * pass at the end of the Metal command buffer committed right before the
++ * render encoder's, either the one it started after (cs_start_render) or one
++ * of its own when the render encoder is the first of its command buffer. A
++ * render encoder that follows other encoders of its Metal command buffer ends
++ * once instead, its rendering's next render encoder starts a Metal command
++ * buffer. Before the rendering's render encoder (re)starts, the work goes into
++ * cmd_buf ahead of it, and the rendering's next render encoder starts a Metal
++ * command buffer too. */
+ mtl_compute_encoder *
+ cs_get_pre_gfx(struct kk_cmd_buffer *cmd)
+ {
+-   if (!cmd->metal.render || !cmd->metal.render_first)
++   struct kk_graphics_state *gfx = &cmd->state.gfx;
++
++   if (gfx->render_pass_descriptor)
++      gfx->render.pre_gfx = true;
++   if (!cmd->metal.render)
+       return cs_get_compute(cmd);
+ 
+-   if (cmd->metal.pre_gfx.compute == NULL) {
+-      struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
+-      if (cmd->metal.pre_gfx.allocator == NULL)
+-         cmd->metal.pre_gfx.allocator = kk_cmd_pool_get_allocator(pool);
+-      mtl_command_buffer *cmd_buf = kk_cmd_pool_get_cmd_buf(pool);
+-      if (cmd->metal.pre_gfx.allocator == NULL || cmd_buf == NULL) {
+-         if (cmd_buf)
+-            kk_cmd_pool_return_cmd_buf(pool, cmd_buf);
+-         return cs_get_compute(cmd);
+-      }
++   if (cmd->metal.pre_gfx.compute)
++      return cmd->metal.pre_gfx.compute;
+ 
+-      mtl_begin_command_buffer(cmd_buf, cmd->metal.pre_gfx.allocator);
+-      if (cmd->vk.base.object_name)
+-         mtl_command_buffer_set_label(cmd_buf, cmd->vk.base.object_name);
+-      mtl_compute_encoder *encoder = mtl_new_compute_command_encoder(cmd_buf);
+-      mtl_compute_set_argument_table(encoder, cmd->argument_table);
+-      kk_encoder_update_debug(cmd, encoder);
+-      kk_encoder_wait_for_sparse_binds(cmd, encoder);
+-      kk_cb_record_count(&cmd->record.compute_encoders);
+-      cmd->metal.pre_gfx.cmd_buf = cmd_buf;
+-      cmd->metal.pre_gfx.compute = encoder;
+-   }
++   if (cmd->metal.pre_gfx.cmd_buf == NULL &&
++       (!cmd->metal.render_first || !kk_cmd_new_pre_gfx_cmd_buf(cmd)))
++      return cs_get_compute(cmd);
+ 
+-   return cmd->metal.pre_gfx.compute;
++   mtl_compute_encoder *encoder =
++      mtl_new_compute_command_encoder(cmd->metal.pre_gfx.cmd_buf);
++   mtl_compute_set_argument_table(encoder, cmd->argument_table);
++   kk_encoder_update_debug(cmd, encoder);
++   kk_encoder_wait_for_sparse_binds(cmd, encoder);
++   kk_cb_record_count(&cmd->record.compute_encoders);
++   cmd->metal.pre_gfx.compute = encoder;
++   return encoder;
+ }
+ 
+-/* Ends the pre_gfx pass of the render encoder that ended, committed before
+- * the render encoder's Metal command buffer (cmd_buf, which it starts) */
++/* Ends the pre_gfx pass of the render encoder that ended and its Metal command
++ * buffer, committed right before the render encoder's */
+ static void
+ end_pre_gfx(struct kk_cmd_buffer *cmd)
+ {
+-   if (cmd->metal.pre_gfx.compute == NULL)
+-      return;
+-
+-   mtl_barrier_after_stages(cmd->metal.pre_gfx.compute, MTL_STAGE_ALL,
+-                            MTL_STAGE_ALL);
+-   mtl_end_encoding(cmd->metal.pre_gfx.compute);
+-   mtl_release(cmd->metal.pre_gfx.compute);
+-   mtl_end_command_buffer(cmd->metal.pre_gfx.cmd_buf);
+-
+-   util_dynarray_append(&cmd->metal.cmd_bufs, cmd->metal.cmd_buf);
+-   mtl_command_buffer **cmd_bufs =
+-      util_dynarray_begin(&cmd->metal.cmd_bufs);
+-   const unsigned count =
+-      util_dynarray_num_elements(&cmd->metal.cmd_bufs, mtl_command_buffer *);
+-   cmd_bufs[count - 2u] = cmd->metal.pre_gfx.cmd_buf;
+-
+-   cmd->metal.pre_gfx.cmd_buf = NULL;
+-   cmd->metal.pre_gfx.compute = NULL;
++   if (cmd->metal.pre_gfx.compute) {
++      mtl_barrier_after_stages(cmd->metal.pre_gfx.compute, MTL_STAGE_ALL,
++                               MTL_STAGE_ALL);
++      mtl_end_encoding(cmd->metal.pre_gfx.compute);
++      mtl_release(cmd->metal.pre_gfx.compute);
++      cmd->metal.pre_gfx.compute = NULL;
++   }
++   if (cmd->metal.pre_gfx.cmd_buf) {
++      mtl_end_command_buffer(cmd->metal.pre_gfx.cmd_buf);
++      cmd->metal.pre_gfx.cmd_buf = NULL;
++   }
+ }
+ 
+ static void
+@@ -506,7 +557,8 @@ flush_post_render_writes(struct kk_cmd_buffer *cmd)
+       return;
+ 
+    util_dynarray_foreach(&cmd->post_render_writes, struct libkk_imm_write, w) {
+-      libkk_write_u32(cmd, kk_grid_1d(1), true, (uint64_t)w->address, w->value);
++      libkk_write_u32(cmd, kk_grid_1d(1), false, (uint64_t)w->address,
++                      w->value);
+    }
+ 
+    util_dynarray_clear(&cmd->post_render_writes);
+@@ -997,7 +1049,7 @@ kk_cmd_write(struct kk_cmd_buffer *cmd, struct libkk_imm_write write)
+    if (cmd->metal.render)
+       util_dynarray_append(&cmd->post_render_writes, write);
+    else
+-      libkk_write_u32(cmd, kk_grid_1d(1), true, write.address, write.value);
++      libkk_write_u32(cmd, kk_grid_1d(1), false, write.address, write.value);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 7531fa7..8857110 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -136,6 +136,15 @@ struct kk_rendering_state {
+    VkSampleLocationEXT sample_locations[KK_MAX_SAMPLES];
+    bool force_attachment_store;
+    bool rendering_to_whole_framebuffer;
++   /* The rendering has attachments and its first render encoder is yet to
++    * start (cs_start_render): that one takes the attachments' load actions
++    * and sample count. It starts at the first use when it would follow other
++    * encoders of its Metal command buffer (kk_CmdBeginRendering). */
++   bool first_start;
++   /* A draw of the rendering recorded pre_gfx work (cs_get_pre_gfx): its
++    * render encoders that would follow other encoders start a Metal command
++    * buffer (cs_start_render). */
++   bool pre_gfx;
+ };
+ 
+ /* Dirty tracking bits for state not tracked by vk_dynamic_graphics_state or
+@@ -264,9 +273,9 @@ struct kk_cmd_buffer {
+       mtl_command_allocator *allocator;
+       /* The Metal command buffer being encoded, the last of cmd_bufs */
+       mtl_command_buffer *cmd_buf;
+-      /* Metal command buffers of the recording in commit order. A render
+-       * encoder starts one of its own (cs_start_render), so that its pre_gfx
+-       * pass can be committed right before it. */
++      /* Metal command buffers of the recording in commit order. Render
++       * encoders of renderings with pre_gfx work start one (cs_start_render),
++       * so that their pre_gfx pass can be committed right before them. */
+       struct util_dynarray cmd_bufs;
+       /* cmd_buf has an encoder */
+       bool cmd_buf_used;
+@@ -275,8 +284,11 @@ struct kk_cmd_buffer {
+       mtl_render_encoder *render;
+       mtl_compute_encoder *compute;
+       /* Compute pass of pre_gfx dispatches recorded while the render encoder
+-       * is open (kk_dispatch_precomp): a Metal command buffer of its own,
+-       * committed before the render encoder's. */
++       * is open (cs_get_pre_gfx), at the end of the Metal command buffer
++       * committed right before the render encoder's: the one the render
++       * encoder started after, or one of its own. Two Metal command buffers
++       * are encoded at once then, each with an allocator of its own:
++       * pre_gfx.cmd_buf with pre_gfx.allocator, cmd_buf with allocator. */
+       struct {
+          mtl_command_allocator *allocator;
+          mtl_command_buffer *cmd_buf;
+@@ -411,6 +423,10 @@ void kk_cmd_buffer_flush_push_descriptors(struct kk_cmd_buffer *cmd,
+ 
+ void kk_apply_attachment_store_ops(struct kk_cmd_buffer *cmd, bool force_store);
+ 
++/* Attachments of the render pass descriptor load (restarted render encoders
++ * of the rendering) */
++void kk_render_pass_descriptor_load_attachments(struct kk_cmd_buffer *cmd);
++
+ bool kk_attachment_do_renderpass_resolve(const struct kk_attachment *attachment,
+                                          bool rendering_to_whole_framebuffer,
+                                          VkImageAspectFlags aspect);
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 0c19135..a380ae6 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -249,6 +249,36 @@ kk_set_color_attachments(mtl_render_pass_descriptor *pass_descriptor,
+    }
+ }
+ 
++void
++kk_render_pass_descriptor_load_attachments(struct kk_cmd_buffer *cmd)
++{
++   mtl_render_pass_descriptor *pass_descriptor =
++      cmd->state.gfx.render_pass_descriptor;
++   const struct kk_rendering_state *render = &cmd->state.gfx.render;
++
++   for (uint32_t i = 0; i < render->color_att_count; i++) {
++      const struct kk_image_view *iview = render->color_att[i].iview;
++      if (!iview)
++         continue;
++      mtl_render_pass_attachment_descriptor *attachment_descriptor =
++         mtl_render_pass_descriptor_get_color_attachment(pass_descriptor, i);
++      mtl_render_pass_attachment_descriptor_set_load_action(
++         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
++   }
++   if (render->depth_att.iview) {
++      mtl_render_pass_attachment_descriptor *attachment_descriptor =
++         mtl_render_pass_descriptor_get_depth_attachment(pass_descriptor);
++      mtl_render_pass_attachment_descriptor_set_load_action(
++         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
++   }
++   if (render->stencil_att.iview) {
++      mtl_render_pass_attachment_descriptor *attachment_descriptor =
++         mtl_render_pass_descriptor_get_stencil_attachment(pass_descriptor);
++      mtl_render_pass_attachment_descriptor_set_load_action(
++         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
++   }
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+                      const VkRenderingInfo *pRenderingInfo)
+@@ -441,35 +471,17 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+    // it
+ 
+    /* Rendering with no attachments requires pushing the start of the render
+-    * pass to first pipeline binding to know sample count. */
++    * pass to first pipeline binding to know sample count. One that would
++    * follow other encoders of the Metal command buffer starts at its first
++    * use: work the first draw records before it (pre_gfx: unroll kernels,
++    * draw predicates) runs ahead of it in that command buffer, and the
++    * rendering's render encoder starts a Metal command buffer of its own
++    * after it only then (cs_start_render). */
+    cmd->state.gfx.render_pass_descriptor = pass_descriptor;
+-   if (!no_framebuffer)
+-      cs_start_render(cmd);
+-
+-   /* Store descriptor in case we need to restart the pass at pipeline barrier,
+-    * but force loads */
+-   for (uint32_t i = 0; i < render->color_att_count; i++) {
+-      const struct kk_image_view *iview = render->color_att[i].iview;
+-      if (!iview)
+-         continue;
+-      mtl_render_pass_attachment_descriptor *attachment_descriptor =
+-         mtl_render_pass_descriptor_get_color_attachment(pass_descriptor, i);
+-      mtl_render_pass_attachment_descriptor_set_load_action(
+-         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
+-   }
+-   if (render->depth_att.iview) {
+-      mtl_render_pass_attachment_descriptor *attachment_descriptor =
+-         mtl_render_pass_descriptor_get_depth_attachment(pass_descriptor);
+-      mtl_render_pass_attachment_descriptor_set_load_action(
+-         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
+-   }
+-   if (render->stencil_att.iview) {
+-      mtl_render_pass_attachment_descriptor *attachment_descriptor =
+-         mtl_render_pass_descriptor_get_stencil_attachment(pass_descriptor);
+-      mtl_render_pass_attachment_descriptor_set_load_action(
+-         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
+-   }
+-   cmd->state.gfx.need_to_start_render_pass = no_framebuffer;
++   render->first_start = !no_framebuffer;
++   cmd->state.gfx.need_to_start_render_pass = true;
++   if (!no_framebuffer && !cmd->metal.cmd_buf_used)
++      cs_get_render(cmd);
+ 
+    kk_cmd_buffer_dirty_all_gfx(cmd);
+ 
+@@ -630,6 +642,10 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
+       .pStencilAttachment = &vk_stencil_att,
+    };
+ 
++   /* A rendering whose render encoder never started still loads or clears,
++    * stores and resolves its attachments */
++   if (render->first_start)
++      cs_get_render(cmd);
+    kk_apply_attachment_store_ops(cmd, false);
+ 
+    /* Clean up previous encoder */
+@@ -981,6 +997,10 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
+                  render->color_att_count * sizeof(render->color_map[0])) != 0) {
+          assert(cmd->state.gfx.render_pass_descriptor);
+ 
++         /* The first render encoder takes the attachments' load actions */
++         if (render->first_start)
++            cs_get_render(cmd);
++
+          /* Apply the store ops before the new color map is stored. */
+          kk_apply_attachment_store_ops(cmd, true);
+ 
+@@ -2596,8 +2616,6 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ {
+    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+ 
+-   kk_flush_gfx_state(cmd);
+-
+    data->restart = dyn->ia.primitive_restart_enable;
+    data->restart_index = dyn->ia.primitive_restart_index;
+    data->flatshade_first =
+@@ -2644,6 +2662,10 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    if (gs_restart && !kk_convert_to_indirect_draw(cmd, data))
+       return;
+ 
++   /* After the pre_gfx work: a render encoder yet to start follows it
++    * (kk_CmdBeginRendering) */
++   kk_flush_gfx_state(cmd);
++
+    for (uint32_t i = 0; i < data->draw_count; i++) {
+       struct kk_draw_data draw_data = build_draw_data(cmd, data, i);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_query_pool.c b/src/kosmickrisp/vulkan/kk_query_pool.c
+index fd8f4fe..d27e80a 100644
+--- a/src/kosmickrisp/vulkan/kk_query_pool.c
++++ b/src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -510,7 +510,7 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+           * compute work in the encoder to trigger it.  Rewrite the low half of
+           * the sentinel the report already holds, which leaves the query
+           * unavailable until the resolve lands. */
+-         libkk_write_u32(cmd, kk_grid_1d(1), true,
++         libkk_write_u32(cmd, kk_grid_1d(1), false,
+                          kk_query_report_addr(dev, pool, query),
+                          (uint32_t)LIBKK_QUERY_UNAVAILABLE);
+ 
+-- 
+2.54.0 (Apple Git-157)
+

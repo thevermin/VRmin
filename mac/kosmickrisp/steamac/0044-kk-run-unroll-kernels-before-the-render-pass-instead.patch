@@ -1,0 +1,664 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Tue, 13 Oct 2026 01:30:00 +0300
+Subject: [PATCH 44/44] kk: run unroll kernels before the render pass instead
+ of ending it
+
+STEAMAC-G. Indexed draws that need an unroll (a flat varying with the last
+vertex provoking, which zink keeps; fans, 8-bit indices, restart) ran the
+unroll kernel in a compute pass that ended the render pass around every such
+draw: attachments stored, the compute pass, attachments loaded again. 0041
+writes the indices of direct non-indexed draws on the CPU; those of indexed
+draws are in memory the GPU may write before the render pass (a copy earlier
+in the command buffer, submissions still running), so the CPU can read them
+neither at recording nor at submission. With 0041 a traced Steam boot still
+had 194 web helper command buffers with unroll kernels, the longest 13.8 ms
+of GPU time on an M1 Max with 37 render passes (4 at 4x MSAA).
+
+Vulkan does not allow writing index, indirect or predicate data inside a
+render pass (no transfers there, and a self-dependency cannot order shader
+writes before index or indirect reads), so these kernels can run before it.
+Dispatches recorded with pre_gfx (kk_dispatch_precomp's parameter, unused so
+far; hk's meaning) while a render encoder is open go into a compute pass in a
+Metal command buffer of its own, committed right before the render encoder's:
+a render encoder starts a Metal command buffer when the one being encoded
+already has an encoder, and a command buffer commits all of its Metal command
+buffers in order. pre_gfx are the predicates of draws and the unrolls of draws
+without a geometry shader (geometry and adjacency); tessellation, geometry
+shaders and the unrolls a passthrough GS reads still end the render encoder.
+The geometry heap is reset for the render encoder whose draws use it and freed
+when that one ends, no longer at every render encoder start (an unroll before
+a render encoder and a GS compute pass ending it keep apart).
+
+host/moltenvk/repro provoking_last.c: 11 indexed draws whose indices a
+vkCmdUpdateBuffer earlier in the command buffer writes: 12 render passes and
+12 compute passes, 2.2 ms of GPU time -> 1 render pass and 2 compute passes
+(the update, the unrolls), 0.33 ms; indexed indirect draws with a geometry
+shader draw among them: 12 render passes, 2.24 ms -> 2, 0.59 ms.
+---
+ src/kosmickrisp/vulkan/kk_cmd_buffer.c | 129 ++++++++++++++++++++++++-
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h |  32 ++++--
+ src/kosmickrisp/vulkan/kk_cmd_draw.c   | 110 +++++++++++----------
+ src/kosmickrisp/vulkan/kk_queue.c      |   8 +-
+ 4 files changed, 215 insertions(+), 64 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index 29b0046..72f7fdc 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -37,6 +37,20 @@ kk_descriptor_state_fini(struct kk_cmd_buffer *cmd,
+    }
+ }
+ 
++/* Returns the Metal command buffers of the last recording to the pool, but
++ * cmd_buf (kept for the next one) */
++static void
++kk_cmd_release_cmd_bufs(struct kk_cmd_buffer *cmd)
++{
++   struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
++
++   util_dynarray_foreach(&cmd->metal.cmd_bufs, mtl_command_buffer *, cmd_buf) {
++      if (*cmd_buf != cmd->metal.cmd_buf)
++         kk_cmd_pool_return_cmd_buf(pool, *cmd_buf);
++   }
++   util_dynarray_clear(&cmd->metal.cmd_bufs);
++}
++
+ static void
+ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
+ {
+@@ -57,9 +71,11 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
+    util_dynarray_clear(&cmd->ts_resolves);
+    util_dynarray_clear(&cmd->ts_stage_map);
+    util_dynarray_clear(&cmd->minmax_uab_sets);
++   kk_cmd_release_cmd_bufs(cmd);
+ }
+ 
+-/* Ends Metal command buffer recording and returns allocator to pool for reuse */
++/* Ends Metal command buffer recording and returns allocators to pool for
++ * reuse */
+ static void
+ end_recording(struct kk_cmd_buffer *cmd)
+ {
+@@ -68,8 +84,13 @@ end_recording(struct kk_cmd_buffer *cmd)
+ 
+    cs_end(cmd);
+    mtl_end_command_buffer(cmd->metal.cmd_buf);
+-   kk_cmd_pool_return_allocator(kk_cmd_buffer_pool(cmd), cmd->metal.allocator);
++   struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
++   kk_cmd_pool_return_allocator(pool, cmd->metal.allocator);
+    cmd->metal.allocator = NULL;
++   if (cmd->metal.pre_gfx.allocator) {
++      kk_cmd_pool_return_allocator(pool, cmd->metal.pre_gfx.allocator);
++      cmd->metal.pre_gfx.allocator = NULL;
++   }
+ }
+ 
+ static void
+@@ -84,6 +105,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+ 
+    /* Ensure closed command buffer for safe returns to pool */
+    end_recording(cmd);
++   kk_cmd_release_cmd_bufs(cmd);
+    if (cmd->metal.cmd_buf)
+       kk_cmd_pool_return_cmd_buf(pool, cmd->metal.cmd_buf);
+    cmd->metal.cmd_buf = NULL;
+@@ -99,6 +121,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+    util_dynarray_fini(&cmd->ts_resolves);
+    util_dynarray_fini(&cmd->ts_stage_map);
+    util_dynarray_fini(&cmd->minmax_uab_sets);
++   util_dynarray_fini(&cmd->metal.cmd_bufs);
+ 
+    vk_free(&pool->vk.alloc, cmd);
+ }
+@@ -132,6 +155,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+    cmd->ts_stage_map = UTIL_DYNARRAY_INIT;
+    cmd->post_render_writes = UTIL_DYNARRAY_INIT;
+    cmd->minmax_uab_sets = UTIL_DYNARRAY_INIT;
++   cmd->metal.cmd_bufs = UTIL_DYNARRAY_INIT;
+ 
+    {
+       mtl_argument_table_descriptor *desc = mtl_new_argument_table_descriptor();
+@@ -228,6 +252,9 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+       if (cmd->metal.allocator == NULL)
+          goto fail_allocator;
+    }
++   kk_cmd_release_cmd_bufs(cmd);
++   util_dynarray_append(&cmd->metal.cmd_bufs, cmd->metal.cmd_buf);
++   cmd->metal.cmd_buf_used = false;
+    mtl_begin_command_buffer(cmd->metal.cmd_buf, cmd->metal.allocator);
+ 
+    return VK_SUCCESS;
+@@ -275,6 +302,24 @@ kk_encoder_wait_for_sparse_binds(struct kk_cmd_buffer *cmd,
+                                      MTL_STAGE_ALL);
+ }
+ 
++/* Ends cmd_buf and continues in a new Metal command buffer (on failure in
++ * cmd_buf, which cmd_buf_used tells) */
++static void
++kk_cmd_next_cmd_buf(struct kk_cmd_buffer *cmd)
++{
++   mtl_command_buffer *next = kk_cmd_pool_get_cmd_buf(kk_cmd_buffer_pool(cmd));
++   if (next == NULL)
++      return;
++
++   mtl_end_command_buffer(cmd->metal.cmd_buf);
++   mtl_begin_command_buffer(next, cmd->metal.allocator);
++   if (cmd->vk.base.object_name)
++      mtl_command_buffer_set_label(next, cmd->vk.base.object_name);
++   util_dynarray_append(&cmd->metal.cmd_bufs, next);
++   cmd->metal.cmd_buf = next;
++   cmd->metal.cmd_buf_used = false;
++}
++
+ void
+ cs_start_render(struct kk_cmd_buffer *cmd)
+ {
+@@ -285,6 +330,13 @@ cs_start_render(struct kk_cmd_buffer *cmd)
+    /* Ensure no other active encoder, aka compute */
+    cs_end(cmd);
+ 
++   /* The render encoder starts a Metal command buffer, so that its pre_gfx
++    * pass can be committed right before it (cs_get_pre_gfx) */
++   if (cmd->metal.cmd_buf_used)
++      kk_cmd_next_cmd_buf(cmd);
++   cmd->metal.render_first = !cmd->metal.cmd_buf_used;
++   cmd->metal.cmd_buf_used = true;
++
+    cmd->metal.render = mtl_new_render_command_encoder_with_descriptor(
+       cmd->metal.cmd_buf, state->render_pass_descriptor);
+ 
+@@ -348,6 +400,7 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
+ 
+    if (cmd->metal.compute == NULL) {
+       cmd->metal.compute = mtl_new_compute_command_encoder(cmd->metal.cmd_buf);
++      cmd->metal.cmd_buf_used = true;
+       mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
+       kk_encoder_update_debug(cmd, cmd->metal.compute);
+       kk_encoder_wait_for_sparse_binds(cmd, cmd->metal.compute);
+@@ -357,6 +410,71 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
+    return cmd->metal.compute;
+ }
+ 
++/* The compute encoder of pre_gfx work (kk_dispatch_precomp): while a render
++ * encoder is open, a compute pass in a Metal command buffer of its own that
++ * cs_end commits right before the render encoder's, which starts with it
++ * (cs_start_render). The render encoder goes on, where ending it for a compute
++ * pass would store its attachments and load them again after (STEAMAC-G: the
++ * unroll kernel of every indexed draw with a flat varying and the last vertex
++ * provoking did, the web helper's frames ran up to 37 render passes). Other
++ * work, and work outside render passes, uses cs_get_compute. */
++mtl_compute_encoder *
++cs_get_pre_gfx(struct kk_cmd_buffer *cmd)
++{
++   if (!cmd->metal.render || !cmd->metal.render_first)
++      return cs_get_compute(cmd);
++
++   if (cmd->metal.pre_gfx.compute == NULL) {
++      struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
++      if (cmd->metal.pre_gfx.allocator == NULL)
++         cmd->metal.pre_gfx.allocator = kk_cmd_pool_get_allocator(pool);
++      mtl_command_buffer *cmd_buf = kk_cmd_pool_get_cmd_buf(pool);
++      if (cmd->metal.pre_gfx.allocator == NULL || cmd_buf == NULL) {
++         if (cmd_buf)
++            kk_cmd_pool_return_cmd_buf(pool, cmd_buf);
++         return cs_get_compute(cmd);
++      }
++
++      mtl_begin_command_buffer(cmd_buf, cmd->metal.pre_gfx.allocator);
++      if (cmd->vk.base.object_name)
++         mtl_command_buffer_set_label(cmd_buf, cmd->vk.base.object_name);
++      mtl_compute_encoder *encoder = mtl_new_compute_command_encoder(cmd_buf);
++      mtl_compute_set_argument_table(encoder, cmd->argument_table);
++      kk_encoder_update_debug(cmd, encoder);
++      kk_encoder_wait_for_sparse_binds(cmd, encoder);
++      kk_cb_record_count(&cmd->record.compute_encoders);
++      cmd->metal.pre_gfx.cmd_buf = cmd_buf;
++      cmd->metal.pre_gfx.compute = encoder;
++   }
++
++   return cmd->metal.pre_gfx.compute;
++}
++
++/* Ends the pre_gfx pass of the render encoder that ended, committed before
++ * the render encoder's Metal command buffer (cmd_buf, which it starts) */
++static void
++end_pre_gfx(struct kk_cmd_buffer *cmd)
++{
++   if (cmd->metal.pre_gfx.compute == NULL)
++      return;
++
++   mtl_barrier_after_stages(cmd->metal.pre_gfx.compute, MTL_STAGE_ALL,
++                            MTL_STAGE_ALL);
++   mtl_end_encoding(cmd->metal.pre_gfx.compute);
++   mtl_release(cmd->metal.pre_gfx.compute);
++   mtl_end_command_buffer(cmd->metal.pre_gfx.cmd_buf);
++
++   util_dynarray_append(&cmd->metal.cmd_bufs, cmd->metal.cmd_buf);
++   mtl_command_buffer **cmd_bufs =
++      util_dynarray_begin(&cmd->metal.cmd_bufs);
++   const unsigned count =
++      util_dynarray_num_elements(&cmd->metal.cmd_bufs, mtl_command_buffer *);
++   cmd_bufs[count - 2u] = cmd->metal.pre_gfx.cmd_buf;
++
++   cmd->metal.pre_gfx.cmd_buf = NULL;
++   cmd->metal.pre_gfx.compute = NULL;
++}
++
+ static void
+ end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
+ {
+@@ -399,6 +517,10 @@ cs_end(struct kk_cmd_buffer *cmd)
+    if (cmd->metal.render) {
+       end_encoder(cmd, cmd->metal.render);
+       cmd->metal.render = NULL;
++      end_pre_gfx(cmd);
++
++      /* The render encoder's draws are done with the geometry heap */
++      cmd->uses_heap = false;
+ 
+       /* The stage map is only valid for the current render encoder */
+       util_dynarray_clear(&cmd->ts_stage_map);
+@@ -834,7 +956,8 @@ kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
+    struct kk_precompiled_shader *prog = &dev->precompiled_cache.shaders[idx];
+    cmd->record.precomp |= BITFIELD_BIT(idx);
+ 
+-   mtl_compute_encoder *encoder = cs_get_compute(cmd);
++   mtl_compute_encoder *encoder =
++      pre_gfx ? cs_get_pre_gfx(cmd) : cs_get_compute(cmd);
+    mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
+                                     MTL_STAGE_DISPATCH);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 6b6b916..90ea194 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -262,9 +262,26 @@ struct kk_cmd_buffer {
+ 
+    struct {
+       mtl_command_allocator *allocator;
++      /* The Metal command buffer being encoded, the last of cmd_bufs */
+       mtl_command_buffer *cmd_buf;
++      /* Metal command buffers of the recording in commit order. A render
++       * encoder starts one of its own (cs_start_render), so that its pre_gfx
++       * pass can be committed right before it. */
++      struct util_dynarray cmd_bufs;
++      /* cmd_buf has an encoder */
++      bool cmd_buf_used;
++      /* The open render encoder is the first encoder of cmd_buf */
++      bool render_first;
+       mtl_render_encoder *render;
+       mtl_compute_encoder *compute;
++      /* Compute pass of pre_gfx dispatches recorded while the render encoder
++       * is open (kk_dispatch_precomp): a Metal command buffer of its own,
++       * committed before the render encoder's. */
++      struct {
++         mtl_command_allocator *allocator;
++         mtl_command_buffer *cmd_buf;
++         mtl_compute_encoder *compute;
++      } pre_gfx;
+    } metal;
+    /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
+    struct util_dynarray ts_resolves;
+@@ -294,7 +311,8 @@ struct kk_cmd_buffer {
+    /* Owned large BOs */
+    struct util_dynarray large_bos;
+ 
+-   /* Does the command buffer use the geometry heap? */
++   /* The geometry heap was reset for the open or next render encoder: its
++    * allocations stay until that render encoder ends (cs_end). */
+    bool uses_heap;
+    /* Set at vkBeginCommandBuffer. One-time-submit buffers skip command
+     * enqueueing in the trampolines since they can never be replayed. */
+@@ -349,6 +367,7 @@ kk_get_descriptors_state(struct kk_cmd_buffer *cmd,
+ void cs_start_render(struct kk_cmd_buffer *cmd);
+ mtl_render_encoder *cs_get_render(struct kk_cmd_buffer *cmd);
+ mtl_compute_encoder *cs_get_compute(struct kk_cmd_buffer *cmd);
++mtl_compute_encoder *cs_get_pre_gfx(struct kk_cmd_buffer *cmd);
+ void cs_end(struct kk_cmd_buffer *cmd);
+ void kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd,
+                                         uint64_t addr);
+@@ -361,11 +380,6 @@ kk_cmd_buffer_dirty_all_gfx(struct kk_cmd_buffer *cmd)
+    cmd->state.dirty_shaders = ~0u;
+    cmd->state.gfx.dirty = ~0u;
+    cmd->state.gfx.descriptors.root_dirty = true;
+-
+-   /* We just flushed out the heap use. If we want to use it again, we'll need
+-    * to queue a free for it again.
+-    */
+-   cmd->uses_heap = false;
+ }
+ 
+ void kk_cmd_release_dynamic_ds_state(struct kk_cmd_buffer *cmd);
+@@ -455,6 +469,12 @@ kk_grid_is_indirect(struct kk_grid grid)
+    return grid.mode != KK_GRID_DIRECT;
+ }
+ 
++/* pre_gfx: while a render encoder is open, the dispatch goes into its pre_gfx
++ * pass, which runs before it (cs_get_pre_gfx) instead of ending it. Only for
++ * work that reads nothing the render pass's draws may write (index, indirect
++ * and predicate buffers: transfers are not allowed in a render pass, and a
++ * self-dependency cannot order shader writes before index or indirect reads)
++ * and whose results only the render pass's draws read. */
+ void kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
+                          bool pre_gfx, enum libkk_program idx, void *data,
+                          size_t data_size);
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 34917cf..c2aa3d5 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1080,28 +1080,25 @@ kk_init_heap(const void *data)
+    };
+ }
+ 
++/* The geometry heap for work recorded with pre_gfx (kk_dispatch_precomp) */
+ static uint64_t
+-kk_heap(struct kk_cmd_buffer *cmd)
++kk_heap(struct kk_cmd_buffer *cmd, bool pre_gfx)
+ {
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+ 
+    util_call_once_data(&dev->heap_init_once, kk_init_heap, cmd);
+ 
+-   /* We need to free all allocations after each command buffer execution */
++   /* Other work ends the render encoder first: its draws are done with what
++    * the heap holds (cs_end), allocations from here on are for the next one.
++    * pre_gfx work allocates for the open one, before it starts. */
++   if (!pre_gfx)
++      cs_get_compute(cmd);
++
++   /* Zeroing the allocated index frees what earlier render encoders used */
+    if (!cmd->uses_heap) {
+       uint64_t addr = dev->heap->gpu;
+-
+-      /* Zeroing the allocated index frees everything. Force compute encoder
+-       * since this path is only taken by tessellation, GS and unroll, which
+-       * already force a compute encoder break */
+-      mtl_compute_encoder *encoder = cs_get_compute(cmd);
+-      kk_cmd_write(cmd, (struct libkk_imm_write){
+-                           addr + offsetof(struct poly_heap, bottom), 0});
+-
+-      /* Ensure heap is set to 0 before we allocate anything. */
+-      mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
+-                                       MTL_STAGE_DISPATCH);
+-
++      libkk_write_u32(cmd, kk_grid_1d(1), pre_gfx,
++                      addr + offsetof(struct poly_heap, bottom), 0u);
+       cmd->uses_heap = true;
+    }
+ 
+@@ -1110,10 +1107,10 @@ kk_heap(struct kk_cmd_buffer *cmd)
+ 
+ /* GPU-generated indices are allocated from the heap, past its header */
+ static struct kk_addr_range
+-kk_heap_indices(struct kk_cmd_buffer *cmd)
++kk_heap_indices(struct kk_cmd_buffer *cmd, bool pre_gfx)
+ {
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+-   uint64_t heap = kk_heap(cmd);
++   uint64_t heap = kk_heap(cmd, pre_gfx);
+ 
+    /* TODO_KOSMICKRISP Self-contained until we have rodata at the device. */
+    return (struct kk_addr_range){
+@@ -1238,7 +1235,7 @@ kk_upload_tess_params(struct kk_cmd_buffer *cmd, struct poly_tess_params *out,
+          : POLY_TESS_PARTITIONING_FRACTIONAL_EVEN;
+ 
+    struct poly_tess_params args = {
+-      .heap = kk_heap(cmd),
++      .heap = kk_heap(cmd, false),
+       .tcs_stride_el = tcs->info.tess.tcs_output_stride / 4,
+       .statistic = 0u,
+       .input_patch_size = dyn->ts.patch_control_points,
+@@ -1375,7 +1372,7 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
+       /* The indirect setup kernel writes the draw and allocates from the
+        * heap, including the index buffer */
+       if (shape == POLY_GS_SHAPE_DYNAMIC_INDEXED)
+-         gfx->gs.index = kk_heap_indices(cmd);
++         gfx->gs.index = kk_heap_indices(cmd, false);
+    } else {
+       poly_geometry_params_set_draw(&params, mode, shape, max_indices,
+                                     draw->grid.size.x, draw->grid.size.y);
+@@ -1742,8 +1739,8 @@ kk_set_unrolled_draw(struct kk_draw_command *data, enum mesa_prim prim,
+ }
+ 
+ /* Indices of a direct draw without an index buffer the CPU writes: the
+- * unroll kernel ends the render pass (its attachments are stored, loaded
+- * again after it), which here costs more than the draw. */
++ * unroll kernel needs a compute pass (and a Metal command buffer) before the
++ * render encoder (cs_get_pre_gfx), which here costs more than the draw. */
+ #define KK_CPU_UNROLL_MAX_INDICES (1u << 20)
+ 
+ /* Direct draws without an index buffer unroll to indices known at recording,
+@@ -1836,13 +1833,13 @@ kk_direct_unroll_size_B(const struct kk_draw_command *data)
+ /* The heap an unroll allocates its indices from, and their range. Direct
+  * draws get one of their own in command buffer memory, sized for the draws
+  * (direct_size_B, kk_direct_unroll_size_B): no reset, nothing shared with
+- * other command buffers or render passes, and no device heap for processes
+- * that only unroll direct draws. The device heap is reset to its start by the
+- * first unroll of every command buffer and render pass (kk_heap), which is
+- * only safe while the queue runs every pass after the previous one ended
+- * (end_encoder's barrier). */
++ * other command buffers or render encoders, and no device heap for processes
++ * that only unroll direct draws. The device heap is reset to its start for
++ * every render encoder that uses it (kk_heap), which is only safe while the
++ * queue runs every pass after the previous one ended (end_encoder's
++ * barrier). */
+ static uint64_t
+-kk_unroll_heap(struct kk_cmd_buffer *cmd, uint64_t direct_size_B,
++kk_unroll_heap(struct kk_cmd_buffer *cmd, uint64_t direct_size_B, bool pre_gfx,
+                struct kk_addr_range *indices)
+ {
+    if (direct_size_B < KK_HEAP_SIZE_B) {
+@@ -1860,16 +1857,17 @@ kk_unroll_heap(struct kk_cmd_buffer *cmd, uint64_t direct_size_B,
+       }
+    }
+ 
+-   const uint64_t heap = kk_heap(cmd);
+-   *indices = kk_heap_indices(cmd);
++   const uint64_t heap = kk_heap(cmd, pre_gfx);
++   *indices = kk_heap_indices(cmd, pre_gfx);
+    return heap;
+ }
+ 
+ /* Unrolling will always be done through indirect rendering, so if this is
+- * called from non-indirect calls, we will fake it. */
++ * called from non-indirect calls, we will fake it. pre_gfx:
++ * kk_dispatch_precomp, false when a passthrough GS reads the unrolled draw. */
+ static bool
+ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+-                   uint64_t direct_size_B)
++                   uint64_t direct_size_B, bool pre_gfx)
+ {
+    if (kk_unroll_geometry_cpu(cmd, data))
+       return true;
+@@ -1888,7 +1886,7 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+    struct kk_addr_range indices;
+    struct libkk_unroll_geometry_args info = {
+       .index_buffer = data->index_buffer.addr,
+-      .heap = kk_unroll_heap(cmd, direct_size_B, &indices),
++      .heap = kk_unroll_heap(cmd, direct_size_B, pre_gfx, &indices),
+       .in_draw = data->indirect_command.addr,
+       .out_draw = out_draws.gpu,
+       .in_draw_stride_el = data->indirect_command.stride / sizeof(uint32_t),
+@@ -1903,8 +1901,8 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+       .mode = data->prim,
+    };
+ 
+-   libkk_unroll_geometry_struct(cmd, kk_grid_1d(1024 * data->draw_count), true,
+-                                info);
++   libkk_unroll_geometry_struct(cmd, kk_grid_1d(1024 * data->draw_count),
++                                pre_gfx, info);
+ 
+    kk_set_unrolled_draw(data, u_decomposed_prim(data->prim), indices,
+                         out_draws.gpu);
+@@ -1913,10 +1911,11 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+ }
+ 
+ /* Metal has no adjacency topologies, so draws without a GS draw the lines or
+- * triangles they rasterize instead. */
++ * triangles they rasterize instead. pre_gfx: kk_dispatch_precomp, false when a
++ * passthrough GS reads the unrolled draw. */
+ static bool
+ kk_unroll_adjacency(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+-                    uint64_t direct_size_B)
++                    uint64_t direct_size_B, bool pre_gfx)
+ {
+    if (unlikely(!kk_convert_to_indirect_draw(cmd, data)))
+       return false;
+@@ -1929,7 +1928,7 @@ kk_unroll_adjacency(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+    struct kk_addr_range indices;
+    struct libkk_unroll_adjacency_args info = {
+       .index_buffer = data->index_buffer.addr,
+-      .heap = kk_unroll_heap(cmd, direct_size_B, &indices),
++      .heap = kk_unroll_heap(cmd, direct_size_B, pre_gfx, &indices),
+       .in_draw = data->indirect_command.addr,
+       .out_draw = out_draws.gpu,
+       .in_draw_stride_el = data->indirect_command.stride / sizeof(uint32_t),
+@@ -1941,8 +1940,8 @@ kk_unroll_adjacency(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+       .mode = data->prim,
+    };
+ 
+-   libkk_unroll_adjacency_struct(cmd, kk_grid_1d(1024 * data->draw_count), true,
+-                                 info);
++   libkk_unroll_adjacency_struct(cmd, kk_grid_1d(1024 * data->draw_count),
++                                 pre_gfx, info);
+ 
+    kk_set_unrolled_draw(data, u_reduced_prim(data->prim), indices,
+                         out_draws.gpu);
+@@ -2341,7 +2340,7 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
+             draw.index.gpu.range / args.in_index_size_B;
+       }
+ 
+-      libkk_tess_setup_indirect_struct(cmd, kk_grid_1d(1), true, args);
++      libkk_tess_setup_indirect_struct(cmd, kk_grid_1d(1), false, args);
+ 
+       uint32_t grid_stride = sizeof(uint32_t) * 3;
+       grid_vs = kk_grid_indirect(gfx->tess.indirect_ptr.gpu + 0u * grid_stride);
+@@ -2383,17 +2382,17 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
+    }
+ 
+    /* First generate counts, then prefix sum them, and then tessellate. */
+-   libkk_tessellate(cmd, grid_tess, true, info.mode, POLY_TESS_MODE_COUNT,
++   libkk_tessellate(cmd, grid_tess, false, info.mode, POLY_TESS_MODE_COUNT,
+                     state);
+ 
+-   libkk_prefix_sum_tess(cmd, kk_grid_1d(1024u), true, state);
++   libkk_prefix_sum_tess(cmd, kk_grid_1d(1024u), false, state);
+ 
+-   libkk_tessellate(cmd, grid_tess, true, info.mode, POLY_TESS_MODE_WITH_COUNTS,
+-                    state);
++   libkk_tessellate(cmd, grid_tess, false, info.mode,
++                    POLY_TESS_MODE_WITH_COUNTS, state);
+ 
+    draw.grid = kk_grid_indirect(gfx->tess.out_draws_addr);
+ 
+-   draw.index.gpu = kk_heap_indices(cmd);
++   draw.index.gpu = kk_heap_indices(cmd, false);
+    draw.index.el_size_B = 4u;
+    draw.primitive_type = mesa_prim_to_mtl_primitive_type(gfx->tess.prim);
+    return draw;
+@@ -2413,7 +2412,7 @@ kk_draw_without_restart(struct kk_cmd_buffer *cmd,
+ 
+    struct libkk_unroll_restart_args args = {
+       .index_buffer = draw.index.gpu.addr,
+-      .heap = kk_heap(cmd),
++      .heap = kk_heap(cmd, false),
+       .in_draw = draw.grid.addr,
+       .out_draw = out_draw.gpu,
+       .restart_index = data->restart_index,
+@@ -2422,10 +2421,10 @@ kk_draw_without_restart(struct kk_cmd_buffer *cmd,
+       .flatshade_first = data->flatshade_first,
+       .mode = data->prim,
+    };
+-   libkk_unroll_restart_struct(cmd, kk_grid_1d(1024u), true, args);
++   libkk_unroll_restart_struct(cmd, kk_grid_1d(1024u), false, args);
+ 
+    draw.grid = kk_grid_indirect(out_draw.gpu);
+-   draw.index.gpu = kk_heap_indices(cmd);
++   draw.index.gpu = kk_heap_indices(cmd, false);
+    return draw;
+ }
+ 
+@@ -2458,7 +2457,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+          .draw = draw.grid.addr,
+          .vp = vertex_params,
+          .p = geometry_params,
+-         .heap = kk_heap(cmd),
++         .heap = kk_heap(cmd, false),
+          .vs_outputs =
+             tes ? tes->info.tess.tes_outputs : vs->info.vs.outputs_written,
+          .prim = mode,
+@@ -2473,7 +2472,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+             draw.index.gpu.range / draw.index.el_size_B;
+       }
+ 
+-      libkk_gs_setup_indirect_struct(cmd, kk_grid_1d(1u), true, args);
++      libkk_gs_setup_indirect_struct(cmd, kk_grid_1d(1u), false, args);
+ 
+       grid_vs = kk_grid_indirect_local(
+          vertex_params + offsetof(struct poly_vertex_params, grid));
+@@ -2514,7 +2513,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+       }
+ 
+       if (gs->prefix_sum) {
+-         libkk_prefix_sum_geom(cmd, kk_grid_1d(1024u * gs->count_words), true,
++         libkk_prefix_sum_geom(cmd, kk_grid_1d(1024u * gs->count_words), false,
+                                geometry_params);
+       }
+ 
+@@ -2621,9 +2620,14 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+    bool geom = kk_gs_info(cmd);
+ 
++   /* Unrolls run before the render encoder (pre_gfx), but those a
++    * passthrough GS reads: its compute pass ends the render encoder, and
++    * frees what the device heap held for it (kk_heap). */
++   const bool pre_gfx = !geom;
++
+    /* Unroll geometry. Skip draw if we fail. */
+    if (requires_unroll(cmd, data)) {
+-      if (!kk_unroll_geometry(cmd, data, unroll_size_B))
++      if (!kk_unroll_geometry(cmd, data, unroll_size_B, pre_gfx))
+          return;
+       /* Adjacency is unrolled again from what the GPU unrolled */
+       unroll_size_B = UINT64_MAX;
+@@ -2631,7 +2635,7 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ 
+    if (!cmd->state.shaders[MESA_SHADER_GEOMETRY] &&
+        mesa_prim_has_adjacency(data->prim) &&
+-       !kk_unroll_adjacency(cmd, data, unroll_size_B))
++       !kk_unroll_adjacency(cmd, data, unroll_size_B, pre_gfx))
+       return;
+ 
+    /* Patch lists do not restart, so only a GS fed by the input assembly needs
+@@ -3077,7 +3081,7 @@ kk_CmdDrawIndirectByteCount2EXT(
+    if (unlikely(!draw.gpu))
+       return;
+ 
+-   libkk_draw_byte_count(cmd, kk_grid_1d(1u), true, draw.gpu,
++   libkk_draw_byte_count(cmd, kk_grid_1d(1u), false, draw.gpu,
+                          pCounterInfo->addressRange.address, counterOffset,
+                          vertexStride, instanceCount, firstInstance);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index a705b5e..2795e22 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -456,8 +456,12 @@ kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
+    mtl_commit_options *options = mtl_new_commit_options();
+    mtl_commit_options_add_feedback_handler(options, callback, user_data, seq);
+ 
+-   mtl_command_queue_commit(queue->mtl_handle, &cmd->metal.cmd_buf, 1u,
+-                            options);
++   /* The recording's Metal command buffers in order, a render encoder's
++    * pre_gfx pass in one before the render encoder's (cs_get_pre_gfx) */
++   mtl_command_queue_commit(
++      queue->mtl_handle, util_dynarray_begin(&cmd->metal.cmd_bufs),
++      util_dynarray_num_elements(&cmd->metal.cmd_bufs, mtl_command_buffer *),
++      options);
+    mtl_release(options);
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Tue, 6 Oct 2026 19:45:00 +0300
+Subject: [PATCH] vulkan/runtime, kk: print device loss in release builds
+
+vk_device_set_lost() and vk_queue_set_lost() report through __vk_errorf(),
+which only logs in debug builds or to a debug messenger. A release
+KosmicKrisp therefore lost its device without a trace: a failed Metal
+command buffer (check_device_lost) or a queue-level loss only showed up as
+VK_ERROR_DEVICE_LOST from some later call. Under Venus that is an
+asynchronous vkQueueSubmit, which virglrenderer turns into a context
+fatal error without a reason ("vkr: vkQueueSubmit resulted in CS error",
+STEAMAC-G on an M4 Max).
+
+Print every device or queue loss on stderr ("MESA: error:
+VK_ERROR_DEVICE_LOST: ..."), with the Metal error code, its name and
+Metal's description for command buffer failures. An unknown
+MTL4CommandQueueError code no longer reaches UNREACHABLE (undefined
+behaviour in a release build) from the completion handler.
+---
+ src/kosmickrisp/bridge/vk_to_mtl_map.c |  5 ++++-
+ src/kosmickrisp/vulkan/kk_queue.c      |  5 +++--
+ src/vulkan/runtime/vk_device.c         | 11 ++++++++++-
+ src/vulkan/runtime/vk_queue.c          |  7 +++++++
+ 4 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/src/kosmickrisp/bridge/vk_to_mtl_map.c b/src/kosmickrisp/bridge/vk_to_mtl_map.c
+index 6dc2d3d..dcd4a44 100644
+--- a/src/kosmickrisp/bridge/vk_to_mtl_map.c
++++ b/src/kosmickrisp/bridge/vk_to_mtl_map.c
+@@ -341,6 +341,9 @@ mtl_command_queue_error_to_string(enum mtl_command_queue_error error)
+    case MTL_COMMAND_QUEUE_ERROR_INTERNAL:
+       return "MTL_COMMAND_QUEUE_ERROR_INTERNAL";
+    default:
+-      UNREACHABLE("Unsupported error value");
++      /* Reached from a Metal completion handler: an error code this
++       * enumeration doesn't know (or a new one) must not be undefined
++       * behaviour in a release build. */
++      return "unknown MTL4CommandQueueError";
+    }
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index 5509318..abc4809 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -45,8 +45,9 @@ check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
+ {
+    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
+       vk_device_set_lost(
+-         &dev->vk, "Command queue error: %s, with message \"%s\"",
+-         mtl_command_queue_error_to_string(data->error), data->error_message);
++         &dev->vk, "Command queue error %d (%s), with message \"%s\"",
++         (int)data->error, mtl_command_queue_error_to_string(data->error),
++         data->error_message ? data->error_message : "");
+    }
+ }
+ 
+diff --git a/src/vulkan/runtime/vk_device.c b/src/vulkan/runtime/vk_device.c
+index 2d471bf..c73f12c 100644
+--- a/src/vulkan/runtime/vk_device.c
++++ b/src/vulkan/runtime/vk_device.c
+@@ -41,6 +41,7 @@
+ #include "util/perf/cpu_trace.h"
+ #include "util/ralloc.h"
+ #include "util/timespec.h"
++#include "util/log.h"
+ 
+ /* Breaks linking cycles since WSI common depends on runtime,
+  * and Meson does not allow runtime to depend on WSI common. */
+@@ -436,11 +437,19 @@ _vk_device_set_lost(struct vk_device *device,
+    p_atomic_inc(&device->_lost.lost);
+    device->_lost.reported = true;
+ 
++   char buf[512];
+    va_list ap;
+    va_start(ap, msg);
+-   __vk_errorv(device, VK_ERROR_DEVICE_LOST, file, line, msg, ap);
++   vsnprintf(buf, sizeof(buf), msg, ap);
+    va_end(ap);
+ 
++   /* __vk_errorf() only logs in debug builds or to a debug messenger: a
++    * release build lost the device silently, and the application only saw
++    * VK_ERROR_DEVICE_LOST from some later call.
++    */
++   mesa_loge("VK_ERROR_DEVICE_LOST: %s (%s:%d)", buf, file, line);
++   __vk_errorf(device, VK_ERROR_DEVICE_LOST, file, line, "%s", buf);
++
+    vk_logd(VK_LOG_OBJS(device), "Timeline mode is %s.",
+            timeline_mode_str(device));
+ 
+diff --git a/src/vulkan/runtime/vk_queue.c b/src/vulkan/runtime/vk_queue.c
+index 78439db..cfc9e0e 100644
+--- a/src/vulkan/runtime/vk_queue.c
++++ b/src/vulkan/runtime/vk_queue.c
+@@ -25,6 +25,7 @@
+ 
+ #include "util/perf/cpu_trace.h"
+ #include "util/u_debug.h"
++#include "util/log.h"
+ #include <inttypes.h>
+ 
+ #include "vk_alloc.h"
+@@ -131,6 +132,12 @@ _vk_queue_set_lost(struct vk_queue *queue,
+    vsnprintf(queue->_lost.error_msg, sizeof(queue->_lost.error_msg), msg, ap);
+    va_end(ap);
+ 
++   /* Reported through __vk_errorf() by the next vk_device_is_lost(), which
++    * only logs in debug builds or to a debug messenger.
++    */
++   mesa_loge("VK_ERROR_DEVICE_LOST: queue lost: %s (%s:%d)",
++             queue->_lost.error_msg, file, line);
++
+    p_atomic_inc(&queue->base.device->_lost.lost);
+ 
+    if (debug_get_bool_option("MESA_VK_ABORT_ON_DEVICE_LOSS", false)) {
+-- 
+2.54.0 (Apple Git-157)
+

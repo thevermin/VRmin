@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Tue, 6 Oct 2026 13:35:48 +0300
+Subject: [PATCH] kk: single texel alignment for texel buffer views
+
+vkd3d-proton requires storage/uniformTexelBufferOffsetSingleTexelAlignment
+(D3D12CreateDevice fails without it), and its descriptor heaps put texel
+buffer views at any texel. Metal needs buffer-backed textures at 16 bytes
+and aborts on others ("Offset of a buffer-backed texture ... must be aligned
+to 16 bytes").
+
+Create the Metal texture at the 16-byte aligned offset below the view,
+wider by the texels in between, and keep that texel offset in a 16-byte
+texel buffer descriptor next to the texture's resource ID. Descriptor
+lowering adds it to the coordinate of buffer image loads, stores and
+atomics and of buffer texel fetches, and subtracts it from size queries;
+out-of-bounds reads stay out of bounds of the (wider) texture. Push
+descriptors, templates and copies carry the offset with the descriptor.
+Reports single texel alignment for both texel buffer types. As MoltenVK
+does with its texture buffer offsets (steamac MoltenVK patch 0029).
+---
+ src/kosmickrisp/vulkan/kk_buffer_view.c       | 23 ++++++---
+ src/kosmickrisp/vulkan/kk_buffer_view.h       |  3 ++
+ src/kosmickrisp/vulkan/kk_descriptor_set.c    |  3 +-
+ .../vulkan/kk_descriptor_set_layout.c         |  3 ++
+ src/kosmickrisp/vulkan/kk_descriptor_types.h  | 16 ++++++
+ .../vulkan/kk_nir_lower_descriptors.c         | 51 +++++++++++++++++++
+ src/kosmickrisp/vulkan/kk_physical_device.c   |  4 +-
+ 7 files changed, 94 insertions(+), 9 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.c b/src/kosmickrisp/vulkan/kk_buffer_view.c
+index 3a0aa03..857aae3 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.c
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.c
+@@ -76,8 +76,22 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+        view->vk.format == VK_FORMAT_R32_SINT)
+       usage |= MTL_TEXTURE_USAGE_SHADER_ATOMIC;
+ 
++   /* Metal needs texture buffers at KK_MIN_TEXEL_BUFFER_ALIGNMENT; views may
++    * start at any texel. Start the texture at the aligned offset below the
++    * view, texel_offset texels earlier (shaders add it to coordinates).
++    */
++   struct kk_buffer *buffer =
++      container_of(view->vk.buffer, struct kk_buffer, vk);
++   const uint64_t mtl_offset = kk_buffer_mtl_offset(buffer, view->vk.offset);
++   uint64_t texture_offset =
++      mtl_offset & ~(uint64_t)(KK_MIN_TEXEL_BUFFER_ALIGNMENT - 1);
++   const uint32_t texel_B = util_format_get_blocksize(p_format);
++   if ((mtl_offset - texture_offset) % texel_B != 0)
++      texture_offset = mtl_offset;
++   view->texel_offset = (mtl_offset - texture_offset) / texel_B;
++
+    struct kk_image_layout layout = {
+-      .width_px = view->vk.elements,
++      .width_px = view->vk.elements + view->texel_offset,
+       .height_px = 1u,
+       .depth_px = 1u,
+       .layers = 1u,
+@@ -95,13 +109,10 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+             .blue = supported_format->unswizzle.blue,
+             .alpha = supported_format->unswizzle.alpha,
+          },
+-      .linear_stride_B = view->vk.range,
++      .linear_stride_B = view->vk.range + (mtl_offset - texture_offset),
+    };
+-   struct kk_buffer *buffer =
+-      container_of(view->vk.buffer, struct kk_buffer, vk);
+    view->mtl_texel_buffer_handle = mtl_new_texture_with_descriptor_linear(
+-      buffer->metal.handle, &layout,
+-      kk_buffer_mtl_offset(buffer, view->vk.offset));
++      buffer->metal.handle, &layout, texture_offset);
+    if (!view->mtl_texel_buffer_handle) {
+       vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
+       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.h b/src/kosmickrisp/vulkan/kk_buffer_view.h
+index 8a995ea..bf5ea0d 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.h
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.h
+@@ -23,6 +23,9 @@ struct kk_buffer_view {
+    struct vk_buffer_view vk;
+    mtl_texture *mtl_texel_buffer_handle;
+    uint64_t texel_buffer_gpu_id;
++   /* Texels from the start of the Metal texture (aligned down) to the view
++    * (struct kk_texel_buffer_descriptor). */
++   uint32_t texel_offset;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_buffer_view, vk.base, VkBufferView,
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set.c b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+index 5f56abc..c6e0072 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -229,7 +229,7 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
+                        const VkBufferView bufferView, uint32_t binding,
+                        uint32_t elem)
+ {
+-   struct kk_storage_image_descriptor desc = {};
++   struct kk_texel_buffer_descriptor desc = {};
+    if (bufferView != VK_NULL_HANDLE) {
+       VK_FROM_HANDLE(kk_buffer_view, view, bufferView);
+ 
+@@ -237,6 +237,7 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
+       assert(view->texel_buffer_gpu_id);
+ 
+       desc.image_gpu_resource_id = view->texel_buffer_gpu_id;
++      desc.texel_offset = view->texel_offset;
+    }
+    write_desc(set, binding, elem, &desc, sizeof(desc));
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c b/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
+index 74f9d5e..552b2d2 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
+@@ -44,6 +44,9 @@ kk_descriptor_stride_align_for_type(
+ 
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
++      *stride = *alignment = sizeof(struct kk_texel_buffer_descriptor);
++      break;
++
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+       *stride = *alignment = sizeof(struct kk_storage_image_descriptor);
+       break;
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_types.h b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+index 3c0f8b8..5e39117 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_types.h
++++ b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+@@ -41,6 +41,22 @@ struct kk_storage_image_descriptor {
+ static_assert(sizeof(struct kk_storage_image_descriptor) == 8,
+               "kk_storage_image_descriptor has no holes");
+ 
++/* Uniform and storage texel buffers. Metal needs buffer-backed textures at
++ * KK_MIN_TEXEL_BUFFER_ALIGNMENT, Vulkan allows views at any texel
++ * (storage/uniformTexelBufferOffsetSingleTexelAlignment, required by
++ * vkd3d-proton): the Metal texture starts at the aligned offset below the
++ * view, and shaders add texel_offset to coordinates (and take it off sizes).
++ * image_gpu_resource_id is first, like in the other image descriptors.
++ */
++struct kk_texel_buffer_descriptor {
++   uint64_t image_gpu_resource_id;
++   uint32_t texel_offset;
++   uint32_t pad;
++};
++
++static_assert(sizeof(struct kk_texel_buffer_descriptor) == 16,
++              "kk_texel_buffer_descriptor has no holes");
++
+ /* This has to match nir_address_format_64bit_bounded_global */
+ struct kk_buffer_address {
+    uint64_t base_addr;
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+index c09da5b..5180f56 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -393,8 +393,32 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
+       .access = nir_intrinsic_access(intr) | var->data.access,
+       .flags = msl_convert_access_flag(var->data.access));
+ 
++   /* Texel buffers: the Metal texture starts texel_offset texels before the
++    * view (struct kk_texel_buffer_descriptor).
++    */
++   nir_def *texel_offset = NULL;
++   if (nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF) {
++      texel_offset = load_resource_deref_desc(
++         b, 1, 32, deref,
++         offsetof(struct kk_texel_buffer_descriptor, texel_offset), ctx);
++      if (intr->intrinsic != nir_intrinsic_image_deref_size) {
++         nir_def *coord = intr->src[1].ssa;
++         nir_def *x = nir_iadd(b, nir_channel(b, coord, 0),
++                               nir_u2uN(b, texel_offset, coord->bit_size));
++         nir_src_rewrite(&intr->src[1], nir_vector_insert_imm(b, coord, x, 0));
++      }
++   }
++
+    nir_rewrite_image_intrinsic(intr, handle, nir_image_intrinsic_type_bindless);
+ 
++   if (texel_offset && intr->intrinsic == nir_intrinsic_bindless_image_size) {
++      b->cursor = nir_after_instr(&intr->instr);
++      nir_def *size = &intr->def;
++      nir_def *x = nir_isub(b, nir_channel(b, size, 0),
++                            nir_u2uN(b, texel_offset, size->bit_size));
++      nir_def_rewrite_uses_after(size, nir_vector_insert_imm(b, size, x, 0));
++   }
++
+    return true;
+ }
+ 
+@@ -566,6 +590,33 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+             .image_dim = tex->sampler_dim, .image_array = tex->is_array);
+       }
+       nir_tex_instr_add_src(tex, nir_tex_src_texture_handle, handle);
++
++      /* Texel buffers: the Metal texture starts texel_offset texels before
++       * the view (struct kk_texel_buffer_descriptor).
++       */
++      if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
++         nir_def *texel_offset = load_resource_deref_desc(
++            b, 1, 32, nir_src_as_deref(nir_src_for_ssa(texture)),
++            plane_offset_B +
++               offsetof(struct kk_texel_buffer_descriptor, texel_offset),
++            ctx);
++         const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
++         if (tex->op == nir_texop_txs) {
++            b->cursor = nir_after_instr(&tex->instr);
++            nir_def *size = &tex->def;
++            nir_def *x = nir_isub(b, nir_channel(b, size, 0),
++                                  nir_u2uN(b, texel_offset, size->bit_size));
++            nir_def_rewrite_uses_after(size,
++                                       nir_vector_insert_imm(b, size, x, 0));
++            b->cursor = nir_before_instr(&tex->instr);
++         } else if (coord_idx >= 0) {
++            nir_def *coord = tex->src[coord_idx].src.ssa;
++            nir_def *x = nir_iadd(b, nir_channel(b, coord, 0),
++                                  nir_u2uN(b, texel_offset, coord->bit_size));
++            nir_src_rewrite(&tex->src[coord_idx].src,
++                            nir_vector_insert_imm(b, coord, x, 0));
++         }
++      }
+    }
+ 
+    if (sampler != NULL) {
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index ece9815..a2ef825 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -776,9 +776,9 @@ kk_get_device_properties(
+       .integerDotProduct4x8BitPackedSignedAccelerated = false,
+       .integerDotProduct4x8BitPackedMixedSignednessAccelerated = false,
+       .storageTexelBufferOffsetAlignmentBytes = KK_MIN_TEXEL_BUFFER_ALIGNMENT,
+-      .storageTexelBufferOffsetSingleTexelAlignment = false,
++      .storageTexelBufferOffsetSingleTexelAlignment = true,
+       .uniformTexelBufferOffsetAlignmentBytes = KK_MIN_TEXEL_BUFFER_ALIGNMENT,
+-      .uniformTexelBufferOffsetSingleTexelAlignment = false,
++      .uniformTexelBufferOffsetSingleTexelAlignment = true,
+       .maxBufferSize = pdev->info.max_buffer_size,
+ 
+       /* VK_KHR_push_descriptor */
+-- 
+2.54.0 (Apple Git-157)
+

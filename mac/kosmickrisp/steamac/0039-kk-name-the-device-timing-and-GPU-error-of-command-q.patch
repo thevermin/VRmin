@@ -1,0 +1,676 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Wed, 7 Oct 2026 22:53:00 +0300
+Subject: [PATCH] kk: name the device, timing and GPU error of command queue
+ failures
+
+STEAMAC-G: on M3/M4/M5 KosmicKrisp devices are lost with
+MTL4CommandQueueErrorTimeout right after Steam's UI starts. 0038's lines
+showed no pending semaphore wait; the failed command buffer never started
+(M3) or ran 49.9 ms (M5). In 18 of 20 events the error comes 0.3-1.1 s
+after Steam's hellovr_vulkan driver probe destroys its device (1.1 s after
+gldriverquery's), in one 1.0 s after a window resize.
+
+A command queue error now logs, before the device loss: the command
+buffer's number and the guest application of its device (Venus passes
+VkApplicationInfo on), how long after its commit it failed, when it
+started on the GPU relative to its commit (or that it never started) with
+the raw GPU times, when the queue's last completed command buffer ended,
+the Metal error's userInfo, the semaphore waits still unsignalled (0038),
+the devices alive in the process and the last ones created and destroyed,
+and, once per process, the error and fault messages Metal/IOGPU/AGX logged
+to os_log in the last 10 s (OSLogStore, current process): Metal 4 reports
+page faults, hangs, timeouts and victims of another command buffer's
+recovery all as one error code, the IOGPU reason only goes to os_log.
+MESA_KK_DEBUG=commits logs device creations/destructions and command
+buffers that started 20 ms after their commit, ran 50 ms or completed
+100 ms after it.
+
+Feedback handlers now use their queue on every completion, and a handler
+could run after vkDeviceWaitIdle, so after vkDestroyDevice: queues count
+the commits whose handler has not run and kk_queue_finish waits for them
+(it only waited for re-recorded command buffers, whose handler also freed
+its data through the device after letting kk_queue_finish go on).
+---
+ src/kosmickrisp/bridge/meson.build            |   2 +-
+ src/kosmickrisp/bridge/mtl_command_queue.h    |  17 ++-
+ src/kosmickrisp/bridge/mtl_command_queue.m    |  63 +++++++-
+ src/kosmickrisp/bridge/mtl_types.h            |   6 +
+ .../bridge/stubs/mtl_command_queue.c          |  10 +-
+ src/kosmickrisp/vulkan/kk_debug.c             |   1 +
+ src/kosmickrisp/vulkan/kk_debug.h             |   3 +
+ src/kosmickrisp/vulkan/kk_device.c            |  85 +++++++++++
+ src/kosmickrisp/vulkan/kk_device.h            |  10 ++
+ src/kosmickrisp/vulkan/kk_queue.c             | 138 +++++++++++++++---
+ src/kosmickrisp/vulkan/kk_queue.h             |  17 ++-
+ 11 files changed, 324 insertions(+), 28 deletions(-)
+
+diff --git a/src/kosmickrisp/bridge/meson.build b/src/kosmickrisp/bridge/meson.build
+index 03ba43b..d225783 100644
+--- a/src/kosmickrisp/bridge/meson.build
++++ b/src/kosmickrisp/bridge/meson.build
+@@ -54,7 +54,7 @@ mtl_bridge_dependencies = [
+ if host_machine.system() == 'darwin'
+   mtl_bridge_dependencies += dependency(
+     'appleframeworks',
+-    modules : ['Foundation']
++    modules : ['Foundation', 'OSLog']
+   )
+ endif
+ 
+diff --git a/src/kosmickrisp/bridge/mtl_command_queue.h b/src/kosmickrisp/bridge/mtl_command_queue.h
+index cd60b83..ff85237 100644
+--- a/src/kosmickrisp/bridge/mtl_command_queue.h
++++ b/src/kosmickrisp/bridge/mtl_command_queue.h
+@@ -11,12 +11,25 @@
+ 
+ #include <stdint.h>
+ 
+-/* MTL4CommitOptions */
++/* MTL4CommitOptions. The feedback data passes tag on and has the host time
++ * (seconds, GPUStartTime's clock) of the handler's addition, just before the
++ * commit, and of the feedback. */
+ mtl_commit_options *mtl_new_commit_options(void);
+ void
+ mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
+                                         mtl_feedback_handler_callback callback,
+-                                        void *data);
++                                        void *data, uint64_t tag);
++
++/* Calls cb for the error and fault messages that the process' GPU frameworks
++ * (Metal, IOGPU, AGX) logged to os_log in the last `seconds` (at most
++ * max_lines, oldest first): Metal 4 reports a GPU page fault, a hang, a
++ * timeout and the discard of a victim of another command buffer's recovery
++ * all as MTL4CommandQueueErrorTimeout, the IOGPU reason only goes to os_log.
++ * Reading the log takes about a second. */
++void mtl_log_recent_gpu_errors(double seconds, unsigned max_lines,
++                               void (*cb)(const char *sender,
++                                          const char *message, void *data),
++                               void *data);
+ 
+ /* MTL4CommandQueue */
+ mtl_command_queue *mtl_new_command_queue(mtl_device *device);
+diff --git a/src/kosmickrisp/bridge/mtl_command_queue.m b/src/kosmickrisp/bridge/mtl_command_queue.m
+index 61d0eeb..2c752cd 100644
+--- a/src/kosmickrisp/bridge/mtl_command_queue.m
++++ b/src/kosmickrisp/bridge/mtl_command_queue.m
+@@ -8,6 +8,19 @@
+ 
+ #include <Metal/MTLDevice.h>
+ #include <Metal/MTLCommandQueue.h>
++#include <OSLog/OSLog.h>
++
++#include <mach/mach_time.h>
++
++/* Seconds on the clock of MTL4CommitFeedback's GPU times (CACurrentMediaTime) */
++static double
++mtl_host_time(void)
++{
++   static mach_timebase_info_data_t timebase;
++   if (timebase.denom == 0u)
++      mach_timebase_info(&timebase);
++   return (double)mach_absolute_time() * timebase.numer / timebase.denom / 1e9;
++}
+ 
+ /* MTL4CommitOptions */
+ mtl_commit_options *
+@@ -21,17 +34,28 @@
+ void
+ mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
+                                         mtl_feedback_handler_callback callback,
+-                                        void *data)
++                                        void *data, uint64_t tag)
+ {
+    @autoreleasepool {
+       MTL4CommitOptions* opt = (MTL4CommitOptions *)options;
++      const double commit_time = mtl_host_time();
+       [opt addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+          @autoreleasepool {
+             NSError *error = feedback.error;
+             struct mtl_feedback_data feedback_data = (struct mtl_feedback_data){
+                .user_data = data,
++               .tag = tag,
+                .error_message =
+                   error ? error.localizedDescription.UTF8String : NULL,
++               .error_info =
++                  error && error.userInfo.count
++                     ? [[error.userInfo.description
++                          componentsSeparatedByCharactersInSet:
++                             NSCharacterSet.newlineCharacterSet]
++                          componentsJoinedByString:@" "].UTF8String
++                     : NULL,
++               .commit_time = commit_time,
++               .feedback_time = mtl_host_time(),
+                .gpu_start = feedback.GPUStartTime,
+                .gpu_end = feedback.GPUEndTime,
+                .error = error
+@@ -44,6 +68,43 @@
+    }
+ }
+ 
++void
++mtl_log_recent_gpu_errors(double seconds, unsigned max_lines,
++                          void (*cb)(const char *sender, const char *message,
++                                     void *data),
++                          void *data)
++{
++   @autoreleasepool {
++      NSError *error = nil;
++      OSLogStore *store =
++         [OSLogStore storeWithScope:OSLogStoreCurrentProcessIdentifier
++                              error:&error];
++      if (!store)
++         return;
++      OSLogPosition *position =
++         [store positionWithDate:[NSDate dateWithTimeIntervalSinceNow:-seconds]];
++      NSPredicate *predicate = [NSPredicate
++         predicateWithFormat:@"messageType == error OR messageType == fault"];
++      OSLogEnumerator *entries =
++         [store entriesEnumeratorWithOptions:0
++                                    position:position
++                                   predicate:predicate
++                                       error:&error];
++      unsigned lines = 0u;
++      for (OSLogEntry *entry in entries) {
++         if (![entry isKindOfClass:[OSLogEntryLog class]])
++            continue;
++         NSString *sender = ((OSLogEntryLog *)entry).sender;
++         if (![sender containsString:@"Metal"] &&
++             ![sender containsString:@"IOGPU"] && ![sender hasPrefix:@"AGX"])
++            continue;
++         cb(sender.UTF8String, entry.composedMessage.UTF8String, data);
++         if (++lines == max_lines)
++            break;
++      }
++   }
++}
++
+ /* MTL4CommandQueue */
+ mtl_command_queue *
+ mtl_new_command_queue(mtl_device *device)
+diff --git a/src/kosmickrisp/bridge/mtl_types.h b/src/kosmickrisp/bridge/mtl_types.h
+index 13ba865..d4a423a 100644
+--- a/src/kosmickrisp/bridge/mtl_types.h
++++ b/src/kosmickrisp/bridge/mtl_types.h
+@@ -415,7 +415,13 @@ struct mtl_sparse_buffer_mapping {
+ 
+ struct mtl_feedback_data {
+    void *user_data;
++   uint64_t tag;
+    const char *error_message;
++   /* The error's userInfo on one line, or NULL */
++   const char *error_info;
++   /* Host times in seconds on the GPU times' clock: the commit, the feedback */
++   double commit_time;
++   double feedback_time;
+    double gpu_start;
+    double gpu_end;
+    enum mtl_command_queue_error error;
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_command_queue.c b/src/kosmickrisp/bridge/stubs/mtl_command_queue.c
+index 2894f3c..7fb681b 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_command_queue.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_command_queue.c
+@@ -16,7 +16,15 @@ mtl_new_commit_options(void)
+ void
+ mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
+                                         mtl_feedback_handler_callback callback,
+-                                        void *data)
++                                        void *data, uint64_t tag)
++{
++}
++
++void
++mtl_log_recent_gpu_errors(double seconds, unsigned max_lines,
++                          void (*cb)(const char *sender, const char *message,
++                                     void *data),
++                          void *data)
+ {
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_debug.c b/src/kosmickrisp/vulkan/kk_debug.c
+index 93841fe..59d6aef 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.c
++++ b/src/kosmickrisp/vulkan/kk_debug.c
+@@ -12,6 +12,7 @@ const struct debug_named_value debug_flags[] = {
+    {"msl", KK_DEBUG_MSL},
+    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
+    {"minmax", KK_DEBUG_MINMAX},
++   {"commits", KK_DEBUG_COMMITS},
+    {NULL, 0},
+ };
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_debug.h b/src/kosmickrisp/vulkan/kk_debug.h
+index 271f6fc..e0d8fe1 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.h
++++ b/src/kosmickrisp/vulkan/kk_debug.h
+@@ -15,6 +15,9 @@ enum kk_debug {
+    /* Log sampler min/max reduction emulation events (reduction samplers,
+     * emulating programs compiled, re-recorded command buffers) */
+    KK_DEBUG_MINMAX = 1ull << 3,
++   /* Log command buffers that started late, ran long on the GPU or completed
++    * late, and device creations/destructions with their application */
++   KK_DEBUG_COMMITS = 1ull << 4,
+ };
+ 
+ extern enum kk_debug kk_mesa_debug_flags;
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index eceb2f1..78b70f6 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -10,6 +10,7 @@
+ #include "kk_buffer.h"
+ #include "kk_buffer_view.h"
+ #include "kk_cmd_buffer.h"
++#include "kk_debug.h"
+ #include "kk_entrypoints.h"
+ #include "kk_image.h"
+ #include "kk_image_view.h"
+@@ -29,6 +30,9 @@
+ #include "vulkan/wsi/wsi_common.h"
+ #include "vk_pipeline_cache.h"
+ 
++#include "util/os_time.h"
++
++#include <stdio.h>
+ #include <time.h>
+ 
+ struct kk_mtl_compiler {
+@@ -240,6 +244,82 @@ kk_sampler_heap_remove(struct kk_device *dev, struct kk_rc_sampler *rc)
+    simple_mtx_unlock(&h->lock);
+ }
+ 
++void
++kk_device_app_name(const struct kk_device *dev, char *name, size_t size)
++{
++   const struct vk_app_info *app = &dev->vk.physical->instance->app_info;
++
++   if (app->app_name && app->engine_name)
++      snprintf(name, size, "%s (%s)", app->app_name, app->engine_name);
++   else if (app->app_name || app->engine_name)
++      snprintf(name, size, "%s", app->app_name ? app->app_name : app->engine_name);
++   else
++      snprintf(name, size, "an unnamed application");
++}
++
++/* Device creations and destructions in the process: a command queue error
++ * logs how long ago the last ones were, which tells whether another guest
++ * device came or went right before. */
++static struct {
++   simple_mtx_t lock;
++   uint32_t alive;
++   int64_t created_ns, destroyed_ns;
++   char created_app[64], destroyed_app[64];
++} kk_device_lifecycle = {.lock = SIMPLE_MTX_INITIALIZER};
++
++static void
++kk_device_note_lifecycle(struct kk_device *dev, bool created)
++{
++   const int64_t now = os_time_get_nano();
++   char app[sizeof(kk_device_lifecycle.created_app)];
++   kk_device_app_name(dev, app, sizeof(app));
++
++   simple_mtx_lock(&kk_device_lifecycle.lock);
++   if (created) {
++      kk_device_lifecycle.alive++;
++      kk_device_lifecycle.created_ns = now;
++      memcpy(kk_device_lifecycle.created_app, app, sizeof(app));
++   } else {
++      kk_device_lifecycle.alive--;
++      kk_device_lifecycle.destroyed_ns = now;
++      memcpy(kk_device_lifecycle.destroyed_app, app, sizeof(app));
++   }
++   const uint32_t alive = kk_device_lifecycle.alive;
++   simple_mtx_unlock(&kk_device_lifecycle.lock);
++
++   if (KK_DEBUG(COMMITS)) {
++      if (created)
++         mesa_logi("kk: device %p of %s created, %u alive", dev, app, alive);
++      else
++         mesa_logi("kk: device %p of %s destroyed after %.1f ms, %u alive", dev,
++                   app, (now - dev->created_ns) / 1e6, alive);
++   }
++}
++
++void
++kk_device_log_lifecycle(void)
++{
++   const int64_t now = os_time_get_nano();
++
++   simple_mtx_lock(&kk_device_lifecycle.lock);
++   if (kk_device_lifecycle.destroyed_ns) {
++      mesa_loge("kk: %u devices alive; the last one was created %.1f ms ago "
++                "(%s), the last one destroyed %.1f ms ago (%s)",
++                kk_device_lifecycle.alive,
++                (now - kk_device_lifecycle.created_ns) / 1e6,
++                kk_device_lifecycle.created_app,
++                (now - kk_device_lifecycle.destroyed_ns) / 1e6,
++                kk_device_lifecycle.destroyed_app);
++   } else {
++      mesa_loge("kk: %u devices alive; the last one was created %.1f ms ago "
++                "(%s), none destroyed",
++                kk_device_lifecycle.alive,
++                (now - kk_device_lifecycle.created_ns) / 1e6,
++                kk_device_lifecycle.created_app);
++   }
++   simple_mtx_unlock(&kk_device_lifecycle.lock);
++}
++
+ static VkResult
+ kk_get_timestamp(struct vk_device *device, uint64_t *timestamp)
+ {
+@@ -337,6 +417,9 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+       mtl_start_gpu_capture(dev->mtl_handle, capture_directory);
+    }
+ 
++   dev->created_ns = os_time_get_nano();
++   kk_device_note_lifecycle(dev, true);
++
+    *pDevice = kk_device_to_handle(dev);
+ 
+    return VK_SUCCESS;
+@@ -374,6 +457,8 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    if (!dev)
+       return;
+ 
++   kk_device_note_lifecycle(dev, false);
++
+    /* End capture before we start releasing resources. Otherwise, Metal capture
+     * may run into issues. */
+    if (pdev->settings.gpu_capture_enabled) {
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 926728e..256760c 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -112,6 +112,9 @@ struct kk_device {
+    /* Serializes compiling the second program of such a pipeline on first
+     * use (kk_cmd_shader_pipeline) */
+    simple_mtx_t lazy_pipeline_lock;
++
++   /* os_time_get_nano() at creation (command queue error diagnostics) */
++   int64_t created_ns;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+@@ -140,6 +143,13 @@ void kk_device_remove_allocation_from_residency_set(
+    struct kk_device *dev, mtl_allocation *allocation);
+ void kk_device_make_resources_resident(struct kk_device *dev);
+ 
++/* The guest application of a device ("gamescope", "steamwebhelper (mesa
++ * zink)"): Venus passes VkApplicationInfo on. */
++void kk_device_app_name(const struct kk_device *dev, char *name, size_t size);
++/* Logs the devices alive in the process (every guest device under
++ * virglrenderer) and the last ones created and destroyed. */
++void kk_device_log_lifecycle(void);
++
+ /* Required to create a sampler */
+ mtl_sampler *kk_sampler_create(struct kk_device *dev,
+                                const struct mtl_sampler_packed *packed);
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index fb3b5c0..fe53f6f 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -26,11 +26,12 @@ struct kk_commit_data {
+    struct kk_cmd_buffer *cmd;
+ };
+ 
++/* Feedback handlers use the queue and the device: wait for all of them. */
+ static void
+-kk_queue_wait_for_commits(struct kk_queue *queue)
++kk_queue_wait_for_feedbacks(struct kk_queue *queue)
+ {
+    mtx_lock(&queue->mutex);
+-   while (queue->commits_in_flight > 0u)
++   while (queue->feedbacks_pending > 0u)
+       cnd_wait(&queue->cond, &queue->mutex);
+    mtx_unlock(&queue->mutex);
+ }
+@@ -43,17 +44,58 @@ kk_queue_release_cmd_buffer_locked(struct kk_queue *queue,
+    util_dynarray_append(&queue->free_cmd_buffers, &cmd->vk);
+ }
+ 
+-/* Names the semaphore waits submitted before their signal that are still
+- * unsignalled, and the GPU time of the failed command buffer: a never
+- * signalled wait shows up as a wait here and no GPU time. */
+ static void
+-kk_queue_log_pending_waits(struct kk_queue *queue,
+-                           struct mtl_feedback_data *data)
++kk_queue_log_gpu_error(const char *sender, const char *message, void *data)
+ {
++   mesa_loge("kk: os_log %s: %s", sender, message);
++}
++
++/* STEAMAC-G: a command queue error has to tell GPU work that ran too long
++ * from a command buffer that never started (a semaphore wait, the GPU busy
++ * elsewhere) and name what came right before: the queue's last completed
++ * work and the last guest device created or destroyed in the process. Never
++ * signalled semaphore waits submitted before their signal are listed. */
++static void
++kk_queue_log_failure(struct kk_queue *queue,
++                     const struct mtl_feedback_data *data)
++{
++   struct kk_device *dev = kk_queue_device(queue);
+    const int64_t now = os_time_get_nano();
++   char app[64];
++   kk_device_app_name(dev, app, sizeof(app));
+ 
+-   mesa_loge("kk: command buffer failed after %.1f ms of GPU time",
+-             (data->gpu_end - data->gpu_start) * 1000.0);
++   mtx_lock(&queue->mutex);
++   const uint64_t committed = queue->commit_seq;
++   const uint32_t awaiting = queue->feedbacks_pending;
++   const double last_gpu_end = queue->last_gpu_end;
++   mtx_unlock(&queue->mutex);
++
++   mesa_loge("kk: command buffer %" PRIu64 " of %s failed %.1f ms after its "
++             "commit (device created %.1f s ago, %" PRIu64 " command buffers "
++             "committed, %u awaiting feedback)",
++             data->tag, app,
++             (data->feedback_time - data->commit_time) * 1000.0,
++             (now - dev->created_ns) / 1e9, committed, awaiting);
++   if (data->gpu_start > 0.0) {
++      mesa_loge("kk: it started %.1f ms after its commit and ran %.1f ms on "
++                "the GPU (GPU start %.6f s, end %.6f s, commit %.6f s)",
++                (data->gpu_start - data->commit_time) * 1000.0,
++                (data->gpu_end - data->gpu_start) * 1000.0, data->gpu_start,
++                data->gpu_end, data->commit_time);
++   } else {
++      mesa_loge("kk: it never started on the GPU (GPU start %.6f s, end "
++                "%.6f s, commit %.6f s)",
++                data->gpu_start, data->gpu_end, data->commit_time);
++   }
++   if (last_gpu_end > 0.0) {
++      mesa_loge("kk: the queue's last completed command buffer ended %.1f ms "
++                "after this commit",
++                (last_gpu_end - data->commit_time) * 1000.0);
++   } else {
++      mesa_loge("kk: no command buffer of the queue completed before");
++   }
++   if (data->error_info)
++      mesa_loge("kk: Metal error info: %s", data->error_info);
+ 
+    mtx_lock(&queue->mutex);
+    for (uint32_t i = 0; i < KK_QUEUE_PENDING_WAITS; i++) {
+@@ -70,24 +112,72 @@ kk_queue_log_pending_waits(struct kk_queue *queue,
+       }
+    }
+    mtx_unlock(&queue->mutex);
++
++   kk_device_log_lifecycle();
++
++   /* Once per process: reading os_log takes about a second, and the first
++    * failure names the cause (later ones are often its victims). */
++   static bool os_log_read;
++   if (!p_atomic_xchg(&os_log_read, true))
++      mtl_log_recent_gpu_errors(10.0, 16u, kk_queue_log_gpu_error, NULL);
+ }
+ 
++/* MESA_KK_DEBUG=commits */
+ static void
+-check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
++kk_queue_log_slow_commit(struct kk_queue *queue,
++                         const struct mtl_feedback_data *data)
+ {
++   const double delay_ms = (data->gpu_start - data->commit_time) * 1000.0;
++   const double gpu_ms = (data->gpu_end - data->gpu_start) * 1000.0;
++   const double feedback_ms = (data->feedback_time - data->commit_time) * 1000.0;
++   if (delay_ms < 20.0 && gpu_ms < 50.0 && feedback_ms < 100.0)
++      return;
++
++   char app[64];
++   kk_device_app_name(kk_queue_device(queue), app, sizeof(app));
++   mesa_logi("kk: command buffer %" PRIu64 " of %s started %.1f ms after its "
++             "commit, ran %.1f ms on the GPU, feedback after %.1f ms",
++             data->tag, app, delay_ms, gpu_ms, feedback_ms);
++}
++
++static void
++kk_queue_check_feedback(struct kk_queue *queue, struct mtl_feedback_data *data)
++{
++   struct kk_device *dev = kk_queue_device(queue);
++
+    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
+-      kk_queue_log_pending_waits(&dev->queue, data);
++      kk_queue_log_failure(queue, data);
+       vk_device_set_lost(
+          &dev->vk, "Command queue error %d (%s), with message \"%s\"",
+          (int)data->error, mtl_command_queue_error_to_string(data->error),
+          data->error_message ? data->error_message : "");
++   } else if (KK_DEBUG(COMMITS)) {
++      kk_queue_log_slow_commit(queue, data);
+    }
+ }
+ 
++/* The handler's last use of the queue: kk_queue_finish may free it after. */
++static void
++kk_queue_feedback_done(struct kk_queue *queue,
++                       const struct mtl_feedback_data *data)
++{
++   mtx_lock(&queue->mutex);
++   if (data->error == MTL_COMMAND_QUEUE_ERROR_NONE &&
++       data->gpu_end > queue->last_gpu_end)
++      queue->last_gpu_end = data->gpu_end;
++   assert(queue->feedbacks_pending > 0u);
++   if (--queue->feedbacks_pending == 0u)
++      cnd_broadcast(&queue->cond);
++   mtx_unlock(&queue->mutex);
++}
++
+ static void
+ commit_callback(struct mtl_feedback_data *data)
+ {
+-   check_device_lost((struct kk_device *)data->user_data, data);
++   struct kk_queue *queue = &((struct kk_device *)data->user_data)->queue;
++
++   kk_queue_check_feedback(queue, data);
++   kk_queue_feedback_done(queue, data);
+ }
+ 
+ static void
+@@ -97,7 +187,7 @@ rerecord_commit_callback(struct mtl_feedback_data *data)
+    struct kk_queue *queue = commit->queue;
+    struct kk_device *dev = kk_queue_device(queue);
+ 
+-   check_device_lost(dev, data);
++   kk_queue_check_feedback(queue, data);
+ 
+    /* Completion callbacks are called from multiple threads, so we need to
+     * ensure the access to queue resources is safe. */
+@@ -109,12 +199,13 @@ rerecord_commit_callback(struct mtl_feedback_data *data)
+    if (--queue->commits_in_flight == 0u) {
+       kk_ResetCommandPool(kk_device_to_handle(dev),
+                           kk_cmd_pool_to_handle(queue->cmd_pool), 0u);
+-      cnd_broadcast(&queue->cond);
+    }
+ 
+    mtx_unlock(&queue->mutex);
+ 
+    vk_free(&dev->vk.alloc, commit);
++
++   kk_queue_feedback_done(queue, data);
+ }
+ 
+ static bool
+@@ -147,8 +238,13 @@ kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
+ {
+    assert(kk_cmd_buffer_has_work(cmd));
+ 
++   mtx_lock(&queue->mutex);
++   const uint64_t seq = ++queue->commit_seq;
++   queue->feedbacks_pending++;
++   mtx_unlock(&queue->mutex);
++
+    mtl_commit_options *options = mtl_new_commit_options();
+-   mtl_commit_options_add_feedback_handler(options, callback, user_data);
++   mtl_commit_options_add_feedback_handler(options, callback, user_data, seq);
+ 
+    mtl_command_queue_commit(queue->mtl_handle, &cmd->metal.cmd_buf, 1u,
+                             options);
+@@ -213,9 +309,9 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
+    kk_device_make_resources_resident(dev);
+ 
+    queue->commits_in_flight++;
+-   kk_queue_commit(queue, rerecord, rerecord_commit_callback, commit);
+-
+    mtx_unlock(&queue->mutex);
++
++   kk_queue_commit(queue, rerecord, rerecord_commit_callback, commit);
+    return VK_SUCCESS;
+ 
+ release:
+@@ -357,6 +453,9 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
+    memset(queue->pending_waits, 0, sizeof(queue->pending_waits));
+    queue->pending_wait_next = 0;
+    queue->commits_in_flight = 0u;
++   queue->feedbacks_pending = 0u;
++   queue->commit_seq = 0u;
++   queue->last_gpu_end = 0.0;
+    mtx_init(&queue->mutex, mtx_plain);
+    cnd_init(&queue->cond);
+ 
+@@ -380,8 +479,9 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
+ void
+ kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
+ {
+-   /* There may be in-flight command buffers, wait for them to finish. */
+-   kk_queue_wait_for_commits(queue);
++   /* There may be in-flight command buffers, and feedback handlers of
++    * completed ones may still run (after vkDeviceWaitIdle): wait for them. */
++   kk_queue_wait_for_feedbacks(queue);
+ 
+    kk_queue_sparse_finish(dev, queue);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_queue.h b/src/kosmickrisp/vulkan/kk_queue.h
+index e9e032d..78f3beb 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.h
++++ b/src/kosmickrisp/vulkan/kk_queue.h
+@@ -35,10 +35,15 @@ struct kk_queue {
+    mtx_t mutex;
+    cnd_t cond;
+ 
+-   /* vkQueueBindSparse (kk_sparse.c): a one page placement sparse buffer and
+-    * the heap page it maps after unmaps of buffer pages, and the event that
+-    * separates texture mapping updates from earlier buffer mapping updates.
+-    * lock orders the queue's mapping updates. */
++   /* Under `mutex`: commits whose feedback handler has not run yet
++    * (kk_queue_finish waits for them, the handlers use the queue), the
++    * number of the last command buffer committed and the GPU end time
++    * (seconds) of the last one completed, for command queue error
++    * diagnostics. */
++   uint32_t feedbacks_pending;
++   uint64_t commit_seq;
++   double last_gpu_end;
++
+    /* The last KK_QUEUE_PENDING_WAITS semaphore waits that were not signalled
+     * yet when submitted (wait before signal), retained, under `mutex`: a
+     * command queue error names the ones still unsignalled. Metal ends a queue
+@@ -51,6 +56,10 @@ struct kk_queue {
+    } pending_waits[KK_QUEUE_PENDING_WAITS];
+    uint32_t pending_wait_next;
+ 
++   /* vkQueueBindSparse (kk_sparse.c): a one page placement sparse buffer and
++    * the heap page it maps after unmaps of buffer pages, and the event that
++    * separates texture mapping updates from earlier buffer mapping updates.
++    * lock orders the queue's mapping updates. */
+    struct {
+       mtl_buffer *flush_buffer;
+       struct kk_bo *flush_bo;

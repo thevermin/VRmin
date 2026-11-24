@@ -1,0 +1,651 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac-build <b@steamac>
+Date: Wed, 7 Oct 2026 14:26:19 +0300
+Subject: [PATCH] kk: sparse residency through views with baseMipLevel > 0, and
+ of gathers
+
+Metal reports the residency of a sparse operation through a texture view
+with baseMipLevel > 0 for the image's level or LOD without the base (the
+data is right): fetches and explicit LODs measure the image's level, a
+storage view's reads level 0, gradient and implicit LODs (computed from
+the image's size) only miss the base in their clamps. Sparse gathers are
+reported resident when footprint texels across a tile edge are not (their
+values are zero), and measured at the sampler's minLod level.
+
+Views with baseMipLevel > 0 of sparse residency images get residency views
+of the same levels and all levels below them (sampled and storage
+descriptors carry them; storage image descriptors grow to 16 bytes).
+Sparse operations through such views take their residency from the same
+operation on the residency view at level/LOD + base: fetches and imageLoad
+at level + base, explicit LODs with the sampler's clamps applied in the
+shader (Metal's order) and sampled through a copy of the sampler without
+LOD clamps, made only when they could matter; gradient and implicit LODs
+(as gradients of the coordinates, taken where the sample is) as gradients
+scaled to the view's LOD + base with the clamps as min_lod_clamp, or an
+explicit LOD at maxLod when the view's isotropic LOD is past it; min/max
+reduction samples with their LOD limited to the view, + base. Gathers, on
+any view, take their residency from a bilinear sample of their level
+through a LINEAR copy of the sampler without clamps. Other views pay a
+descriptor load and a branch per sparse operation.
+---
+ src/kosmickrisp/vulkan/kk_descriptor_set.c    |  11 +
+ src/kosmickrisp/vulkan/kk_descriptor_types.h  |  24 +-
+ src/kosmickrisp/vulkan/kk_image_view.c        |  35 +-
+ src/kosmickrisp/vulkan/kk_image_view.h        |   8 +
+ .../vulkan/kk_nir_lower_descriptors.c         | 336 ++++++++++++++++++
+ src/kosmickrisp/vulkan/kk_sampler.c           |  36 ++
+ src/kosmickrisp/vulkan/kk_sampler.h           |   6 +
+ 7 files changed, 453 insertions(+), 3 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set.c b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+index 18764eb..7e1de1c 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -75,6 +75,9 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
+             assert(view->planes[plane].sampled_gpu_resource_id);
+             desc[plane].image_gpu_resource_id =
+                view->planes[plane].sampled_gpu_resource_id;
++            desc[plane].residency_gpu_resource_id =
++               view->planes[plane].residency_sampled_gpu_resource_id;
++            desc[plane].residency_base_level = view->vk.base_mip_level;
+          }
+ 
+          float min_lod = MAX2(view->vk.min_lod - view->vk.base_mip_level, 0.0);
+@@ -105,6 +108,12 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
+          desc[plane].sampler_lod_max_fp16 = sampler->lod_max_fp16;
+          desc[plane].sampler_filter_flags = sampler->filter_flags;
+          desc[plane].clamp_0_sampler_index_or_negative = -1;
++         desc[plane].sampler_residency_index = sampler->residency_hw
++                                                  ? sampler->residency_hw->index
++                                                  : desc[plane].sampler_index;
++         desc[plane].sampler_gather_index = sampler->gather_hw
++                                               ? sampler->gather_hw->index
++                                               : desc[plane].sampler_index;
+       }
+ 
+       if (sampler->has_border) {
+@@ -168,6 +177,8 @@ get_storage_image_view_desc(
+ 
+       assert(view->planes[plane].storage_gpu_resource_id);
+       desc.image_gpu_resource_id = view->planes[plane].storage_gpu_resource_id;
++      desc.residency_gpu_resource_id =
++         view->planes[plane].residency_storage_gpu_resource_id;
+    }
+ 
+    assert(sizeof(desc) <= dst_size);
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_types.h b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+index 18cf6f5..6d01dec 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_types.h
++++ b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+@@ -28,7 +28,24 @@ struct kk_sampled_image_descriptor {
+ 
+    uint16_t sampler_filter_flags;
+    uint32_t border[4];
+-   uint64_t pad_to_power_2[3];
++
++   /* Views with baseMipLevel > 0 of sparse residency images: Metal reports
++    * the residency of such a view's level (or LOD) as that of the image's
++    * level (LOD), without the base (the data is right). Sparse operations
++    * take their residency from residency_gpu_resource_id, a view of the
++    * same levels and all levels below them, at level (LOD) + base
++    * (residency_base_level), sampling with sampler_residency_index, the
++    * sampler without LOD clamps (sampler_index if its clamps can't matter;
++    * the shader applies them), gathers as bilinear samples of level base
++    * with sampler_gather_index (LINEAR, no clamps).
++    * residency_gpu_resource_id is 0 for other views.
++    */
++   uint64_t residency_gpu_resource_id;
++   uint16_t residency_base_level;
++   uint16_t sampler_residency_index;
++   uint16_t sampler_gather_index;
++   uint16_t pad16;
++   uint64_t pad64;
+ };
+ 
+ static_assert(sizeof(struct kk_sampled_image_descriptor) == 64,
+@@ -42,11 +59,14 @@ static_assert(sizeof(struct kk_sampled_image_descriptor) == 64,
+ #define KK_SAMPLER_MIP_LINEAR (1 << 4)
+ #define KK_SAMPLER_UNNORMALIZED (1 << 5)
+ 
++/* residency_gpu_resource_id: as in struct kk_sampled_image_descriptor, the
++ * base level is the difference of the two textures' level counts. */
+ struct kk_storage_image_descriptor {
+    uint64_t image_gpu_resource_id;
++   uint64_t residency_gpu_resource_id;
+ };
+ 
+-static_assert(sizeof(struct kk_storage_image_descriptor) == 8,
++static_assert(sizeof(struct kk_storage_image_descriptor) == 16,
+               "kk_storage_image_descriptor has no holes");
+ 
+ /* Uniform and storage texel buffers. Metal needs buffer-backed textures at
+diff --git a/src/kosmickrisp/vulkan/kk_image_view.c b/src/kosmickrisp/vulkan/kk_image_view.c
+index 90eb6f6..5f54202 100644
+--- a/src/kosmickrisp/vulkan/kk_image_view.c
++++ b/src/kosmickrisp/vulkan/kk_image_view.c
+@@ -178,6 +178,17 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+          view_layout.array_len = subres_layout.layers;
+       }
+ 
++      /* Metal reports the residency of a view with baseMipLevel > 0 for the
++       * image's levels from 0: sparse operations query a view that also has
++       * the levels below (struct kk_sampled_image_descriptor). */
++      const bool residency_view =
++         (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) &&
++         view_layout.base_level > 0;
++      struct kk_view_layout residency_layout = view_layout;
++      residency_layout.base_level = 0;
++      residency_layout.num_levels =
++         view_layout.base_level + view_layout.num_levels;
++
+       if (view->vk.usage &
+           (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) {
+          view->planes[view_plane].mtl_handle_sampled =
+@@ -185,19 +196,35 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+          view->planes[view_plane].sampled_gpu_resource_id =
+             mtl_texture_get_gpu_resource_id(
+                view->planes[view_plane].mtl_handle_sampled);
++         if (residency_view) {
++            view->planes[view_plane].mtl_handle_residency_sampled =
++               mtl_new_texture_view_with(mtl_handle, &residency_layout);
++            view->planes[view_plane].residency_sampled_gpu_resource_id =
++               mtl_texture_get_gpu_resource_id(
++                  view->planes[view_plane].mtl_handle_residency_sampled);
++         }
+       }
+ 
+       if (view->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
+          /* For storage images, we can't have any cubes */
+          if (view->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
+-             view->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)
++             view->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) {
+             view_layout.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
++            residency_layout.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
++         }
+ 
+          view->planes[view_plane].mtl_handle_storage =
+             mtl_new_texture_view_with(mtl_handle, &view_layout);
+          view->planes[view_plane].storage_gpu_resource_id =
+             mtl_texture_get_gpu_resource_id(
+                view->planes[view_plane].mtl_handle_storage);
++         if (residency_view) {
++            view->planes[view_plane].mtl_handle_residency_storage =
++               mtl_new_texture_view_with(mtl_handle, &residency_layout);
++            view->planes[view_plane].residency_storage_gpu_resource_id =
++               mtl_texture_get_gpu_resource_id(
++                  view->planes[view_plane].mtl_handle_residency_storage);
++         }
+       }
+ 
+       if (view->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+@@ -256,6 +283,12 @@ kk_image_view_finish(struct kk_device *dev, struct kk_image_view *view)
+ 
+       if (view->planes[plane].mtl_handle_subres)
+          mtl_release(view->planes[plane].mtl_handle_subres);
++
++      if (view->planes[plane].mtl_handle_residency_sampled)
++         mtl_release(view->planes[plane].mtl_handle_residency_sampled);
++
++      if (view->planes[plane].mtl_handle_residency_storage)
++         mtl_release(view->planes[plane].mtl_handle_residency_storage);
+    }
+ 
+    vk_image_view_finish(&view->vk);
+diff --git a/src/kosmickrisp/vulkan/kk_image_view.h b/src/kosmickrisp/vulkan/kk_image_view.h
+index 16ef404..7fecf94 100644
+--- a/src/kosmickrisp/vulkan/kk_image_view.h
++++ b/src/kosmickrisp/vulkan/kk_image_view.h
+@@ -44,6 +44,14 @@ struct kk_image_view {
+       /* Used if view has to create its own alias of a specific subresource */
+       mtl_texture *mtl_handle_subres;
+ 
++      /* Views with baseMipLevel > 0 of sparse residency images: the sampled
++       * and storage views extended down to level 0, for residency queries
++       * (struct kk_sampled_image_descriptor::residency_gpu_resource_id) */
++      mtl_texture *mtl_handle_residency_sampled;
++      mtl_texture *mtl_handle_residency_storage;
++      uint64_t residency_sampled_gpu_resource_id;
++      uint64_t residency_storage_gpu_resource_id;
++
+       uint64_t sampled_gpu_resource_id;
+       uint64_t storage_gpu_resource_id;
+       uint64_t input_gpu_resource_id;
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+index d53e155..00eec64 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -425,6 +425,70 @@ and_sparse_residency(nir_builder *b, nir_instr *instr, nir_def *def,
+    nir_def_rewrite_uses_after(def, nir_vector_insert_imm(b, def, code, code_comp));
+ }
+ 
++/* Replaces the residency code (last component, read as old_code right after
++ * def) of a sparse load's def with new_code, at the cursor: all other uses of
++ * def come after it (code emitted in between is in its own control flow). */
++static void
++replace_sparse_residency(nir_builder *b, nir_def *def, nir_def *old_code,
++                         nir_def *new_code)
++{
++   nir_def *val =
++      nir_vector_insert_imm(b, def, new_code, def->num_components - 1);
++   nir_foreach_use_including_if_safe(use, def) {
++      if (nir_src_is_if(use) ||
++          (nir_src_use_instr(use) != nir_def_instr(val) &&
++           nir_src_use_instr(use) != nir_def_instr(old_code)))
++         nir_src_rewrite(use, val);
++   }
++}
++
++static nir_def *
++sparse_residency_code(nir_builder *b, nir_def *def)
++{
++   return nir_channel(b, def, def->num_components - 1);
++}
++
++/* Residency of a sparse imageLoad through a storage view with
++ * baseMipLevel > 0 (struct kk_storage_image_descriptor): the same load from
++ * the residency view, at the level plus the base. */
++static void
++lower_storage_view_residency(nir_builder *b, nir_intrinsic_instr *intr,
++                             nir_deref_instr *deref, nir_alu_type type,
++                             const struct lower_descriptors_ctx *ctx)
++{
++   const unsigned offs =
++      offsetof(struct kk_storage_image_descriptor, residency_gpu_resource_id);
++   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
++   const bool array = nir_intrinsic_image_array(intr);
++
++   b->cursor = nir_after_instr(&intr->instr);
++   nir_def *id = load_resource_deref_desc(b, 2, 32, deref, offs, ctx);
++   nir_def *code = sparse_residency_code(b, &intr->def);
++   nir_push_if(
++      b, nir_ine_imm(
++            b, nir_ior(b, nir_channel(b, id, 0), nir_channel(b, id, 1)), 0));
++   nir_def *residency = nir_load_texture_handle_kk(
++      b, 1, 64, load_resource_addr(b, 1, 64, deref, offs, ctx),
++      .dest_type = type, .image_dim = dim, .image_array = array,
++      .access = ACCESS_NON_WRITEABLE, .flags = MSL_ACCESS_READ);
++   nir_def *base = nir_isub(
++      b,
++      nir_bindless_image_levels(b, 32, residency, .image_dim = dim,
++                                .image_array = array),
++      nir_bindless_image_levels(b, 32, intr->src[0].ssa, .image_dim = dim,
++                                .image_array = array));
++   nir_def *lod = intr->src[3].ssa;
++   nir_def *read = nir_bindless_image_sparse_load(
++      b, intr->def.num_components, intr->def.bit_size, residency,
++      intr->src[1].ssa, intr->src[2].ssa,
++      nir_iadd(b, lod, nir_u2uN(b, base, lod->bit_size)), .image_dim = dim,
++      .image_array = array, .dest_type = type, .access = ACCESS_NON_WRITEABLE);
++   nir_def *view_code = sparse_residency_code(b, read);
++   nir_pop_if(b, NULL);
++   replace_sparse_residency(b, &intr->def, code,
++                            nir_if_phi(b, view_code, code));
++}
++
+ static bool
+ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
+                    const struct lower_descriptors_ctx *ctx)
+@@ -481,6 +545,11 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
+    if (residency)
+       and_sparse_residency(b, &intr->instr, &intr->def, residency);
+ 
++   if (intr->intrinsic == nir_intrinsic_bindless_image_sparse_load &&
++       nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_BUF &&
++       nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_MS)
++      lower_storage_view_residency(b, intr, deref, type, ctx);
++
+    if (texel_offset && intr->intrinsic == nir_intrinsic_bindless_image_size) {
+       b->cursor = nir_after_instr(&intr->instr);
+       nir_def *size = &intr->def;
+@@ -570,6 +639,266 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
+    }
+ }
+ 
++static nir_def *
++tex_src_def(nir_tex_instr *tex, nir_tex_src_type type)
++{
++   const int i = nir_tex_instr_src_index(tex, type);
++   return i < 0 ? NULL : tex->src[i].src.ssa;
++}
++
++static void
++set_tex_src(nir_tex_instr *tex, nir_tex_src_type type, nir_def *def)
++{
++   nir_steal_tex_src(tex, type);
++   if (def)
++      nir_tex_instr_add_src(tex, type, def);
++}
++
++/* txs (level 0, as float) or query_levels of texture handle `handle` with
++ * tex's type */
++static nir_def *
++tex_query(nir_builder *b, nir_tex_instr *tex, nir_texop op, nir_def *handle,
++          unsigned num_components)
++{
++   const bool txs = op == nir_texop_txs;
++   nir_tex_instr *query = nir_tex_instr_create(b->shader, txs ? 2 : 1);
++   query->op = op;
++   query->sampler_dim = tex->sampler_dim;
++   query->is_array = tex->is_array;
++   query->is_shadow = tex->is_shadow;
++   query->dest_type = nir_type_int32;
++   query->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, handle);
++   if (txs)
++      query->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(b, 0));
++   nir_def_init(&query->instr, &query->def, nir_tex_instr_dest_size(query), 32);
++   nir_builder_instr_insert(b, &query->instr);
++   return nir_i2f32(b, nir_trim_vector(b, &query->def, num_components));
++}
++
++/* A copy of sparse sample/fetch `tex` from texture `texture` (and sampler
++ * `sampler` if not NULL) with op `op` and these LOD sources, at the cursor;
++ * returns its residency code */
++static nir_def *
++residency_tex(nir_builder *b, nir_tex_instr *tex, nir_texop op,
++              nir_def *texture, nir_def *sampler, nir_def *lod, nir_def *ddx,
++              nir_def *ddy, nir_def *min_lod)
++{
++   nir_tex_instr *copy =
++      nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
++   nir_builder_instr_insert(b, &copy->instr);
++   copy->op = op;
++   set_tex_src(copy, nir_tex_src_texture_handle, texture);
++   if (sampler)
++      set_tex_src(copy, nir_tex_src_sampler_handle, sampler);
++   set_tex_src(copy, nir_tex_src_bias, NULL);
++   set_tex_src(copy, nir_tex_src_lod, lod);
++   set_tex_src(copy, nir_tex_src_ddx, ddx);
++   set_tex_src(copy, nir_tex_src_ddy, ddy);
++   set_tex_src(copy, nir_tex_src_min_lod, min_lod);
++   return sparse_residency_code(b, &copy->def);
++}
++
++/* Residency of sparse gather `tex` as that of a bilinear sample (struct
++ * kk_sampled_image_descriptor::sampler_gather_index) of level `lod` of
++ * `texture`: Metal reports a gather resident when texels of its footprint
++ * across a tile edge are not (their values are zero). */
++static nir_def *
++gather_residency(nir_builder *b, nir_tex_instr *tex, nir_def *texture,
++                 nir_deref_instr *sampler, nir_def *lod,
++                 unsigned plane_offset_B,
++                 const struct lower_descriptors_ctx *ctx)
++{
++   nir_def *gather = nir_load_sampler_handle_kk(
++      b, load_resource_deref_desc(
++            b, 1, 16, sampler,
++            plane_offset_B + offsetof(struct kk_sampled_image_descriptor,
++                                      sampler_gather_index),
++            ctx));
++   return residency_tex(b, tex, nir_texop_txl, texture, gather, lod, NULL, NULL,
++                        NULL);
++}
++
++/* Residency of sparse samples and fetches through views with
++ * baseMipLevel > 0 (struct kk_sampled_image_descriptor): Metal measures it
++ * for the image's level or LOD without the base (gradient and implicit LODs
++ * are computed from the image's size, so only their clamps miss the base).
++ * The same operation on the residency view, which starts at level 0, at
++ * level/LOD + base gives it:
++ *  - fetches: level + base;
++ *  - explicit LODs: max(LOD, the sampler's minLod and MinLod), then its
++ *    maxLod (Metal's order; the residency sampler has no clamps), + base;
++ *  - gradients and implicit LODs (as gradients of the coordinates, taken
++ *    where the sample is): gradients scaled by the size ratio of the views'
++ *    level 0 times 2^(base + bias), so that the LOD is the view's + base,
++ *    the sampler's minLod and MinLod as min_lod_clamp + base; when the
++ *    view's isotropic LOD is past the sampler's maxLod, an explicit LOD at
++ *    maxLod + base (anisotropic LODs are lower: approximate there; not for
++ *    cubes);
++ *  - gathers: a bilinear sample (LINEAR, unclamped sampler) of level base,
++ *    whose footprint is the gather's; also for other views, at level 0
++ *    (gather_residency).
++ *  - min/max reduction: its LOD limited to the view's levels, + base (the
++ *    reduction samplers have no clamps).
++ * Unnormalized coordinates are not handled (their samplers aren't
++ * mipmapped: the residency view's level 0 only; D3D has none).
++ */
++static void
++lower_sampled_view_residency(nir_builder *b, nir_tex_instr *tex,
++                             nir_deref_instr *texture, nir_deref_instr *sampler,
++                             unsigned plane_offset_B,
++                             const struct lower_descriptors_ctx *ctx)
++{
++   const bool minmax = tex->backend_flags & MSL_TEX_FLAG_MINMAX;
++   const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
++   const unsigned dims = cube ? 3 : 2;
++   nir_def *view = tex_src_def(tex, nir_tex_src_texture_handle);
++   nir_def *lod = tex_src_def(tex, nir_tex_src_lod);
++   nir_def *bias = tex_src_def(tex, nir_tex_src_bias);
++   nir_def *ddx = tex_src_def(tex, nir_tex_src_ddx);
++   nir_def *ddy = tex_src_def(tex, nir_tex_src_ddy);
++   nir_def *min_lod = tex_src_def(tex, nir_tex_src_min_lod);
++
++   b->cursor = nir_before_instr(&tex->instr);
++   if (!minmax && (tex->op == nir_texop_tex || tex->op == nir_texop_txb)) {
++      if (b->shader->info.stage == MESA_SHADER_FRAGMENT) {
++         nir_def *coord =
++            nir_trim_vector(b, tex_src_def(tex, nir_tex_src_coord), dims);
++         ddx = nir_ddx(b, coord);
++         ddy = nir_ddy(b, coord);
++      } else {
++         lod = bias ? bias : nir_imm_float(b, 0.0f);
++         bias = NULL;
++      }
++   }
++
++   b->cursor = nir_after_instr(&tex->instr);
++   const unsigned offs =
++      plane_offset_B +
++      offsetof(struct kk_sampled_image_descriptor, residency_gpu_resource_id);
++   nir_def *id = load_resource_deref_desc(b, 2, 32, texture, offs, ctx);
++   nir_def *code = sparse_residency_code(b, &tex->def);
++   nir_if *nif = nir_push_if(
++      b, nir_ine_imm(
++            b, nir_ior(b, nir_channel(b, id, 0), nir_channel(b, id, 1)), 0));
++   nir_def *addr = load_resource_addr(b, 1, 64, texture, offs, ctx);
++   nir_def *residency =
++      tex->is_shadow
++         ? nir_load_depth_texture_kk(b, 1, 64, addr,
++                                     .image_dim = tex->sampler_dim,
++                                     .image_array = tex->is_array)
++         : nir_load_texture_handle_kk(
++              b, 1, 64, addr, .dest_type = tex->dest_type,
++              .image_dim = tex->sampler_dim, .image_array = tex->is_array);
++   nir_def *base = nir_u2u32(
++      b, load_resource_deref_desc(
++            b, 1, 16, texture,
++            plane_offset_B + offsetof(struct kk_sampled_image_descriptor,
++                                      residency_base_level),
++            ctx));
++   nir_def *fbase = nir_u2f32(b, base);
++
++   nir_def *view_code;
++   if (tex->op == nir_texop_txf) {
++      lod = lod ? lod : nir_imm_int(b, 0);
++      lod = nir_iadd(b, lod, nir_u2uN(b, base, lod->bit_size));
++      view_code = residency_tex(b, tex, nir_texop_txf, residency, NULL, lod,
++                                NULL, NULL, NULL);
++   } else if (tex->op == nir_texop_tg4) {
++      view_code = gather_residency(b, tex, residency, sampler, fbase,
++                                   plane_offset_B, ctx);
++   } else if (minmax) {
++      nir_def *last = nir_fadd_imm(
++         b, tex_query(b, tex, nir_texop_query_levels, view, 1), -1.0f);
++      lod = nir_fadd(b, nir_fmin(b, nir_fmax_imm(b, lod, 0.0f), last), fbase);
++      view_code = residency_tex(b, tex, nir_texop_txl, residency, NULL, lod,
++                                NULL, NULL, NULL);
++   } else {
++      assert(sampler);
++      nir_def *clamp = nir_f2f32(
++         b, load_resource_deref_desc(
++               b, 2, 16, sampler,
++               plane_offset_B + offsetof(struct kk_sampled_image_descriptor,
++                                         sampler_lod_min_fp16),
++               ctx));
++      nir_def *smin = nir_channel(b, clamp, 0);
++      nir_def *smax = nir_channel(b, clamp, 1);
++      nir_def *unclamped = nir_load_sampler_handle_kk(
++         b, load_resource_deref_desc(
++               b, 1, 16, sampler,
++               plane_offset_B + offsetof(struct kk_sampled_image_descriptor,
++                                         sampler_residency_index),
++               ctx));
++      /* Metal's order (as the sample itself): max(minLod, MinLod), then
++       * maxLod */
++      nir_def *lo = smin;
++      if (min_lod)
++         lo = nir_fmax(b, lo, nir_f2f32(b, min_lod));
++
++      /* Explicit LOD (or maxLod, below) */
++      nir_def *explicit_lod = NULL;
++      if (!ddx || !cube) {
++         nir_def *l = ddx ? smax : nir_f2f32(b, lod);
++         explicit_lod =
++            nir_fadd(b, nir_fmin(b, nir_fmax(b, l, lo), smax), fbase);
++      }
++
++      if (!ddx) {
++         view_code = residency_tex(b, tex, nir_texop_txl, residency, unclamped,
++                                   explicit_lod, NULL, NULL, NULL);
++      } else {
++         const unsigned size_components = cube ? 2 : dims;
++         nir_def *residency_size =
++            tex_query(b, tex, nir_texop_txs, residency, size_components);
++         nir_def *scale =
++            nir_fdiv(b, tex_query(b, tex, nir_texop_txs, view, size_components),
++                     residency_size);
++         if (cube)
++            scale = nir_channel(b, scale, 0);
++         scale =
++            nir_fmul(b, scale,
++                     nir_fexp2(b, bias ? nir_fadd(b, fbase, nir_f2f32(b, bias))
++                                       : fbase));
++         nir_def *dx = nir_fmul(b, nir_f2f32(b, ddx), scale);
++         nir_def *dy = nir_fmul(b, nir_f2f32(b, ddy), scale);
++         nir_def *min_lod_clamp = nir_fadd(b, lo, fbase);
++         if (cube) {
++            view_code = residency_tex(b, tex, nir_texop_txd, residency,
++                                      unclamped, NULL, dx, dy, min_lod_clamp);
++         } else {
++            /* Isotropic LOD of the view: of the residency view - base */
++            nir_def *vx = nir_fmul(b, dx, residency_size);
++            nir_def *vy = nir_fmul(b, dy, residency_size);
++            nir_def *view_lod = nir_fsub(
++               b,
++               nir_fmul_imm(b,
++                            nir_flog2(b, nir_fmax(b, nir_fdot(b, vx, vx),
++                                                  nir_fdot(b, vy, vy))),
++                            0.5f),
++               fbase);
++            nir_push_if(b, nir_flt(b, smax, nir_fmax(b, view_lod, lo)));
++            nir_def *clamped =
++               residency_tex(b, tex, nir_texop_txl, residency, unclamped,
++                             explicit_lod, NULL, NULL, NULL);
++            nir_push_else(b, NULL);
++            nir_def *gradient =
++               residency_tex(b, tex, nir_texop_txd, residency, unclamped, NULL,
++                             dx, dy, min_lod_clamp);
++            nir_pop_if(b, NULL);
++            view_code = nir_if_phi(b, clamped, gradient);
++         }
++      }
++   }
++   nir_def *other_code = code;
++   if (tex->op == nir_texop_tg4) {
++      nir_push_else(b, nif);
++      other_code = gather_residency(b, tex, view, sampler, nir_imm_float(b, 0),
++                                    plane_offset_B, ctx);
++   }
++   nir_pop_if(b, nif);
++   replace_sparse_residency(b, &tex->def, code,
++                            nir_if_phi(b, view_code, other_code));
++}
++
+ static bool
+ lower_tex(nir_builder *b, nir_tex_instr *tex,
+           const struct lower_descriptors_ctx *ctx)
+@@ -738,6 +1067,13 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+       nir_tex_instr_add_src(tex, nir_tex_src_max_lod_kk, lod_max);
+    }
+ 
++   if (tex->is_sparse && tex->sampler_dim != GLSL_SAMPLER_DIM_BUF &&
++       tex->sampler_dim != GLSL_SAMPLER_DIM_MS && tex->op != nir_texop_txf_ms)
++      lower_sampled_view_residency(
++         b, tex, nir_src_as_deref(nir_src_for_ssa(texture)),
++         sampler ? nir_src_as_deref(nir_src_for_ssa(sampler)) : NULL,
++         plane_offset_B, ctx);
++
+    return true;
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_sampler.c b/src/kosmickrisp/vulkan/kk_sampler.c
+index 791ff67..3bc5a30 100644
+--- a/src/kosmickrisp/vulkan/kk_sampler.c
++++ b/src/kosmickrisp/vulkan/kk_sampler.c
+@@ -179,6 +179,38 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
+    }
+    sampler->plane_count = 1;
+ 
++   /* Residency queries through views with baseMipLevel > 0 sample a view
++    * from level 0 at LOD + base, so the sampler's LOD clamps (relative to the
++    * view) must not apply there: the shader applies them. They can't matter
++    * when the clamp range includes [0, 14] (the levels of a 16384 texel
++    * image). Software min/max reduction samplers have none
++    * (create_sampler_descriptor). Gathers take theirs from a bilinear sample
++    * (LINEAR, weighted average) of the gathered level. */
++   if (dev->vk.enabled_features.sparseResidencyImage2D) {
++      const bool emulated_reduction =
++         kk_device_physical(dev)->info.gpu_apple_family < 10 &&
++         packed.reduction_mode != MTL_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
++      const bool clamps = packed.min_lod > 0.0f || packed.max_lod < 14.0f;
++      struct mtl_sampler_packed residency = packed;
++      residency.min_lod = 0.0f;
++      residency.max_lod = FLT_MAX;
++      struct mtl_sampler_packed gather = residency;
++      gather.min_filter = gather.mag_filter = MTL_SAMPLER_MIN_MAG_FILTER_LINEAR;
++      gather.reduction_mode = MTL_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
++
++      if (clamps && !emulated_reduction)
++         result = kk_sampler_heap_add(dev, residency, &sampler->residency_hw);
++      if (result == VK_SUCCESS &&
++          (clamps || emulated_reduction ||
++           packed.min_filter != MTL_SAMPLER_MIN_MAG_FILTER_LINEAR ||
++           packed.mag_filter != MTL_SAMPLER_MIN_MAG_FILTER_LINEAR))
++         result = kk_sampler_heap_add(dev, gather, &sampler->gather_hw);
++      if (result != VK_SUCCESS) {
++         kk_DestroySampler(device, kk_sampler_to_handle(sampler), pAllocator);
++         return result;
++      }
++   }
++
+    /* In order to support CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT, we
+     * need multiple sampler planes: at minimum we will need one for luminance
+     * (the default), and one for chroma.  Each sampler plane needs its own
+@@ -277,6 +309,10 @@ kk_DestroySampler(VkDevice device, VkSampler _sampler,
+ 
+    for (uint8_t plane = 0; plane < sampler->plane_count; plane++)
+       kk_sampler_heap_remove(dev, sampler->planes[plane].hw);
++   if (sampler->residency_hw)
++      kk_sampler_heap_remove(dev, sampler->residency_hw);
++   if (sampler->gather_hw)
++      kk_sampler_heap_remove(dev, sampler->gather_hw);
+ 
+    vk_sampler_destroy(&dev->vk, pAllocator, &sampler->vk);
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_sampler.h b/src/kosmickrisp/vulkan/kk_sampler.h
+index f91201c..f504475 100644
+--- a/src/kosmickrisp/vulkan/kk_sampler.h
++++ b/src/kosmickrisp/vulkan/kk_sampler.h
+@@ -33,6 +33,12 @@ struct kk_sampler {
+    struct {
+       struct kk_rc_sampler *hw;
+    } planes[2];
++
++   /* For residency queries through views with baseMipLevel > 0 (struct
++    * kk_sampled_image_descriptor): plane 0 without LOD clamps, and that with
++    * LINEAR filters for gathers; NULL when plane 0 is that already. */
++   struct kk_rc_sampler *residency_hw;
++   struct kk_rc_sampler *gather_hw;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_sampler, vk.base, VkSampler,

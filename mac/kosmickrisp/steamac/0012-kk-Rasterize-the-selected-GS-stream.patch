@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Willie Abrams <willie@pobox.com>
+Date: Thu, 1 Oct 2026 14:07:02 -0500
+Subject: [PATCH 12/19] kk: Rasterize the selected GS stream
+
+Pass the rasterization stream to poly in the per-draw data. For a
+multistream GS, poly drops vertices from the other streams before
+rasterization.
+
+Without a multistream GS, selecting a nonzero stream rasterizes nothing.
+Use an empty scissor for that case, and update it when the stream or
+pipeline changes.
+
+Assisted-by: Claude Code
+---
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h            |  3 +++
+ src/kosmickrisp/vulkan/kk_cmd_draw.c              | 14 +++++++++++---
+ src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c |  2 ++
+ 3 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index aed3656..6238283 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -93,6 +93,9 @@ struct kk_per_draw_data {
+ 
+    /* Whether the last vertex of a primitive is its provoking vertex */
+    uint32_t provoking_last;
++
++   /* GS stream selected for rasterization */
++   uint32_t rasterization_stream;
+ };
+ 
+ struct kk_attachment {
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 5aee977..799c1e4 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1407,8 +1407,15 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+       desc->root_dirty = true;
+    }
+ 
+-   if (IS_DIRTY(RS_RASTERIZER_DISCARD_ENABLE)) {
+-      if (dyn->rs.rasterizer_discard_enable) {
++   /* A nonzero stream rasterizes nothing without a multistream GS. */
++   const struct poly_gs_info *gs = kk_gs_info(cmd);
++   bool rast_discard =
++      dyn->rs.rasterizer_discard_enable ||
++      (dyn->rs.rasterization_stream != 0 && !(gs && gs->multistream));
++
++   if (IS_DIRTY(RS_RASTERIZER_DISCARD_ENABLE) ||
++       IS_DIRTY(RS_RASTERIZATION_STREAM) || IS_SHADER_DIRTY(VERTEX)) {
++      if (rast_discard) {
+          set_empty_scissor(enc);
+       } else {
+          /* Enforce setting the correct scissors */
+@@ -1433,7 +1440,7 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+    }
+ 
+    /* We enable raster discard by setting scissor to size (0, 0) */
+-   if (!(dyn->rs.rasterizer_discard_enable || gfx->is_cull_front_and_back) &&
++   if (!(rast_discard || gfx->is_cull_front_and_back) &&
+        (IS_DIRTY(VP_VIEWPORT_COUNT) || IS_DIRTY(VP_VIEWPORTS) ||
+         IS_DIRTY(VP_SCISSOR_COUNT) || IS_DIRTY(VP_SCISSORS) ||
+         IS_DIRTY(RS_DEPTH_CLAMP_ENABLE) || IS_DIRTY(RS_DEPTH_CLIP_ENABLE)))
+@@ -2107,6 +2114,7 @@ kk_upload_per_draw_data(struct kk_cmd_buffer *cmd, uint32_t upload_mask,
+          &cmd->vk.dynamic_graphics_state;
+       gfx->per_draw_data.provoking_last =
+          dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
++      gfx->per_draw_data.rasterization_stream = dyn->rs.rasterization_stream;
+    }
+ 
+    struct kk_ptr shader_data_gpu =
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+index 6b9dff2..c09da5b 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -825,6 +825,8 @@ lower_poly(struct nir_builder *b, nir_intrinsic_instr *intrin, void *data)
+       return lower_sysval_to_per_draw(b, intrin, geometry_params);
+    case nir_intrinsic_load_provoking_last:
+       return lower_sysval_to_per_draw(b, intrin, provoking_last);
++   case nir_intrinsic_load_rasterization_stream:
++      return lower_sysval_to_per_draw(b, intrin, rasterization_stream);
+    case nir_intrinsic_load_index_size_poly:
+       return lower_sysval_to_per_draw(b, intrin, index_size);
+    case nir_intrinsic_load_first_vertex:
+-- 
+2.54.0 (Apple Git-157)
+

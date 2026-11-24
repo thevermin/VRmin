@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Tue, 13 Oct 2026 01:00:00 +0300
+Subject: [PATCH 43/44] kk: unroll direct draws into indices of their own
+ command buffer
+
+STEAMAC-G follow-up. The unroll kernel allocated the indices it writes from
+the device's 128 MB geometry heap, which the first unroll of every command
+buffer and every render pass reset to its start (kk_heap). That is only safe
+while the queue runs every pass after the previous one ended (end_encoder's
+barrier before all queue stages), which it does today: a command buffer that
+waits for a timeline semaphore at its submission and another one unrolling
+other indices submitted after it keep their own colors, the second starting
+after the first's 2.2 ms (host/moltenvk/repro provoking_last.c, before and
+after this patch). Direct draws (indexed, or without an index buffer past the
+CPU unroll's 1M indices) know their counts at recording: their unroll gets a
+heap of its own in command buffer memory, sized for poly_setup_unroll_for_draw's
+upper bound. No reset dispatch, nothing shared with other command buffers or
+render passes, and no 128 MB device heap for processes that only unroll direct
+draws (zink's). Indirect draws, tessellation and geometry shaders, whose sizes
+only the GPU knows, keep the device heap.
+---
+ src/kosmickrisp/vulkan/kk_cmd_draw.c | 93 ++++++++++++++++++++++++----
+ 1 file changed, 82 insertions(+), 11 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 46ea34e..34917cf 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1058,13 +1058,17 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
+    }
+ }
+ 
++/* The device heap: GPU allocations whose sizes only the GPU knows
++ * (tessellation, geometry shaders, unrolls of indirect draws) */
++#define KK_HEAP_SIZE_B (128u * 1024u * 1024u)
++
+ static void
+ kk_init_heap(const void *data)
+ {
+    struct kk_cmd_buffer *cmd = (struct kk_cmd_buffer *)data;
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+ 
+-   size_t size = 128 * 1024 * 1024;
++   size_t size = KK_HEAP_SIZE_B;
+    kk_alloc_bo(dev, &dev->vk.base, size, 0, &dev->heap);
+ 
+    struct poly_heap *map = (struct poly_heap *)dev->heap->cpu;
+@@ -1807,10 +1811,65 @@ kk_unroll_geometry_cpu(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    return true;
+ }
+ 
++/* Upper bound of the indices an unroll of direct draws writes (what
++ * poly_setup_unroll_for_draw allocates for each), UINT64_MAX for indirect
++ * draws: only the GPU knows their counts. */
++static uint64_t
++kk_direct_unroll_size_B(const struct kk_draw_command *data)
++{
++   if (data->indirect)
++      return UINT64_MAX;
++
++   const uint32_t per_prim = mesa_vertices_per_prim(data->prim);
++   uint64_t size_B = 0u;
++   for (uint32_t i = 0u; i < data->draw_count; i++) {
++      const uint32_t count = data->indexed ? data->indexed_draws[i].indexCount
++                                           : data->draws[i].vertexCount;
++      size_B += align64((uint64_t)u_decomposed_prims_for_vertices(
++                           data->prim, count) *
++                           per_prim * sizeof(uint32_t),
++                        16u);
++   }
++   return size_B;
++}
++
++/* The heap an unroll allocates its indices from, and their range. Direct
++ * draws get one of their own in command buffer memory, sized for the draws
++ * (direct_size_B, kk_direct_unroll_size_B): no reset, nothing shared with
++ * other command buffers or render passes, and no device heap for processes
++ * that only unroll direct draws. The device heap is reset to its start by the
++ * first unroll of every command buffer and render pass (kk_heap), which is
++ * only safe while the queue runs every pass after the previous one ended
++ * (end_encoder's barrier). */
++static uint64_t
++kk_unroll_heap(struct kk_cmd_buffer *cmd, uint64_t direct_size_B,
++               struct kk_addr_range *indices)
++{
++   if (direct_size_B < KK_HEAP_SIZE_B) {
++      /* poly_heap_alloc_offs fails an allocation that reaches the size */
++      const uint32_t size_B = direct_size_B + 16u;
++      struct kk_ptr mem = kk_pool_alloc(cmd, size_B, 16u);
++      struct kk_ptr heap = kk_pool_alloc(cmd, sizeof(struct poly_heap), 16u);
++      if (likely(mem.gpu && heap.gpu)) {
++         *(struct poly_heap *)heap.cpu = (struct poly_heap){
++            .base = mem.gpu,
++            .size = size_B,
++         };
++         *indices = (struct kk_addr_range){.addr = mem.gpu, .range = size_B};
++         return heap.gpu;
++      }
++   }
++
++   const uint64_t heap = kk_heap(cmd);
++   *indices = kk_heap_indices(cmd);
++   return heap;
++}
++
+ /* Unrolling will always be done through indirect rendering, so if this is
+  * called from non-indirect calls, we will fake it. */
+ static bool
+-kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
++kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
++                   uint64_t direct_size_B)
+ {
+    if (kk_unroll_geometry_cpu(cmd, data))
+       return true;
+@@ -1826,9 +1885,10 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    if (unlikely(!out_draws.gpu))
+       return false;
+ 
++   struct kk_addr_range indices;
+    struct libkk_unroll_geometry_args info = {
+       .index_buffer = data->index_buffer.addr,
+-      .heap = kk_heap(cmd),
++      .heap = kk_unroll_heap(cmd, direct_size_B, &indices),
+       .in_draw = data->indirect_command.addr,
+       .out_draw = out_draws.gpu,
+       .in_draw_stride_el = data->indirect_command.stride / sizeof(uint32_t),
+@@ -1846,8 +1906,8 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    libkk_unroll_geometry_struct(cmd, kk_grid_1d(1024 * data->draw_count), true,
+                                 info);
+ 
+-   kk_set_unrolled_draw(data, u_decomposed_prim(data->prim),
+-                        kk_heap_indices(cmd), out_draws.gpu);
++   kk_set_unrolled_draw(data, u_decomposed_prim(data->prim), indices,
++                        out_draws.gpu);
+ 
+    return true;
+ }
+@@ -1855,7 +1915,8 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ /* Metal has no adjacency topologies, so draws without a GS draw the lines or
+  * triangles they rasterize instead. */
+ static bool
+-kk_unroll_adjacency(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
++kk_unroll_adjacency(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
++                    uint64_t direct_size_B)
+ {
+    if (unlikely(!kk_convert_to_indirect_draw(cmd, data)))
+       return false;
+@@ -1865,9 +1926,10 @@ kk_unroll_adjacency(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    if (unlikely(!out_draws.gpu))
+       return false;
+ 
++   struct kk_addr_range indices;
+    struct libkk_unroll_adjacency_args info = {
+       .index_buffer = data->index_buffer.addr,
+-      .heap = kk_heap(cmd),
++      .heap = kk_unroll_heap(cmd, direct_size_B, &indices),
+       .in_draw = data->indirect_command.addr,
+       .out_draw = out_draws.gpu,
+       .in_draw_stride_el = data->indirect_command.stride / sizeof(uint32_t),
+@@ -1882,7 +1944,7 @@ kk_unroll_adjacency(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    libkk_unroll_adjacency_struct(cmd, kk_grid_1d(1024 * data->draw_count), true,
+                                  info);
+ 
+-   kk_set_unrolled_draw(data, u_reduced_prim(data->prim), kk_heap_indices(cmd),
++   kk_set_unrolled_draw(data, u_reduced_prim(data->prim), indices,
+                         out_draws.gpu);
+ 
+    return true;
+@@ -2548,6 +2610,10 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+        mesa_prim_has_adjacency(data->prim))
+       data->flatshade_first = true;
+ 
++   /* The indices direct draws unroll to at most, before predicates make them
++    * indirect */
++   uint64_t unroll_size_B = kk_direct_unroll_size_B(data);
++
+    /* Convert to indirect and process predicates. Skip draw if we fail. */
+    if (data->predicate_count > 0 && !kk_predicate_draws(cmd, data))
+       return;
+@@ -2556,11 +2622,16 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    bool geom = kk_gs_info(cmd);
+ 
+    /* Unroll geometry. Skip draw if we fail. */
+-   if (requires_unroll(cmd, data) && !kk_unroll_geometry(cmd, data))
+-      return;
++   if (requires_unroll(cmd, data)) {
++      if (!kk_unroll_geometry(cmd, data, unroll_size_B))
++         return;
++      /* Adjacency is unrolled again from what the GPU unrolled */
++      unroll_size_B = UINT64_MAX;
++   }
+ 
+    if (!cmd->state.shaders[MESA_SHADER_GEOMETRY] &&
+-       mesa_prim_has_adjacency(data->prim) && !kk_unroll_adjacency(cmd, data))
++       mesa_prim_has_adjacency(data->prim) &&
++       !kk_unroll_adjacency(cmd, data, unroll_size_B))
+       return;
+ 
+    /* Patch lists do not restart, so only a GS fed by the input assembly needs
+-- 
+2.54.0 (Apple Git-157)
+

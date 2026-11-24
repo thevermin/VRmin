@@ -1,0 +1,1369 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Wed, 7 Oct 2026 14:36:41 +0300
+Subject: [PATCH] kk: emulate sampler min/max only for draws with a reduction
+ sampler bound
+
+The min/max reduction emulation before Apple10 cost every sample, also
+through ordinary samplers: the per-sample branch on the descriptor's
+filter flags (and the non-inlined footprint call) doubled the GPU time of
+sampling-bound shaders (fragment texture() 7.5 -> 14.8 ms, compute
+textureLod 1.9 -> 4.0 ms on an M1 Max) and made their compiles 1.3-1.6x
+slower, even in applications that never create a reduction sampler.
+
+Pipelines whose samplers come from descriptor sets now have two programs:
+one that emulates min/max only for immutable samplers (resolved when the
+pipeline is compiled: immutable samplers that all reduce are emulated
+without a branch, others are left alone; their filter flags are part of
+the set layout hash), and a minmax program that also emulates the samplers
+of the sets it records in kk_shader_info::minmax_sets. Descriptor sets
+count the reduction samplers written or copied into them (never
+decremented; a copy of mutable descriptors counts one if the source set
+has any) and push descriptor sets those pushed in the command buffer.
+Draws and dispatches use the minmax program only while one of those sets
+holds a reduction sampler.
+
+The program a pipeline compiles at creation is the one without emulation,
+unless a set of one of those layouts already got a reduction sampler (a
+descriptor heap like vkd3d-proton's sampler heap is then bound with every
+draw), or, for pipelines read from a pipeline cache, any set; the other
+program is compiled on first use (MESA_KK_DEBUG=minmax logs reduction
+samplers, programs compiled at creation and on first use, and replays).
+Both programs' MSL is built at creation (pipeline caches serialize both);
+the minmax program's while Metal compiles the other one on another thread.
+
+Update-after-bind sets may get a reduction sampler after recording: draws
+that used the program without emulation record such sets, and a command
+buffer submitted after one of them got a reduction sampler is re-recorded
+from its command queue (the replay decides on the final counts).
+One-time-submit command buffers can't be replayed and use the minmax
+program for update-after-bind sets right away.
+
+M1 Max, 403 pipelines (gamescope, FSR2, dxil-spirv references), Metal
+source cache defeated, median of 3 runs: 59.96 s vs 59.89 s with the
+emulation compiled out (1.001; sampling shaders 1.002-1.006); with a
+reduction sampler in every layout 69.78 s (1.165, as before). Runtime with
+ordinary samplers equals the emulation compiled out (fragment 7.46-7.49 ms
+both, compute 1.85/2.41 ms both); through a MIN sampler unchanged.
+---
+ src/kosmickrisp/vulkan/kk_cmd_buffer.c        |   4 +
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h        |  11 +
+ src/kosmickrisp/vulkan/kk_cmd_dispatch.c      |   5 +-
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          |  26 +-
+ src/kosmickrisp/vulkan/kk_debug.c             |   1 +
+ src/kosmickrisp/vulkan/kk_debug.h             |   3 +
+ src/kosmickrisp/vulkan/kk_descriptor_set.c    |  40 ++
+ src/kosmickrisp/vulkan/kk_descriptor_set.h    |   6 +
+ .../vulkan/kk_descriptor_set_layout.c         |   3 +
+ .../vulkan/kk_descriptor_set_layout.h         |   5 +
+ src/kosmickrisp/vulkan/kk_device.c            |   3 +
+ src/kosmickrisp/vulkan/kk_device.h            |   9 +
+ .../vulkan/kk_nir_lower_sampler_minmax.c      | 152 ++++++-
+ src/kosmickrisp/vulkan/kk_queue.c             |  27 +-
+ src/kosmickrisp/vulkan/kk_sampler.c           |   5 +
+ src/kosmickrisp/vulkan/kk_shader.c            | 418 ++++++++++++++----
+ src/kosmickrisp/vulkan/kk_shader.h            |  21 +-
+ 17 files changed, 627 insertions(+), 112 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index f712597..f412d6b 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -56,6 +56,7 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
+    util_dynarray_clear(&cmd->post_render_writes);
+    util_dynarray_clear(&cmd->ts_resolves);
+    util_dynarray_clear(&cmd->ts_stage_map);
++   util_dynarray_clear(&cmd->minmax_uab_sets);
+ }
+ 
+ /* Ends Metal command buffer recording and returns allocator to pool for reuse */
+@@ -97,6 +98,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+    util_dynarray_fini(&cmd->post_render_writes);
+    util_dynarray_fini(&cmd->ts_resolves);
+    util_dynarray_fini(&cmd->ts_stage_map);
++   util_dynarray_fini(&cmd->minmax_uab_sets);
+ 
+    vk_free(&pool->vk.alloc, cmd);
+ }
+@@ -129,6 +131,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+    cmd->ts_resolves = UTIL_DYNARRAY_INIT;
+    cmd->ts_stage_map = UTIL_DYNARRAY_INIT;
+    cmd->post_render_writes = UTIL_DYNARRAY_INIT;
++   cmd->minmax_uab_sets = UTIL_DYNARRAY_INIT;
+ 
+    {
+       mtl_argument_table_descriptor *desc = mtl_new_argument_table_descriptor();
+@@ -214,6 +217,7 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
+    cmd->one_time_submit =
+       pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++   cmd->replay = false;
+ 
+    /* vk_command_buffer_begin will reset the command buffer meaning the
+     * allocator may be returned to the pool. Request a new one. */
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 6238283..0ce07e0 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -160,6 +160,9 @@ struct kk_graphics_state {
+    enum kk_dirty dirty;
+    uint32_t pipeline_sample_count;
+ 
++   /* Program of the bound VS draws use (kk_cmd_shader_pipeline) */
++   const struct kk_pipeline_handles *pipe;
++
+    struct {
+       enum mtl_visibility_result_mode mode;
+ 
+@@ -294,6 +297,14 @@ struct kk_cmd_buffer {
+    /* Metal command buffers are single-shot: a resubmission must re-record
+     * by replaying the enqueued commands (see rerecord_cmd_buffer). */
+    bool submitted;
++   /* Recorded by kk_queue_submit's replay of another command buffer */
++   bool replay;
++   /* Update-after-bind descriptor sets without reduction samplers that draws
++    * and dispatches used a pipeline's program without sampler min/max
++    * emulation for (struct kk_descriptor_set *, kk_cmd_shader_pipeline): if
++    * one of them holds a reduction sampler at submission, the command buffer
++    * is re-recorded. */
++   struct util_dynarray minmax_uab_sets;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(kk_cmd_buffer, vk.base, VkCommandBuffer,
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_dispatch.c b/src/kosmickrisp/vulkan/kk_cmd_dispatch.c
+index 4df22e7..daae042 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_dispatch.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_dispatch.c
+@@ -33,8 +33,11 @@ kk_flush_compute_state(struct kk_cmd_buffer *cmd)
+    if (desc->root.addr)
+       kk_cmd_bind_root_to_argument_table(cmd, desc->root.addr);
+ 
++   /* The CS's program with or without sampler min/max emulation */
+    mtl_compute_set_pipeline_state(
+-      encoder, cmd->state.shaders[MESA_SHADER_COMPUTE]->pipeline.cs);
++      encoder,
++      kk_cmd_shader_pipeline(cmd, cmd->state.shaders[MESA_SHADER_COMPUTE], desc)
++         ->cs);
+ }
+ 
+ static void
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index cba5139..f832c8c 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1011,8 +1011,7 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
+    }
+ 
+    if (IS_SHADER_DIRTY(VERTEX)) {
+-      struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+-      mtl_render_set_pipeline_state(enc, vs->pipeline.gfx.render);
++      mtl_render_set_pipeline_state(enc, gfx->pipe->gfx.render);
+       if (gfx->depth_stencil_state)
+          mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
+    }
+@@ -1590,6 +1589,14 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
+    struct kk_graphics_state *gfx = &cmd->state.gfx;
+    struct kk_descriptor_state *desc = &gfx->descriptors;
+ 
++   /* The VS's program with or without sampler min/max emulation */
++   const struct kk_pipeline_handles *pipe = kk_cmd_shader_pipeline(
++      cmd, cmd->state.shaders[MESA_SHADER_VERTEX], desc);
++   if (pipe != gfx->pipe) {
++      gfx->pipe = pipe;
++      cmd->state.dirty_shaders |= BITFIELD_BIT(MESA_SHADER_VERTEX);
++   }
++
+    kk_flush_render_pass(cmd);
+    kk_flush_pipeline(cmd);
+ 
+@@ -2194,7 +2201,7 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
+ 
+    mtl_compute_encoder *enc = cs_get_compute(cmd);
+    {
+-      mtl_compute_pipeline_state *pipeline = vs->pipeline.gfx.pre_render[0];
++      mtl_compute_pipeline_state *pipeline = gfx->pipe->gfx.pre_render[0];
+       struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
+       mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                        MTL_STAGE_DISPATCH);
+@@ -2202,7 +2209,7 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
+       kk_dispatch_compute(enc, grid_vs, local_size);
+    }
+    {
+-      mtl_compute_pipeline_state *pipeline = vs->pipeline.gfx.pre_render[1];
++      mtl_compute_pipeline_state *pipeline = gfx->pipe->gfx.pre_render[1];
+       struct mtl_size local_size = {tcs->info.tess.tcs_output_patch_size, 1, 1};
+       /* Avoid Metal validation error by trying to launch empty compute. Return
+        * empty data. We set restart to true to avoid unroll. */
+@@ -2322,14 +2329,15 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+ 
+    /* The stage feeding the GS and its compute pass are the last two pre-render
+     * pipelines */
+-   uint32_t pre_render_count = vs->pipeline.gfx.pre_render_count;
++   const struct kk_pipeline_handles *pipe = gfx->pipe;
++   uint32_t pre_render_count = pipe->gfx.pre_render_count;
+    struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
+    mtl_compute_encoder *enc = cs_get_compute(cmd);
+ 
+    mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                     MTL_STAGE_DISPATCH);
+    mtl_compute_set_pipeline_state(
+-      enc, vs->pipeline.gfx.pre_render[pre_render_count - 2u]);
++      enc, pipe->gfx.pre_render[pre_render_count - 2u]);
+    kk_dispatch_compute(enc, grid_vs, local_size);
+ 
+    /* Prefix sum the dynamic counts to find each primitive's capture offset.
+@@ -2339,7 +2347,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+       if (gs->count_words) {
+          mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                           MTL_STAGE_DISPATCH);
+-         mtl_compute_set_pipeline_state(enc, vs->pipeline.gfx.gs_count);
++         mtl_compute_set_pipeline_state(enc, pipe->gfx.gs_count);
+          kk_dispatch_compute(enc, grid_gs, local_size);
+       }
+ 
+@@ -2350,7 +2358,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+ 
+       mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                        MTL_STAGE_DISPATCH);
+-      mtl_compute_set_pipeline_state(enc, vs->pipeline.gfx.pre_gs);
++      mtl_compute_set_pipeline_state(enc, pipe->gfx.pre_gs);
+       mtl_dispatch_threads(enc, (struct mtl_size){1u, 1u, 1u},
+                            (struct mtl_size){1u, 1u, 1u});
+    }
+@@ -2358,7 +2366,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+    mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                     MTL_STAGE_DISPATCH);
+    mtl_compute_set_pipeline_state(
+-      enc, vs->pipeline.gfx.pre_render[pre_render_count - 1u]);
++      enc, pipe->gfx.pre_render[pre_render_count - 1u]);
+    kk_dispatch_compute(enc, grid_gs, local_size);
+ 
+    struct kk_draw_data rast = {
+diff --git a/src/kosmickrisp/vulkan/kk_debug.c b/src/kosmickrisp/vulkan/kk_debug.c
+index 763c750..93841fe 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.c
++++ b/src/kosmickrisp/vulkan/kk_debug.c
+@@ -11,6 +11,7 @@ const struct debug_named_value debug_flags[] = {
+    {"nir", KK_DEBUG_NIR},
+    {"msl", KK_DEBUG_MSL},
+    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
++   {"minmax", KK_DEBUG_MINMAX},
+    {NULL, 0},
+ };
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_debug.h b/src/kosmickrisp/vulkan/kk_debug.h
+index 9084a62..271f6fc 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.h
++++ b/src/kosmickrisp/vulkan/kk_debug.h
+@@ -12,6 +12,9 @@ enum kk_debug {
+    KK_DEBUG_MSL = 1ull << 1,
+    /* Forces robustness for all shaders */
+    KK_DEBUG_FORCE_ROBUSTNESS = 1ull << 2,
++   /* Log sampler min/max reduction emulation events (reduction samplers,
++    * emulating programs compiled, re-recorded command buffers) */
++   KK_DEBUG_MINMAX = 1ull << 3,
+ };
+ 
+ extern enum kk_debug kk_mesa_debug_flags;
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set.c b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+index 7e1de1c..7c8e91b 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -19,6 +19,7 @@
+ 
+ #include "util/format/u_format.h"
+ #include "util/half_float.h"
++#include "util/u_atomic.h"
+ 
+ static inline uint32_t
+ align_u32(uint32_t v, uint32_t a)
+@@ -136,6 +137,20 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
+    memcpy(dst, desc, sizeof(desc[0]) * plane_count);
+ }
+ 
++/* Sampler min/max reduction emulation before Apple10 (kk_shader.c) */
++static void
++count_reduction_sampler(struct kk_descriptor_set *set)
++{
++   struct kk_device *dev =
++      container_of(set->layout->vk.base.device, struct kk_device, vk);
++
++   p_atomic_inc(&set->reduction_samplers);
++   if (!p_atomic_read(&set->layout->reduction_samplers))
++      p_atomic_set(&set->layout->reduction_samplers, true);
++   if (!p_atomic_read(&dev->reduction_sampler_sets))
++      p_atomic_set(&dev->reduction_sampler_sets, true);
++}
++
+ static void
+ write_sampled_image_view_desc(struct kk_descriptor_set *set,
+                               const VkDescriptorImageInfo *const _info,
+@@ -152,6 +167,10 @@ write_sampled_image_view_desc(struct kk_descriptor_set *set,
+          info.sampler =
+             kk_sampler_to_handle(binding_layout->immutable_samplers[elem]);
+       }
++      VK_FROM_HANDLE(kk_sampler, sampler, info.sampler);
++      if (sampler && (sampler->filter_flags & (KK_SAMPLER_REDUCTION_MIN |
++                                               KK_SAMPLER_REDUCTION_MAX)))
++         count_reduction_sampler(set);
+    }
+ 
+    uint32_t dst_size;
+@@ -362,6 +381,25 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
+          }
+       }
+ 
++      /* Copied reduction samplers count for the destination too. Mutable
++       * descriptors can't be told apart: count one if the source has any. */
++      if (src_binding_layout->stride > 0 &&
++          p_atomic_read(&src->reduction_samplers)) {
++         if (src_binding_layout->type == VK_DESCRIPTOR_TYPE_SAMPLER ||
++             src_binding_layout->type ==
++                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
++            for (uint32_t j = 0; j < copy->descriptorCount; j++) {
++               const struct kk_sampled_image_descriptor *desc = desc_ubo_data(
++                  src, copy->srcBinding, copy->srcArrayElement + j, NULL);
++               if (desc->sampler_filter_flags &
++                   (KK_SAMPLER_REDUCTION_MIN | KK_SAMPLER_REDUCTION_MAX))
++                  count_reduction_sampler(dst);
++            }
++         } else if (src_binding_layout->type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT) {
++            count_reduction_sampler(dst);
++         }
++      }
++
+       switch (src_binding_layout->type) {
+       case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+       case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
+@@ -438,6 +476,7 @@ kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,
+          break;
+       }
+    }
++   push_set->reduction_samplers += set.reduction_samplers;
+ }
+ 
+ static void kk_descriptor_pool_free(struct kk_descriptor_pool *pool,
+@@ -850,4 +889,5 @@ kk_push_descriptor_set_update_template(
+       .mapped_ptr = push_set->data,
+    };
+    kk_descriptor_set_write_template(&tmp_set, template, data);
++   push_set->reduction_samplers += tmp_set.reduction_samplers;
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set.h b/src/kosmickrisp/vulkan/kk_descriptor_set.h
+index 97ea137..0b702f7 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set.h
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set.h
+@@ -47,6 +47,10 @@ struct kk_descriptor_set {
+    void *mapped_ptr;
+    uint64_t addr;
+    uint32_t size;
++   /* Sampler descriptors with a min/max reduction written or copied into the
++    * set (never decremented): draws with such a set bound use their
++    * pipeline's min/max emulating program before Apple10. */
++   uint32_t reduction_samplers;
+ 
+    struct kk_buffer_address dynamic_buffers[];
+ };
+@@ -66,6 +70,8 @@ kk_descriptor_set_addr(const struct kk_descriptor_set *set)
+ struct kk_push_descriptor_set {
+    uint8_t data[KK_PUSH_DESCRIPTOR_SET_SIZE];
+    struct kk_descriptor_set_layout *layout;
++   /* As kk_descriptor_set::reduction_samplers */
++   uint32_t reduction_samplers;
+ };
+ 
+ void kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c b/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
+index 552b2d2..32cffdb 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
+@@ -314,6 +314,9 @@ kk_CreateDescriptorSetLayout(VkDevice device,
+             /* We zalloc the object, so it's safe to hash the whole thing */
+             if (sampler != NULL && sampler->vk.ycbcr_conversion != NULL)
+                BLAKE3_UPDATE_VALUE(sampler->vk.ycbcr_conversion->state);
++            /* Min/max emulation is resolved at compile time for these */
++            if (sampler != NULL)
++               BLAKE3_UPDATE_VALUE(sampler->filter_flags);
+          }
+       }
+    }
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set_layout.h b/src/kosmickrisp/vulkan/kk_descriptor_set_layout.h
+index 9440f83..a7c0c73 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set_layout.h
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set_layout.h
+@@ -50,6 +50,11 @@ struct kk_descriptor_set_layout {
+ 
+    VkDescriptorSetLayoutCreateFlagBits flags;
+ 
++   /* A set of this layout got a sampler with a min/max reduction (never
++    * cleared): pipelines with this layout compile their min/max emulating
++    * program when they are created (kk_shader.c) */
++   bool reduction_samplers;
++
+    /* Size of the descriptor buffer for this descriptor set */
+    /* Does not contain the size needed for variable count descriptors */
+    uint32_t non_variable_descriptor_buffer_size;
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 0450464..b82ecec 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -294,6 +294,7 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    dev->vk.command_buffer_ops = &kk_cmd_buffer_ops;
+    dev->vk.command_dispatch_table = &dev->vk.dispatch_table;
+    dev->vk.get_timestamp = kk_get_timestamp;
++   simple_mtx_init(&dev->lazy_pipeline_lock, mtx_plain);
+ 
+    /* Create a new Metal pipeline compiler for the device */
+    dev->mtl_compiler_handle = kk_acquire_compiler(dev);
+@@ -358,6 +359,7 @@ fail_vab_memory:
+ fail_compiler:
+    kk_release_compiler(dev);
+ fail_init:
++   simple_mtx_destroy(&dev->lazy_pipeline_lock);
+    vk_device_finish(&dev->vk);
+ fail_alloc:
+    vk_free(&dev->vk.alloc, dev);
+@@ -399,6 +401,7 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    simple_mtx_destroy(&dev->residency_set.mutex);
+ 
+    kk_release_compiler(dev);
++   simple_mtx_destroy(&dev->lazy_pipeline_lock);
+ 
+    vk_device_finish(&dev->vk);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 0e85bba..bfaeca8 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -103,6 +103,15 @@ struct kk_device {
+    /* Geomtry heap */
+    struct kk_bo *heap;
+    util_once_flag heap_init_once;
++
++   /* Sampler min/max reduction emulation before Apple10 (kk_shader.c): a
++    * descriptor set got a reduction sampler, so pipelines read from a
++    * pipeline cache (no set layouts to check) compile their min/max
++    * emulating program first */
++   bool reduction_sampler_sets;
++   /* Serializes compiling the second program of such a pipeline on first
++    * use (kk_cmd_shader_pipeline) */
++   simple_mtx_t lazy_pipeline_lock;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_sampler_minmax.c b/src/kosmickrisp/vulkan/kk_nir_lower_sampler_minmax.c
+index 824fe5b..c1366dd 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_sampler_minmax.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_sampler_minmax.c
+@@ -2,12 +2,74 @@
+  * Copyright 2026 Google LLC
+  * SPDX-License-Identifier: MIT
+  */
++#include "kk_descriptor_set_layout.h"
+ #include "kk_descriptor_types.h"
++#include "kk_sampler.h"
+ #include "kk_shader.h"
+ #include "kosmickrisp/compiler/nir_to_msl.h"
+ #include "nir_builder.h"
+ #include "nir_builtin_builder.h"
+ 
++struct lower_state {
++   bool dynamic;
++   uint32_t set_layout_count;
++   struct vk_descriptor_set_layout *const *set_layouts;
++   uint32_t dynamic_sets;
++};
++
++enum sampler_kind {
++   /* Immutable samplers without a reduction: nothing to emulate */
++   SAMPLER_REGULAR,
++   /* Immutable samplers that all reduce: always emulated */
++   SAMPLER_REDUCTION,
++   /* Known when the descriptor set is bound */
++   SAMPLER_DYNAMIC,
++};
++
++static enum sampler_kind
++classify(nir_deref_instr *deref, struct lower_state *state, uint32_t *set_out)
++{
++   nir_variable *var = nir_deref_instr_get_variable(deref);
++   if (var == NULL) {
++      *set_out = ~0u; /* any set */
++      return SAMPLER_DYNAMIC;
++   }
++   const uint32_t set = var->data.descriptor_set;
++   *set_out = set;
++   if (set >= state->set_layout_count || state->set_layouts[set] == NULL)
++      return SAMPLER_DYNAMIC;
++
++   const struct kk_descriptor_set_layout *layout =
++      vk_to_kk_descriptor_set_layout(state->set_layouts[set]);
++   if (var->data.binding >= layout->binding_count)
++      return SAMPLER_DYNAMIC;
++   const struct kk_descriptor_set_binding_layout *binding =
++      &layout->binding[var->data.binding];
++   if (binding->immutable_samplers == NULL)
++      return SAMPLER_DYNAMIC;
++
++   uint32_t first = 0, count = binding->array_size;
++   if (deref->deref_type == nir_deref_type_array &&
++       nir_src_is_const(deref->arr.index) &&
++       nir_deref_instr_parent(deref)->deref_type == nir_deref_type_var) {
++      first = MIN2(nir_src_as_uint(deref->arr.index), count - 1);
++      count = 1;
++   }
++
++   bool regular = false, reduction = false;
++   for (uint32_t i = first; i < first + count; i++) {
++      const struct kk_sampler *sampler = binding->immutable_samplers[i];
++      if (sampler && (sampler->filter_flags & (KK_SAMPLER_REDUCTION_MIN |
++                                               KK_SAMPLER_REDUCTION_MAX)))
++         reduction = true;
++      else
++         regular = true;
++   }
++   return !reduction ? SAMPLER_REGULAR
++          : !regular ? SAMPLER_REDUCTION
++                     : SAMPLER_DYNAMIC;
++}
++
+ static nir_def *
+ src(nir_tex_instr *tex, nir_tex_src_type type)
+ {
+@@ -22,26 +84,14 @@ load_state(nir_builder *b, nir_def *sampler, unsigned components,
+    return nir_load_sampler_state_kk(b, components, bits, sampler, .base = offset);
+ }
+ 
+-static bool
+-lower(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
++/* Software reduction of a sample through a min/max sampler, whose hardware
++ * sampler is a point sampler. Only lambda preparation is per sample site;
++ * footprint enumeration and reduction live in one non-inlined MSL helper per
++ * texture type. */
++static nir_def *
++build_emulated(nir_builder *b, nir_tex_instr *tex, nir_def *sampler,
++               nir_def *flags)
+ {
+-   if (tex->is_shadow ||
+-       nir_alu_type_get_base_type(tex->dest_type) != nir_type_float ||
+-       (tex->op != nir_texop_tex && tex->op != nir_texop_txb &&
+-        tex->op != nir_texop_txl && tex->op != nir_texop_txd))
+-      return false;
+-   nir_def *sampler = src(tex, nir_tex_src_sampler_deref);
+-   if (!sampler)
+-      return false;
+-
+-   b->cursor = nir_before_instr(&tex->instr);
+-   nir_def *flags = nir_u2u32(b, load_state(b, sampler, 1, 16,
+-      offsetof(struct kk_sampled_image_descriptor, sampler_filter_flags)));
+-   nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, flags,
+-      KK_SAMPLER_REDUCTION_MIN | KK_SAMPLER_REDUCTION_MAX), 0));
+-
+-   /* Only lambda preparation is per sample site. Footprint enumeration and
+-    * reduction live in one non-inlined MSL helper per texture type. */
+    nir_def *lod = src(tex, nir_tex_src_lod);
+    if (tex->op == nir_texop_txd) {
+       unsigned dims = tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? 3 : 2;
+@@ -101,17 +151,75 @@ lower(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
+    nir_tex_instr_add_src(emulated, nir_tex_src_backend1, params);
+    nir_tex_instr_add_src(emulated, nir_tex_src_backend2, border);
+ 
++   return &emulated->def;
++}
++
++static bool
++lower(nir_builder *b, nir_tex_instr *tex, void *data)
++{
++   struct lower_state *state = data;
++
++   if (tex->is_shadow || (tex->backend_flags & MSL_TEX_FLAG_MINMAX) ||
++       nir_alu_type_get_base_type(tex->dest_type) != nir_type_float ||
++       (tex->op != nir_texop_tex && tex->op != nir_texop_txb &&
++        tex->op != nir_texop_txl && tex->op != nir_texop_txd))
++      return false;
++   nir_def *sampler = src(tex, nir_tex_src_sampler_deref);
++   if (!sampler)
++      return false;
++
++   uint32_t set;
++   enum sampler_kind kind = classify(nir_def_as_deref(sampler), state, &set);
++   if (kind == SAMPLER_REGULAR)
++      return false;
++
++   if (kind == SAMPLER_DYNAMIC) {
++      /* Without the emulation, the pipeline's draws and dispatches use its
++       * emulating program when one of these sets holds a reduction sampler. */
++      state->dynamic_sets |= set < 32 ? BITFIELD_BIT(set) : ~0u;
++      if (!state->dynamic)
++         return false;
++   }
++
++   b->cursor = nir_before_instr(&tex->instr);
++   nir_def *flags = nir_u2u32(b, load_state(b, sampler, 1, 16,
++      offsetof(struct kk_sampled_image_descriptor, sampler_filter_flags)));
++
++   if (kind == SAMPLER_REDUCTION) {
++      nir_def_replace(&tex->def, build_emulated(b, tex, sampler, flags));
++      return true;
++   }
++
++   nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, flags,
++      KK_SAMPLER_REDUCTION_MIN | KK_SAMPLER_REDUCTION_MAX), 0));
++   nir_def *emulated = build_emulated(b, tex, sampler, flags);
+    nir_push_else(b, NULL);
+    nir_tex_instr *original = nir_instr_as_tex(
+       nir_instr_clone(b->shader, &tex->instr));
+    nir_builder_instr_insert(b, &original->instr);
+    nir_pop_if(b, NULL);
+-   nir_def_replace(&tex->def, nir_if_phi(b, &emulated->def, &original->def));
++   nir_def_replace(&tex->def, nir_if_phi(b, emulated, &original->def));
+    return true;
+ }
+ 
++/* Before Apple10, samplers with a min/max reduction are point samplers whose
++ * reduction the shader computes. Immutable samplers are resolved here.
++ * Samplers from descriptor sets are emulated only with dynamic: without it,
++ * dynamic_sets_out gets the sets they come from, which need the emulating
++ * program (compiled with dynamic) when they hold a reduction sampler. */
+ bool
+-kk_nir_lower_sampler_minmax(nir_shader *nir)
++kk_nir_lower_sampler_minmax(nir_shader *nir, bool dynamic,
++                            uint32_t set_layout_count,
++                            struct vk_descriptor_set_layout *const *set_layouts,
++                            uint32_t *dynamic_sets_out)
+ {
+-   return nir_shader_tex_pass(nir, lower, nir_metadata_none, NULL);
++   struct lower_state state = {
++      .dynamic = dynamic,
++      .set_layout_count = set_layout_count,
++      .set_layouts = set_layouts,
++   };
++   bool progress =
++      nir_shader_tex_pass(nir, lower, nir_metadata_none, &state);
++   *dynamic_sets_out |= state.dynamic_sets;
++   return progress;
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index 429d8c7..5e495f7 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -8,6 +8,8 @@
+ #include "kk_queue.h"
+ #include "kk_buffer.h"
+ #include "kk_cmd_buffer.h"
++#include "kk_debug.h"
++#include "kk_descriptor_set.h"
+ #include "kk_device.h"
+ #include "kk_entrypoints.h"
+ #include "kk_physical_device.h"
+@@ -91,6 +93,24 @@ kk_cmd_buffer_has_work(struct kk_cmd_buffer *cmd)
+    return cmd->metal.cmd_buf;
+ }
+ 
++/* Draws or dispatches used a pipeline's program without sampler min/max
++ * emulation for an update-after-bind set that got a reduction sampler after
++ * recording (kk_cmd_shader_pipeline). */
++static bool
++kk_cmd_buffer_needs_minmax_replay(struct kk_cmd_buffer *cmd)
++{
++   util_dynarray_foreach(&cmd->minmax_uab_sets, struct kk_descriptor_set *,
++                         set) {
++      if (p_atomic_read(&(*set)->reduction_samplers)) {
++         if (KK_DEBUG(MINMAX))
++            mesa_logi("kk: command buffer re-recorded: an update-after-bind "
++                      "set got a sampler with a min/max reduction");
++         return true;
++      }
++   }
++   return false;
++}
++
+ static void
+ kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
+                 mtl_feedback_handler_callback callback, void *user_data)
+@@ -138,6 +158,7 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
+    result = kk_BeginCommandBuffer(rerecord_handle, &begin_info);
+    if (result != VK_SUCCESS)
+       goto release;
++   rerecord->replay = true;
+ 
+    vk_cmd_queue_execute(&cmd->vk.cmd_queue, rerecord_handle,
+                         &dev->vk.dispatch_table);
+@@ -212,8 +233,10 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+       }
+ 
+       /* Metal's command buffers are one time use, re-record multiple
+-       * submissions. */
+-      if (cmd_buffer->submitted) {
++       * submissions, and command buffers whose sampler min/max emulation
++       * changed after recording. */
++      if (cmd_buffer->submitted ||
++          kk_cmd_buffer_needs_minmax_replay(cmd_buffer)) {
+          VkResult result = rerecord_and_commit_cmd_buffer(queue, cmd_buffer);
+          if (result != VK_SUCCESS)
+             return result;
+diff --git a/src/kosmickrisp/vulkan/kk_sampler.c b/src/kosmickrisp/vulkan/kk_sampler.c
+index 3bc5a30..5f5cd26 100644
+--- a/src/kosmickrisp/vulkan/kk_sampler.c
++++ b/src/kosmickrisp/vulkan/kk_sampler.c
+@@ -8,7 +8,9 @@
+ #include "kk_sampler.h"
+ 
+ #include "kk_entrypoints.h"
++#include "kk_debug.h"
+ #include "kk_descriptor_types.h"
++#include "kk_device.h"
+ #include "kk_physical_device.h"
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+@@ -21,6 +23,7 @@
+ #include "util/format/format_utils.h"
+ #include "util/format_srgb.h"
+ #include <float.h>
++#include "util/log.h"
+ 
+ static bool
+ uses_border(const VkSamplerCreateInfo *info)
+@@ -290,6 +293,8 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
+          (pCreateInfo->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR
+              ? KK_SAMPLER_MIP_LINEAR : 0) |
+          (pCreateInfo->unnormalizedCoordinates ? KK_SAMPLER_UNNORMALIZED : 0);
++      if (KK_DEBUG(MINMAX))
++         mesa_logi("kk: sampler with a min/max reduction created (emulated)");
+    }
+ 
+    *pSampler = kk_sampler_to_handle(sampler);
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index ac3a2d3..503184f 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -9,6 +9,7 @@
+ 
+ #include "kk_cmd_buffer.h"
+ #include "kk_debug.h"
++#include "kk_descriptor_set.h"
+ #include "kk_descriptor_set_layout.h"
+ #include "kk_device.h"
+ #include "kk_format.h"
+@@ -21,6 +22,8 @@
+ #include "kosmickrisp/bridge/vk_to_mtl_map.h"
+ #include "kosmickrisp/compiler/nir_to_msl.h"
+ 
++#include "c11/threads.h"
++
+ #include "nir_builder.h"
+ #include "nir_lower_blend.h"
+ 
+@@ -177,6 +180,9 @@ enum kk_feature_key {
+    KK_FEAT_NULL_DESCRIPTOR = BITFIELD_BIT(1),
+    KK_FEAT_IMAGE_VIEW_MIN_LOD = BITFIELD_BIT(2),
+    KK_FEAT_SAMPLER_MINMAX = BITFIELD_BIT(3),
++   /* Not part of the key: build the program that emulates min/max reduction
++    * for samplers from descriptor sets too (kk_compile_shaders) */
++   KK_FEAT_SAMPLER_MINMAX_DYNAMIC = BITFIELD_BIT(4),
+ };
+ 
+ static enum kk_feature_key
+@@ -686,7 +692,7 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
+              uint32_t set_layout_count,
+              struct vk_descriptor_set_layout *const *set_layouts,
+              const struct vk_graphics_pipeline_state *state,
+-             enum kk_feature_key features)
++             enum kk_feature_key features, uint32_t *minmax_sets)
+ {
+    struct kk_physical_device *pdev = kk_device_physical(dev);
+ 
+@@ -803,7 +809,9 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
+     * Border emulation then operates on those point samples. */
+    if (pdev->info.gpu_apple_family < 10 &&
+        (features & KK_FEAT_SAMPLER_MINMAX))
+-      NIR_PASS(_, nir, kk_nir_lower_sampler_minmax);
++      NIR_PASS(_, nir, kk_nir_lower_sampler_minmax,
++               features & KK_FEAT_SAMPLER_MINMAX_DYNAMIC, set_layout_count,
++               set_layouts, minmax_sets);
+ 
+    if (features & KK_FEAT_CUSTOM_BORDER)
+       NIR_PASS(_, nir, kk_nir_lower_custom_border);
+@@ -889,6 +897,9 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+    ralloc_free((void *)shader->pre_gs.entrypoint_name);
+    ralloc_free((void *)shader->pre_gs.code);
+ 
++   if (shader->minmax)
++      kk_shader_destroy(vk_dev, shader->minmax, pAllocator);
++
+    vk_shader_free(&dev->vk, pAllocator, &shader->vk);
+ }
+ 
+@@ -1270,7 +1281,9 @@ get_empty_nir(struct kk_device *dev, mesa_shader_stage stage,
+       .null_uniform_buffer_descriptor = false,
+       .null_storage_buffer_descriptor = false,
+    };
+-   kk_lower_nir(dev, nir, false, &no_robustness, 0u, NULL, state, features);
++   uint32_t minmax_sets = 0u;
++   kk_lower_nir(dev, nir, false, &no_robustness, 0u, NULL, state, features,
++                &minmax_sets);
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+ 
+    return nir;
+@@ -1617,7 +1630,8 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+             pipeline_descriptor, i, vs->info.vs.rt_formats[i]);
+    }
+ 
+-   if (vs->info.vs.has_ds) {
++   /* A pipeline whose minmax program was compiled first has it already */
++   if (vs->info.vs.has_ds && pipe->gfx.ds_handle == NULL) {
+       pipe->gfx.ds_handle = kk_compile_ds_state(device, &vs->info);
+    }
+ 
+@@ -1801,24 +1815,25 @@ kk_xfb_passthrough_gs(const nir_shader *last, enum mesa_prim prim)
+    return gs;
+ }
+ 
++/* Lowers, links and translates to MSL one program of a pipeline: shaders
++ * (with room for shader_count + 2, generated[] marks the stages KK added) get
++ * the stages, the VS or CS first. Takes ownership of nirs. minmax_sets gets
++ * the descriptor sets of samplers whose min/max emulation the program leaves
++ * to KK_FEAT_SAMPLER_MINMAX_DYNAMIC. */
+ static VkResult
+-kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+-                   struct vk_shader_compile_info *infos,
+-                   const struct vk_graphics_pipeline_state *state,
+-                   const struct vk_features *enabled_features,
+-                   const VkAllocationCallbacks *pAllocator,
+-                   struct vk_shader **shaders_out)
++kk_build_shaders(struct kk_device *dev, uint32_t shader_count,
++                 const struct vk_shader_compile_info *infos, nir_shader **nirs,
++                 const struct vk_graphics_pipeline_state *state,
++                 enum kk_feature_key features,
++                 const VkAllocationCallbacks *pAllocator,
++                 struct kk_shader **shaders, bool *generated,
++                 uint32_t *total_out, uint32_t *minmax_sets)
+ {
+    VkResult result = VK_SUCCESS;
+-   struct kk_device *dev = container_of(device, struct kk_device, vk);
+    struct kk_physical_device *pdev = kk_device_physical(dev);
+ 
+-   enum kk_feature_key features = kk_make_feature_key(enabled_features);
+-
+    /* Leave room for a generated fragment shader and an XFB passthrough GS. */
+    nir_shader *nir_shaders[shader_count + 2u];
+-   struct kk_shader *shaders[shader_count + 2u];
+-   bool generated[shader_count + 2u];
+ 
+    /* Capture the last pre-rasterization stage, adding a passthrough GS if
+     * the application doesn't have one. */
+@@ -1829,7 +1844,7 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+           infos[i].stage == MESA_SHADER_GEOMETRY)
+          last_vtg = i;
+    }
+-   bool xfb_gs = state && infos[last_vtg].nir->xfb_info &&
++   bool xfb_gs = state && nirs[last_vtg]->xfb_info &&
+                  infos[last_vtg].stage != MESA_SHADER_GEOMETRY;
+ 
+    /* Lower shaders, notably lowering IO. This is a prerequisite for intershader
+@@ -1838,7 +1853,7 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+    uint32_t total_shaders = 0u;
+    for (uint32_t i = 0u; i < shader_count; ++i) {
+       const struct vk_shader_compile_info *info = &infos[i];
+-      nir_shader *nir = info->nir;
++      nir_shader *nir = nirs[i];
+ 
+       /* Stages before the tessellator or a GS run as compute */
+       bool emulated_stage =
+@@ -1848,7 +1863,8 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+ 
+       msl_preprocess_nir_workarounds(nir, pdev->settings.disabled_workarounds);
+       kk_lower_nir(dev, nir, emulated_stage, info->robustness,
+-                   info->set_layout_count, info->set_layouts, state, features);
++                   info->set_layout_count, info->set_layouts, state, features,
++                   minmax_sets);
+ 
+       if (nir->info.stage == MESA_SHADER_VERTEX)
+          vertex_robustness = info->robustness;
+@@ -1940,20 +1956,20 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+          for (uint32_t j = i + 1; j < total_shaders; j++)
+             ralloc_free(nir_shaders[j]);
+ 
+-         /* Memset the output array */
+-         memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
+-
+          return result;
+       }
+    }
+ 
+-   /* Compile pipeline:
+-    * 1. Compute pipeline
+-    * 2. Graphics with all stages (since we don't support GPL nor shader
+-    * objects for now). This will be addressed later.
+-    */
+-   if (shaders[0]->vk.stage == MESA_SHADER_COMPUTE) {
+-      struct kk_shader *s = shaders[0];
++   *total_out = total_shaders;
++   return VK_SUCCESS;
++}
++
++/* Creates the Metal pipelines of a program (its VS or CS). */
++static VkResult
++kk_compile_program(struct kk_device *dev, struct kk_shader *s)
++{
++   VkResult result;
++   if (s->info.stage == MESA_SHADER_COMPUTE) {
+       uint32_t local_size_threads = s->info.cs.local_size.x *
+                                     s->info.cs.local_size.y *
+                                     s->info.cs.local_size.z;
+@@ -1961,16 +1977,173 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+          kk_compile_compute_pipeline(dev, &s->msl_data[MESA_SHADER_COMPUTE],
+                                      local_size_threads, &s->pipeline.cs);
+    } else {
+-      gather_graphics_pipeline_create_info(state, shaders, total_shaders);
+-      struct kk_shader *vs = shaders[0];
+-      const uint32_t samples =
+-         kk_supported_sample_count(kk_device_physical(dev), vs->info.vs.sample_count);
+-      if (samples != vs->info.vs.sample_count) {
+-         mesa_logw("kk: rasterizationSamples %u is not supported, using %u",
+-                   vs->info.vs.sample_count, samples);
+-         vs->info.vs.sample_count = samples;
++      result = kk_compile_graphics_pipeline(dev, s);
++   }
++   if (result == VK_SUCCESS)
++      p_atomic_set(&s->pipeline_ready, true);
++   return result;
++}
++
++/* Graphics pipeline state the VS of a program holds. */
++static void
++kk_gather_program(struct kk_device *dev,
++                  const struct vk_graphics_pipeline_state *state,
++                  struct kk_shader **shaders, uint32_t total_shaders)
++{
++   gather_graphics_pipeline_create_info(state, shaders, total_shaders);
++   struct kk_shader *vs = shaders[0];
++   const uint32_t samples =
++      kk_supported_sample_count(kk_device_physical(dev), vs->info.vs.sample_count);
++   if (samples != vs->info.vs.sample_count) {
++      mesa_logw("kk: rasterizationSamples %u is not supported, using %u",
++                vs->info.vs.sample_count, samples);
++      vs->info.vs.sample_count = samples;
++   }
++}
++
++/* Before Apple10 a pipeline whose samplers come from descriptor sets has two
++ * programs: the VS or CS one, which emulates min/max reduction only for
++ * immutable samplers, and its minmax one, which also emulates it for the
++ * samplers of info.minmax_sets (a branch, LOD preparation and a call per
++ * sample: about twice the GPU time of sampling-bound shaders, and 1.3-1.6x
++ * the compile time). Draws and dispatches use the minmax program only while
++ * one of those sets holds a reduction sampler (kk_cmd_shader_pipeline).
++ * Pipelines compile the other program when they are created, unless a set of
++ * one of those sets' layouts already got a reduction sampler (descriptor
++ * heaps: vkd3d-proton's sampler heap is then bound with every draw; for
++ * pipelines read from a pipeline cache, any set); the program not compiled at
++ * creation is compiled on first use. While Metal compiles the program without
++ * emulation at creation (another thread), the minmax program's MSL is built
++ * (kk_compile_shaders). */
++static bool
++kk_minmax_layouts_used(uint32_t minmax_sets, uint32_t set_layout_count,
++                       struct vk_descriptor_set_layout *const *set_layouts)
++{
++   for (uint32_t s = 0; s < set_layout_count; s++) {
++      if (s < 32 && !(minmax_sets & BITFIELD_BIT(s)))
++         continue;
++      if (set_layouts[s] != NULL &&
++          p_atomic_read(
++             &vk_to_kk_descriptor_set_layout(set_layouts[s])->reduction_samplers))
++         return true;
++   }
++   return false;
++}
++
++static VkResult
++kk_compile_programs(struct kk_device *dev, struct kk_shader *s,
++                    bool minmax_first)
++{
++   if (s->minmax == NULL || !minmax_first)
++      return kk_compile_program(dev, s);
++
++   if (KK_DEBUG(MINMAX))
++      mesa_logi("kk: min/max emulating program of a pipeline compiled at "
++                "creation (a set has a reduction sampler)");
++   VkResult result = kk_compile_program(dev, s->minmax);
++   /* Binding the VS sets its static depth/stencil state */
++   if (result == VK_SUCCESS && s->info.stage == MESA_SHADER_VERTEX &&
++       s->info.vs.has_ds)
++      s->pipeline.gfx.ds_handle = kk_compile_ds_state(dev, &s->info);
++   return result;
++}
++
++struct kk_program_job {
++   struct kk_device *dev;
++   struct kk_shader *s;
++   VkResult result;
++};
++
++static int
++kk_program_job_run(void *data)
++{
++   struct kk_program_job *job = data;
++   job->result = kk_compile_program(job->dev, job->s);
++   return 0;
++}
++
++static VkResult
++kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
++                   struct vk_shader_compile_info *infos,
++                   const struct vk_graphics_pipeline_state *state,
++                   const struct vk_features *enabled_features,
++                   const VkAllocationCallbacks *pAllocator,
++                   struct vk_shader **shaders_out)
++{
++   struct kk_device *dev = container_of(device, struct kk_device, vk);
++   struct kk_physical_device *pdev = kk_device_physical(dev);
++   enum kk_feature_key features = kk_make_feature_key(enabled_features);
++   const bool minmax = pdev->info.gpu_apple_family < 10 &&
++                       (features & KK_FEAT_SAMPLER_MINMAX);
++
++   nir_shader *nirs[shader_count], *minmax_nirs[shader_count];
++   for (uint32_t i = 0u; i < shader_count; ++i) {
++      nirs[i] = infos[i].nir;
++      minmax_nirs[i] = minmax ? nir_shader_clone(NULL, infos[i].nir) : NULL;
++   }
++
++   struct kk_shader *shaders[shader_count + 2u];
++   bool generated[shader_count + 2u];
++   uint32_t total_shaders = 0u, minmax_sets = 0u;
++   VkResult result =
++      kk_build_shaders(dev, shader_count, infos, nirs, state, features,
++                       pAllocator, shaders, generated, &total_shaders,
++                       &minmax_sets);
++   if (result != VK_SUCCESS || !minmax_sets) {
++      for (uint32_t i = 0u; i < shader_count; ++i)
++         ralloc_free(minmax_nirs[i]);
++   }
++   if (result != VK_SUCCESS) {
++      memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
++      return result;
++   }
++
++   /* Compile pipeline:
++    * 1. Compute pipeline
++    * 2. Graphics with all stages (since we don't support GPL nor shader
++    * objects for now). This will be addressed later.
++    */
++   struct kk_shader *s = shaders[0];
++   s->info.minmax_sets = minmax_sets;
++   if (s->vk.stage != MESA_SHADER_COMPUTE)
++      kk_gather_program(dev, state, shaders, total_shaders);
++
++   /* Metal compiles the program without min/max emulation while the minmax
++    * program's MSL is built (kk_compile_programs). */
++   const bool minmax_first =
++      minmax_sets && kk_minmax_layouts_used(minmax_sets,
++                                            infos[0].set_layout_count,
++                                            infos[0].set_layouts);
++   struct kk_program_job job = {.dev = dev, .s = s};
++   thrd_t thread;
++   const bool threaded =
++      minmax_sets && !minmax_first &&
++      thrd_create(&thread, kk_program_job_run, &job) == thrd_success;
++
++   if (minmax_sets) {
++      struct kk_shader *minmax_shaders[shader_count + 2u];
++      bool minmax_generated[shader_count + 2u];
++      uint32_t minmax_total = 0u, unused_sets = 0u;
++      result = kk_build_shaders(
++         dev, shader_count, infos, minmax_nirs, state,
++         features | KK_FEAT_SAMPLER_MINMAX_DYNAMIC, pAllocator, minmax_shaders,
++         minmax_generated, &minmax_total, &unused_sets);
++      if (result == VK_SUCCESS) {
++         if (s->vk.stage != MESA_SHADER_COMPUTE)
++            kk_gather_program(dev, state, minmax_shaders, minmax_total);
++         /* The VS or CS has the program now */
++         for (uint32_t i = 1; i < minmax_total; i++)
++            kk_shader_destroy(&dev->vk, minmax_shaders[i], pAllocator);
++         s->minmax = minmax_shaders[0];
+       }
+-      result = kk_compile_graphics_pipeline(dev, shaders[0]);
++   }
++
++   if (threaded) {
++      thrd_join(thread, NULL);
++      if (result == VK_SUCCESS)
++         result = job.result;
++   } else if (result == VK_SUCCESS) {
++      result = kk_compile_programs(dev, s, minmax_first);
+    }
+ 
+    /* The VS has the pipeline data now, so free the generated shaders. */
+@@ -2027,13 +2200,9 @@ kk_msl_serialize(const struct msl_compile_data *data, struct blob *blob)
+    blob_write_bytes(blob, data->code, code_length);
+ }
+ 
+-static bool
+-kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
+-                    struct blob *blob)
++static void
++kk_program_serialize(const struct kk_shader *shader, struct blob *blob)
+ {
+-   struct kk_shader *shader = container_of(vk_shader, struct kk_shader, vk);
+-
+-   blob_write_bytes(blob, &shader->info, sizeof(shader->info));
+    kk_msl_serialize(&shader->msl_data[shader->info.stage], blob);
+    if (shader->info.stage == MESA_SHADER_VERTEX) {
+       u_foreach_bit(stage, shader->info.vs.additional_stages_bits) {
+@@ -2046,6 +2215,19 @@ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
+       kk_msl_serialize(&shader->gs_count, blob);
+    if (kk_has_pre_gs(&shader->info))
+       kk_msl_serialize(&shader->pre_gs, blob);
++}
++
++static bool
++kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
++                    struct blob *blob)
++{
++   struct kk_shader *shader = container_of(vk_shader, struct kk_shader, vk);
++
++   blob_write_bytes(blob, &shader->info, sizeof(shader->info));
++   kk_program_serialize(shader, blob);
++   /* info.minmax_sets != 0: the minmax program follows */
++   if (shader->minmax)
++      kk_program_serialize(shader->minmax, blob);
+ 
+    return !blob->out_of_memory;
+ }
+@@ -2072,6 +2254,41 @@ kk_msl_deserialize(struct blob_reader *blob, struct msl_compile_data *data)
+    return VK_SUCCESS;
+ }
+ 
++/* Reads the MSL of a program whose info is set */
++static VkResult
++kk_program_deserialize(struct blob_reader *blob, struct kk_shader *shader)
++{
++   const struct kk_shader_info *info = &shader->info;
++   VkResult result = kk_msl_deserialize(blob, &shader->msl_data[info->stage]);
++   if (result != VK_SUCCESS)
++      return result;
++
++   if (info->stage == MESA_SHADER_VERTEX) {
++      u_foreach_bit(stage, info->vs.additional_stages_bits) {
++         result = kk_msl_deserialize(blob, &shader->msl_data[stage]);
++         if (result != VK_SUCCESS)
++            return result;
++      }
++   }
++
++   if (kk_has_gs_main(info)) {
++      result = kk_msl_deserialize(blob, &shader->gs_main);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   if (kk_has_gs_count(info)) {
++      result = kk_msl_deserialize(blob, &shader->gs_count);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   if (kk_has_pre_gs(info))
++      result = kk_msl_deserialize(blob, &shader->pre_gs);
++
++   return result;
++}
++
+ static VkResult
+ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
+                       uint32_t binary_version,
+@@ -2090,48 +2307,30 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
+    if (shader == NULL)
+       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+-   VkResult result = kk_msl_deserialize(blob, &shader->msl_data[info.stage]);
++   shader->info = info;
++   VkResult result = kk_program_deserialize(blob, shader);
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
+-   shader->info = info;
+-
+-   if (shader->info.stage == MESA_SHADER_VERTEX) {
+-      u_foreach_bit(stage, shader->info.vs.additional_stages_bits) {
+-         result = kk_msl_deserialize(blob, &shader->msl_data[stage]);
+-         if (result != VK_SUCCESS)
+-            goto fail;
+-      }
+-   }
+-
+-   if (kk_has_gs_main(&info)) {
+-      result = kk_msl_deserialize(blob, &shader->gs_main);
+-      if (result != VK_SUCCESS)
+-         goto fail;
+-   }
+-
+-   if (kk_has_gs_count(&info)) {
+-      result = kk_msl_deserialize(blob, &shader->gs_count);
+-      if (result != VK_SUCCESS)
++   if (info.minmax_sets) {
++      shader->minmax = vk_shader_zalloc(&dev->vk, &kk_shader_ops, info.stage,
++                                        pAllocator, sizeof(*shader));
++      if (shader->minmax == NULL) {
++         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+          goto fail;
+-   }
+-
+-   if (kk_has_pre_gs(&info)) {
+-      result = kk_msl_deserialize(blob, &shader->pre_gs);
++      }
++      shader->minmax->info = info;
++      shader->minmax->info.minmax_sets = 0u;
++      result = kk_program_deserialize(blob, shader->minmax);
+       if (result != VK_SUCCESS)
+          goto fail;
+    }
+ 
+-   if (info.stage == MESA_SHADER_COMPUTE) {
+-      uint32_t local_size_threads = shader->info.cs.local_size.x *
+-                                    shader->info.cs.local_size.y *
+-                                    shader->info.cs.local_size.z;
+-      result = kk_compile_compute_pipeline(
+-         dev, &shader->msl_data[MESA_SHADER_COMPUTE], local_size_threads,
+-         &shader->pipeline.cs);
+-   } else if (info.stage == MESA_SHADER_VERTEX) {
+-      result = kk_compile_graphics_pipeline(dev, shader);
+-   }
++   /* Without the pipeline's set layouts: the minmax program first once any
++    * set got a reduction sampler */
++   if (info.stage == MESA_SHADER_COMPUTE || info.stage == MESA_SHADER_VERTEX)
++      result = kk_compile_programs(
++         dev, shader, p_atomic_read(&dev->reduction_sampler_sets));
+ 
+    if (result != VK_SUCCESS)
+       goto fail;
+@@ -2151,6 +2350,71 @@ kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd, struct kk_shader *shader)
+    cmd->state.shaders[MESA_SHADER_COMPUTE] = shader;
+ }
+ 
++/* The program of a pipeline (its VS or CS) a draw or dispatch with the
++ * descriptor sets of desc uses: the minmax program while one of the sets its
++ * samplers come from holds a reduction sampler (kk_compile_programs). An
++ * update-after-bind set may get one after recording, before submission: such
++ * sets are recorded for kk_queue_submit, which then re-records the command
++ * buffer from its command queue. One-time-submit command buffers have no
++ * command queue to replay and use the minmax program with them right away. */
++const struct kk_pipeline_handles *
++kk_cmd_shader_pipeline(struct kk_cmd_buffer *cmd, struct kk_shader *shader,
++                       const struct kk_descriptor_state *desc)
++{
++   if (shader->minmax == NULL)
++      return &shader->pipeline;
++
++   bool minmax = false;
++   uint32_t uab_sets = 0u;
++   u_foreach_bit(s, shader->info.minmax_sets & BITFIELD_MASK(KK_MAX_SETS)) {
++      const struct kk_descriptor_set *set = desc->sets[s];
++      if (set == NULL) {
++         minmax = desc->push[s] != NULL && desc->push[s]->reduction_samplers;
++      } else if (p_atomic_read(&set->reduction_samplers)) {
++         minmax = true;
++      } else if (!cmd->replay &&
++                 (set->layout->flags &
++                  VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)) {
++         minmax = cmd->one_time_submit;
++         uab_sets |= BITFIELD_BIT(s);
++      }
++      if (minmax)
++         break;
++   }
++
++   if (!minmax) {
++      u_foreach_bit(s, uab_sets) {
++         struct kk_descriptor_set *set = desc->sets[s];
++         bool recorded = false;
++         util_dynarray_foreach(&cmd->minmax_uab_sets,
++                               struct kk_descriptor_set *, it)
++            recorded |= *it == set;
++         if (!recorded)
++            util_dynarray_append(&cmd->minmax_uab_sets, set);
++      }
++   }
++
++   struct kk_shader *program = minmax ? shader->minmax : shader;
++   if (unlikely(!p_atomic_read(&program->pipeline_ready))) {
++      struct kk_device *dev = kk_cmd_buffer_device(cmd);
++      VkResult result = VK_SUCCESS;
++      simple_mtx_lock(&dev->lazy_pipeline_lock);
++      if (!program->pipeline_ready) {
++         if (KK_DEBUG(MINMAX))
++            mesa_logi("kk: %s program of a pipeline compiled on first use",
++                      minmax ? "min/max emulating" : "plain");
++         result = kk_compile_program(dev, program);
++      }
++      simple_mtx_unlock(&dev->lazy_pipeline_lock);
++      if (result != VK_SUCCESS) {
++         /* The pipeline's other program is ready */
++         vk_command_buffer_set_error(&cmd->vk, result);
++         program = minmax ? shader : shader->minmax;
++      }
++   }
++   return &program->pipeline;
++}
++
+ static void
+ kk_cmd_bind_graphics_shader(struct kk_cmd_buffer *cmd,
+                             const mesa_shader_stage stage,
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index d2e9db7..2ee4ed5 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -20,6 +20,7 @@
+ #include "vk_shader.h"
+ 
+ struct kk_cmd_buffer;
++struct kk_descriptor_state;
+ 
+ struct kk_tess_info {
+    enum tess_primitive_mode mode : 8;
+@@ -54,6 +55,10 @@ struct kk_shader_info {
+    /* Required for fragment shader cull distance discards. */
+    uint8_t num_cull_distances;
+ 
++   /* VS or CS with a minmax program: descriptor sets whose reduction samplers
++    * need it (kk_compile_programs) */
++   uint32_t minmax_sets;
++
+    union {
+       /* Vertex shader is the pipeline, store all relevant data here. */
+       struct {
+@@ -157,6 +162,13 @@ struct kk_shader {
+    /* XFB pre-GS and count shader; code is NULL when the program isn't needed. */
+    struct msl_compile_data gs_count;
+    struct msl_compile_data pre_gs;
++
++   /* VS or CS: the program emulating min/max reduction for samplers from
++    * descriptor sets, or NULL (kk_compile_programs) */
++   struct kk_shader *minmax;
++   /* Metal pipelines created, when minmax isn't NULL (one of the two
++    * programs is compiled on first use) */
++   bool pipeline_ready;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
+@@ -191,7 +203,10 @@ bool kk_nir_lower_poly(struct nir_shader *nir);
+ bool kk_nir_lower_null_images(nir_shader *nir);
+ 
+ bool kk_nir_lower_textures(nir_shader *nir);
+-bool kk_nir_lower_sampler_minmax(nir_shader *nir);
++bool kk_nir_lower_sampler_minmax(nir_shader *nir, bool dynamic,
++                                 uint32_t set_layout_count,
++                                 struct vk_descriptor_set_layout *const *set_layouts,
++                                 uint32_t *dynamic_sets_out);
+ 
+ bool kk_nir_lower_vs_multiview(nir_shader *nir, uint32_t view_mask);
+ bool kk_nir_lower_fs_multiview(nir_shader *nir, uint32_t view_mask);
+@@ -209,4 +224,8 @@ VkResult kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
+ void kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd,
+                                 struct kk_shader *shader);
+ 
++const struct kk_pipeline_handles *
++kk_cmd_shader_pipeline(struct kk_cmd_buffer *cmd, struct kk_shader *shader,
++                       const struct kk_descriptor_state *desc);
++
+ #endif /* KK_SHADER_H */

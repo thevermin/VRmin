@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Willie Abrams <willie@pobox.com>
+Date: Thu, 1 Oct 2026 14:07:10 -0500
+Subject: [PATCH 14/19] kk: Implement vkCmdDrawIndirectByteCount2EXT
+
+Use a small kernel to turn the XFB byte counter into an indirect draw.
+Subtract counterOffset, clamp to zero and divide by vertexStride. The
+draw starts at vertex zero and uses the usual indirect path.
+
+Assisted-by: Claude Code
+---
+ src/kosmickrisp/libkk/kk_draws.cl    | 16 +++++++++++
+ src/kosmickrisp/vulkan/kk_cmd_draw.c | 41 ++++++++++++++++++++++++++++
+ 2 files changed, 57 insertions(+)
+
+diff --git a/src/kosmickrisp/libkk/kk_draws.cl b/src/kosmickrisp/libkk/kk_draws.cl
+index 15ac3a5..413596b 100644
+--- a/src/kosmickrisp/libkk/kk_draws.cl
++++ b/src/kosmickrisp/libkk/kk_draws.cl
+@@ -71,6 +71,22 @@ libkk_predicate_indirect_neq_zero(global uint32_t *out, constant uint32_t *in,
+    libkk_predicate_draw(out, in, out_stride_el, in_stride_el, draw_id, enabled);
+ }
+ 
++/* Build an indirect draw from the XFB byte counter for
++ * vkCmdDrawIndirectByteCount2EXT. */
++KERNEL(1)
++libkk_draw_byte_count(global uint32_t *out_draw, constant uint32_t *byte_count,
++                      uint32_t counter_offset, uint32_t vertex_stride,
++                      uint32_t instance_count, uint32_t first_instance)
++{
++   uint32_t bytes =
++      *byte_count > counter_offset ? *byte_count - counter_offset : 0;
++
++   out_draw[0] = bytes / vertex_stride; /* vertex_count */
++   out_draw[1] = instance_count;
++   out_draw[2] = 0; /* first_vertex */
++   out_draw[3] = first_instance;
++}
++
+ KERNEL(1024)
+ libkk_unroll_geometry(
+    uint64_t index_buffer, global struct poly_heap *heap,
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 799c1e4..f681a4d 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -2873,3 +2873,44 @@ kk_CmdEndTransformFeedback2EXT(
+    kk_begin_end_xfb(cmd, firstCounterRange, counterRangeCount, pCounterInfos,
+                     false);
+ }
++
++VKAPI_ATTR void VKAPI_CALL
++kk_CmdDrawIndirectByteCount2EXT(
++   VkCommandBuffer commandBuffer, uint32_t instanceCount,
++   uint32_t firstInstance,
++   const VkBindTransformFeedbackBuffer2InfoEXT *pCounterInfo,
++   uint32_t counterOffset, uint32_t vertexStride)
++{
++   /* Metal validation complains about draws with no instances. */
++   if (instanceCount == 0)
++      return;
++
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++
++   const struct vk_dynamic_graphics_state *dyn =
++      &cmd->vk.dynamic_graphics_state;
++
++   struct kk_ptr draw = kk_pool_alloc(cmd, sizeof(VkDrawIndirectCommand), 4u);
++   if (unlikely(!draw.gpu))
++      return;
++
++   libkk_draw_byte_count(cmd, kk_grid_1d(1u), true, draw.gpu,
++                         pCounterInfo->addressRange.address, counterOffset,
++                         vertexStride, instanceCount, firstInstance);
++
++   struct kk_draw_command data = {
++      .prim = vk_topology_to_mesa(dyn->ia.primitive_topology),
++      .upload_mask = build_per_draw_upload_mask(cmd),
++      .indirect = true,
++      .predicate_count = cmd->state.cond_render.enabled ? 1u : 0u,
++      .predicate_op[0] = cmd->state.cond_render.inverted
++                            ? KK_PREDICATE_EQ_ZERO
++                            : KK_PREDICATE_NEQ_ZERO,
++      .draw_count = 1,
++      .predicate_addr[0] = cmd->state.cond_render.address,
++      .indirect_command.addr = draw.gpu,
++      .indirect_command.stride = sizeof(VkDrawIndirectCommand),
++   };
++
++   kk_draw(cmd, &data);
++}
+-- 
+2.54.0 (Apple Git-157)
+
