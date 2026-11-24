@@ -78,7 +78,9 @@ jobs:
         working-directory: dxmt
         run: |
           if [ "$DXMT_REPO" = 3Shain/dxmt ]; then
-            for p in ../vrmin/mac/dxmt/steamac/*.patch; do git apply "$p"; done
+            # (sin el 0023, los «residency sets» de Metal: con él los paneles de SteamVR, texturas de otro proceso,
+            #  salían cortados o con basura)
+            for p in ../vrmin/mac/dxmt/steamac/*.patch; do case "$p" in *0023-*) continue;; esac; git apply "$p"; done
           fi
           git apply ../vrmin/mac/dxmt/msaa-8x-to-4x.patch
           git apply ../vrmin/mac/dxmt/shared-buffer-handle.patch   # (SteamVR's compositor)
