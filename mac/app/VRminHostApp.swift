@@ -1291,7 +1291,19 @@ final class AppModel: ObservableObject {
     /// Le pide al Steam de VRmin que instale SteamVR (si Steam está cerrado, lo abre primero)
     func installSteamVR() { run(L("Instalando SteamVR"), "instalar_steamvr.sh", exclusive: false) }
     /// Instalar un juego (desde la Tienda): primero se pregunta dónde (InstallWhereSheet)
-    func installGame(_ id: String, _ name: String) { installAsk = InstallAsk(id: id, name: name) }
+    func installGame(_ id: String, _ name: String) {
+        // (con el motor a medias, Steam no termina de bajar el juego: queda como «instalación fallida» y hay que
+        //  verificarlo. Primero se completa el motor y después se pregunta dónde instalarlo)
+        if !engineReady {
+            append(L("Antes de instalar %@ hay que completar el motor: se completa y después se instala", name))
+            run(L("Instalando el motor"), "instalar_motor.sh") { [weak self] in
+                guard let self, self.engineReady else { return }
+                self.installAsk = InstallAsk(id: id, name: name)
+            }
+            return
+        }
+        installAsk = InstallAsk(id: id, name: name)
+    }
     /// Le pide al Steam de VRmin que lo instale en esa carpeta (una biblioteca de Steam, o una nueva que se suma)
     func installGame(_ id: String, _ name: String, into folder: URL) {
         run(L("Instalando %@", name), "instalar_juego.sh", [id, name, "install", folder.path], exclusive: false)

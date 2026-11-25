@@ -3333,31 +3333,57 @@ final class Lobby {
     }
 
     // MARK: Juegos
+    /// Las bibliotecas de Steam: la de VRmin y las que se sumaron al instalar (otro disco, por ejemplo), como
+    /// steamLibraries en VRmin Host: los juegos instalados ahí también van a la lista del Quest
+    private func steamLibraries() -> [URL] {
+        let prefix = URL(fileURLWithPath: dataDir).appendingPathComponent("prefijo")
+        let main = prefix.appendingPathComponent("drive_c/Program Files (x86)/Steam/steamapps")
+        var out = [main]
+        guard let s = try? String(contentsOf: main.appendingPathComponent("libraryfolders.vdf"), encoding: .utf8),
+              let re = try? NSRegularExpression(pattern: #""path"\s+"([^"]+)""#) else { return out }
+        for m in re.matches(in: s, range: NSRange(s.startIndex..., in: s)) {
+            guard let r = Range(m.range(at: 1), in: s) else { continue }
+            let win = s[r].replacingOccurrences(of: "\\\\", with: "\\")
+            guard win.count >= 2, Array(win)[1] == ":" else { continue }
+            let root = prefix.appendingPathComponent("dosdevices/\(win.prefix(1).lowercased()):").resolvingSymlinksInPath()
+            let sa = win.dropFirst(2).split(separator: "\\").reduce(root) { $0.appendingPathComponent(String($1)) }
+                .appendingPathComponent("steamapps")
+            if FileManager.default.fileExists(atPath: sa.path),
+               !out.contains(where: { $0.resolvingSymlinksInPath().path.lowercased() == sa.resolvingSymlinksInPath().path.lowercased() }) {
+                out.append(sa)
+            }
+        }
+        return out
+    }
+
     private func scanGames() {
-        let lib = URL(fileURLWithPath: dataDir).appendingPathComponent("prefijo/drive_c/Program Files (x86)/Steam/steamapps")
-        guard !dataDir.isEmpty, let files = try? FileManager.default.contentsOfDirectory(atPath: lib.path),
+        guard !dataDir.isEmpty,
               let re = try? NSRegularExpression(pattern: "^\\s*\"(\\w+)\"\\s+\"([^\"]*)\"", options: [.anchorsMatchLines]) else { return }
+        let main = URL(fileURLWithPath: dataDir).appendingPathComponent("prefijo/drive_c/Program Files (x86)/Steam/steamapps")
         var out: [GameEntry] = []
-        for f in files where f.hasPrefix("appmanifest_") && f.hasSuffix(".acf") {
-            guard let txt = try? String(contentsOf: lib.appendingPathComponent(f), encoding: .utf8) else { continue }
-            var d: [String: String] = [:]
-            for m in re.matches(in: txt, range: NSRange(txt.startIndex..., in: txt)) {
-                guard let k = Range(m.range(at: 1), in: txt), let v = Range(m.range(at: 2), in: txt) else { continue }
-                if d[String(txt[k])] == nil { d[String(txt[k])] = String(txt[v]) }
+        for lib in steamLibraries() {
+            guard let files = try? FileManager.default.contentsOfDirectory(atPath: lib.path) else { continue }
+            for f in files where f.hasPrefix("appmanifest_") && f.hasSuffix(".acf") {
+                guard let txt = try? String(contentsOf: lib.appendingPathComponent(f), encoding: .utf8) else { continue }
+                var d: [String: String] = [:]
+                for m in re.matches(in: txt, range: NSRange(txt.startIndex..., in: txt)) {
+                    guard let k = Range(m.range(at: 1), in: txt), let v = Range(m.range(at: 2), in: txt) else { continue }
+                    if d[String(txt[k])] == nil { d[String(txt[k])] = String(txt[v]) }
+                }
+                guard let id = d["appid"], let dir = d["installdir"], !LOBBY_NOT_GAMES.contains(id), d["LastOwner"] != "0",   // (ver scanLibrary en VRmin Host)
+                      FileManager.default.fileExists(atPath: lib.appendingPathComponent("common/\(dir)").path) else { continue }
+                // VR o plano: lo decide VRmin Host (vrjuegos.py, con la tienda de Steam) y queda en perfiles/detectado
+                var vr = true
+                if let dd = try? Data(contentsOf: URL(fileURLWithPath: dataDir + "/perfiles/detectado/\(id).json")),
+                   let o = try? JSONSerialization.jsonObject(with: dd) as? [String: Any] {
+                    vr = (o["vr"] as? Bool) ?? !((o["apis"] as? [Any]) ?? [1]).isEmpty
+                }
+                if !out.contains(where: { $0.id == id }) { out.append(GameEntry(id: id, name: d["name"] ?? dir, vr: vr, dir: dir)) }
             }
-            guard let id = d["appid"], let dir = d["installdir"], !LOBBY_NOT_GAMES.contains(id), d["LastOwner"] != "0",   // (ver scanLibrary en VRmin Host)
-                  FileManager.default.fileExists(atPath: lib.appendingPathComponent("common/\(dir)").path) else { continue }
-            // VR o plano: lo decide VRmin Host (vrjuegos.py, con la tienda de Steam) y queda en perfiles/detectado
-            var vr = true
-            if let dd = try? Data(contentsOf: URL(fileURLWithPath: dataDir + "/perfiles/detectado/\(id).json")),
-               let o = try? JSONSerialization.jsonObject(with: dd) as? [String: Any] {
-                vr = (o["vr"] as? Bool) ?? !((o["apis"] as? [Any]) ?? [1]).isEmpty
-            }
-            out.append(GameEntry(id: id, name: d["name"] ?? dir, vr: vr, dir: dir))
         }
         out.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         // SteamVR primero: abierto solo es como ponerse un Valve Index (su sala y su menú, con la biblioteca de Steam)
-        if FileManager.default.fileExists(atPath: lib.appendingPathComponent("common/SteamVR/bin/win64/vrstartup.exe").path) {
+        if FileManager.default.fileExists(atPath: main.appendingPathComponent("common/SteamVR/bin/win64/vrstartup.exe").path) {
             out.insert(GameEntry(id: STEAMVR_APPID, name: "SteamVR", vr: true, dir: ""), at: 0)
         }
         games = out
