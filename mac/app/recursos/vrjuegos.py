@@ -17,7 +17,7 @@ Este script decide qué usar en cada juego combinando, en este orden:
 Uso:
   vrjuegos.py detectar APPID           detecta y muestra (JSON)
   vrjuegos.py resolver APPID           variables para bash (las usa jugar.sh)
-  vrjuegos.py poner APPID CLAVE VALOR  guarda una elección (runtime, lanzar, estado, nota, args, exe, diagnostico)
+  vrjuegos.py poner APPID CLAVE VALOR  guarda una elección (runtime, lanzar, estado, nota, args, exe, diagnostico, vulkan)
   vrjuegos.py listar                   todos los juegos con su detección y perfil (JSON, lo usa la app)
   vrjuegos.py intento APPID RUNTIME    se abrió con ese runtime (todavía sin imagen)
   vrjuegos.py exito APPID              el juego mandó imagen: ese runtime anda
@@ -28,6 +28,7 @@ Funciona con el python3 que trae macOS (3.9): sin sintaxis nueva.
 """
 import json
 import os
+import platform
 import re
 import shlex
 import sys
@@ -88,6 +89,9 @@ EN = {
         "DOOM VFR was made for Vive controllers (real SteamVR adapts them to the Quest's)",
     "Hecho para otros controles (Vive o Index): anda mejor con SteamVR real, que los adapta a los del Quest":
         "Made for other controllers (Vive or Index): works better with real SteamVR, which adapts them to the Quest's",
+    "KosmicKrisp necesita macOS 26 o más nuevo: se usa MoltenVK": "KosmicKrisp needs macOS 26 or newer: using MoltenVK",
+    "KosmicKrisp no está instalado: se usa MoltenVK": "KosmicKrisp isn't installed: using MoltenVK",
+    "KosmicKrisp solo anda con el juego abierto directo: se usa MoltenVK": "KosmicKrisp only works with the game opened directly: using MoltenVK",
     "Este juego se hizo para otros controles: anda mejor con SteamVR real (instalalo desde Steam, en Herramientas)":
         "This game was made for other controllers: it works better with real SteamVR (install it from Steam, under Tools)",
     "Gráficos: se pide DirectX 11 (%s), lo único que entiende nuestro runtime": "Graphics: asking for DirectX 11 (%s), the only one our runtime understands",
@@ -529,6 +533,19 @@ def resolver_juego(juego, det=None):
     # esperando la respuesta dentro de Wine y se cuelga (y el juego, sin Steam, se cierra)
     if runtime == "steamvr" and exe:
         lanzar = "directo"
+    # Vulkan con KosmicKrisp (el driver de Vulkan de Mesa para Metal) en vez de MoltenVK, para este juego: el Wine de
+    # VRmin lo carga con VRMIN_VULKAN_LIB (mac/kosmickrisp/vulkan_kk.c). Necesita macOS 26, y la variable solo le llega
+    # al juego abierto directo
+    if usr.get("vulkan") == "kosmickrisp":
+        kk = os.path.join(DATOS, "kosmickrisp", "lib", "libvulkan_kk.dylib")
+        if int((platform.mac_ver()[0] or "0").split(".")[0]) < 26:
+            avisos.append(T("KosmicKrisp necesita macOS 26 o más nuevo: se usa MoltenVK"))
+        elif not os.path.isfile(kk):
+            avisos.append(T("KosmicKrisp no está instalado: se usa MoltenVK"))
+        elif lanzar != "directo" or not exe:
+            avisos.append(T("KosmicKrisp solo anda con el juego abierto directo: se usa MoltenVK"))
+        else:
+            env["VRMIN_VULKAN_LIB"] = kk
     return {
         "id": appid, "nombre": juego["nombre"], "carpeta": juego["carpeta"],
         "pedido": pedido, "runtime": runtime, "avisos": avisos,
@@ -590,6 +607,10 @@ def cmd_poner(appid, clave, valor):
         usr["args"] = json.loads(valor) if valor.strip().startswith("[") else shlex.split(valor)
     elif clave == "env":
         usr["env"] = json.loads(valor)
+    elif clave == "vulkan":
+        if valor not in ("moltenvk", "kosmickrisp"):
+            sys.exit("vulkan: moltenvk o kosmickrisp")
+        usr["vulkan"] = valor
     elif clave in ("nota", "exe"):
         usr[clave] = valor
     elif clave in ("diagnostico", "dx11"):

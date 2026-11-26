@@ -32,8 +32,8 @@ DXMT_URL="https://github.com/thevermin/VRmin/releases/download/v0.62/dxmt-vrmin-
 DXMT_SHA="1b8a1f3593496171d5baf579ba3e1db4fb15ba914a98a23126ff7fe94bca0f4c"
 DXMT_DIR="$P/dxmt/vrmin-3"
 # (2: también win32u, con Vulkan para SteamVR real: las texturas compartidas por Metal, y FreeType)
-MSYNC_URL="https://github.com/thevermin/VRmin/releases/download/v0.61/wine-msync-vrmin-3.tar.gz"
-MSYNC_SHA="c732cd022fd5eac7824bdb0e6ad3ba35af0f6a7aca9163cc31c5db815004a11b"
+MSYNC_URL="https://github.com/thevermin/VRmin/releases/download/v0.62/wine-msync-vrmin-4.tar.gz"
+MSYNC_SHA="654976ad9677aeb189112d9c8f40ce3a9627e7feb6e3bf3e36cd7473103919d5"
 # MoltenVK de VRmin: el fork de UTM (1.4.1 con geometry shaders) con los arreglos de steamac (.github/workflows/moltenvk.yml)
 MVK_URL="https://github.com/thevermin/VRmin/releases/download/v0.62/moltenvk-vrmin-1.tar.gz"
 MVK_SHA="b335b9719cf3be02fc225f733e1697ba6c8b082e03db8a31c091b366e76f488b"
