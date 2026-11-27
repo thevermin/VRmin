@@ -2263,6 +2263,7 @@ static bool initXR(App &app) {
 
     std::vector<const char *> enable = { XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME, XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME };
     if (hasExt(exts, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) { enable.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME); app.hasRefresh = true; }
+    if (hasExt(exts, "XR_BD_controller_interaction")) enable.push_back("XR_BD_controller_interaction");
     // Supermuestreo del compositor para las capas con texto (lista y escritorio)
     if (hasExt(exts, XR_FB_COMPOSITION_LAYER_SETTINGS_EXTENSION_NAME)) { enable.push_back(XR_FB_COMPOSITION_LAYER_SETTINGS_EXTENSION_NAME); app.hasLayerSettings = true; }
     // Ver tu cuarto real durante la transición de entrada y salida
@@ -2418,34 +2419,54 @@ static bool initXR(App &app) {
     app.aMenu = makeAction(app, "menu", XR_ACTION_TYPE_BOOLEAN_INPUT);
     app.aHaptic = makeAction(app, "haptic", XR_ACTION_TYPE_VIBRATION_OUTPUT);
 
-    std::vector<XrActionSuggestedBinding> b;
-    auto sug = [&](XrAction act, const char *pth) { b.push_back({act, path(app, pth)}); };
-    for (const char *h : {"left", "right"}) {
-        std::string base = std::string("/user/hand/") + h;
-        sug(app.aGrip, (base + "/input/grip/pose").c_str());
-        sug(app.aAim, (base + "/input/aim/pose").c_str());
-        sug(app.aTrigger, (base + "/input/trigger/value").c_str());
-        sug(app.aTrigTouch, (base + "/input/trigger/touch").c_str());
-        sug(app.aSqueeze, (base + "/input/squeeze/value").c_str());
-        sug(app.aStick, (base + "/input/thumbstick").c_str());
-        sug(app.aStickClick, (base + "/input/thumbstick/click").c_str());
-        sug(app.aStickTouch, (base + "/input/thumbstick/touch").c_str());
-        sug(app.aHaptic, (base + "/output/haptic").c_str());
-    }
-    sug(app.aA, "/user/hand/left/input/x/click");
-    sug(app.aB, "/user/hand/left/input/y/click");
-    sug(app.aATouch, "/user/hand/left/input/x/touch");
-    sug(app.aBTouch, "/user/hand/left/input/y/touch");
-    sug(app.aMenu, "/user/hand/left/input/menu/click");
-    sug(app.aA, "/user/hand/right/input/a/click");
-    sug(app.aB, "/user/hand/right/input/b/click");
-    sug(app.aATouch, "/user/hand/right/input/a/touch");
-    sug(app.aBTouch, "/user/hand/right/input/b/touch");
-    XrInteractionProfileSuggestedBinding sb{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
-    sb.interactionProfile = path(app, "/interaction_profiles/oculus/touch_controller");
-    sb.countSuggestedBindings = (uint32_t)b.size();
-    sb.suggestedBindings = b.data();
-    XRCHK(xrSuggestInteractionProfileBindings(app.instance, &sb));
+    auto suggestProfile = [&](const char *profile) {
+        std::vector<XrActionSuggestedBinding> b;
+        auto sug = [&](XrAction act, const char *pth) { b.push_back({act, path(app, pth)}); };
+        const bool simple = strcmp(profile, "/interaction_profiles/khr/simple_controller") == 0;
+        for (const char *h : {"left", "right"}) {
+            std::string base = std::string("/user/hand/") + h;
+            sug(app.aGrip, (base + "/input/grip/pose").c_str());
+            sug(app.aAim, (base + "/input/aim/pose").c_str());
+            sug(app.aHaptic, (base + "/output/haptic").c_str());
+            if (simple) {
+                sug(app.aTrigger, (base + "/input/select/click").c_str());
+                sug(app.aA, (base + "/input/select/click").c_str());
+            } else {
+                sug(app.aTrigger, (base + "/input/trigger/value").c_str());
+                sug(app.aTrigTouch, (base + "/input/trigger/touch").c_str());
+                sug(app.aSqueeze, (base + "/input/squeeze/value").c_str());
+                sug(app.aStick, (base + "/input/thumbstick").c_str());
+                sug(app.aStickClick, (base + "/input/thumbstick/click").c_str());
+                sug(app.aStickTouch, (base + "/input/thumbstick/touch").c_str());
+            }
+        }
+        if (!simple) {
+            sug(app.aA, "/user/hand/left/input/x/click");
+            sug(app.aB, "/user/hand/left/input/y/click");
+            sug(app.aATouch, "/user/hand/left/input/x/touch");
+            sug(app.aBTouch, "/user/hand/left/input/y/touch");
+            sug(app.aMenu, "/user/hand/left/input/menu/click");
+            sug(app.aA, "/user/hand/right/input/a/click");
+            sug(app.aB, "/user/hand/right/input/b/click");
+            sug(app.aATouch, "/user/hand/right/input/a/touch");
+            sug(app.aBTouch, "/user/hand/right/input/b/touch");
+        } else {
+            sug(app.aMenu, "/user/hand/left/input/menu/click");
+            sug(app.aB, "/user/hand/right/input/menu/click");
+        }
+        XrInteractionProfileSuggestedBinding sb{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+        sb.interactionProfile = path(app, profile);
+        sb.countSuggestedBindings = (uint32_t)b.size();
+        sb.suggestedBindings = b.data();
+        XrResult r = xrSuggestInteractionProfileBindings(app.instance, &sb);
+        if (XR_FAILED(r)) LOGE("Bindings %s: %d", profile, (int)r);
+        else LOGI("Bindings %s: OK", profile);
+    };
+
+    suggestProfile("/interaction_profiles/oculus/touch_controller");
+    suggestProfile("/interaction_profiles/bytedance/pico4_controller");
+    suggestProfile("/interaction_profiles/bytedance/pico_neo3_controller");
+    suggestProfile("/interaction_profiles/khr/simple_controller");
     XrSessionActionSetsAttachInfo at{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
     at.countActionSets = 1;
     at.actionSets = &app.actionSet;
@@ -9247,6 +9268,16 @@ static void pollXrEvents(App &app) {
                 app.sessionRunning = false;
             } else if (sc->state == XR_SESSION_STATE_EXITING || sc->state == XR_SESSION_STATE_LOSS_PENDING) {
                 app.exitRequested = true;
+            }
+        } else if (ev.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+            auto *ic = (XrEventDataInteractionProfileChanged *)&ev;
+            for (int h = 0; h < 2; h++) {
+                XrInteractionProfileState ps{XR_TYPE_INTERACTION_PROFILE_STATE};
+                if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(ic->session, app.hand[h], &ps)) && ps.interactionProfile != XR_NULL_PATH) {
+                    char buf[256]; uint32_t n = 0;
+                    if (XR_SUCCEEDED(xrPathToString(app.instance, ps.interactionProfile, sizeof(buf), &n, buf)))
+                        LOGI("Perfil de interacción %s: %s", h == 0 ? "izq" : "der", buf);
+                }
             }
         } else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
             // recentrado (botón de Meta): medir de nuevo la altura; en el Modo Centinela (visor apoyado) la altura no se
